@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多路线规划地图</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            background-color: #f5f5f5;
+        }
+        
+        .header {
+            background-color: #2c3e50;
+            color: #ffffff;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+        }
+        
+        .header p {
+            margin: 10px 0 0 0;
+            font-size: 16px;
+            opacity: 0.9;
+        }
+        
+        .map-container {
+            position: relative;
+            width: 100%;
+            height: 80vh;
+            margin: 20px 0 40px;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+            background: #ffffff;
+        }
+        
+        #mapContainer {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .info-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.96);
+            padding: 16px 18px;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+            max-width: 320px;
+            z-index: 1000;
+            backdrop-filter: blur(3px);
+            max-height: calc(80vh - 60px);
+            overflow-y: auto;
+            overscroll-behavior: contain;
+        }
+        
+        .info-panel h3 {
+            margin: 0 0 12px 0;
+            color: #2c3e50;
+            font-size: 16px;
+        }
+        
+        .info-item {
+            margin: 8px 0;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .info-item.legend-group {
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            padding: 4px 6px;
+            border-radius: 6px;
+            transition: background-color 0.2s ease, opacity 0.2s ease;
+        }
+        
+        .info-item.legend-group .swatch {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border-radius: 3px;
+            margin-right: 8px;
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.15);
+        }
+        
+        .info-item.legend-group.active {
+            background: #ecf5ff;
+        }
+        
+        .info-item.legend-group:not(.active) {
+            opacity: 0.6;
+        }
+        
+        .info-item.legend-group:hover {
+            background: #f2f8fc;
+        }
+        
+        .info-label {
+            font-weight: bold;
+            color: #34495e;
+            margin-right: 6px;
+        }
+        
+        .info-value {
+            color: #7f8c8d;
+            flex: 1;
+            text-align: right;
+        }
+        
+        #legendPanel::-webkit-scrollbar,
+        #legend::-webkit-scrollbar,
+        #routeDetailsContainer::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        #legendPanel::-webkit-scrollbar-thumb,
+        #legend::-webkit-scrollbar-thumb,
+        #routeDetailsContainer::-webkit-scrollbar-thumb {
+            background: rgba(44, 62, 80, 0.25);
+            border-radius: 999px;
+        }
+
+        #legendPanel::-webkit-scrollbar-thumb:hover,
+        #legend::-webkit-scrollbar-thumb:hover,
+        #routeDetailsContainer::-webkit-scrollbar-thumb:hover {
+            background: rgba(44, 62, 80, 0.4);
+        }
+
+        #legend {
+            margin-top: 12px;
+            max-height: 260px;
+            overflow-y: auto;
+            padding-right: 6px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(44, 62, 80, 0.25) transparent;
+        }
+
+        #routeDetailsContainer {
+            max-height: 240px;
+            overflow-y: auto;
+            padding-right: 6px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(44, 62, 80, 0.25) transparent;
+        }
+        
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 255, 255, 0.95);
+            padding: 20px 26px;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+            text-align: center;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            width: 32px;
+            height: 32px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 12px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>多路线规划地图</h1>
+        <p>从 JSON 加载多条路线，自动配色并支持分组开关</p>
+    </div>
+
+    <div class="map-container">
+        <div id="mapContainer"></div>
+
+        <div class="info-panel" id="legendPanel">
+            <h3>路线分组与颜色</h3>
+            <div class="info-item">
+                <span class="info-label">显示 / 总计：</span>
+                <span class="info-value" id="routeCount">加载中...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">数据文件：</span>
+                <span class="info-value" id="routeFileName">加载中...</span>
+            </div>
+            <div id="legend"></div>
+
+            <div id="routeDetailsContainer" style="display: none; margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px;">
+                <h4 id="route-details-title" style="margin: 0 0 10px 0; font-size: 15px; color: #2c3e50;">路线详情</h4>
+                <div id="route-summary"></div>
+                <div id="route-segments"></div>
+            </div>
+        </div>
+
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <div>正在加载地图...</div>
+        </div>
+    </div>
+
+    <script>
+        let map;
+        let TENCENT_KEY;
+
+        const COLOR_PALETTE = [
+            "#3777FF",
+            "#FF7043",
+            "#26A69A",
+            "#AB47BC",
+            "#FFA726",
+            "#EC407A",
+            "#66BB6A",
+            "#5C6BC0",
+            "#8D6E63",
+            "#42A5F5"
+        ];
+
+        const groupMetaMap = new Map();
+        let allRouteGeometries = [];
+        let totalRouteCount = 0;
+        const routeResultMemoryCache = new Map();
+        const LOCAL_ROUTE_CACHE_PREFIX = "tasi_map_route_cache_v1";
+        const LOCAL_ROUTE_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const requestedRoutesFile = urlParams.get("file");
+        const routesFile = normalizeRoutesFilename(requestedRoutesFile);
+        let activeRoutesFile = routesFile;
+
+        function getLegendElement() {
+            return document.getElementById("legend");
+        }
+
+        function getRouteCountElement() {
+            return document.getElementById("routeCount");
+        }
+
+        function updateRouteFileLabel(text) {
+            const el = document.getElementById("routeFileName");
+            if (el) {
+                el.textContent = text;
+            }
+        }
+
+        function normalizeRoutesFilename(fileParam) {
+            if (!fileParam || typeof fileParam !== "string") {
+                return "routes.json";
+            }
+            const sanitized = fileParam.trim().split(/[\\\/]/).pop() || "routes.json";
+            return sanitized.endsWith(".json") ? sanitized : `${sanitized}.json`;
+        }
+
+        function normalizePathPoints(pathLike) {
+            if (!Array.isArray(pathLike) || pathLike.length < 2) return [];
+
+            const points = [];
+            for (const item of pathLike) {
+                if (item && typeof item.lat === "number" && typeof item.lng === "number") {
+                    points.push({ lat: item.lat, lng: item.lng });
+                    continue;
+                }
+                if (Array.isArray(item) && item.length >= 2) {
+                    const lat = Number(item[0]);
+                    const lng = Number(item[1]);
+                    if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+                        points.push({ lat, lng });
+                    }
+                    continue;
+                }
+                if (item && typeof item.latitude === "number" && typeof item.longitude === "number") {
+                    points.push({ lat: item.latitude, lng: item.longitude });
+                }
+            }
+
+            return points.length >= 2 ? points : [];
+        }
+
+        function getRouteCacheKey(mode, start, end) {
+            return [
+                LOCAL_ROUTE_CACHE_PREFIX,
+                mode || "driving",
+                start?.lat,
+                start?.lng,
+                end?.lat,
+                end?.lng
+            ].join("|");
+        }
+
+        function readLocalRouteCache(cacheKey) {
+            const now = Date.now();
+            const memoryHit = routeResultMemoryCache.get(cacheKey);
+            if (memoryHit && memoryHit.expiresAt > now) {
+                return memoryHit.value;
+            }
+
+            try {
+                const raw = localStorage.getItem(cacheKey);
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                if (!parsed || parsed.expiresAt <= now || !parsed.value) {
+                    localStorage.removeItem(cacheKey);
+                    return null;
+                }
+                routeResultMemoryCache.set(cacheKey, parsed);
+                return parsed.value;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        function writeLocalRouteCache(cacheKey, value) {
+            const payload = {
+                value,
+                expiresAt: Date.now() + LOCAL_ROUTE_CACHE_TTL_MS
+            };
+            routeResultMemoryCache.set(cacheKey, payload);
+            try {
+                localStorage.setItem(cacheKey, JSON.stringify(payload));
+            } catch (_) {
+                /* ignore localStorage quota errors */
+            }
+        }
+
+        function parsePrecomputedRoute(route) {
+            if (!route || typeof route !== "object") return null;
+
+            const candidates = [
+                route.path,
+                route.polyline,
+                route.precomputed_route?.path,
+                route.precomputed_route?.polyline,
+                route.geometry?.path,
+                route.geometry?.polyline
+            ];
+
+            for (const candidate of candidates) {
+                const path = normalizePathPoints(candidate);
+                if (path.length >= 2) {
+                    const distance = Number(
+                        route.distance ?? route.precomputed_route?.distance ?? route.geometry?.distance ?? NaN
+                    );
+                    const duration = Number(
+                        route.duration ?? route.precomputed_route?.duration ?? route.geometry?.duration ?? NaN
+                    );
+                    return {
+                        path,
+                        distance: Number.isNaN(distance) ? NaN : distance,
+                        duration: Number.isNaN(duration) ? NaN : duration
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        function updateRouteSummary(activeCount) {
+            const routeCountEl = getRouteCountElement();
+            if (!routeCountEl) return;
+            if (totalRouteCount > 0) {
+                routeCountEl.textContent = `${activeCount}/${totalRouteCount} 条`;
+            } else {
+                routeCountEl.textContent = `${activeCount} 条`;
+            }
+        }
+
+        function resetRouteState() {
+            // 清理之前的标记
+            allRouteGeometries.forEach(item => {
+                if (item.markers) {
+                    item.markers.forEach(marker => {
+                        if (marker && marker.setMap) {
+                            marker.setMap(null);
+                        }
+                    });
+                }
+            });
+
+            groupMetaMap.clear();
+            allRouteGeometries = [];
+            totalRouteCount = 0;
+            const legendEl = getLegendElement();
+            if (legendEl) {
+                legendEl.innerHTML = "";
+            }
+            updateRouteSummary(0);
+            updateRouteFileLabel(activeRoutesFile);
+        }
+
+        async function fetchRoutes() {
+            const tried = new Set();
+            let currentFile = activeRoutesFile;
+
+            while (currentFile && !tried.has(currentFile)) {
+                tried.add(currentFile);
+                updateRouteFileLabel(currentFile);
+
+                try {
+                    const res = await fetch(`/api/routes?file=${encodeURIComponent(currentFile)}`);
+                    if (!res.ok) {
+                        let errDetail = "";
+                        let errData = null;
+                        try {
+                            errData = await res.json();
+                            errDetail = errData.error || "";
+                        } catch (_) {
+                            /* ignore parse errors */
+                        }
+
+                        if (res.status === 404 && errData && Array.isArray(errData.available) && errData.available.length) {
+                            const nextFile = errData.available.find(name => !tried.has(name));
+                            if (nextFile) {
+                                console.warn(`文件 ${currentFile} 未找到，尝试使用可用文件 ${nextFile}`);
+                                currentFile = nextFile;
+                                continue;
+                            }
+                        }
+
+                        throw new Error(errDetail || `HTTP ${res.status}`);
+                    }
+
+                    activeRoutesFile = currentFile;
+                    updateRouteFileLabel(activeRoutesFile);
+                    return await res.json();
+                } catch (err) {
+                    console.error("加载路线文件失败:", err);
+                    alert(`加载路线文件失败: ${err.message}\n请求文件: ${currentFile}\n请确认后端服务正在运行，且文件存在于 routes 目录中。`);
+                    updateRouteFileLabel(`${currentFile} (加载失败)`);
+                    return null;
+                }
+            }
+
+            alert("未找到可用的路线文件，请检查 routes 目录。");
+            updateRouteFileLabel("未找到文件");
+            return null;
+        }
+
+        async function initMap() {
+            if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", () => runInit(true));
+            } else {
+                runInit(false);
+            }
+        }
+
+        async function runInit(isDOMContentLoaded) {
+            console.log("runInit called. DOMContentLoaded:", isDOMContentLoaded);
+            const loadingEl = document.getElementById("loading");
+            if (loadingEl) {
+                loadingEl.style.display = "none";
+            }
+
+            const routes = await fetchRoutes();
+            if (!routes) return;
+
+            resetRouteState();
+
+            const centerLat = routes.center ? routes.center.lat : 39.90923;
+            const centerLng = routes.center ? routes.center.lng : 116.397428;
+            const zoom = routes.zoom || 12;
+
+            const mapContainer = document.getElementById("mapContainer");
+            if (!mapContainer) {
+                console.error("地图容器 \"mapContainer\" 未找到。");
+                return;
+            }
+
+            if (!window.TMap) {
+                console.error("TMap 对象未定义，无法初始化地图。");
+                alert("未能加载腾讯地图，请刷新页面或检查网络连接。");
+                return;
+            }
+
+            map = new TMap.Map(mapContainer, {
+                center: new TMap.LatLng(centerLat, centerLng),
+                zoom,
+                viewMode: "2D"
+            });
+
+            await planAllRoutes(routes);
+        }
+
+        async function fetchRouteByMode(mode, start, end) {
+            const from = `${start.lat},${start.lng}`;
+            const to = `${end.lat},${end.lng}`;
+
+            const modeMapping = {
+                // 文档支持的模式
+                "driving": "driving",
+                "walking": "walking", 
+                "bicycling": "bicycling",
+                "ebicycling": "ebicycling",
+                "transit": "transit",
+                "edriving": "edriving",
+                // 别名映射
+                car: "driving",
+                bike: "bicycling",
+                walk: "walking",
+                bus: "transit",
+                metro: "transit",
+                transfer: "transit",
+                riding: "bicycling",
+                plane: "driving"
+            };
+            const endpoint = modeMapping[mode] || "driving";
+            const cacheKey = getRouteCacheKey(endpoint, start, end);
+
+            const cachedRoute = readLocalRouteCache(cacheKey);
+            if (cachedRoute) {
+                return cachedRoute;
+            }
+
+            const baseUrl = `/api/direction?mode=${endpoint}&from=${from}&to=${to}`;
+
+            function parseDirectionJson(json) {
+                let distance = NaN;
+                let duration = NaN;
+                let path = [];
+                if (json && json.result) {
+                    if (Array.isArray(json.result.routes) && json.result.routes.length > 0) {
+                        const r0 = json.result.routes[0];
+                        distance = parseFloat(r0.distance || r0.dist || NaN);
+                        duration = parseFloat(r0.duration || r0.time || NaN);
+                        if (Array.isArray(r0.polyline)) {
+                            path = decodeTencentPolyline(r0.polyline);
+                        }
+                        if ((!path || path.length < 2) && Array.isArray(r0.steps)) {
+                            for (const step of r0.steps) {
+                                if (step.mode === 'TRANSIT' && step.lines && Array.isArray(step.lines) && step.lines.length > 0) {
+                                    // 对于公交路线，取第一条线路的polyline
+                                    if (Array.isArray(step.lines[0].polyline)) {
+                                        path = path.concat(decodeTencentPolyline(step.lines[0].polyline));
+                                    }
+                                } else if (Array.isArray(step.polyline)) {
+                                    path = path.concat(decodeTencentPolyline(step.polyline));
+                                }
+                            }
+                        }
+                    } else if (json.result.route && Array.isArray(json.result.route.polyline)) {
+                        path = decodeTencentPolyline(json.result.route.polyline);
+                    }
+                }
+                return { path, distance, duration };
+            }
+
+            try {
+                const res = await fetch(baseUrl);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const json = await res.json();
+                if (json.error) throw new Error(`后端错误: ${json.error}`);
+                if (json.status !== 0) throw new Error(`地图API状态 ${json.status}: ${json.message}`);
+                const parsed = parseDirectionJson(json);
+                if (parsed.path && parsed.path.length >= 2) {
+                    writeLocalRouteCache(cacheKey, parsed);
+                }
+                return parsed;
+            } catch (err) {
+                console.warn("路线请求失败, 使用直线兜底", mode, err);
+                return { path: [start, end], distance: NaN, duration: NaN };
+            }
+        }
+    </script>
+
+    <script>
+        function hideLoadingOverlay() {
+            const loadingEl = document.getElementById("loading");
+            if (loadingEl) {
+                loadingEl.style.display = "none";
+            }
+        }
+
+        function showTencentKeySetupGuide(payload) {
+            hideLoadingOverlay();
+
+            const envVars = Array.isArray(payload?.accepted_env_vars)
+                ? payload.accepted_env_vars.join(" / ")
+                : "TENCENT_KEY / TENCENT_MAP_KEY";
+
+            const howToFix = Array.isArray(payload?.how_to_fix) && payload.how_to_fix.length
+                ? payload.how_to_fix.map((item, idx) => `${idx + 1}. ${item}`).join("\n")
+                : "1. 在 .env 文件配置腾讯地图 Key。\n2. 刷新页面重试。";
+
+            const message = [
+                "未检测到腾讯地图 API Key，无法加载在线地图。",
+                `支持环境变量: ${envVars}`,
+                "",
+                "建议操作:",
+                howToFix
+            ].join("\n");
+
+            console.warn("腾讯地图 Key 缺失:", payload || {});
+            alert(message);
+        }
+
+        async function loadConfig() {
+            try {
+                const res = await fetch('/api/config');
+                let config = null;
+                try {
+                    config = await res.json();
+                } catch (_) {
+                    config = null;
+                }
+
+                if (!res.ok) {
+                    if (config && config.error_code === "TENCENT_KEY_MISSING") {
+                        showTencentKeySetupGuide(config);
+                        return;
+                    }
+
+                    const errMessage = (config && config.error) ? config.error : `HTTP ${res.status}`;
+                    throw new Error(errMessage);
+                }
+
+                TENCENT_KEY = config.key;
+                loadTencentMap();
+            } catch (err) {
+                console.error("加载配置失败:", err);
+                hideLoadingOverlay();
+                alert("无法加载地图配置，请检查后端服务。若需在线地图，请先配置腾讯地图 API Key。");
+            }
+        }
+
+        function loadTencentMap() {
+            if (!TENCENT_KEY) {
+                console.error("API Key 未加载，无法初始化地图。");
+                return;
+            }
+
+            if (window.TMap) {
+                initMap();
+                return;
+            }
+
+            const existing = document.querySelector('script[data-tmap-loader="true"]');
+            if (existing) {
+                existing.addEventListener("load", () => {
+                    if (window.TMap) {
+                        initMap();
+                    } else {
+                        console.error("Tencent Map 脚本已加载但 TMap 未定义。");
+                        alert("腾讯地图脚本加载后仍未提供 TMap 对象，请稍后重试或检查网络环境。");
+                    }
+                });
+                return;
+            }
+
+            const script = document.createElement("script");
+            script.src = `https://map.qq.com/api/gljs?v=1.exp&key=${TENCENT_KEY}&libraries=service&callback=initMap`;
+            script.async = true;
+            script.defer = true;
+            script.dataset.tmapLoader = "true";
+            script.onerror = () => {
+                console.error("腾讯地图脚本加载失败。");
+                alert("腾讯地图脚本加载失败，请检查网络或稍后再试。");
+            };
+            document.body.appendChild(script);
+        }
+
+        window.addEventListener("load", loadConfig);
+    </script>
+
+    <script>
+        let multiPolyline = null;
+        let multiMarker = null;
+
+        function parseDuration(timeStr) {
+            if (!timeStr || typeof timeStr !== 'string') return 0;
+            const match = timeStr.match(/(\d+)/);
+            return match ? parseInt(match[0], 10) : 0;
+        }
+
+        function formatDuration(minutes) {
+            if (isNaN(minutes) || minutes === 0) return 'N/A';
+            if (minutes < 60) return `${minutes}分钟`;
+            const hours = Math.floor(minutes / 60);
+            const mins = minutes % 60;
+            return `${hours}小时${mins > 0 ? `${mins}分钟` : ''}`;
+        }
+
+        function showRouteDetails(groupName) {
+            const detailsContainer = document.getElementById('routeDetailsContainer');
+            const titleEl = document.getElementById('route-details-title');
+            const summaryEl = document.getElementById('route-summary');
+            const segmentsEl = document.getElementById('route-segments');
+
+            if (!groupName || !detailsContainer || !summaryEl || !segmentsEl) {
+                if (detailsContainer) detailsContainer.style.display = 'none';
+                return;
+            }
+
+            const routesInGroup = allRouteGeometries
+                .filter(item => item.group === groupName)
+                .map(item => item.route)
+                .sort((a, b) => (a.id || '').localeCompare(b.id || '')); // Sort to ensure order
+
+            if (routesInGroup.length === 0) {
+                detailsContainer.style.display = 'none';
+                return;
+            }
+
+            titleEl.textContent = `${groupName} - 路线详情`;
+            summaryEl.innerHTML = '';
+            segmentsEl.innerHTML = '';
+
+            if (routesInGroup.length === 1) {
+                // Single route display
+                const route = routesInGroup[0];
+                summaryEl.innerHTML = `
+                    <div class="info-item">
+                        <span class="info-label">起点:</span>
+                        <span class="info-value">${route.start.name || 'N/A'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">终点:</span>
+                        <span class="info-value">${route.end.name || 'N/A'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">备注:</span>
+                        <span class="info-value">${route.note || '无'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">预期时间:</span>
+                        <span class="info-value">${route.expected_time || 'N/A'}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">实际时间:</span>
+                        <span class="info-value">${route.actual_time || 'N/A'}</span>
+                    </div>
+                `;
+            } else {
+                // Multi-segment route display
+                const overallStart = routesInGroup[0].start.name;
+                const overallEnd = routesInGroup[routesInGroup.length - 1].end.name;
+                let totalExpectedTime = 0;
+                let totalActualTime = 0;
+
+                routesInGroup.forEach(route => {
+                    totalExpectedTime += parseDuration(route.expected_time);
+                    totalActualTime += parseDuration(route.actual_time);
+                });
+
+                summaryEl.innerHTML = `
+                    <div class="info-item">
+                        <span class="info-label">总起点:</span>
+                        <span class="info-value">${overallStart}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">总终点:</span>
+                        <span class="info-value">${overallEnd}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">总预期时间:</span>
+                        <span class="info-value">${formatDuration(totalExpectedTime)}</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="info-label">总实际时间:</span>
+                        <span class="info-value">${formatDuration(totalActualTime)}</span>
+                    </div>
+                `;
+
+                routesInGroup.forEach((route, index) => {
+                    const segmentHtml = `
+                        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #f0f0f0;">
+                            <p style="font-weight: bold; margin: 0 0 5px 0;">分段 ${index + 1}: ${route.start.name} → ${route.end.name}</p>
+                            <div class="info-item" style="font-size: 13px;">
+                                <span class="info-label">交通方式:</span>
+                                <span class="info-value">${route.mode || '驾车'}</span>
+                            </div>
+                            <div class="info-item" style="font-size: 13px;">
+                                <span class="info-label">预期/实际:</span>
+                                <span class="info-value">${route.expected_time || 'N/A'} / ${route.actual_time || 'N/A'}</span>
+                            </div>
+                             <div class="info-item" style="font-size: 13px;">
+                                <span class="info-label">备注:</span>
+                                <span class="info-value">${route.note || '无'}</span>
+                            </div>
+                        </div>
+                    `;
+                    segmentsEl.innerHTML += segmentHtml;
+                });
+            }
+
+            detailsContainer.style.display = 'block';
+        }
+
+        function slugifyGroupName(name) {
+            return (name || "group")
+                .toString()
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, "_")
+                .replace(/[^\w-]/g, "") || "group";
+        }
+
+        function ensureGroupMeta(groupName, preferredColor) {
+            const name = groupName || "未分组";
+            if (!groupMetaMap.has(name)) {
+                const paletteIndex = groupMetaMap.size % COLOR_PALETTE.length;
+                const color = preferredColor || COLOR_PALETTE[paletteIndex];
+                const styleId = `style_${groupMetaMap.size + 1}_${slugifyGroupName(name)}`;
+                groupMetaMap.set(name, {
+                    name,
+                    color,
+                    styleId,
+                    count: 0,
+                    active: true
+                });
+            } else if (preferredColor) {
+                const meta = groupMetaMap.get(name);
+                if (meta.color !== preferredColor) {
+                    meta.color = preferredColor;
+                }
+            }
+            return groupMetaMap.get(name);
+        }
+
+        function buildLegend() {
+            const legendEl = getLegendElement();
+            if (!legendEl) return;
+            legendEl.innerHTML = "";
+
+            if (groupMetaMap.size === 0) {
+                const emptyRow = document.createElement("div");
+                emptyRow.className = "info-item";
+                emptyRow.textContent = "暂无路线数据";
+                legendEl.appendChild(emptyRow);
+                return;
+            }
+
+            groupMetaMap.forEach(meta => {
+                const row = document.createElement("div");
+                row.className = `info-item legend-group${meta.active ? " active" : ""}`;
+                row.dataset.group = meta.name;
+
+                const swatch = document.createElement("span");
+                swatch.className = "swatch";
+                swatch.style.backgroundColor = meta.color;
+                row.appendChild(swatch);
+
+                const text = document.createElement("span");
+                text.textContent = `${meta.name} (${meta.count})`;
+                row.appendChild(text);
+
+                row.addEventListener("click", () => {
+                    toggleGroupVisibility(meta.name, row);
+                    showRouteDetails(meta.name);
+                });
+                legendEl.appendChild(row);
+            });
+        }
+
+        function toggleGroupVisibility(groupName, rowEl) {
+            const meta = groupMetaMap.get(groupName);
+            if (!meta) return;
+            meta.active = !meta.active;
+            if (rowEl) {
+                rowEl.classList.toggle("active", meta.active);
+                rowEl.style.opacity = meta.active ? "1" : "0.6";
+            }
+            applyGroupVisibility(true);
+        }
+
+        function applyGroupVisibility(shouldRefit = false) {
+            const activeGroups = new Set();
+            groupMetaMap.forEach((meta, name) => {
+                if (meta.active) activeGroups.add(name);
+            });
+
+            const activeItems = allRouteGeometries.filter(item => activeGroups.has(item.group));
+            updateRouteSummary(activeItems.length);
+
+            if (multiPolyline) {
+                multiPolyline.setGeometries(activeItems.map(item => item.geometry));
+            }
+
+            if (multiMarker) {
+                const activeMarkers = activeItems.flatMap(item => item.markers || []);
+                multiMarker.setGeometries(activeMarkers);
+            }
+
+            if (shouldRefit) {
+                const bounds = computeBounds(activeItems);
+                fitMapToBounds(bounds);
+            }
+        }
+
+        function computeBounds(items) {
+            const bounds = { minLat: null, maxLat: null, minLng: null, maxLng: null };
+            for (const item of items) {
+                expandBounds(bounds, item.rawPoints);
+            }
+            return bounds;
+        }
+
+        function expandBounds(bounds, points) {
+            if (!points || !points.length) return;
+            for (const pt of points) {
+                if (!pt || typeof pt.lat !== "number" || typeof pt.lng !== "number") continue;
+                if (bounds.minLat === null || pt.lat < bounds.minLat) bounds.minLat = pt.lat;
+                if (bounds.maxLat === null || pt.lat > bounds.maxLat) bounds.maxLat = pt.lat;
+                if (bounds.minLng === null || pt.lng < bounds.minLng) bounds.minLng = pt.lng;
+                if (bounds.maxLng === null || pt.lng > bounds.maxLng) bounds.maxLng = pt.lng;
+            }
+        }
+
+        function fitMapToBounds(bounds) {
+            if (!map || bounds.minLat === null || bounds.maxLat === null || bounds.minLng === null || bounds.maxLng === null) {
+                return;
+            }
+
+            const latSpan = Math.abs(bounds.maxLat - bounds.minLat);
+            const lngSpan = Math.abs(bounds.maxLng - bounds.minLng);
+            const centerLat = (bounds.minLat + bounds.maxLat) / 2;
+            const centerLng = (bounds.minLng + bounds.maxLng) / 2;
+            const center = new TMap.LatLng(centerLat, centerLng);
+
+            if (typeof map.fitBounds === "function" && (latSpan > 1e-5 || lngSpan > 1e-5)) {
+                const sw = new TMap.LatLng(bounds.minLat, bounds.minLng);
+                const ne = new TMap.LatLng(bounds.maxLat, bounds.maxLng);
+                map.fitBounds(new TMap.LatLngBounds(sw, ne));
+            } else {
+                map.setCenter(center);
+                if (typeof map.setZoom === "function" && latSpan < 1e-5 && lngSpan < 1e-5) {
+                    const fallbackZoom = Math.max(map.getZoom ? map.getZoom() : 12, 14);
+                    map.setZoom(fallbackZoom);
+                }
+            }
+        }
+
+        function decodeTencentPolyline(polyline) {
+            if (!polyline) return [];
+
+            if (Array.isArray(polyline)) {
+                if (!polyline.length) return [];
+
+                if (typeof polyline[0] === "object") {
+                    return polyline
+                        .filter(p => p && typeof p.lat === "number" && typeof p.lng === "number")
+                        .map(p => ({ lat: p.lat, lng: p.lng }));
+                }
+
+                if (typeof polyline[0] === "number") {
+                    const coords = [...polyline];
+                    for (let i = 2; i < coords.length; i++) {
+                        coords[i] = coords[i - 2] + coords[i] / 1e6;
+                    }
+                    const result = [];
+                    for (let i = 0; i + 1 < coords.length; i += 2) {
+                        result.push({ lat: coords[i], lng: coords[i + 1] });
+                    }
+                    return result;
+                }
+            }
+
+            if (typeof polyline === "string") {
+                if (polyline.length < 2) return [];
+                let lat = 0;
+                let lng = 0;
+                const result = [];
+                for (let i = 0; i < polyline.length;) {
+                    let b;
+                    let shift = 0;
+                    let res = 0;
+                    do {
+                        b = polyline.charCodeAt(i++) - 63;
+                        res |= (b & 31) << shift;
+                        shift += 5;
+                    } while (b >= 32);
+                    lat += (res & 1) ? ~(res >> 1) : (res >> 1);
+
+                    shift = 0;
+                    res = 0;
+                    do {
+                        b = polyline.charCodeAt(i++) - 63;
+                        res |= (b & 31) << shift;
+                        shift += 5;
+                    } while (b >= 32);
+                    lng += (res & 1) ? ~(res >> 1) : (res >> 1);
+
+                    result.push({ lat: lat / 1e5, lng: lng / 1e5 });
+                }
+                return result;
+            }
+
+            console.warn("未识别的 polyline 格式:", polyline);
+            return [];
+        }
+
+        async function planAllRoutes(routesData) {
+            if (!map) {
+                console.warn("地图实例尚未创建，无法规划路线。");
+                return;
+            }
+
+            resetRouteState();
+
+            if (multiPolyline) {
+                multiPolyline.setMap(null);
+                multiPolyline = null;
+            }
+            if (multiMarker) {
+                multiMarker.setMap(null);
+                multiMarker = null;
+            }
+
+            const routeList = Array.isArray(routesData?.routes) ? routesData.routes : [];
+            if (!routeList.length) {
+                console.warn("未找到可绘制的路线数据。");
+                buildLegend();
+                applyGroupVisibility(false);
+                return;
+            }
+
+            routeList.forEach(route => ensureGroupMeta(route.group, route.color));
+
+            groupMetaMap.forEach(meta => {
+                meta.count = 0;
+                meta.active = true;
+            });
+
+            const styles = {};
+            groupMetaMap.forEach(meta => {
+                styles[meta.styleId] = new TMap.PolylineStyle({
+                    color: meta.color,
+                    width: 6,
+                    lineCap: "round"
+                });
+            });
+
+            multiPolyline = new TMap.MultiPolyline({
+                map,
+                styles,
+                geometries: []
+            });
+
+            multiMarker = new TMap.MultiMarker({
+                map,
+                styles: {
+                    "start": new TMap.MarkerStyle({
+                        "width": 25,
+                        "height": 35,
+                        "anchor": { x: 16, y: 32 },
+                        "src": "https://mapapi.qq.com/web/lbs/javascriptGL/demo/img/start.png"
+                    }),
+                    "end": new TMap.MarkerStyle({
+                        "width": 25,
+                        "height": 35,
+                        "anchor": { x: 16, y: 32 },
+                        "src": "https://mapapi.qq.com/web/lbs/javascriptGL/demo/img/end.png"
+                    })
+                },
+                geometries: []
+            });
+
+            const results = [];
+            const markerGeometries = [];
+            const boundsAccumulator = { minLat: null, maxLat: null, minLng: null, maxLng: null };
+
+            for (let index = 0; index < routeList.length; index++) {
+                const route = routeList[index];
+                const meta = ensureGroupMeta(route.group, route.color);
+                const planned = await planSingleRoute(route, meta, index);
+                if (planned && planned.geometry && planned.rawPoints && planned.rawPoints.length) {
+                    results.push(planned);
+                    meta.count += 1;
+                    expandBounds(boundsAccumulator, planned.rawPoints);
+                    if (planned.markers) {
+                        markerGeometries.push(...planned.markers);
+                    }
+                }
+            }
+
+            allRouteGeometries = results;
+            totalRouteCount = results.length;
+
+            if (multiMarker) {
+                multiMarker.setGeometries(markerGeometries);
+            }
+
+            buildLegend();
+            applyGroupVisibility(false);
+            fitMapToBounds(boundsAccumulator);
+        }
+
+        async function planSingleRoute(route, meta, routeIndex) {
+            if (!route || !route.start || !route.end) {
+                console.warn("路线缺少起止点信息，已跳过", route);
+                return null;
+            }
+
+            const start = route.start;
+            const end = route.end;
+            const mode = route.mode || "driving";
+            const styleId = meta.styleId;
+            const geometryId = route.id || `${styleId}-${mode}-${routeIndex}`;
+
+            const precomputed = parsePrecomputedRoute(route);
+            const result = precomputed || await fetchRouteByMode(mode, start, end);
+            let path = Array.isArray(result.path) ? result.path : [];
+
+            if (path.length < 2) {
+                console.warn("路线坐标为空，使用起终点直线兜底", geometryId);
+                path = [start, end];
+            }
+
+            const latLngPath = path
+                .filter(p => p && typeof p.lat === "number" && typeof p.lng === "number")
+                .map(p => new TMap.LatLng(p.lat, p.lng));
+
+            if (!latLngPath.length) {
+                console.warn("无法生成有效的坐标，跳过路线", geometryId);
+                return null;
+            }
+
+            // 定义起点和终点标记的几何形状
+            const markers = [
+                {
+                    "id": `${geometryId}-start`,
+                    "styleId": 'start',
+                    "position": new TMap.LatLng(start.lat, start.lng),
+                },
+                {
+                    "id": `${geometryId}-end`,
+                    "styleId": 'end',
+                    "position": new TMap.LatLng(end.lat, end.lng),
+                }
+            ];
+
+            return {
+                geometry: {
+                    id: geometryId,
+                    styleId,
+                    paths: latLngPath
+                },
+                rawPoints: path,
+                group: meta.name,
+                meta,
+                route,
+                markers: markers
+            };
+        }
+    </script>
+</body>
+</html>
+

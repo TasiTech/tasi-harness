@@ -1,0 +1,29 @@
+{
+  "market": {
+    "id": "skillhub",
+    "name": "SkillHub",
+    "description": "General-purpose reusable skills."
+  },
+  "skills": [
+    {
+      "id": "meeting-recap",
+      "name": "meeting-recap",
+      "description": "Turn messy notes into a crisp meeting recap with owners and next steps.",
+      "category": "productivity",
+      "version": "2.0.0",
+      "readme": "Useful when the user pastes notes and wants an action-focused recap.",
+      "skillContent": "---\nname: meeting-recap\ndescription: Convert meeting notes into a concise recap.\ncategory: productivity\n---\n\n# Meeting Recap\n\n1. Extract decisions, risks, and owners.\n2. Group next steps into a short flat list.\n3. Keep the final output concise and skimmable.\n",
+      "homepage": "https://example.invalid/skillhub/meeting-recap"
+    },
+    {
+      "id": "daily-digest",
+      "name": "daily-digest",
+      "description": "Generate a daily digest from local task outputs and session history.",
+      "category": "productivity",
+      "version": "1.0.0",
+      "readme": "Pairs well with scheduled tasks and email notifications.",
+      "skillContent": "---\nname: daily-digest\ndescription: Summarize daily task outputs into a digest.\ncategory: productivity\n---\n\n# Daily Digest\n\n1. Review today's relevant context.\n2. Highlight completed work, blockers, and follow-ups.\n3. Keep the summary ready for chat or email delivery.\n",
+      "homepage": "https://example.invalid/skillhub/daily-digest"
+    }
+  ]
+}

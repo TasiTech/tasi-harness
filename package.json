@@ -1,0 +1,87 @@
+{
+  "name": "tasi-harness",
+  "version": "1.1.0",
+  "description": "Tasi Harness - TypeScript Electron desktop agent inspired by Hermes Agent architecture.",
+  "main": "dist/main/main.js",
+  "author": "Tasi Harness",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build:icons": "powershell -ExecutionPolicy Bypass -File scripts/generate-th-icons.ps1",
+    "dev": "concurrently -k \"tsc -p tsconfig.node.json --watch\" \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 dist/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "build:main": "tsc -p tsconfig.node.json",
+    "build:renderer": "vite build",
+    "build": "npm run clean && npm run typecheck && npm run build:main && npm run build:renderer",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder",
+    "dist:win": "node scripts/package-installers.mjs --win",
+    "dist:mac": "node scripts/package-installers.mjs --mac",
+    "dist:installers": "node scripts/package-installers.mjs --win --mac",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
+    "lint": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "jszip": "^3.10.1",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "concurrently": "latest",
+    "cross-env": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "latest",
+    "wait-on": "latest"
+  },
+  "build": {
+    "appId": "com.tasiharness.desktop",
+    "productName": "Tasi Harness",
+    "npmRebuild": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "resources/**/*",
+      "package.json",
+      "README.md",
+      "docs/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/skills",
+        "to": "skills"
+      },
+      {
+        "from": "resources/opencli-extension",
+        "to": "opencli-extension"
+      }
+    ],
+    "mac": {
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "createDesktopShortcut": "always",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "build/icons"
+    }
+  }
+}

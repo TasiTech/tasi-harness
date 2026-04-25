@@ -1,0 +1,29 @@
+{
+  "market": {
+    "id": "clawhub",
+    "name": "ClawHub",
+    "description": "Curated agent skills for desktop automation."
+  },
+  "skills": [
+    {
+      "id": "release-briefing",
+      "name": "release-briefing",
+      "description": "Summarize local changes into a clean release note and validation checklist.",
+      "category": "developer",
+      "version": "1.0.0",
+      "readme": "Use this skill when the user asks for a release summary, rollout note, or concise ship checklist.",
+      "skillContent": "---\nname: release-briefing\ndescription: Produce concise release notes and a validation checklist.\ncategory: developer\n---\n\n# Release Briefing\n\nUse this skill when the user asks for a release summary.\n\n## Steps\n\n1. Inspect local changes and user-facing impact.\n2. Group changes by outcome, not by file.\n3. Call out validation status and remaining risk.\n",
+      "homepage": "https://example.invalid/clawhub/release-briefing"
+    },
+    {
+      "id": "workspace-audit",
+      "name": "workspace-audit",
+      "description": "Audit a workspace for risky commands, missing tests, and stale docs.",
+      "category": "developer",
+      "version": "1.1.0",
+      "readme": "Use this skill for repo health checks and local audit passes.",
+      "skillContent": "---\nname: workspace-audit\ndescription: Audit a local workspace for risk and maintenance gaps.\ncategory: developer\n---\n\n# Workspace Audit\n\n1. Read the relevant docs and package scripts.\n2. Check tests, config drift, and security-sensitive commands.\n3. Return findings ordered by severity.\n",
+      "homepage": "https://example.invalid/clawhub/workspace-audit"
+    }
+  ]
+}

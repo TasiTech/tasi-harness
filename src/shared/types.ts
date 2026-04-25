@@ -1,0 +1,431 @@
+export type ProviderKind =
+  | 'openai'
+  | 'openai-compatible'
+  | 'deepseek'
+  | 'qwen-bailian'
+  | 'minimax'
+  | 'kimi'
+  | 'anthropic'
+  | 'anthropic-compatible'
+  | 'ollama'
+  | 'mock';
+export type OpenCliBridgeMode = 'embedded' | 'external';
+
+export type AgentRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface ToolCallFunction {
+  name: string;
+  arguments: string;
+}
+
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: ToolCallFunction;
+}
+
+export interface AgentMessage {
+  id?: string;
+  role: AgentRole;
+  content: string;
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+  createdAt?: string;
+}
+
+export interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  enum?: string[];
+  required?: string[];
+  description?: string;
+  additionalProperties?: boolean | JsonSchema;
+  default?: unknown;
+}
+
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: JsonSchema;
+  };
+}
+
+export interface ToolExecutionContext {
+  sessionId: string;
+  workspaceDir: string;
+  requestId: string;
+}
+
+export interface ToolExecutionResult {
+  ok: boolean;
+  content: string;
+  data?: unknown;
+}
+
+export interface OpenCliExtensionStatus {
+  mode: OpenCliBridgeMode;
+  loaded: boolean;
+  available: boolean;
+  detectedPath?: string;
+  loadedPath?: string;
+  message: string;
+}
+
+export type ToolExecutor = (args: unknown, context: ToolExecutionContext) => Promise<ToolExecutionResult>;
+
+export interface RegisteredTool {
+  definition: ToolDefinition;
+  execute: ToolExecutor;
+  safety: 'read-only' | 'writes-workspace' | 'executes-command' | 'network' | 'stateful';
+}
+
+export interface LlmUsage {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
+export interface LlmCompletion {
+  message: AgentMessage;
+  usage?: LlmUsage;
+  raw?: unknown;
+}
+
+export interface LlmRequest {
+  messages: AgentMessage[];
+  tools?: ToolDefinition[];
+  temperature?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
+}
+
+export interface AppConfig {
+  provider: ProviderKind;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  temperature: number;
+  maxIterations: number;
+  workspaceDir: string;
+  allowShellTools: boolean;
+  enableNetworkTools: boolean;
+  opencliBridgeMode: OpenCliBridgeMode;
+  opencliExtensionPath: string;
+  theme: 'dark' | 'light';
+  systemPersona: string;
+  enabledToolNames: string[];
+  defaultExecutionMode: ExecutionMode;
+  skillMarketSources: SkillMarketplaceSource[];
+  emailNotifications: EmailNotificationSettings;
+}
+
+export interface PublicEmailNotificationSettings extends Omit<EmailNotificationSettings, 'password'> {
+  passwordConfigured: boolean;
+  password?: string;
+}
+
+export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifications'> {
+  apiKeyConfigured: boolean;
+  apiKey?: string;
+  emailNotifications: PublicEmailNotificationSettings;
+}
+
+export type MemoryTarget = 'memory' | 'user';
+export type MemoryScope = 'global' | 'session';
+export type MemoryDomain = 'finance' | 'daily_life' | 'work' | 'reading' | 'education' | 'health' | 'other';
+
+export interface MemoryMutationOptions {
+  scope?: MemoryScope;
+  sessionId?: string;
+  domain?: MemoryDomain | string;
+  entryId?: string;
+}
+
+export interface MemoryQueryOptions {
+  target?: MemoryTarget;
+  sessionId?: string;
+  domain?: MemoryDomain | string;
+  intent?: string;
+  limit?: number;
+  includeGlobal?: boolean;
+}
+
+export interface MemoryClearRequest {
+  target?: MemoryTarget;
+  mode: 'entry' | 'domain' | 'all';
+  entryId?: string;
+  domain?: MemoryDomain | string;
+  sessionId?: string;
+}
+
+export interface MemoryDomainUsage {
+  domain: string;
+  count: number;
+}
+
+export interface MemoryEntry {
+  id: string;
+  target: MemoryTarget;
+  scope: MemoryScope;
+  sessionId?: string;
+  domain: MemoryDomain | string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MemoryUsage {
+  target: MemoryTarget;
+  limit: number;
+  used: number;
+  percent: number;
+}
+
+export interface MemoryState {
+  entries: MemoryEntry[];
+  usage: MemoryUsage[];
+  domains: MemoryDomainUsage[];
+  query?: MemoryQueryOptions;
+  rendered: string;
+}
+
+export interface SkillMetadata {
+  name: string;
+  description: string;
+  category: string;
+  path: string;
+  readonly: boolean;
+  source: 'bundled' | 'local';
+  updatedAt?: string;
+  marketplaceSourceId?: string;
+  marketplaceSkillId?: string;
+  version?: string;
+}
+
+export interface SkillDocument extends SkillMetadata {
+  content: string;
+  frontmatter: Record<string, string | string[] | boolean | number>;
+}
+
+export interface SessionSummary {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+}
+
+export interface SessionRecord extends SessionSummary {
+  messages: AgentMessage[];
+  toolEvents: ToolEvent[];
+  lastExecution?: AgentExecutionDetails;
+}
+
+export interface AgentRunOptions {
+  sessionId?: string;
+  userInput: string;
+  executionMode?: ExecutionMode;
+  usePersonalKnowledgeBase?: boolean;
+  origin?: 'chat' | 'scheduled';
+  scheduledTaskId?: string;
+}
+
+export interface AgentRunResult {
+  sessionId: string;
+  finalResponse: string;
+  messages: AgentMessage[];
+  toolEvents: ToolEvent[];
+  followUpQuestions?: string[];
+  usage?: LlmUsage;
+  iterations: number;
+  execution: AgentExecutionDetails;
+}
+
+export interface ToolEvent {
+  id: string;
+  toolName: string;
+  args: unknown;
+  ok: boolean;
+  content: string;
+  createdAt: string;
+}
+
+export interface AgentToolEventStream {
+  sessionId: string;
+  event: ToolEvent;
+}
+
+export type ExecutionMode = 'workspace' | 'sandbox';
+
+export interface AgentExecutionDetails {
+  mode: ExecutionMode;
+  workspaceDir: string;
+  sandboxId?: string;
+}
+
+export interface SkillMarketplaceSource {
+  id: string;
+  name: string;
+  description: string;
+  catalogUrl?: string;
+  enabled: boolean;
+}
+
+export interface MarketplaceSkill {
+  id: string;
+  sourceId: string;
+  sourceName: string;
+  name: string;
+  description: string;
+  category: string;
+  version: string;
+  readme: string;
+  skillContent: string;
+  homepage?: string;
+  remoteVersionId?: string;
+  installCommand?: string;
+  installed: boolean;
+  installedSkillName?: string;
+}
+
+export interface MarketplaceBrowseResult {
+  sources: SkillMarketplaceSource[];
+  skills: MarketplaceSkill[];
+}
+
+export interface SkillInstallRequest {
+  sourceId: string;
+  skillId: string;
+}
+
+export interface EmailNotificationSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  secure: boolean;
+  username: string;
+  password: string;
+  from: string;
+  to: string;
+}
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  scheduleType: 'once' | 'interval';
+  runAt?: string;
+  intervalMinutes?: number;
+  nextRunAt: string;
+  enabled: boolean;
+  executionMode: ExecutionMode;
+  notifyByEmail: boolean;
+  sessionId?: string;
+  lastRunAt?: string;
+  lastResult?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScheduledTaskCreateRequest {
+  name: string;
+  prompt: string;
+  scheduleType: 'once' | 'interval';
+  runAt?: string;
+  intervalMinutes?: number;
+  executionMode: ExecutionMode;
+  notifyByEmail: boolean;
+}
+
+export interface ScheduledTaskPatchRequest {
+  id: string;
+  name?: string;
+  prompt?: string;
+  scheduleType?: 'once' | 'interval';
+  runAt?: string;
+  intervalMinutes?: number;
+  executionMode?: ExecutionMode;
+  notifyByEmail?: boolean;
+  enabled?: boolean;
+}
+
+export interface AppInfo {
+  version: string;
+  platform: string;
+  electron: string;
+  node: string;
+  harnessHome: string;
+}
+
+export interface SkillWriteRequest {
+  name: string;
+  content: string;
+  category?: string;
+}
+
+export interface SkillPatchRequest {
+  name: string;
+  oldString: string;
+  newString: string;
+}
+
+export interface SkillArchiveUploadRequest {
+  filename: string;
+  contentBase64: string;
+  name?: string;
+  category?: string;
+}
+
+export interface PersonalKnowledgeUploadRequest {
+  filename: string;
+  contentBase64: string;
+}
+
+export interface PersonalKnowledgeDocument {
+  id: string;
+  title: string;
+  filename: string;
+  sourceExt: string;
+  sourcePath: string;
+  markdownPath: string;
+  imagesDir?: string;
+  chunkCount: number;
+  charCount: number;
+  excerpt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PersonalKnowledgeState {
+  docs: PersonalKnowledgeDocument[];
+  totalDocs: number;
+  totalChunks: number;
+  totalChars: number;
+}
+
+export interface ToolRunRequest {
+  name: string;
+  args: unknown;
+  sessionId?: string;
+  executionMode?: ExecutionMode;
+}
+
+export interface SearchResult<T> {
+  item: T;
+  score: number;
+  highlights: string[];
+}
+
+export function nowIso(): string {
+  return new Date().toISOString();
+}
+
+export function createId(prefix = 'id'): string {
+  const random = Math.random().toString(36).slice(2, 10);
+  return `${prefix}_${Date.now().toString(36)}_${random}`;
+}
