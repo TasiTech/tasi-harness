@@ -23,6 +23,7 @@ const api = {
   agent: {
     chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) =>
       ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase),
+    stop: () => ipcRenderer.invoke('agent:stop'),
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';
       const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentToolEventStream) => listener(payload);
@@ -72,8 +73,8 @@ const api = {
     info: () => ipcRenderer.invoke('app:info'),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
     openExternalUrl: (url: string) => ipcRenderer.invoke('app:openExternalUrl', url),
-    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id),
-    openCliExtensionStatus: () => ipcRenderer.invoke('app:openCliExtensionStatus')
+    closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
+    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
   }
 };
 

@@ -14,6 +14,13 @@ let cleanup = () => {};
 afterEach(() => cleanup());
 
 describe('builtin tools', () => {
+  it('includes external browser defaults for controlled system-browser mode', () => {
+    const cfg = defaultConfig();
+    expect(cfg.externalBrowserEngine).toBe('auto');
+    expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
+    expect(cfg.externalBrowserProfileMode).toBe('isolated');
+  });
+
   it('writes only inside workspace and rejects escaped paths', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
@@ -60,9 +67,9 @@ describe('builtin tools', () => {
     ensureDir(cfg.workspaceDir);
     const skills = new SkillManager(env.home);
     const skill = skills.create({
-      name: 'OpenCLI Agent 1.0.1',
+      name: 'Tasi Browser Helper 1.0.1',
       category: 'local',
-      content: '---\nname: opencli-agent-1.0.1\ndescription: demo\ncategory: local\n---\n\nbash {SKILL_DIR}/scripts/check_setup.sh'
+      content: '---\nname: tasi-browser-helper-1.0.1\ndescription: demo\ncategory: local\n---\n\nbash {SKILL_DIR}/scripts/check_setup.sh'
     });
     skills.writeSupportingFile(skill.name, 'scripts/check_setup.sh', '#!/usr/bin/env bash\necho ok\n');
     const registry = new ToolRegistry();
@@ -72,7 +79,7 @@ describe('builtin tools', () => {
       sessionStore: new SessionStore(env.home),
       skillManager: skills
     })) registry.register(tool);
-    const result = await registry.execute('skill_view', { name: 'opencli-agent-1.0.1' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' });
+    const result = await registry.execute('skill_view', { name: 'tasi-browser-helper-1.0.1' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' });
     expect(result.ok).toBe(true);
     expect(result.content).toContain('# Resolved skill directory:');
     expect(result.content).toContain('# Skills are execution workflows, not optional reference text.');
@@ -82,7 +89,7 @@ describe('builtin tools', () => {
     expect(result.content).not.toContain('{SKILL_DIR}');
   });
 
-  it('adds opencli preview url for search commands when bridge output has no url', async () => {
+  it('returns raw terminal output without injecting browser preview markers', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), allowShellTools: true };
@@ -96,10 +103,13 @@ describe('builtin tools', () => {
     })) registry.register(tool);
     const result = await registry.execute(
       'terminal',
-      { command: 'opencli baidu search "beijing weather"', timeout_ms: 120000 },
+      { command: 'echo hello', timeout_ms: 120000 },
       { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
     );
-    expect(result.content).toContain('opencli_preview_url: https://www.baidu.com/s?wd=beijing%20weather');
+    expect(result.ok).toBe(true);
+    expect(result.content).toContain('exit=0');
+    expect(result.content).toContain('stdout:\nhello');
+    expect(result.content).not.toContain('browser_preview_url:');
   });
 
   it('returns browser preview markers for built-in browser tools in embedded mode', async () => {

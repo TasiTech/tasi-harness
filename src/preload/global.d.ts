@@ -2,7 +2,6 @@ import type {
   AgentToolEventStream,
   AgentRunResult,
   AppInfo,
-  OpenCliExtensionStatus,
   MemoryClearRequest,
   MemoryQueryOptions,
   MemoryState,
@@ -38,6 +37,7 @@ declare global {
       };
       agent: {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
+        stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
       };
       sessions: {
@@ -82,8 +82,8 @@ declare global {
         info(): Promise<AppInfo>;
         openPath(path: string): Promise<ToolExecutionResult>;
         openExternalUrl(url: string): Promise<ToolExecutionResult>;
+        closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
-        openCliExtensionStatus(): Promise<OpenCliExtensionStatus>;
       };
     };
   }

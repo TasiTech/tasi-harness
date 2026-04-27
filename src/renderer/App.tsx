@@ -24,6 +24,7 @@ import {
   providerPreset,
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
+import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -39,8 +40,10 @@ const defaultConfig: PublicAppConfig = {
   workspaceDir: '',
   allowShellTools: false,
   enableNetworkTools: false,
-  opencliBridgeMode: 'embedded',
-  opencliExtensionPath: '',
+  browserMode: 'embedded',
+  externalBrowserEngine: 'auto',
+  externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
+  externalBrowserProfileMode: 'isolated',
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -114,7 +117,7 @@ function extractUrlFromValue(value: unknown, depth = 0): string | undefined {
 }
 
 function extractPreviewUrlMarker(text: string): string | undefined {
-  const marker = text.match(/(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/i);
+  const marker = text.match(/browser_preview_url:\s*(https?:\/\/[^\s"'<>`]+)/i);
   if (!marker?.[1]) return undefined;
   return marker[1].replace(/[),.;!?]+$/, '');
 }
@@ -127,13 +130,11 @@ function shouldFallbackOpenExternal(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
-  if (!combined.includes('opencli_preview_url')) return false;
-  return /bridge is disconnected|showing fallback|extension not connected/i.test(combined);
+  return false;
 }
 
 function isWebPreviewEvent(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (combined.includes('opencli')) return true;
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
   return event.toolName.toLowerCase().includes('open') && combined.includes('http');
@@ -152,42 +153,6 @@ function latestWebPreviewUrl(events: ToolEvent[], fallbackOnly = false): string 
     if (fromContent) return fromContent;
   }
   return undefined;
-}
-
-function openCliInstallGuide(tr: TranslateFn): string {
-  return tr(
-    [
-      'OpenCLI extension is required before using external browser mode.',
-      'Install steps:',
-      '1. Open Chrome/Chromium.',
-      '2. Open `chrome://extensions` and enable Developer mode.',
-      '3. Click "Load unpacked" and select your OpenCLI extension folder (with `manifest.json`).',
-      '4. Run `opencli doctor` to verify the bridge connection.'
-    ].join('\n'),
-    [
-      '切换到外部浏览器模式前，需要先安装 OpenCLI 扩展。',
-      '安装步骤：',
-      '1. 打开 Chrome/Chromium。',
-      '2. 打开 `chrome://extensions` 并开启开发者模式。',
-      '3. 点击“加载已解压的扩展程序”，选择包含 `manifest.json` 的 OpenCLI 扩展目录。',
-      '4. 运行 `opencli doctor` 验证桥接连接。'
-    ].join('\n')
-  );
-}
-
-function externalBrowserBridgeGuide(tr: TranslateFn): string {
-  return tr(
-    [
-      'External browser mode requires an external browser bridge.',
-      'Please install Agent Browser or OpenCLI, and enable the matching browser plugin or extension.',
-      'If the bridge is not ready yet, switch back to the built-in browser mode first.'
-    ].join('\n'),
-    [
-      '外部浏览器模式需要外部浏览器桥接能力。',
-      '请安装 Agent Browser 或 OpenCLI，并启用对应的浏览器插件或扩展。',
-      '如果桥接环境还没准备好，可以先切回内置浏览器模式。'
-    ].join('\n')
-  );
 }
 
 function useAsyncData<T>(loader: () => Promise<T>, fallback: T): [T, () => Promise<void>] {
@@ -446,7 +411,7 @@ export function App(): ReactElement {
           />
         )}
         {page === 'knowledge' && <KnowledgePage tr={tr} knowledge={knowledge} refreshKnowledge={refreshKnowledge} />}
-        {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} refreshMemory={refreshMemory} />}
+        {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} />}
         {page === 'skills' && <SkillsPage tr={tr} skills={skills} refreshSkills={refreshSkills} />}
         {page === 'tasks' && <TasksPage tr={tr} tasks={tasks} refreshTasks={refreshTasks} refreshSessions={refreshSessions} />}
         {page === 'sessions' && (
@@ -567,6 +532,7 @@ function ChatPage(props: {
 }): ReactElement {
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [followUpQuestions, setFollowUpQuestions] = useState<string[]>([]);
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
@@ -599,7 +565,7 @@ function ChatPage(props: {
   );
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
-  const showEmbeddedWebPreview = props.config.opencliBridgeMode === 'embedded';
+  const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
   useEffect(() => {
@@ -629,7 +595,7 @@ function ChatPage(props: {
     setPreviewAddress(previewUrl);
   }, [previewUrl]);
   useEffect(() => {
-    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl) {
+    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !busy) {
       externalPreviewOpenUrlRef.current = '';
       return;
     }
@@ -642,7 +608,7 @@ function ChatPage(props: {
     }).catch((e) => {
       setError(e instanceof Error ? e.message : String(e));
     });
-  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl]);
+  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl, busy]);
   useEffect(() => {
     if (!shouldShowWebPreview) return;
     previewContentMetricsRef.current = null;
@@ -1011,11 +977,17 @@ function ChatPage(props: {
 
   const connected = props.config.apiKeyConfigured || !providerRequiresApiKey(props.config.provider);
 
-  async function setBridgeMode(mode: PublicAppConfig['opencliBridgeMode']): Promise<void> {
-    if (mode === props.config.opencliBridgeMode) return;
+  function isStoppedByUserError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    if (error.name === 'AbortError') return true;
+    return /session stopped by user|operation was aborted|aborted/i.test(error.message);
+  }
+
+  async function setBridgeMode(mode: PublicAppConfig['browserMode']): Promise<void> {
+    if (mode === props.config.browserMode) return;
     try {
       setError('');
-      const next = await window.tasiHarness.config.set({ opencliBridgeMode: mode });
+      const next = await window.tasiHarness.config.set({ browserMode: mode });
       props.setConfig(next);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1028,6 +1000,7 @@ function ChatPage(props: {
     setInput('');
     setError('');
     setBusy(true);
+    setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
     props.setMessages([...props.messages, { role: 'user', content: text, createdAt: new Date().toISOString() }]);
@@ -1040,9 +1013,33 @@ function ChatPage(props: {
       setFollowUpQuestions((result.followUpQuestions ?? []).filter((item) => item.trim()).slice(0, 4));
       await props.refreshSessions();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (isStoppedByUserError(e)) {
+        setError('');
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
+      if (props.config.browserMode === 'external') {
+        try {
+          await window.tasiHarness.app.closeExternalPreview();
+        } catch {
+          // Ignore cleanup errors when closing external preview window.
+        }
+      }
+      setStopping(false);
       setBusy(false);
+    }
+  }
+
+  async function stopCurrentSession(): Promise<void> {
+    if (!busy || stopping) return;
+    setStopping(true);
+    setError('');
+    try {
+      await window.tasiHarness.agent.stop();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setStopping(false);
     }
   }
 
@@ -1206,7 +1203,7 @@ function ChatPage(props: {
             <option value="workspace">{props.tr('Workspace', '工作区')}</option>
             <option value="sandbox">{props.tr('Sandbox', '沙箱')}</option>
           </select>
-          <select value={props.config.opencliBridgeMode} onChange={(e) => void setBridgeMode(e.target.value as PublicAppConfig['opencliBridgeMode'])}>
+          <select value={props.config.browserMode} onChange={(e) => void setBridgeMode(e.target.value as PublicAppConfig['browserMode'])}>
             <option value="embedded">{props.tr('Built-in browser', '内部浏览器')}</option>
             <option value="external">{props.tr('External browser', '外部浏览器')}</option>
           </select>
@@ -1365,203 +1362,34 @@ function ChatPage(props: {
             }
           }}
         />
-        <button className="send-btn" disabled={!input.trim() || busy || !connected} onClick={() => void send()}>{busy ? '...' : props.tr('->', '->')}</button>
+        <button
+          className={`send-btn${busy ? ' stop' : ''}`}
+          disabled={busy ? stopping : !input.trim() || !connected}
+          title={busy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
+          onClick={() => {
+            if (busy) {
+              void stopCurrentSession();
+              return;
+            }
+            void send();
+          }}
+        >
+          {busy ? (stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
+        </button>
       </div>
     </section>
   );
 }
 
-function splitTrailingUrlPunctuation(rawUrl: string): { href: string; trailing: string } {
-  const match = rawUrl.match(/^(.*?)([),.;!?。，；！？）]+)?$/);
-  if (!match) return { href: rawUrl, trailing: '' };
-  return { href: match[1] || rawUrl, trailing: match[2] || '' };
-}
-
-export function renderInlineMarkdown(input: string, keyPrefix: string): ReactElement[] {
-  const linkPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-  const parts: ReactElement[] = [];
-  let cursor = 0;
-  let index = 0;
-
-  function renderEmphasis(text: string, prefix: string): ReactElement[] {
-    const tokenPattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|https?:\/\/[^\s<>"']+)/g;
-    const nodes: ReactElement[] = [];
-    let start = 0;
-    let tokenIndex = 0;
-    for (const match of text.matchAll(tokenPattern)) {
-      const raw = match[0] ?? '';
-      const matchIndex = match.index ?? 0;
-      if (matchIndex > start) {
-        nodes.push(<span key={`${prefix}-plain-${tokenIndex++}`}>{text.slice(start, matchIndex)}</span>);
-      }
-      if (raw.startsWith('`') && raw.endsWith('`')) {
-        nodes.push(<code key={`${prefix}-code-${tokenIndex++}`}>{raw.slice(1, -1)}</code>);
-      } else if (raw.startsWith('**') && raw.endsWith('**')) {
-        nodes.push(<strong key={`${prefix}-strong-${tokenIndex++}`}>{raw.slice(2, -2)}</strong>);
-      } else if (raw.startsWith('*') && raw.endsWith('*')) {
-        nodes.push(<em key={`${prefix}-em-${tokenIndex++}`}>{raw.slice(1, -1)}</em>);
-      } else if (/^https?:\/\//i.test(raw)) {
-        const { href, trailing } = splitTrailingUrlPunctuation(raw);
-        nodes.push(
-          <a key={`${prefix}-url-${tokenIndex++}`} href={href} target="_blank" rel="noreferrer">
-            {href}
-          </a>
-        );
-        if (trailing) {
-          nodes.push(<span key={`${prefix}-trail-${tokenIndex++}`}>{trailing}</span>);
-        }
-      } else {
-        nodes.push(<span key={`${prefix}-raw-${tokenIndex++}`}>{raw}</span>);
-      }
-      start = matchIndex + raw.length;
-    }
-    if (start < text.length) {
-      nodes.push(<span key={`${prefix}-plain-${tokenIndex++}`}>{text.slice(start)}</span>);
-    }
-    return nodes;
-  }
-
-  for (const match of input.matchAll(linkPattern)) {
-    const [full, label, url] = match;
-    const matchIndex = match.index ?? 0;
-    if (matchIndex > cursor) {
-      parts.push(...renderEmphasis(input.slice(cursor, matchIndex), `${keyPrefix}-txt-${index++}`));
-    }
-    parts.push(
-      <a key={`${keyPrefix}-link-${index++}`} href={url} target="_blank" rel="noreferrer">
-        {label}
-      </a>
-    );
-    cursor = matchIndex + full.length;
-  }
-  if (cursor < input.length) {
-    parts.push(...renderEmphasis(input.slice(cursor), `${keyPrefix}-txt-${index++}`));
-  }
-  return parts;
-}
-
-function renderMarkdownContent(content: string, keyPrefix: string): ReactElement[] {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const blocks: ReactElement[] = [];
-  const fencePattern = /```([\w-]*)\n([\s\S]*?)```/g;
-  let cursor = 0;
-  let blockIndex = 0;
-
-  function renderTextSection(section: string, prefix: string): void {
-    const lines = section.split('\n');
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i] ?? '';
-      const trimmed = line.trim();
-      if (!trimmed) {
-        i += 1;
-        continue;
-      }
-
-      const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
-      if (heading) {
-        const level = Math.min(6, heading[1].length) as 1 | 2 | 3 | 4 | 5 | 6;
-        const text = heading[2] ?? '';
-        const tag = `h${level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
-        const contentNodes = renderInlineMarkdown(text, `${prefix}-h-${i}`);
-        blocks.push(
-          tag === 'h1' ? <h1 key={`${prefix}-h1-${i}`}>{contentNodes}</h1> :
-          tag === 'h2' ? <h2 key={`${prefix}-h2-${i}`}>{contentNodes}</h2> :
-          tag === 'h3' ? <h3 key={`${prefix}-h3-${i}`}>{contentNodes}</h3> :
-          tag === 'h4' ? <h4 key={`${prefix}-h4-${i}`}>{contentNodes}</h4> :
-          tag === 'h5' ? <h5 key={`${prefix}-h5-${i}`}>{contentNodes}</h5> :
-          <h6 key={`${prefix}-h6-${i}`}>{contentNodes}</h6>
-        );
-        i += 1;
-        continue;
-      }
-
-      if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
-        blocks.push(<hr key={`${prefix}-hr-${i}`} />);
-        i += 1;
-        continue;
-      }
-
-      if (/^[-*]\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^[-*]\s+/.test(next)) break;
-          items.push(next.replace(/^[-*]\s+/, ''));
-          i += 1;
-        }
-        blocks.push(
-          <ul key={`${prefix}-ul-${i}`}>
-            {items.map((item, idx) => (
-              <li key={`${prefix}-ul-${i}-${idx}`}>{renderInlineMarkdown(item, `${prefix}-ul-inline-${i}-${idx}`)}</li>
-            ))}
-          </ul>
-        );
-        continue;
-      }
-
-      if (/^\d+\.\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^\d+\.\s+/.test(next)) break;
-          items.push(next.replace(/^\d+\.\s+/, ''));
-          i += 1;
-        }
-        blocks.push(
-          <ol key={`${prefix}-ol-${i}`}>
-            {items.map((item, idx) => (
-              <li key={`${prefix}-ol-${i}-${idx}`}>{renderInlineMarkdown(item, `${prefix}-ol-inline-${i}-${idx}`)}</li>
-            ))}
-          </ol>
-        );
-        continue;
-      }
-
-      if (/^>\s+/.test(trimmed)) {
-        const quoteLines: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^>\s+/.test(next)) break;
-          quoteLines.push(next.replace(/^>\s+/, ''));
-          i += 1;
-        }
-        const quoteText = quoteLines.join(' ');
-        blocks.push(<blockquote key={`${prefix}-q-${i}`}>{renderInlineMarkdown(quoteText, `${prefix}-q-inline-${i}`)}</blockquote>);
-        continue;
-      }
-
-      const para: string[] = [];
-      while (i < lines.length) {
-        const next = lines[i] ?? '';
-        const nextTrim = next.trim();
-        if (!nextTrim || /^(#{1,6})\s+/.test(nextTrim) || /^(?:-{3,}|\*{3,}|_{3,})$/.test(nextTrim) || /^[-*]\s+/.test(nextTrim) || /^\d+\.\s+/.test(nextTrim) || /^>\s+/.test(nextTrim)) break;
-        para.push(nextTrim);
-        i += 1;
-      }
-      blocks.push(<p key={`${prefix}-p-${i}`}>{renderInlineMarkdown(para.join(' '), `${prefix}-p-inline-${i}`)}</p>);
-    }
-  }
-
-  for (const match of normalized.matchAll(fencePattern)) {
-    const full = match[0] ?? '';
-    const lang = (match[1] ?? '').trim();
-    const code = (match[2] ?? '').replace(/\n$/, '');
-    const matchIndex = match.index ?? 0;
-    if (matchIndex > cursor) {
-      renderTextSection(normalized.slice(cursor, matchIndex), `${keyPrefix}-text-${blockIndex++}`);
-    }
-    blocks.push(
-      <pre className="msg-code-block" key={`${keyPrefix}-codeblock-${blockIndex++}`}>
-        <code className={lang ? `language-${lang}` : ''}>{code}</code>
-      </pre>
-    );
-    cursor = matchIndex + full.length;
-  }
-  if (cursor < normalized.length) {
-    renderTextSection(normalized.slice(cursor), `${keyPrefix}-text-${blockIndex++}`);
-  }
-  return blocks.length > 0 ? blocks : [<p key={`${keyPrefix}-fallback`}>{content}</p>];
+function renderMarkdownContent(content: string, keyPrefix: string): ReactElement {
+  const normalized = normalizeMarkdownForRender(content);
+  return (
+    <div
+      key={`${keyPrefix}-md`}
+      className="msg-markdown"
+      dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(normalized) }}
+    />
+  );
 }
 
 function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
@@ -1800,7 +1628,7 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
   );
 }
 
-function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: string; refreshMemory: () => Promise<void> }): ReactElement {
+function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: string }): ReactElement {
   const [notice, setNotice] = useState('');
   const [searchIntent, setSearchIntent] = useState('');
   const [searchDomain, setSearchDomain] = useState<MemoryDomain | 'all'>('all');
@@ -1808,24 +1636,22 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
   const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
   const [activeEntryId, setActiveEntryId] = useState<string | null>(null);
   const [previewEntry, setPreviewEntry] = useState<MemoryEntry | null>(null);
-  const [clearingMode, setClearingMode] = useState<'entry' | 'domain' | 'all' | null>(null);
-
-  function toMemoryOnly(state: MemoryState): MemoryState {
-    return {
-      ...state,
-      entries: state.entries.filter((entry) => entry.target === 'memory'),
-      usage: state.usage.filter((u) => u.target === 'memory')
-    };
-  }
-
-  const [retrieved, setRetrieved] = useState<MemoryState>(toMemoryOnly(props.memory));
+  const [retrieved, setRetrieved] = useState<MemoryState>({
+    ...props.memory,
+    entries: props.memory.entries.filter((entry) => entry.target === 'memory'),
+    usage: props.memory.usage.filter((u) => u.target === 'memory')
+  });
 
   useEffect(() => {
-    setRetrieved(toMemoryOnly(props.memory));
+    setRetrieved({
+      ...props.memory,
+      entries: props.memory.entries.filter((entry) => entry.target === 'memory'),
+      usage: props.memory.usage.filter((u) => u.target === 'memory')
+    });
     if (props.sessionId && !searchSessionId) setSearchSessionId(props.sessionId);
   }, [props.memory, props.sessionId]);
 
-  async function refreshRetrieved(): Promise<MemoryState> {
+  async function refreshRetrieved(): Promise<void> {
     const next = await window.tasiHarness.memory.get({
       target: 'memory',
       sessionId: searchSessionId.trim() || undefined,
@@ -1834,9 +1660,11 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
       includeGlobal: true,
       limit: 200
     });
-    const filtered = toMemoryOnly(next);
-    setRetrieved(filtered);
-    return filtered;
+    setRetrieved({
+      ...next,
+      entries: next.entries.filter((entry) => entry.target === 'memory'),
+      usage: next.usage.filter((u) => u.target === 'memory')
+    });
   }
 
   async function retrieve(): Promise<void> {
@@ -1876,11 +1704,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     return categorizedEntries.byDomain.get(activeCategory) ?? [];
   }, [activeCategory, categorizedEntries]);
 
-  const activeCategoryLabel = useMemo(() => {
-    const found = categories.find((category) => category.value === activeCategory);
-    return found?.label ?? props.tr('Selected category', '当前分类');
-  }, [activeCategory, categories, props.tr]);
-
   useEffect(() => {
     if (activeEntryId && !visibleEntries.some((entry) => entry.id === activeEntryId)) {
       setActiveEntryId(null);
@@ -1896,98 +1719,10 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     return line.length > 60 ? `${line.slice(0, 60)}...` : line;
   }
 
-  async function syncAfterClear(successNotice: string): Promise<void> {
-    await Promise.all([props.refreshMemory(), refreshRetrieved()]);
-    setNotice(successNotice);
-  }
-
-  async function clearEntry(entry: MemoryEntry): Promise<void> {
-    const label = entryTitle(entry.content);
-    const confirmed = window.confirm(props.tr(`Delete this memory entry?\n\n${label}`, `确认删除这条记忆吗？\n\n${label}`));
-    if (!confirmed) return;
-    try {
-      setClearingMode('entry');
-      await window.tasiHarness.memory.clear({ target: 'memory', mode: 'entry', entryId: entry.id });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(props.tr('Memory entry deleted.', '记忆条目已删除。'));
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
-  async function clearCategory(): Promise<void> {
-    if (activeCategory === 'all') return;
-    const sessionId = searchSessionId.trim();
-    const confirmed = window.confirm(
-      sessionId
-        ? props.tr(
-            `Delete all "${activeCategoryLabel}" memory entries for session ${sessionId}?\n\nThis is not limited by the intent search text.`,
-            `确认删除会话 ${sessionId} 中分类“${activeCategoryLabel}”的全部记忆吗？\n\n这个操作不受意图搜索文本限制。`
-          )
-        : props.tr(
-            `Delete all "${activeCategoryLabel}" memory entries across all sessions?\n\nThis is not limited by the intent search text.`,
-            `确认删除所有会话中分类“${activeCategoryLabel}”的全部记忆吗？\n\n这个操作不受意图搜索文本限制。`
-          )
-    );
-    if (!confirmed) return;
-    try {
-      setClearingMode('domain');
-      await window.tasiHarness.memory.clear({
-        target: 'memory',
-        mode: 'domain',
-        domain: activeCategory,
-        sessionId: sessionId || undefined
-      });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(
-        sessionId
-          ? props.tr(`Cleared ${activeCategoryLabel} memory for session ${sessionId}.`, `已清除会话 ${sessionId} 的“${activeCategoryLabel}”记忆。`)
-          : props.tr(`Cleared all ${activeCategoryLabel} memory entries.`, `已清除全部“${activeCategoryLabel}”记忆。`)
-      );
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
-  async function clearAllMemory(): Promise<void> {
-    const sessionId = searchSessionId.trim();
-    const confirmed = window.confirm(
-      sessionId
-        ? props.tr(`Delete all memory entries for session ${sessionId}?`, `确认删除会话 ${sessionId} 的全部记忆吗？`)
-        : props.tr('Delete all memory entries across all sessions?', '确认删除所有会话中的全部记忆吗？')
-    );
-    if (!confirmed) return;
-    try {
-      setClearingMode('all');
-      await window.tasiHarness.memory.clear({
-        target: 'memory',
-        mode: 'all',
-        sessionId: sessionId || undefined
-      });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(
-        sessionId
-          ? props.tr(`Cleared all memory for session ${sessionId}.`, `已清除会话 ${sessionId} 的全部记忆。`)
-          : props.tr('Cleared all memory entries.', '已清除全部记忆。')
-      );
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
   return (
     <>
       <section className="page">
-      <PageHeader title={props.tr('Memory', '记忆')} subtitle={props.tr('Search, inspect, and clear saved memory. Memory is committed after one chat run or one scheduled task run completes.', '支持检索、查看和清除已保存记忆。Memory 会在一次对话或定时任务完成后统一存储。')} />
+      <PageHeader title={props.tr('Memory', '记忆')} subtitle={props.tr('Display and retrieval only. Memory is committed after one chat run or one scheduled task run completes.', '仅展示和检索。Memory 会在一次对话或定时任务完成后统一存储。')} />
       <div className="split-grid memory-layout">
         <div className="card">
           <h2>{props.tr('Search Filters', '检索条件')}</h2>
@@ -2004,26 +1739,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
           <input value={searchSessionId} onChange={(e) => setSearchSessionId(e.target.value)} placeholder={props.tr('limit retrieval to one session', '限定检索到某个会话')} />
           <div className="button-row">
             <button className="primary-button" onClick={() => void retrieve()}>{props.tr('Retrieve', '检索')}</button>
-          </div>
-          <h2>{props.tr('Clear Memory', '清除记忆')}</h2>
-          <div className="card-subtle">
-            {searchSessionId.trim()
-              ? props.tr(
-                  `Category/all clear will be limited to session ${searchSessionId.trim()}.`,
-                  `分类清除和全部清除将限制在会话 ${searchSessionId.trim()} 内。`
-                )
-              : props.tr(
-                  'Without a session filter, category/all clear affects all saved memory entries.',
-                  '未填写会话 ID 时，分类清除和全部清除会作用于全部已保存记忆。'
-                )}
-          </div>
-          <div className="button-row">
-            <button className="danger-button" disabled={activeCategory === 'all' || clearingMode !== null} onClick={() => void clearCategory()}>
-              {clearingMode === 'domain' ? '...' : props.tr('Clear category', '清除分类')}
-            </button>
-            <button className="danger-button" disabled={retrieved.entries.length === 0 || clearingMode !== null} onClick={() => void clearAllMemory()}>
-              {clearingMode === 'all' ? '...' : props.tr('Clear all', '清除全部')}
-            </button>
           </div>
           {notice && <div className="notice-box">{notice}</div>}
           <h2>{props.tr('Memory usage', '记忆用量')}</h2>
@@ -2087,11 +1802,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
               <span className="soft-badge">{prettyDate(previewEntry.updatedAt)}</span>
             </div>
             <pre className="code-block">{previewEntry.content}</pre>
-            <div className="button-row modal-actions">
-              <button className="danger-button" disabled={clearingMode !== null} onClick={() => void clearEntry(previewEntry)}>
-                {clearingMode === 'entry' ? '...' : props.tr('Delete this entry', '删除这条记忆')}
-              </button>
-            </div>
           </div>
         </div>
       )}
@@ -2764,7 +2474,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label>{tr('Temperature', '温度')}</label>
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
-          <input type="number" min="1" max="32" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
           <label>{tr('Workspace directory', '工作区目录')}</label>
           <input value={draft.workspaceDir} onChange={(e) => setDraft((old) => ({ ...old, workspaceDir: e.target.value }))} />
           <label>{tr('Default execution mode', '默认执行模式')}</label>
@@ -2772,6 +2482,46 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="workspace">{tr('Workspace', '工作区')}</option>
             <option value="sandbox">{tr('Sandbox', '沙箱')}</option>
           </select>
+          <label>{tr('Browser mode', '浏览器模式')}</label>
+          <select value={draft.browserMode} onChange={(e) => setDraft((old) => ({ ...old, browserMode: e.target.value as PublicAppConfig['browserMode'] }))}>
+            <option value="embedded">{tr('Built-in browser', '内置浏览器')}</option>
+            <option value="external">{tr('External browser', '外部浏览器')}</option>
+          </select>
+          <label>{tr('External browser engine', '外部浏览器引擎')}</label>
+          <select
+            value={draft.externalBrowserEngine}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserEngine: e.target.value as PublicAppConfig['externalBrowserEngine'] }))}
+          >
+            <option value="auto">{tr('Auto (CDP first)', '自动（优先 CDP）')}</option>
+            <option value="cdp">{tr('CDP only', '仅 CDP')}</option>
+            <option value="webdriver-safari">{tr('Safari WebDriver only', '仅 Safari WebDriver')}</option>
+          </select>
+          <label>{tr('CDP endpoint', 'CDP 端点')}</label>
+          <input
+            value={draft.externalBrowserCdpEndpoint}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserCdpEndpoint: e.target.value }))}
+            placeholder="http://127.0.0.1:9222"
+          />
+          <label>{tr('External browser profile', '外部浏览器配置档')}</label>
+          <select
+            value={draft.externalBrowserProfileMode}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserProfileMode: e.target.value as PublicAppConfig['externalBrowserProfileMode'] }))}
+          >
+            <option value="isolated">{tr('Isolated (safe default)', '隔离（默认更安全）')}</option>
+            <option value="system">{tr('System profile (reuse login)', '系统配置档（复用登录态）')}</option>
+          </select>
+          <div className="card-subtle">
+            {tr(
+              'External auto mode tries CDP first (Chromium/Chrome/Edge, including local auto-launch), then Safari WebDriver on macOS, and finally falls back to shell.openExternal.',
+              '外部自动模式会先尝试 CDP（Chromium/Chrome/Edge，含本地自动拉起），在 macOS 上再尝试 Safari WebDriver，最后回退到 shell.openExternal。'
+            )}
+          </div>
+          <div className="card-subtle">
+            {tr(
+              'System profile mode reuses website login state and will force-close running browser processes when controlled takeover is required.',
+              '系统配置档模式可复用网站登录态，并会在需要受控接管时自动强制关闭正在运行的浏览器进程。'
+            )}
+          </div>
           <label>{tr('Persona', '系统角色')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>
@@ -2873,5 +2623,3 @@ function AboutPage({ tr, info }: { tr: TranslateFn; info: AppInfo | null }): Rea
     </section>
   );
 }
-
-

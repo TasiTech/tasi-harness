@@ -16,6 +16,17 @@ function parseToolArgs(raw: string): unknown {
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
+  signal?: AbortSignal;
+}
+
+function createAbortError(): Error {
+  const error = new Error('Session stopped by user.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw createAbortError();
 }
 
 export class AgentLoop {
@@ -35,6 +46,7 @@ export class AgentLoop {
   ) {}
 
   async run(options: AgentLoopRuntimeOptions): Promise<AgentRunResult> {
+    throwIfAborted(options.signal);
     const cfg = this.deps.getConfig();
     const requestId = createId('run');
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
@@ -58,7 +70,8 @@ export class AgentLoop {
       const appended: AgentMessage[] = [userMessage];
 
       for (; iterations < cfg.maxIterations; iterations++) {
-        const completion = await client.complete({ messages, tools, temperature: cfg.temperature });
+        throwIfAborted(options.signal);
+        const completion = await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
         const assistant = { ...completion.message, id: completion.message.id ?? createId('msg'), createdAt: nowIso() };
         usage = completion.usage ?? usage;
         messages.push(assistant);
@@ -71,12 +84,14 @@ export class AgentLoop {
         }
 
         for (const call of toolCalls) {
+          throwIfAborted(options.signal);
           const args = parseToolArgs(call.function.arguments);
           const result = await this.deps.toolRegistry.execute(call.function.name, args, {
             sessionId: session.id,
             workspaceDir: execution.workspaceDir,
             requestId: call.id
           });
+          throwIfAborted(options.signal);
           const event: ToolEvent = {
             id: createId('toolevent'),
             toolName: call.function.name,

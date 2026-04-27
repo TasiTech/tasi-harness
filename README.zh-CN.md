@@ -142,7 +142,7 @@ npm test
 支持两种网页展示模式：
 
 - `embedded`：网页直接在应用内预览，开箱即用。
-- `external`：网页可在外部 Chromium 浏览器中展示；打包应用时可自动加载 `resources/opencli-extension` 中的 OpenCLI 桥接扩展。
+- `external`：网页可在由 Tasi Harness 管理的外部预览窗口中展示。
 
 ### 个人知识库
 
@@ -174,7 +174,7 @@ npm test
 - 上传技能压缩包
 - 浏览 ClawHub、SkillHub 等市场来源
 
-浏览器自动化相关的内置技能现在以 `agent-browser` 提供。
+浏览器自动化相关的内置技能现在以 `tasi-browser-automation` 提供。
 
 ### 会话与记忆
 

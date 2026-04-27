@@ -9,7 +9,9 @@ export type ProviderKind =
   | 'anthropic-compatible'
   | 'ollama'
   | 'mock';
-export type OpenCliBridgeMode = 'embedded' | 'external';
+export type BrowserMode = 'embedded' | 'external';
+export type ExternalBrowserEngine = 'auto' | 'cdp' | 'webdriver-safari';
+export type ExternalBrowserProfileMode = 'isolated' | 'system';
 
 export type AgentRole = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -66,15 +68,6 @@ export interface ToolExecutionResult {
   data?: unknown;
 }
 
-export interface OpenCliExtensionStatus {
-  mode: OpenCliBridgeMode;
-  loaded: boolean;
-  available: boolean;
-  detectedPath?: string;
-  loadedPath?: string;
-  message: string;
-}
-
 export type ToolExecutor = (args: unknown, context: ToolExecutionContext) => Promise<ToolExecutionResult>;
 
 export interface RegisteredTool {
@@ -113,8 +106,10 @@ export interface AppConfig {
   workspaceDir: string;
   allowShellTools: boolean;
   enableNetworkTools: boolean;
-  opencliBridgeMode: OpenCliBridgeMode;
-  opencliExtensionPath: string;
+  browserMode: BrowserMode;
+  externalBrowserEngine: ExternalBrowserEngine;
+  externalBrowserCdpEndpoint: string;
+  externalBrowserProfileMode: ExternalBrowserProfileMode;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];

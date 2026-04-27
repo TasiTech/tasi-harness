@@ -1,14 +1,14 @@
 ---
-name: agent-browser
+name: tasi-browser-automation
 description: Use browser tools to open webpages, interact with elements, and extract page content in the browser automation session.
 category: browser
 ---
 
-# Agent Browser
+# Tasi Browser Automation
 
 Use this skill when the user needs web actions through Tasi Harness browser automation.
 
-In external browser mode, treat these browser tools as the fallback plan: prefer Agent Browser or OpenCLI first only when the user or environment clearly indicates that an external bridge is installed and working.
+In external browser mode, treat these browser tools as the default plan and rely on the harness-managed external preview window when needed.
 
 ## Tooling
 
@@ -35,5 +35,5 @@ Use these browser tools:
 - Prefer CSS selectors over brittle positional assumptions.
 - If an interaction fails, re-check page state, then wait and retry once.
 - In embedded mode, do not ask the user to install Chrome extensions for this flow.
-- In external mode, if Agent Browser or OpenCLI is confirmed available, prefer that bridge first for browser-facing work.
-- If no external bridge is available, use these browser tools and rely on `browser_preview_url` plus the harness fallback opener to surface the final page in the user's browser.
+- In external mode, use these browser tools and rely on `browser_preview_url` plus the harness external preview opener to surface the final page.
+- This bundled skill is named `tasi-browser-automation` to avoid confusion with similarly named community skills.

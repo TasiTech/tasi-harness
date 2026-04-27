@@ -182,7 +182,9 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
 .primary-button { background: var(--accent); color: #001a15; border-color: var(--accent); font-weight: 800; }
 .ghost-button:hover, .mini-button:hover { border-color: var(--accent); color: var(--accent); }
 .danger-button { color: var(--danger); border-color: rgba(255, 91, 110, 0.3); background: rgba(255, 91, 110, 0.08); }
-.send-btn { width: 46px; min-height: 46px; border-radius: 14px; border: none; color: #001a15; background: var(--accent); font-weight: 900; }
+.send-btn { width: 46px; min-height: 46px; border-radius: 14px; border: none; color: #001a15; background: var(--accent); font-weight: 900; display: inline-flex; align-items: center; justify-content: center; }
+.send-btn.stop { color: #ffffff; background: rgba(255, 91, 110, 0.92); }
+.send-stop-icon { width: 12px; height: 12px; border-radius: 2px; background: currentColor; display: inline-block; }
 .send-btn:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .chat-page { display: flex; flex-direction: column; padding: 0; overflow: hidden; min-height: 0; }
@@ -381,6 +383,47 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   border-top: 1px solid var(--border);
   margin: 12px 0;
 }
+.msg-table-wrap {
+  margin: 0 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow-x: auto;
+  background: var(--bg-tertiary);
+}
+.msg-table-wrap:last-child { margin-bottom: 0; }
+.msg-table {
+  width: 100%;
+  min-width: max-content;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.msg-table th,
+.msg-table td {
+  padding: 8px 10px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.msg-table th {
+  font-weight: 700;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.04);
+}
+.msg-table td {
+  color: var(--text-secondary);
+}
+.msg-table tr:last-child td { border-bottom: 0; }
+.msg-table th:last-child,
+.msg-table td:last-child { border-right: 0; }
+.msg-table th p,
+.msg-table td p,
+.msg-table th ul,
+.msg-table td ul,
+.msg-table th ol,
+.msg-table td ol,
+.msg-table th blockquote,
+.msg-table td blockquote { margin: 0; }
 .msg-bubble a { color: inherit; text-decoration: underline; }
 .msg-bubble code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

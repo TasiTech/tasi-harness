@@ -7,11 +7,11 @@ Use browser automation as the only supported Ctrip path for `tasi-travel`.
 
 ## Browser Modes
 - Embedded mode: use built-in `browser_*` tools and the built-in preview by default.
-- External mode: prefer Agent Browser only when a working external bridge is clearly available.
-- If bridge availability is unknown, disconnected, or unstable, continue with `browser_*` tools and rely on the harness preview or fallback opener.
+- External mode: continue using `browser_*`; the harness auto-selects controlled system browser runtime when available.
+- If controlled external runtime is unavailable, the harness may fall back to a plain opener; continue with `browser_*` and keep degraded state explicit when extraction quality drops.
 
 Related browser skill references:
-- Agent Browser: `../../../browser/agent-browser/SKILL.md`
+- Tasi browser automation: `../../../browser/tasi-browser-automation/SKILL.md`
 - Built-in browser operator: `../../../browser/embedded-browser-operator/SKILL.md`
 
 ## Tooling
@@ -108,7 +108,7 @@ Extraction rules:
 Treat these as degraded or failed states and expose them clearly:
 - page did not load
 - browser tools unavailable
-- bridge disconnected
+- controlled external runtime unavailable and fallback opener cannot keep stable extractable context
 - no visible result cards after bounded retries
 - anti-bot or login wall blocked extraction
 - content changed before extraction completed

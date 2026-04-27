@@ -18,96 +18,6 @@ export interface BuiltinToolDeps {
   browserAutomation?: BrowserAutomation;
 }
 
-type OpenCliPreviewKind = 'browser_open' | 'search';
-
-interface OpenCliPreviewTarget {
-  url: string;
-  kind: OpenCliPreviewKind;
-}
-
-function splitShellWords(command: string): string[] {
-  const tokens = command.match(/"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|\S+/g) ?? [];
-  return tokens.map((token) => {
-    if (token.startsWith('"') && token.endsWith('"')) return token.slice(1, -1).replace(/\\"/g, '"');
-    if (token.startsWith("'") && token.endsWith("'")) return token.slice(1, -1);
-    return token;
-  });
-}
-
-function inferOpenCliPreviewTarget(command: string): OpenCliPreviewTarget | null {
-  const words = splitShellWords(command);
-  const openCliIndex = words.findIndex((word) => /(^|[\\/])opencli(?:\.cmd|\.exe)?$/i.test(word));
-  if (openCliIndex < 0) return null;
-  const args = words.slice(openCliIndex + 1);
-  if (args.length < 2) return null;
-  const platform = args[0].toLowerCase();
-  const action = args[1].toLowerCase();
-  if (platform === 'browser' && action === 'open') {
-    const raw = (args[2] ?? '').trim();
-    if (!raw) return null;
-    return { kind: 'browser_open', url: /^https?:\/\//i.test(raw) ? raw : `https://${raw}` };
-  }
-  if (action !== 'search') return null;
-  const queryTokens: string[] = [];
-  for (const token of args.slice(2)) {
-    if (token.startsWith('-')) break;
-    queryTokens.push(token);
-  }
-  const query = queryTokens.join(' ').trim();
-  if (!query) return null;
-  const encoded = encodeURIComponent(query);
-  const engines: Record<string, (q: string) => string> = {
-    baidu: (q) => `https://www.baidu.com/s?wd=${q}`,
-    bing: (q) => `https://www.bing.com/search?q=${q}`,
-    google: (q) => `https://www.google.com/search?q=${q}`,
-    duckduckgo: (q) => `https://duckduckgo.com/?q=${q}`,
-    brave: (q) => `https://search.brave.com/search?q=${q}`,
-    yahoo: (q) => `https://search.yahoo.com/search?p=${q}`,
-    browser: (q) => `https://www.google.com/search?q=${q}`
-  };
-  const toUrl = engines[platform] ?? engines.google;
-  return { kind: 'search', url: toUrl(encoded) };
-}
-
-function isOpenCliCommand(command: string): boolean {
-  const words = splitShellWords(command);
-  return words.some((word) => /(^|[\\/])opencli(?:\.cmd|\.exe)?$/i.test(word));
-}
-
-function appendOpenCliResultHints(command: string, result: ToolExecutionResult, bridgeMode: AppConfig['opencliBridgeMode']): ToolExecutionResult {
-  if (!command.trim()) return result;
-  if (/terminal tool is disabled|blocked dangerous command pattern/i.test(result.content)) return result;
-  if (!isOpenCliCommand(command)) return result;
-
-  const bridgeDisconnected = /browser bridge extension not connected|extension not connected/i.test(result.content);
-  const target = inferOpenCliPreviewTarget(command);
-  const hasPreviewUrl = /opencli_preview_url:\s*https?:\/\/\S+/i.test(result.content);
-  const hasUrlInOutput = /https?:\/\/\S+/i.test(result.content);
-  const lines = [result.content];
-  let changed = false;
-
-  if (target && !hasPreviewUrl && (bridgeDisconnected || !hasUrlInOutput)) {
-    lines.push('', `opencli_preview_url: ${target.url}`);
-    changed = true;
-    if (bridgeDisconnected) {
-      lines.push('opencli bridge is disconnected, showing fallback in built-in web preview.');
-    }
-  }
-
-  if (bridgeDisconnected) {
-    lines.push(
-      '',
-      bridgeMode === 'embedded'
-        ? 'bridge_mode=embedded: external Chrome extension install is not required for this mode. Use the built-in preview when opencli_preview_url is present.'
-        : 'bridge_mode=external: ensure Chrome/Chromium is running and the OpenCLI extension is enabled. If the bridge is unavailable, fall back to browser_* tools; the harness can still open the final URL in the user browser.'
-    );
-    changed = true;
-  }
-
-  if (!changed) return result;
-  return { ...result, content: lines.join('\n') };
-}
-
 function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
   const raw = args[name];
   const value = typeof raw === 'number' ? raw : Number(raw);
@@ -629,14 +539,13 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const cfg = deps.getConfig();
       const obj = objectArgs(args);
       const cwd = safeJoin(cfg.workspaceDir, stringArg(obj, 'cwd', '.'));
-      const command = stringArg(obj, 'command');
       const result = await runTerminalCommand({
-        command,
+        command: stringArg(obj, 'command'),
         cwd,
         timeoutMs: Number(obj.timeout_ms) || 120000,
         allowShellTools: cfg.allowShellTools
       });
-      return appendOpenCliResultHints(command, result, cfg.opencliBridgeMode);
+      return result;
     }
   };
 

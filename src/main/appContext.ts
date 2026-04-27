@@ -1,6 +1,6 @@
 import { app } from 'electron';
-import { existsSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig, RegisteredTool } from '../shared/types.js';
 import { AgentLoop } from './agent/agentLoop.js';
@@ -45,20 +45,6 @@ function findResourcesRoot(): string {
   const withMarkets = candidates.find((candidate) => candidate && existsSync(join(candidate, 'markets')));
   if (withMarkets) return withMarkets;
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? resolve(process.cwd(), 'resources');
-}
-
-function findManifestInDirectory(path: string): string | null {
-  if (!existsSync(path)) return null;
-  if (statSync(path).isFile() && path.toLowerCase().endsWith('manifest.json')) return dirname(path);
-  const direct = resolve(path, 'manifest.json');
-  if (existsSync(direct)) return resolve(path);
-  if (!statSync(path).isDirectory()) return null;
-  for (const name of readdirSync(path)) {
-    const child = resolve(path, name);
-    if (!existsSync(child) || !statSync(child).isDirectory()) continue;
-    if (existsSync(resolve(child, 'manifest.json'))) return child;
-  }
-  return null;
 }
 
 export class AppContext {
@@ -147,20 +133,16 @@ export class AppContext {
   }
 
   private describeExternalBrowserBridge(config: AppConfig): string {
-    if (config.opencliBridgeMode !== 'external') return '';
-    const explicit = config.opencliExtensionPath?.trim();
-    const candidates = [
-      explicit || '',
-      resolve(this.harnessHome, 'extensions', 'opencli-extension'),
-      resolve(process.cwd(), 'resources', 'opencli-extension'),
-      resolve(app.getAppPath(), 'resources', 'opencli-extension'),
-      resolve(process.resourcesPath ?? '', 'opencli-extension')
-    ].filter(Boolean);
-    const openCliDetected = candidates.some((candidate) => Boolean(findManifestInDirectory(candidate)));
-    if (openCliDetected) {
-      return '- External browser bridge snapshot: OpenCLI extension files were detected locally. Prefer Agent Browser or OpenCLI flows when they are responsive, but if the bridge is disconnected or the command fails, immediately fall back to browser_* tools and let the harness open the resulting page in the user browser.';
-    }
-    return '- External browser bridge snapshot: no OpenCLI bridge installation was detected automatically. Agent Browser availability is not auto-detected here, so do not assume any external bridge exists. Use browser_* tools by default and let the harness open resulting pages in the user browser.';
+    if (config.browserMode !== 'external') return '';
+    const strategy =
+      config.externalBrowserEngine === 'auto'
+        ? process.platform === 'darwin'
+          ? 'cdp (with local auto-launch) -> webdriver-safari -> shell.openExternal fallback'
+          : 'cdp (with local auto-launch) -> shell.openExternal fallback'
+        : config.externalBrowserEngine === 'cdp'
+          ? 'cdp (with local auto-launch) -> shell.openExternal fallback'
+          : 'webdriver-safari -> shell.openExternal fallback';
+    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; strategy=${strategy}.`;
   }
 
   private createTools(): RegisteredTool[] {

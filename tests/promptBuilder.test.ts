@@ -18,13 +18,15 @@ describe('PromptBuilder', () => {
       new SkillManager(env.home),
       new PersonalKnowledgeBase(env.home),
       () =>
-        '- External browser bridge snapshot: no OpenCLI bridge installation was detected automatically. Agent Browser availability is not auto-detected here, so do not assume any external bridge exists. Use browser_* tools by default and let the harness open resulting pages in the user browser.'
+        '- External browser bridge snapshot: engine=auto; cdpEndpoint=http://127.0.0.1:9222; strategy=cdp -> shell.openExternal fallback.'
     );
 
-    const prompt = await builder.build({ ...defaultConfig(), opencliBridgeMode: 'external' }, { userInput: 'open example.com' });
+    const prompt = await builder.build({ ...defaultConfig(), browserMode: 'external' }, { userInput: 'open example.com' });
 
-    expect(prompt).toContain('prefer Agent Browser or OpenCLI only when a working external bridge is known to be available');
-    expect(prompt).toContain('Use browser_* tools by default');
+    expect(prompt).toContain('Browser mode is external.');
+    expect(prompt).toContain('In external browser mode, use browser_* tools as the default workflow');
+    expect(prompt).toContain('engine=auto');
+    expect(prompt).toContain('shell.openExternal fallback');
   });
 
   it('tells the agent to follow relevant skill workflows instead of skipping to a self-generated answer', async () => {

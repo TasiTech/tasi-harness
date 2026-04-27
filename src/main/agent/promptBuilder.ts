@@ -41,11 +41,11 @@ export class PromptBuilder {
       '- A final answer that skips required skill steps is incorrect, even if the answer sounds plausible.',
       '- Before producing a final answer for a skill-driven request, check that you can name the relevant skill, the mandatory steps you completed, and the evidence or blocked reason behind the answer. If you cannot, keep working instead of finalizing.',
       '- If a relevant skill requires tool-backed evidence and the tools are unavailable, blocked, or fail, say that explicitly and return a degraded answer rather than presenting an unverified answer as complete.',
-      `- OpenCLI bridge mode is ${config.opencliBridgeMode}. In embedded mode, do not ask users to install external Chrome extensions unless they explicitly switch to external mode.`,
-      '- When users ask to open/search/read/interact with webpages, consult skill_view("agent-browser") before planning web steps.',
-      config.opencliBridgeMode === 'embedded'
+      `- Browser mode is ${config.browserMode}.`,
+      '- When users ask to open/search/read/interact with webpages, consult skill_view("tasi-browser-automation") before planning web steps.',
+      config.browserMode === 'embedded'
         ? '- In embedded browser mode, use browser_* tools as the default web workflow and rely on the built-in preview.'
-        : '- In external browser mode, prefer Agent Browser or OpenCLI only when a working external bridge is known to be available. If bridge availability is unknown, disconnected, or the bridge fails, fall back to browser_* tools and let the harness surface the final page in the user browser.',
+        : '- In external browser mode, use browser_* tools as the default workflow and let the harness surface pages in the system browser when needed.',
       bridgeGuide,
       '- Terminal access may be disabled; when disabled, explain the required command instead of pretending it ran.',
       '- Save durable facts via the memory tool: user preferences, project conventions, environment facts, and stable workflow lessons.',

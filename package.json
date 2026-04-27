@@ -60,10 +60,6 @@
       {
         "from": "resources/skills",
         "to": "skills"
-      },
-      {
-        "from": "resources/opencli-extension",
-        "to": "opencli-extension"
       }
     ],
     "mac": {

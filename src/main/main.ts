@@ -1,6 +1,5 @@
 import { app, BrowserWindow, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AppContext } from './appContext.js';
 import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
@@ -9,7 +8,6 @@ import type {
   AgentToolEventStream,
   AppConfig,
   MemoryClearRequest,
-  OpenCliExtensionStatus,
   ToolEvent,
   ToolExecutionResult,
   MemoryQueryOptions,
@@ -25,26 +23,27 @@ import type {
 import { createId } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
+import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let devToolsWindow: BrowserWindow | null = null;
 const context = new AppContext();
-let loadedOpenCliExtensionDir: string | null = null;
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
-const OPENCLI_ELECTRON_UNSUPPORTED_PERMISSIONS = new Set(['debugger', 'cookies']);
-const warnedOpenCliMessages = new Set<string>();
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
-
-function warnOpenCliOnce(message: string): void {
-  if (warnedOpenCliMessages.has(message)) return;
-  warnedOpenCliMessages.add(message);
-  console.warn(message);
-}
+const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
+const externalFallbackUrls = new Set<string>();
+const activeChatControllers = new Map<number, AbortController>();
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === 'AbortError') return true;
+  return /operation was aborted|session stopped by user|aborted/i.test(error.message);
 }
 
 function getDevToolsWindowMetrics(parent: BrowserWindow): { bounds: Rectangle; minWidth: number; minHeight: number } {
@@ -169,17 +168,6 @@ function sessionPartition(target: WebContents): string {
   return '';
 }
 
-function extractWebPreviewUrls(content: string): string[] {
-  const urls: string[] = [];
-  const pattern = /(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/gi;
-  for (const match of content.matchAll(pattern)) {
-    const raw = (match[1] ?? '').trim();
-    if (!raw) continue;
-    urls.push(raw.replace(/[),.;!?]+$/, ''));
-  }
-  return urls;
-}
-
 function findFirstHttpUrl(text: string): string | undefined {
   const match = text.match(/https?:\/\/[^\s"'<>`)\]}]+/i);
   if (!match) return undefined;
@@ -218,7 +206,7 @@ function extractUrlFromValue(value: unknown, depth = 0): string | undefined {
 }
 
 function extractPreviewUrlMarker(text: string): string | undefined {
-  const marker = text.match(/(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/i);
+  const marker = text.match(/browser_preview_url:\s*(https?:\/\/[^\s"'<>`]+)/i);
   if (!marker?.[1]) return undefined;
   return marker[1].replace(/[),.;!?]+$/, '');
 }
@@ -237,13 +225,11 @@ function shouldFallbackOpenExternal(toolName: string, args: unknown, content: st
   const combined = previewSourceText(toolName, args, content);
   if (toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
-  if (!combined.includes('opencli_preview_url')) return false;
-  return /bridge is disconnected|showing fallback|extension not connected/i.test(combined);
+  return false;
 }
 
 function isWebPreviewEvent(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (combined.includes('opencli')) return true;
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
   return event.toolName.toLowerCase().includes('open') && combined.includes('http');
@@ -270,204 +256,47 @@ function latestWebPreviewUrlFromEvents(events: ToolEvent[], fallbackOnly = false
 
 async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResult> {
   if (!url) return { ok: false, content: 'No preview URL available to open.' };
-  if (context.getConfig().opencliBridgeMode !== 'external') {
+  const config = context.getConfig();
+  if (config.browserMode !== 'external') {
     return { ok: false, content: 'External browser mode is not active.' };
   }
   const now = Date.now();
   if (lastExternalBrowserOpen && lastExternalBrowserOpen.url === url && now - lastExternalBrowserOpen.at < 1500) {
     return { ok: true, content: `External browser already opened recently for ${url}.` };
   }
-  try {
-    await shell.openExternal(
-      url,
-      process.platform === 'win32'
-        ? {
-            workingDirectory: context.harnessHome,
-            logUsage: true
-          }
-        : undefined
-    );
+  const managed = await externalBrowserBridge.open(url, config);
+  if (managed.ok) {
     lastExternalBrowserOpen = { url, at: now };
-    return { ok: true, content: `Opened ${url} in the external browser.` };
+    return managed;
+  }
+  console.warn(`[browser][external] managed open failed for ${url}; fallback=shell.openExternal; reason=${managed.content}`);
+  try {
+    await shell.openExternal(url);
+    externalFallbackUrls.add(url);
+    lastExternalBrowserOpen = { url, at: now };
+    return {
+      ok: true,
+      content: `Managed external open failed (${managed.content}); fell back to shell.openExternal for ${url}.`
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[opencli] failed to open external browser for ${url}: ${message}`);
-    return { ok: false, content: `Failed to open ${url} in the external browser: ${message}` };
+    console.warn(`[browser] failed to open system default browser for ${url}: ${message}`);
+    return {
+      ok: false,
+      content: `Failed both managed and fallback open for ${url}. managed=${managed.content}; fallback=${message}`
+    };
   }
 }
 
-function openCliExtensionCandidates(cfg: AppConfig): string[] {
-  const explicit = cfg.opencliExtensionPath?.trim();
-  const candidates = [
-    explicit || '',
-    resolve(context.harnessHome, 'extensions', 'opencli-extension'),
-    resolve(process.cwd(), 'resources', 'opencli-extension'),
-    resolve(app.getAppPath(), 'resources', 'opencli-extension'),
-    resolve(process.resourcesPath ?? '', 'opencli-extension')
-  ].filter(Boolean);
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const item of candidates) {
-    const normalized = resolve(item);
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    unique.push(normalized);
-  }
-  return unique;
-}
-
-function findManifestInDirectory(path: string): string | null {
-  if (!existsSync(path)) return null;
-  const direct = resolve(path, 'manifest.json');
-  if (existsSync(direct)) return resolve(path);
-  if (!statSync(path).isDirectory()) return null;
-  for (const name of readdirSync(path)) {
-    const child = resolve(path, name);
-    if (!existsSync(child) || !statSync(child).isDirectory()) continue;
-    if (existsSync(resolve(child, 'manifest.json'))) return child;
-  }
-  return null;
-}
-
-function readExtensionManifest(extensionDir: string): { permissions: string[] } | null {
-  const manifestPath = resolve(extensionDir, 'manifest.json');
-  if (!existsSync(manifestPath)) return null;
-  try {
-    const raw = readFileSync(manifestPath, 'utf8');
-    const parsed = JSON.parse(raw) as { permissions?: unknown };
-    const permissions = Array.isArray(parsed.permissions) ? parsed.permissions.filter((item): item is string => typeof item === 'string') : [];
-    return { permissions };
-  } catch {
-    return null;
-  }
-}
-
-function detectOpenCliElectronCompatibility(extensionDir: string): { compatible: boolean; message?: string } {
-  const manifest = readExtensionManifest(extensionDir);
-  if (!manifest) {
-    return { compatible: false, message: `Cannot read manifest.json from ${extensionDir}.` };
-  }
-  const unsupported = manifest.permissions.filter((permission) => OPENCLI_ELECTRON_UNSUPPORTED_PERMISSIONS.has(permission));
-  if (unsupported.length === 0) return { compatible: true };
+async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
+  const managedResult = await externalBrowserBridge.close();
+  const fallbackCount = externalFallbackUrls.size;
+  externalFallbackUrls.clear();
+  lastExternalBrowserOpen = null;
+  if (fallbackCount <= 0) return managedResult;
   return {
-    compatible: false,
-    message: `OpenCLI extension requests unsupported Electron APIs (${unsupported.join(', ')}). Use external browser mode for full bridge support.`
-  };
-}
-
-async function loadExtensionCompat(extensionDir: string): Promise<void> {
-  if (!mainWindow) throw new Error('Main window is not ready yet.');
-  const currentSession = mainWindow.webContents.session as unknown as {
-    loadExtension?: (path: string, options?: { allowFileAccess?: boolean }) => Promise<unknown>;
-    extensions?: { loadExtension?: (path: string, options?: { allowFileAccess?: boolean }) => Promise<unknown> };
-  };
-  if (currentSession.extensions?.loadExtension) {
-    await currentSession.extensions.loadExtension(extensionDir, { allowFileAccess: true });
-    return;
-  }
-  if (currentSession.loadExtension) {
-    await currentSession.loadExtension(extensionDir, { allowFileAccess: true });
-    return;
-  }
-  throw new Error('No extension loader API found on current Electron session.');
-}
-
-function findOpenCliExtensionDir(cfg: AppConfig): string | null {
-  for (const candidate of openCliExtensionCandidates(cfg)) {
-    if (!existsSync(candidate)) continue;
-    if (statSync(candidate).isFile() && candidate.toLowerCase().endsWith('manifest.json')) return dirname(candidate);
-    const found = findManifestInDirectory(candidate);
-    if (found) return found;
-  }
-  return null;
-}
-
-async function ensureOpenCliExtensionLoaded(): Promise<void> {
-  if (!mainWindow) return;
-  const cfg = context.getConfig();
-  if (cfg.opencliBridgeMode !== 'embedded') return;
-  const extensionDir = findOpenCliExtensionDir(cfg);
-  if (!extensionDir) {
-    if (cfg.opencliExtensionPath?.trim()) {
-      warnOpenCliOnce(`[opencli] extension manifest not found under: ${cfg.opencliExtensionPath}`);
-    }
-    return;
-  }
-  const compatibility = detectOpenCliElectronCompatibility(extensionDir);
-  if (!compatibility.compatible) {
-    warnOpenCliOnce(`[opencli] skipped loading extension from ${extensionDir}: ${compatibility.message}`);
-    return;
-  }
-  if (loadedOpenCliExtensionDir === extensionDir) return;
-  try {
-    await loadExtensionCompat(extensionDir);
-    loadedOpenCliExtensionDir = extensionDir;
-    console.info(`[opencli] loaded browser bridge extension from ${extensionDir}`);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (/already loaded/i.test(msg)) {
-      loadedOpenCliExtensionDir = extensionDir;
-      return;
-    }
-    console.warn(`[opencli] failed to load browser bridge extension from ${extensionDir}: ${msg}`);
-  }
-}
-
-function openCliExtensionStatus(): OpenCliExtensionStatus {
-  const cfg = context.getConfig();
-  const detected = findOpenCliExtensionDir(cfg);
-  const compatibility = detected ? detectOpenCliElectronCompatibility(detected) : { compatible: false as const };
-  const loadedPath = loadedOpenCliExtensionDir ? resolve(loadedOpenCliExtensionDir) : '';
-  const detectedPath = detected ? resolve(detected) : '';
-  const loaded = Boolean(loadedPath) && (!detectedPath || loadedPath === detectedPath);
-  const available = Boolean(detectedPath);
-  if (cfg.opencliBridgeMode === 'external') {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: 'External browser mode is active. Extension status is optional in this mode.'
-    };
-  }
-  if (available && !compatibility.compatible) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded: false,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: compatibility.message || 'OpenCLI extension is not compatible with Electron embedded mode.'
-    };
-  }
-  if (loaded) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: `OpenCLI extension is loaded${loadedPath ? ` from ${loadedPath}` : ''}.`
-    };
-  }
-  if (available) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: `Extension files were detected at ${detectedPath}, but are not loaded yet.`
-    };
-  }
-  return {
-    mode: cfg.opencliBridgeMode,
-    loaded,
-    available,
-    detectedPath: undefined,
-    loadedPath: loadedPath || undefined,
-    message: 'OpenCLI extension files were not found.'
+    ok: managedResult.ok,
+    content: `${managedResult.content} ${fallbackCount} fallback URL(s) were opened via shell.openExternal and cannot be auto-closed.`
   };
 }
 
@@ -489,8 +318,6 @@ async function createWindow(): Promise<void> {
       webviewTag: true
     }
   });
-  await ensureOpenCliExtensionLoaded();
-
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.webContents.once('did-finish-load', () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -508,36 +335,55 @@ function registerIpc(): void {
     const sanitized = { ...partial };
     if (typeof sanitized.apiKey !== 'string') delete sanitized.apiKey;
     const next = context.configStore.update(sanitized);
-    await ensureOpenCliExtensionLoaded();
+    if (next.browserMode !== 'external') await closeExternalBrowserPreview();
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
   ipcMain.handle('config:test', async () => testLlmConnection(context.getConfig()));
 
   ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
     if (!input || !input.trim()) throw new Error('Message cannot be empty.');
+    const senderId = _event.sender.id;
+    if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
+    const controller = new AbortController();
+    activeChatControllers.set(senderId, controller);
     try {
       const result = await context.agentLoop.run({
         userInput: input,
         sessionId,
         executionMode,
-      usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
-      origin: 'chat',
-      onToolEvent: (eventSessionId, toolEvent) => {
-        void maybeOpenExternalBrowser(latestWebPreviewUrlFromEvents([toolEvent], true));
-        const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-        _event.sender.send('agent:tool-event', payload);
-      }
-    });
+        usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
+        origin: 'chat',
+        signal: controller.signal,
+        onToolEvent: (eventSessionId, toolEvent) => {
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+          _event.sender.send('agent:tool-event', payload);
+        }
+      });
       const followUpQuestions = await generateFollowUpQuestions(
         () => createLlmClient(context.getConfig()),
         context.getConfig(),
         { userInput: input, finalResponse: result.finalResponse }
       );
-      await maybeOpenExternalBrowser(latestWebPreviewUrlFromEvents(result.toolEvents, true));
       return { ...result, followUpQuestions };
     } catch (error) {
+      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
       throw new Error(error instanceof Error ? error.message : String(error));
+    } finally {
+      const active = activeChatControllers.get(senderId);
+      if (active === controller) activeChatControllers.delete(senderId);
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
     }
+  });
+
+  ipcMain.handle('agent:stop', async (_event) => {
+    const senderId = _event.sender.id;
+    const controller = activeChatControllers.get(senderId);
+    if (!controller) return { ok: true, content: 'No active chat session to stop.' };
+    controller.abort();
+    if (context.getConfig().browserMode === 'external') {
+      await closeExternalBrowserPreview();
+    }
+    return { ok: true, content: 'Stop signal sent.' };
   });
 
   ipcMain.handle('sessions:list', () => context.sessionStore.list());
@@ -569,22 +415,26 @@ function registerIpc(): void {
   ipcMain.handle('tasks:runNow', async (_event, id: string) => {
     const task = context.scheduledTaskStore.list().find((item) => item.id === id);
     if (!task) throw new Error(`Task not found: ${id}`);
-    const result = await context.agentLoop.run({
-      userInput: task.prompt,
-      sessionId: task.sessionId,
-      executionMode: task.executionMode,
-      origin: 'scheduled',
-      scheduledTaskId: task.id
-    });
-    const updated = context.scheduledTaskStore.markRun(id, { sessionId: result.sessionId, output: result.finalResponse });
-    if (updated.notifyByEmail) {
-      await context.emailNotifier.send(
-        context.getConfig().emailNotifications,
-        `[Tasi Harness] ${updated.name}`,
-        [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
-      );
+    try {
+      const result = await context.agentLoop.run({
+        userInput: task.prompt,
+        sessionId: task.sessionId,
+        executionMode: task.executionMode,
+        origin: 'scheduled',
+        scheduledTaskId: task.id
+      });
+      const updated = context.scheduledTaskStore.markRun(id, { sessionId: result.sessionId, output: result.finalResponse });
+      if (updated.notifyByEmail) {
+        await context.emailNotifier.send(
+          context.getConfig().emailNotifications,
+          `[Tasi Harness] ${updated.name}`,
+          [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
+        );
+      }
+      return result;
+    } finally {
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
     }
-    return result;
   });
 
   ipcMain.handle('tools:list', () => context.toolRegistry.definitions(context.getConfig().enabledToolNames));
@@ -611,6 +461,7 @@ function registerIpc(): void {
     return { ok: !err, content: err || 'Opened.' };
   });
   ipcMain.handle('app:openExternalUrl', async (_event, url: string) => maybeOpenExternalBrowser(url));
+  ipcMain.handle('app:closeExternalPreview', async () => closeExternalBrowserPreview());
   ipcMain.handle('app:setEmbeddedPreviewWebContentsId', (_event, id: number | null) => {
     if (id == null) {
       embeddedPreviewWebContentsId = null;
@@ -632,11 +483,13 @@ function registerIpc(): void {
     target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
   });
-  ipcMain.handle('app:openCliExtensionStatus', () => openCliExtensionStatus());
 }
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  for (const controller of activeChatControllers.values()) controller.abort();
+  activeChatControllers.clear();
+  void closeExternalBrowserPreview();
 });
 
 app.whenReady().then(() => {
@@ -645,6 +498,11 @@ app.whenReady().then(() => {
   app.on('web-contents-created', (_event, contents) => {
     contents.once('destroyed', () => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;
+      const controller = activeChatControllers.get(contents.id);
+      if (controller) {
+        controller.abort();
+        activeChatControllers.delete(contents.id);
+      }
     });
   });
   registerIpc();

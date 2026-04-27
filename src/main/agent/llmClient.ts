@@ -171,7 +171,7 @@ function formatFetchFailure(config: AppConfig, endpoint: string, error: unknown)
   } else {
     hints.push('Check Base URL, API key, proxy/firewall settings, DNS, and TLS certificate trust on this machine.');
   }
-  if (config.opencliBridgeMode === 'external') {
+  if (config.browserMode === 'external') {
     hints.push('This happened before the external browser step; verify model/network connectivity first.');
   }
   return hints.join(' ');

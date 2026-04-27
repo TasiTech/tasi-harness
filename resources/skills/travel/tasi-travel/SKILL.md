@@ -12,7 +12,7 @@ Provide a single entry workflow for trip planning while keeping provider logic m
 This skill uses an entry-plus-modules structure:
 - Entry layer (this file): request understanding, orchestration, provider routing, and output assembly.
 - Provider layer: platform-specific retrieval and normalization.
-- Browser evidence layer: Ctrip web retrieval through Agent Browser or built-in `browser_*` tools.
+- Browser evidence layer: Ctrip web retrieval through built-in `browser_*` tools, with runtime mode handled by the harness.
 - Visualization layer: parked for now; Step 4A map artifact generation is temporarily disabled.
 - Asset layer: map runtime files under `./assets/map/` are retained for future re-enable, but are not part of the active workflow right now.
 - Capability details: kept inside provider docs to reduce fragmentation while preserving extension points.
@@ -67,7 +67,7 @@ These files remain bundled, but the entry workflow currently does not start them
 | Provider | Auth Method | Rate Limit Handling | Credential Key |
 |---|---|---|---|
 | flyai | Probe first; ask on 401/403 only | Stop retries; mark degraded; fallback | Not required unless auth error |
-| ctrip_browser | Browser-mode dependent; do not assume an external bridge exists | Stop retries; mark degraded; fallback | None |
+| ctrip_browser | Browser tools first; external mode is harness-managed (auto-detect controlled runtime, then fallback opener if needed) | Stop retries; mark degraded; fallback | None |
 | tencent_map | Check key availability for non-map capabilities only | Stop retries; mark degraded; fallback | TENCENT_KEY or TENCENT_MAP_KEY |
 
 ### Provider References
@@ -76,7 +76,7 @@ These files remain bundled, but the entry workflow currently does not start them
 - ctrip-browser: ./references/provider-ctrip-browser.md
 - Ctrip guide: ./references/ctrip-information-search-guide.md
 - Extension guide: ./references/provider-extension.md
-- Agent Browser skill: ../../browser/agent-browser/SKILL.md
+- Tasi browser automation skill: ../../browser/tasi-browser-automation/SKILL.md
 - Built-in browser operator: ../../browser/embedded-browser-operator/SKILL.md
 
 ## Provider Routing Policy
@@ -89,9 +89,9 @@ These files remain bundled, but the entry workflow currently does not start them
    - For hotel, POI, flight, and train information, try `ctrip_browser` first. If browser extraction returns no accepted rows or cannot produce usable evidence, fall back to `flyai`.
    - If all providers fail, trigger `Offline Degradation Mode`.
 3. **Browser policy**:
-   - In embedded mode, use built-in `browser_*` tools as the default Ctrip workflow.
-   - In external mode, prefer Agent Browser only when a working external bridge is clearly available.
-   - If bridge availability is unknown, disconnected, or unstable, continue with `browser_*` tools instead of blocking on bridge setup.
+   - In both embedded and external modes, use `browser_*` tools as the default Ctrip workflow.
+   - In external mode, rely on harness-managed external runtime selection (Chromium-family via CDP first; Safari via WebDriver on macOS when configured).
+   - If controlled external runtime is unavailable and the harness falls back to a plain external opener, continue workflow and keep uncertainty visible; do not block on manual runtime setup.
 
 ### Degradation Rules
 - **HTTP 429 / Rate Limit / Trial Limit**: mark category as `degraded`, stop retries for this turn, and switch to the next provider.
@@ -108,7 +108,7 @@ Use hotel search when the user asks for nearby hotels, accommodation options, ho
 ### Tool Binding
 - Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
 - Preferred extract format: `format=json`
-- External bridge policy: in external browser mode, prefer Agent Browser only when a working external bridge is clearly available; otherwise continue with `browser_*` tools.
+- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
 - Required args: `city`, `check_in`, `check_out`
 - Optional args: `keyword`, `limit`
 - Preferred source: Ctrip hotel list or search pages that match the requested city and date range.
@@ -150,7 +150,7 @@ Use POI search when the user asks for city attractions, scenic spots, museums, l
 ### Tool Binding
 - Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
 - Preferred extract format: `format=json`
-- External bridge policy: in external browser mode, prefer Agent Browser only when a working external bridge is clearly available; otherwise continue with `browser_*` tools.
+- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
 - Required args: `city`
 - Optional args: `keyword`, `limit`
 - Preferred source: Ctrip sight or guide listing pages and clearly attributable POI detail pages.

@@ -142,7 +142,7 @@ The app includes a built-in browser automation session with tools such as:
 Two browser presentation modes are supported:
 
 - `embedded`: previews pages inside the desktop app and works out of the box.
-- `external`: can surface pages in an external Chromium-based browser. Packaged builds can auto-load the bundled OpenCLI bridge extension from `resources/opencli-extension`.
+- `external`: can surface pages in an external browser preview window managed by Tasi Harness.
 
 ### Personal knowledge base
 
@@ -174,7 +174,7 @@ Skills are plain `SKILL.md` files with frontmatter and instructions. You can:
 - upload skill archives
 - browse marketplace catalogs such as ClawHub and SkillHub
 
-Bundled browser automation guidance is available as the `agent-browser` skill.
+Bundled browser automation guidance is available as the `tasi-browser-automation` skill.
 
 ### Sessions and memory
 

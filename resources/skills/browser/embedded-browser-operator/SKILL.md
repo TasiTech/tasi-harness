@@ -33,5 +33,4 @@ Use these browser tools:
 - Prefer CSS selectors over brittle positional assumptions.
 - If an interaction fails, re-check page state, then wait and retry once.
 - In embedded mode, do not ask the user to install Chrome extensions for this flow.
-- In external mode, prefer Agent Browser or OpenCLI first only when a working external bridge is clearly available.
-- If no external bridge is available, these tools remain the fallback path; rely on `browser_preview_url` and the harness fallback opener to surface the final page in the user's browser.
+- In external mode, these tools remain fully supported; rely on `browser_preview_url` and the harness external preview opener to surface the final page.

@@ -22,8 +22,10 @@ export function defaultConfig(): AppConfig {
     workspaceDir: join(DEFAULT_HOME, 'workspace'),
     allowShellTools: false,
     enableNetworkTools: false,
-    opencliBridgeMode: 'embedded',
-    opencliExtensionPath: '',
+    browserMode: 'embedded',
+    externalBrowserEngine: 'auto',
+    externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
+    externalBrowserProfileMode: 'isolated',
     theme: 'dark',
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
