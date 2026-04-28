@@ -36,31 +36,6 @@ It also seeds bundled skills and starts scheduler polling.
 - WeChat channel integration (QR login state, message polling, external message append, and agent-triggered reply path).
 - Automatic external preview cleanup after run completion/stop.
 
-## Agent Execution Flow
-
-```mermaid
-sequenceDiagram
-  participant UI as Renderer
-  participant IPC as main.ts
-  participant LOOP as AgentLoop
-  participant PROMPT as PromptBuilder
-  participant LLM as LlmClient
-  participant TOOLS as ToolRegistry
-  participant STORE as SessionStore/MemoryStore
-
-  UI->>IPC: agent:chat(input, sessionId, mode, usePKB)
-  IPC->>LOOP: run(...)
-  LOOP->>STORE: beginDeferredMemory + append user message
-  LOOP->>PROMPT: build(system prompt)
-  LOOP->>LLM: complete(messages, tools)
-  LLM-->>LOOP: assistant + tool_calls/answer
-  LOOP->>TOOLS: execute tool calls (iterative)
-  TOOLS-->>LOOP: tool results
-  LOOP->>STORE: append messages/tool events
-  LOOP->>STORE: commitDeferredMemory + sync session memory
-  LOOP-->>IPC: final response + usage + events
-  IPC-->>UI: result + session update events
-```
 
 ## Prompt Construction
 

@@ -37,31 +37,6 @@ Tasi Harness 是一个 Electron 桌面应用，分为三层：
 - 管理微信通道（二维码登录状态、消息轮询、外部消息入会话、智能体回复回写）。
 - 在任务结束/停止时自动清理外部浏览器预览。
 
-## Agent 运行流程图
-
-```mermaid
-sequenceDiagram
-  participant UI as Renderer
-  participant IPC as main.ts
-  participant LOOP as AgentLoop
-  participant PROMPT as PromptBuilder
-  participant LLM as LlmClient
-  participant TOOLS as ToolRegistry
-  participant STORE as SessionStore/MemoryStore
-
-  UI->>IPC: agent:chat(input, sessionId, mode, usePKB)
-  IPC->>LOOP: run(...)
-  LOOP->>STORE: beginDeferredMemory + 追加用户消息
-  LOOP->>PROMPT: build(系统提示词)
-  LOOP->>LLM: complete(messages, tools)
-  LLM-->>LOOP: assistant + tool_calls/answer
-  LOOP->>TOOLS: 迭代执行工具调用
-  TOOLS-->>LOOP: 工具结果
-  LOOP->>STORE: 追加消息与工具事件
-  LOOP->>STORE: commitDeferredMemory + 同步会话记忆
-  LOOP-->>IPC: 最终回复 + usage + events
-  IPC-->>UI: 返回结果 + 会话更新事件
-```
 
 ## Prompt 构建结构
 
