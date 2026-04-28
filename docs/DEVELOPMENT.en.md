@@ -1,4 +1,6 @@
-# Development Guide
+﻿# Development Guide
+
+[English](DEVELOPMENT.en.md) | [简体中文](DEVELOPMENT.zh-CN.md)
 
 ## Useful commands
 
@@ -34,3 +36,4 @@ On startup, missing bundled skills are copied into `~/.tasi-harness/skills` so t
 ## Testing notes
 
 The tests use temporary directories and do not write into the real user home. The agent-loop test uses `MockLlmClient`, so no network or API key is required.
+

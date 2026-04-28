@@ -1,4 +1,6 @@
-# Security
+﻿# Security
+
+[English](SECURITY.en.md) | [简体中文](SECURITY.zh-CN.md)
 
 Tasi Harness is a local desktop agent. Local agents can be powerful, so the default configuration is intentionally conservative.
 
@@ -36,3 +38,4 @@ The main process stores provider settings in `~/.tasi-harness/config.json`. The 
 - Add code signing and auto-update signature verification.
 - Add a Docker or remote terminal backend for untrusted commands.
 - Add an allowlist of approved workspace roots.
+

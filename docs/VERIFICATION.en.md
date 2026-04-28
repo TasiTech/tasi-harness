@@ -1,4 +1,6 @@
-# Verification
+﻿# Verification
+
+[English](VERIFICATION.en.md) | [简体中文](VERIFICATION.zh-CN.md)
 
 Generated project was checked in this environment with:
 
@@ -18,3 +20,4 @@ Notes:
 
 - Electron binary download was skipped during dependency installation in this restricted environment, but TypeScript compile and unit tests do not require the Electron runtime binary.
 - On a normal developer machine, run `npm install` without `--ignore-scripts` before `npm run dev` or packaging so Electron can download its runtime binary.
+
