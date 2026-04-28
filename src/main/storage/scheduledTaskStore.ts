@@ -20,7 +20,9 @@ export class ScheduledTaskStore {
   }
 
   list(): ScheduledTask[] {
-    return this.store.read().sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
+    return this.store.read()
+      .map((task) => ({ ...task, notifyByWechat: Boolean(task.notifyByWechat), isRunning: Boolean(task.isRunning) }))
+      .sort((a, b) => a.nextRunAt.localeCompare(b.nextRunAt));
   }
 
   create(req: ScheduledTaskCreateRequest): ScheduledTask {
@@ -34,8 +36,10 @@ export class ScheduledTaskStore {
       intervalMinutes: req.intervalMinutes,
       nextRunAt: computeNextRunAt(req, createdAt),
       enabled: true,
+      isRunning: false,
       executionMode: req.executionMode,
       notifyByEmail: req.notifyByEmail,
+      notifyByWechat: req.notifyByWechat ?? false,
       createdAt,
       updatedAt: createdAt
     };
@@ -70,7 +74,14 @@ export class ScheduledTaskStore {
     return true;
   }
 
-  markRun(id: string, result: { sessionId?: string; output?: string; error?: string }): ScheduledTask {
+  markRun(id: string, result: {
+    sessionId?: string;
+    output?: string;
+    error?: string;
+    iterations?: number;
+    toolEventCount?: number;
+    trace?: string;
+  }): ScheduledTask {
     const current = this.list().find((task) => task.id === id);
     if (!current) throw new Error(`Scheduled task not found: ${id}`);
     const ts = nowIso();
@@ -80,11 +91,32 @@ export class ScheduledTaskStore {
       lastRunAt: ts,
       lastResult: result.output ?? current.lastResult,
       lastError: result.error,
-      nextRunAt: current.scheduleType === 'interval' ? computeNextRunAt(current, ts) : current.nextRunAt,
+      lastIterations: result.iterations ?? current.lastIterations,
+      lastToolEventCount: result.toolEventCount ?? current.lastToolEventCount,
+      lastTrace: result.trace ?? current.lastTrace,
+      nextRunAt: current.scheduleType === 'interval' ? computeNextRunAt(current, ts) : ts,
       enabled: current.scheduleType === 'interval' ? current.enabled : false,
+      isRunning: false,
+      runStartedAt: undefined,
       updatedAt: ts
     };
     const next = this.list().map((task) => (task.id === id ? nextTask : task));
+    this.store.write(next);
+    return nextTask;
+  }
+
+  setRunning(id: string, running: boolean): ScheduledTask {
+    const tasks = this.list();
+    const current = tasks.find((task) => task.id === id);
+    if (!current) throw new Error(`Scheduled task not found: ${id}`);
+    const ts = nowIso();
+    const nextTask: ScheduledTask = {
+      ...current,
+      isRunning: running,
+      runStartedAt: running ? ts : undefined,
+      updatedAt: ts
+    };
+    const next = tasks.map((task) => (task.id === id ? nextTask : task));
     this.store.write(next);
     return nextTask;
   }

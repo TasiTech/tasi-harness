@@ -22,6 +22,7 @@ import { TaskScheduler } from './scheduler/taskScheduler.js';
 import { EmbeddedBrowserAutomation } from './browser/embeddedBrowserAutomation.js';
 import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
+import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
 
 function findBundledSkillsRoot(): string | undefined {
   const here = fileURLToPath(new URL('.', import.meta.url));
@@ -64,6 +65,7 @@ export class AppContext {
   readonly taskScheduler: TaskScheduler;
   readonly embeddedBrowserAutomation: EmbeddedBrowserAutomation;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
+  readonly sessionDocumentContextStore: SessionDocumentContextStore;
 
   constructor(home = process.env.TASI_HARNESS_HOME || DEFAULT_HOME) {
     this.harnessHome = ensureDir(home);
@@ -81,6 +83,7 @@ export class AppContext {
     this.personalKnowledgeBase = new PersonalKnowledgeBase(this.harnessHome, {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
     });
+    this.sessionDocumentContextStore = new SessionDocumentContextStore(this.harnessHome);
     const resourcesRoot = findResourcesRoot();
     this.marketplaceManager = new MarketplaceManager(resourcesRoot, this.skillManager, () => this.getConfig().skillMarketSources);
     this.toolRegistry = new ToolRegistry();
@@ -89,7 +92,8 @@ export class AppContext {
       this.memoryStore,
       this.skillManager,
       this.personalKnowledgeBase,
-      (config) => this.describeExternalBrowserBridge(config)
+      (config) => this.describeExternalBrowserBridge(config),
+      this.sessionDocumentContextStore
     );
     this.agentLoop = new AgentLoop({
       getConfig: () => this.getConfig(),
@@ -114,7 +118,8 @@ export class AppContext {
       taskStore: this.scheduledTaskStore,
       agentLoop: this.agentLoop,
       configStore: this.configStore,
-      emailNotifier: this.emailNotifier
+      emailNotifier: this.emailNotifier,
+      sessionStore: this.sessionStore
     });
     this.taskScheduler.start();
   }

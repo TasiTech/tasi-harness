@@ -5,7 +5,7 @@
 Tasi Harness 是一个基于 Electron、TypeScript、React 与 Vite 的本地优先桌面 AI Agent。它把桌面化聊天体验、OpenAI 兼容工具调用、浏览器自动化、持久记忆、技能系统、定时任务，以及可将 Office 文档转换为 Markdown 的个人知识库整合在一起。
 
 > Tasi Harness 在架构上借鉴了 Hermes-Agent 风格的运行时模式。
-
+![Tasi Harness Screenshot](docs/screen_shot.png)
 ## 项目特点
 
 - 桌面优先的 AI Agent，聊天、技能、记忆、文档知识库都在本地完成管理。

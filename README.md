@@ -6,6 +6,8 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 
 > Tasi Harness is inspired by Hermes-Agent-style runtime patterns. It does not bundle the original Python Hermes Agent runtime.
 
+![Tasi Harness Screenshot](docs/screen_shot.png)
+
 ## Highlights
 
 - Desktop-first AI agent with local sessions, local memory, and local skill files.

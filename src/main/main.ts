@@ -7,20 +7,25 @@ import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
   AppConfig,
+  ExternalSessionMessageRequest,
   MemoryClearRequest,
   ToolEvent,
   ToolExecutionResult,
   MemoryQueryOptions,
   PersonalKnowledgeUploadRequest,
+  SessionDocumentUploadRequest,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
+  SessionUpdateEvent,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
-  ToolRunRequest
+  ToolRunRequest,
+  WechatChannelLoginStatusPayload,
+  WechatChannelQrCodePayload
 } from '../shared/types.js';
-import { createId } from '../shared/types.js';
+import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
 import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
@@ -35,6 +40,18 @@ let lastExternalBrowserOpen: { url: string; at: number } | null = null;
 const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
 const externalFallbackUrls = new Set<string>();
 const activeChatControllers = new Map<number, AbortController>();
+let wechatPollerAbortController: AbortController | null = null;
+let wechatPollerFingerprint = '';
+const seenWechatMessageIds: string[] = [];
+const seenWechatMessageIdSet = new Set<string>();
+const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+
+function broadcastSessionUpdated(event: SessionUpdateEvent): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('sessions:updated', event);
+  }
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -44,6 +61,421 @@ function isAbortLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === 'AbortError') return true;
   return /operation was aborted|session stopped by user|aborted/i.test(error.message);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function getStringField(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function getNumberField(record: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
+  const lines = [
+    `Iterations: ${result.iterations}`,
+    `Execution mode: ${result.execution.mode}`,
+    `Tool events: ${result.toolEvents.length}`
+  ];
+  for (const event of result.toolEvents) {
+    const preview = event.content.replace(/\s+/g, ' ').slice(0, 140);
+    lines.push(`- [${event.ok ? 'ok' : 'fail'}] ${event.toolName}${event.createdAt ? ` @ ${event.createdAt}` : ''} :: ${preview}`);
+  }
+  return lines.join('\n');
+}
+
+function buildWechatAuthHeaders(botToken: string): Record<string, string> {
+  const randomUin = Math.floor(Math.random() * 0xffffffff).toString(10);
+  return {
+    'Content-Type': 'application/json',
+    AuthorizationType: 'ilink_bot_token',
+    Authorization: `Bearer ${botToken}`,
+    'X-WECHAT-UIN': Buffer.from(randomUin).toString('base64')
+  };
+}
+
+function extractWechatTextPayload(value: unknown): string {
+  const record = asRecord(value);
+  if (!record) return '';
+  const items = Array.isArray(record.item_list) ? record.item_list : [];
+  const chunks: string[] = [];
+  for (const itemRaw of items) {
+    const item = asRecord(itemRaw);
+    if (!item) continue;
+    const type = getNumberField(item, ['type']);
+    if (type === 1) {
+      const textItem = asRecord(item.text_item);
+      const text = textItem && typeof textItem.text === 'string' ? textItem.text.trim() : '';
+      if (text) chunks.push(text);
+      continue;
+    }
+    if (type === 2) chunks.push('[image]');
+    else if (type === 3) chunks.push('[voice]');
+    else if (type === 4) chunks.push('[file]');
+    else if (type === 5) chunks.push('[video]');
+  }
+  return chunks.join('\n').trim();
+}
+
+function ensureWechatSessionId(): string {
+  const current = context.getConfig().wechatChannel;
+  const configured = current.sessionId?.trim();
+  if (configured) return configured;
+  const created = context.sessionStore.create('WeChat ClawBot');
+  context.configStore.update({
+    wechatChannel: {
+      ...current,
+      sessionId: created.id
+    }
+  });
+  return created.id;
+}
+
+function markWechatMessageSeen(messageId: string): boolean {
+  const id = messageId.trim();
+  if (!id) return false;
+  if (seenWechatMessageIdSet.has(id)) return true;
+  seenWechatMessageIdSet.add(id);
+  seenWechatMessageIds.push(id);
+  while (seenWechatMessageIds.length > 2000) {
+    const removed = seenWechatMessageIds.shift();
+    if (removed) seenWechatMessageIdSet.delete(removed);
+  }
+  return false;
+}
+
+async function sendWechatText(
+  baseUrl: string,
+  botToken: string,
+  payload: { toUserId: string; contextToken: string; text: string; fromUserId?: string }
+): Promise<void> {
+  const response = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
+    method: 'POST',
+    headers: buildWechatAuthHeaders(botToken),
+    body: JSON.stringify({
+      msg: {
+        from_user_id: payload.fromUserId ?? '',
+        to_user_id: payload.toUserId,
+        client_id: `tasi-${createId('wx')}`,
+        message_type: 2,
+        message_state: 2,
+        context_token: payload.contextToken,
+        item_list: [
+          {
+            type: 1,
+            text_item: { text: payload.text }
+          }
+        ]
+      },
+      base_info: { channel_version: '1.0.0' }
+    })
+  });
+  if (!response.ok) throw new Error(`sendmessage HTTP ${response.status}`);
+  const body = await response.json() as unknown;
+  const record = asRecord(body);
+  if (!record) throw new Error('Invalid sendmessage response.');
+  const errcode = getNumberField(record, ['errcode']);
+  if (typeof errcode === 'number' && errcode !== 0) {
+    const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `errcode=${errcode}`;
+    throw new Error(errMsg);
+  }
+  const ret = getNumberField(record, ['ret']);
+  if (typeof ret === 'number' && ret !== 0) {
+    const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`;
+    throw new Error(errMsg);
+  }
+}
+
+async function sendWechatTaskNotification(taskName: string, runAtIso: string, executionMode: 'workspace' | 'sandbox', content: string): Promise<void> {
+  const channel = context.getConfig().wechatChannel;
+  const token = channel.botToken?.trim();
+  const toUserId = channel.lastInboundUserId?.trim();
+  const contextToken = channel.lastContextToken?.trim();
+  if (!channel.enabled || !token || !toUserId || !contextToken) return;
+  const baseUrl = (channel.baseUrl?.trim() || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+  const body = [
+    `[Task] ${taskName}`,
+    `Run at: ${runAtIso}`,
+    `Execution: ${executionMode}`,
+    '',
+    content.trim()
+  ].join('\n');
+  const text = body.length > 1800 ? `${body.slice(0, 1797)}...` : body;
+  await sendWechatText(baseUrl, token, {
+    toUserId,
+    contextToken,
+    text,
+    fromUserId: channel.botId?.trim() || undefined
+  });
+}
+
+async function fetchWechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload> {
+  const clean = qrcodeKey.trim();
+  if (!clean) throw new Error('qrcodeKey is required.');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(`https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(clean)}`, {
+      method: 'GET',
+      headers: {
+        'iLink-App-ClientVersion': '1'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    const record = asRecord(body);
+    if (!record) throw new Error('Invalid iLink status response.');
+    const statusRaw = getStringField(record, ['status']) ?? 'unknown';
+    const status = ['wait', 'scaned', 'confirmed', 'expired'].includes(statusRaw) ? statusRaw as WechatChannelLoginStatusPayload['status'] : 'unknown';
+    return {
+      status,
+      botToken: getStringField(record, ['bot_token']),
+      botId: getStringField(record, ['ilink_bot_id']),
+      userId: getStringField(record, ['ilink_user_id']),
+      baseUrl: getStringField(record, ['baseurl']),
+      fetchedAt: new Date().toISOString()
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function stopWechatPoller(): void {
+  if (!wechatPollerAbortController) return;
+  wechatPollerAbortController.abort();
+  wechatPollerAbortController = null;
+  wechatPollerFingerprint = '';
+}
+
+function startWechatPoller(): void {
+  const cfg = context.getConfig().wechatChannel;
+  if (!cfg.enabled || !cfg.botToken?.trim()) {
+    stopWechatPoller();
+    return;
+  }
+  const token = cfg.botToken.trim();
+  const baseUrl = (cfg.baseUrl?.trim() || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+  const fingerprint = `${token.slice(0, 8)}:${baseUrl}`;
+  if (wechatPollerAbortController && wechatPollerFingerprint === fingerprint) return;
+  stopWechatPoller();
+  const controller = new AbortController();
+  wechatPollerAbortController = controller;
+  wechatPollerFingerprint = fingerprint;
+
+  void (async () => {
+    let cursor = cfg.cursor ?? '';
+    while (!controller.signal.aborted) {
+      try {
+        const response = await fetch(`${baseUrl}/ilink/bot/getupdates`, {
+          method: 'POST',
+          headers: buildWechatAuthHeaders(token),
+          body: JSON.stringify({
+            get_updates_buf: cursor,
+            base_info: { channel_version: '1.0.0' }
+          }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const body = await response.json() as unknown;
+        const record = asRecord(body);
+        if (!record) throw new Error('Invalid getupdates response.');
+        const errcode = getNumberField(record, ['errcode']);
+        if (errcode === -14) {
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              enabled: false,
+              loginStatus: 'expired',
+              lastError: 'WeChat session expired. Please scan a new QR code.'
+            }
+          });
+          stopWechatPoller();
+          return;
+        }
+        const ret = getNumberField(record, ['ret']);
+        if (typeof ret === 'number' && ret !== 0) {
+          throw new Error(typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`);
+        }
+        const nextCursor = getStringField(record, ['get_updates_buf', 'sync_buf']) ?? cursor;
+        if (nextCursor !== cursor) {
+          cursor = nextCursor;
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              cursor
+            }
+          });
+        }
+        const msgs = Array.isArray(record.msgs) ? record.msgs : [];
+        if (msgs.length === 0) continue;
+        const sessionId = ensureWechatSessionId();
+        const botId = context.getConfig().wechatChannel.botId?.trim() || undefined;
+        for (const msgRaw of msgs) {
+          const msg = asRecord(msgRaw);
+          if (!msg) continue;
+          const messageType = getNumberField(msg, ['message_type']);
+          const messageState = getNumberField(msg, ['message_state']);
+          if (typeof messageType === 'number' && messageType !== 1) continue;
+          if (typeof messageState === 'number' && messageState !== 2) continue;
+          const fromUser = getStringField(msg, ['from_user_id']) ?? '';
+          if (!fromUser || fromUser.endsWith('@im.bot')) continue;
+          const contextToken = getStringField(msg, ['context_token']) ?? '';
+          const text = extractWechatTextPayload(msg);
+          if (!text) continue;
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              lastInboundUserId: fromUser,
+              lastContextToken: contextToken || context.getConfig().wechatChannel.lastContextToken
+            }
+          });
+          const rawMessageId = getStringField(msg, ['message_id']) ?? String(getNumberField(msg, ['message_id']) ?? '');
+          if (rawMessageId && markWechatMessageSeen(rawMessageId)) continue;
+          const ts = getNumberField(msg, ['create_time_ms']);
+          const createdAt = typeof ts === 'number' ? new Date(ts).toISOString() : new Date().toISOString();
+          const shadowUserId = createId('wx_shadow_user');
+          const pendingAssistantId = createId('wx_pending');
+          const updatedInbound = context.sessionStore.appendMessages(sessionId, [
+            {
+              id: shadowUserId,
+              role: 'user',
+              content: `[WeChat:${fromUser}] ${text}`,
+              createdAt
+            },
+            {
+              id: pendingAssistantId,
+              role: 'assistant',
+              content: WECHAT_PENDING_MARKER,
+              createdAt: nowIso()
+            }
+          ], []);
+          broadcastSessionUpdated({
+            sessionId: updatedInbound.id,
+            source: 'external',
+            updatedAt: updatedInbound.updatedAt
+          });
+
+          try {
+            const runResult = await context.agentLoop.run({
+              userInput: text,
+              sessionId,
+              executionMode: context.getConfig().defaultExecutionMode,
+              origin: 'scheduled'
+            });
+            const postRunRecord = context.sessionStore.read(sessionId);
+            if (postRunRecord) {
+              const cleaned = postRunRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+              context.sessionStore.replaceMessages(sessionId, cleaned);
+            }
+            const reply = runResult.finalResponse.trim();
+            broadcastSessionUpdated({
+              sessionId: runResult.sessionId,
+              source: 'external',
+              updatedAt: new Date().toISOString()
+            });
+            if (!reply) continue;
+            if (!contextToken) continue;
+            const outboundText = reply.length > 1800 ? `${reply.slice(0, 1797)}...` : reply;
+            await sendWechatText(baseUrl, token, {
+              toUserId: fromUser,
+              contextToken,
+              text: outboundText,
+              fromUserId: botId
+            });
+          } catch (error) {
+            const fallbackRecord = context.sessionStore.read(sessionId);
+            if (fallbackRecord) {
+              const replaced = fallbackRecord.messages.map((item) => (
+                item.id === pendingAssistantId
+                  ? { ...item, content: `[WeChat error] ${error instanceof Error ? error.message : String(error)}` }
+                  : item
+              ));
+              context.sessionStore.replaceMessages(sessionId, replaced);
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[wechat] auto-reply failed: ${message}`);
+            context.configStore.update({
+              wechatChannel: {
+                ...context.getConfig().wechatChannel,
+                lastError: `[auto-reply] ${message}`,
+                loginStatus: 'error'
+              }
+            });
+          }
+        }
+      } catch (error) {
+        if (controller.signal.aborted || isAbortLikeError(error)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        context.configStore.update({
+          wechatChannel: {
+            ...context.getConfig().wechatChannel,
+            lastError: message,
+            loginStatus: 'error'
+          }
+        });
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    }
+  })();
+}
+
+async function fetchWechatChannelQrCode(fallbackBindUrl: string): Promise<WechatChannelQrCodePayload> {
+  const fallback = fallbackBindUrl.trim() || 'https://ilinkai.weixin.qq.com';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3', {
+      method: 'GET',
+      headers: {
+        'iLink-App-ClientVersion': '1'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    const record = asRecord(body);
+    if (!record) throw new Error('Invalid iLink response.');
+    if (typeof record.ret === 'number' && record.ret !== 0) {
+      const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `ret=${record.ret}`;
+      throw new Error(errMsg);
+    }
+    if (typeof record.errcode === 'number' && record.errcode !== 0) {
+      const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `errcode=${record.errcode}`;
+      throw new Error(errMsg);
+    }
+    const qrcodeContent = getStringField(record, ['qrcode_img_content', 'qrcodeUrl', 'qrcode_url', 'qrcode']);
+    if (!qrcodeContent) throw new Error('Missing qrcode content.');
+    const qrcodeKey = getStringField(record, ['qrcode']);
+    return {
+      qrcodeContent,
+      qrcodeKey,
+      source: 'ilink-api',
+      fetchedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[wechat] Failed to fetch iLink qrcode, fallback to configured bind URL: ${message}`);
+    return {
+      qrcodeContent: fallback,
+      source: 'manual-bind-url',
+      fetchedAt: new Date().toISOString()
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function getDevToolsWindowMetrics(parent: BrowserWindow): { bounds: Rectangle; minWidth: number; minHeight: number } {
@@ -335,10 +767,60 @@ function registerIpc(): void {
     const sanitized = { ...partial };
     if (typeof sanitized.apiKey !== 'string') delete sanitized.apiKey;
     const next = context.configStore.update(sanitized);
+    startWechatPoller();
     if (next.browserMode !== 'external') await closeExternalBrowserPreview();
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
   ipcMain.handle('config:test', async () => testLlmConnection(context.getConfig()));
+  ipcMain.handle('config:wechatQrcode', async () => {
+    const payload = await fetchWechatChannelQrCode(context.getConfig().wechatChannel.bindUrl);
+    if (payload.qrcodeKey) {
+      context.configStore.update({
+        wechatChannel: {
+          ...context.getConfig().wechatChannel,
+          lastQrcodeKey: payload.qrcodeKey,
+          loginStatus: 'wait',
+          lastError: ''
+        }
+      });
+    }
+    return payload;
+  });
+  ipcMain.handle('config:wechatQrcodeStatus', async (_event, qrcodeKey: string) => {
+    try {
+      const status = await fetchWechatQrcodeStatus(qrcodeKey);
+      const current = context.getConfig().wechatChannel;
+      if (status.status === 'confirmed' && status.botToken) {
+        context.configStore.update({
+          wechatChannel: {
+            ...current,
+            enabled: true,
+            botToken: status.botToken,
+            botId: status.botId,
+            userId: status.userId,
+            baseUrl: status.baseUrl || current.baseUrl || 'https://ilinkai.weixin.qq.com',
+            cursor: '',
+            loginStatus: 'confirmed',
+            lastError: ''
+          }
+        });
+        startWechatPoller();
+      } else {
+        context.configStore.update({
+          wechatChannel: {
+            ...current,
+            loginStatus: status.status === 'unknown' ? 'error' : status.status
+          }
+        });
+      }
+      return status;
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        return { status: 'unknown', fetchedAt: new Date().toISOString() };
+      }
+      throw error;
+    }
+  });
 
   ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
     if (!input || !input.trim()) throw new Error('Message cannot be empty.');
@@ -364,7 +846,13 @@ function registerIpc(): void {
         context.getConfig(),
         { userInput: input, finalResponse: result.finalResponse }
       );
-      return { ...result, followUpQuestions };
+      const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
+      broadcastSessionUpdated({
+        sessionId: result.sessionId,
+        source: 'chat',
+        updatedAt: new Date().toISOString()
+      });
+      return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
     } catch (error) {
       if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
       throw new Error(error instanceof Error ? error.message : String(error));
@@ -391,12 +879,43 @@ function registerIpc(): void {
   ipcMain.handle('sessions:delete', (_event, id: string) => context.sessionStore.delete(id));
   ipcMain.handle('sessions:rename', (_event, id: string, title: string) => context.sessionStore.rename(id, title));
   ipcMain.handle('sessions:search', (_event, query: string) => context.sessionStore.search(query).map((r) => r.item));
+  ipcMain.handle('sessions:appendExternalMessage', (_event, req: ExternalSessionMessageRequest) => {
+    const content = req.content?.trim();
+    if (!content) throw new Error('content is required.');
+    const role = req.role === 'assistant' ? 'assistant' : 'user';
+    const existing = req.sessionId?.trim() ? context.sessionStore.read(req.sessionId.trim()) : null;
+    const session = existing ?? context.sessionStore.create(req.title?.trim() || 'WeChat session');
+    const updated = context.sessionStore.appendMessages(session.id, [{
+      role,
+      content,
+      createdAt: req.createdAt
+    }], []);
+    broadcastSessionUpdated({
+      sessionId: updated.id,
+      source: 'external',
+      updatedAt: updated.updatedAt
+    });
+    return updated;
+  });
 
   ipcMain.handle('memory:get', (_event, query?: MemoryQueryOptions) => context.memoryStore.getState(query));
   ipcMain.handle('memory:clear', (_event, request: MemoryClearRequest) => context.memoryStore.clear(request));
   ipcMain.handle('knowledge:list', () => context.personalKnowledgeBase.getState());
   ipcMain.handle('knowledge:addDocument', (_event, req: PersonalKnowledgeUploadRequest) => context.personalKnowledgeBase.addDocument(req));
   ipcMain.handle('knowledge:deleteDocument', (_event, id: string) => context.personalKnowledgeBase.deleteDocument(id));
+  ipcMain.handle('session-docs:list', (_event, sessionId: string) => context.sessionDocumentContextStore.list(sessionId));
+  ipcMain.handle('session-docs:upload', async (_event, req: SessionDocumentUploadRequest) => {
+    const session = req.sessionId
+      ? context.sessionStore.read(req.sessionId) ?? context.sessionStore.create()
+      : context.sessionStore.create();
+    const document = await context.sessionDocumentContextStore.addDocument({
+      ...req,
+      sessionId: session.id,
+      workspaceDir: context.getConfig().workspaceDir
+    });
+    return { sessionId: session.id, document };
+  });
+  ipcMain.handle('session-docs:delete', (_event, sessionId: string, id: string) => context.sessionDocumentContextStore.deleteDocument(sessionId, id));
 
   ipcMain.handle('skills:list', () => context.skillManager.list());
   ipcMain.handle('skills:read', (_event, name: string) => context.skillManager.read(name));
@@ -415,6 +934,7 @@ function registerIpc(): void {
   ipcMain.handle('tasks:runNow', async (_event, id: string) => {
     const task = context.scheduledTaskStore.list().find((item) => item.id === id);
     if (!task) throw new Error(`Task not found: ${id}`);
+    context.scheduledTaskStore.setRunning(id, true);
     try {
       const result = await context.agentLoop.run({
         userInput: task.prompt,
@@ -423,7 +943,14 @@ function registerIpc(): void {
         origin: 'scheduled',
         scheduledTaskId: task.id
       });
-      const updated = context.scheduledTaskStore.markRun(id, { sessionId: result.sessionId, output: result.finalResponse });
+      const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
+      const updated = context.scheduledTaskStore.markRun(id, {
+        sessionId: result.sessionId,
+        output: result.finalResponse,
+        iterations: result.iterations,
+        toolEventCount: result.toolEvents.length,
+        trace: buildTaskTrace(result)
+      });
       if (updated.notifyByEmail) {
         await context.emailNotifier.send(
           context.getConfig().emailNotifications,
@@ -431,7 +958,39 @@ function registerIpc(): void {
           [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
         );
       }
-      return result;
+      if (updated.notifyByWechat) {
+        try {
+          await sendWechatTaskNotification(
+            updated.name,
+            updated.lastRunAt ?? updated.updatedAt,
+            result.execution.mode,
+            result.finalResponse
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const cfg = context.getConfig();
+          const shouldResetContext = /ret=-2|parameter/i.test(message);
+          context.configStore.update({
+            wechatChannel: {
+              ...cfg.wechatChannel,
+              lastError: `[runNow-wechat-notify] ${message}`,
+              lastContextToken: shouldResetContext ? '' : cfg.wechatChannel.lastContextToken
+            }
+          });
+        }
+      }
+      broadcastSessionUpdated({
+        sessionId: result.sessionId,
+        source: 'scheduled',
+        updatedAt: new Date().toISOString()
+      });
+      return { ...result, totalUsage: usageRecord.totalUsage };
+    } catch (error) {
+      context.scheduledTaskStore.markRun(id, {
+        error: error instanceof Error ? error.message : String(error),
+        trace: error instanceof Error ? error.stack || error.message : String(error)
+      });
+      throw error;
     } finally {
       if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
     }
@@ -489,6 +1048,7 @@ app.on('before-quit', () => {
   isAppQuitting = true;
   for (const controller of activeChatControllers.values()) controller.abort();
   activeChatControllers.clear();
+  stopWechatPoller();
   void closeExternalBrowserPreview();
 });
 
@@ -506,6 +1066,7 @@ app.whenReady().then(() => {
     });
   });
   registerIpc();
+  startWechatPoller();
   void createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow();

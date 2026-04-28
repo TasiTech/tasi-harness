@@ -37,6 +37,11 @@ export class ConfigStore {
       ...defaults.emailNotifications,
       ...merged.emailNotifications
     };
+    merged.wechatChannel = {
+      ...defaults.wechatChannel,
+      ...merged.wechatChannel,
+      pluginName: 'clawbot'
+    };
     return merged;
   }
 
@@ -70,6 +75,11 @@ export class ConfigStore {
         password: typeof partial.emailNotifications?.password === 'string' && partial.emailNotifications.password.length > 0
           ? partial.emailNotifications.password
           : current.emailNotifications.password
+      },
+      wechatChannel: {
+        ...current.wechatChannel,
+        ...(partial.wechatChannel ?? {}),
+        pluginName: 'clawbot'
       }
     };
     ensureDir(next.workspaceDir);

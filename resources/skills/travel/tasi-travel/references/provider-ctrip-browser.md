@@ -62,6 +62,22 @@ Normalize these fields whenever available:
 - `detailUrl`
 - `sourceUrl`
 
+Hotel link hint (Ctrip mobile list pattern):
+- Prefer opening hotel search links like:
+  - `https://m.ctrip.com/webapp/hotels/hotelsearch/listPage?...`
+- Validate and preserve these parameters from URL evidence whenever present:
+  - destination: `d-city`, `d-name`, `d-country`, `d-type`
+  - stay dates: `c-in`, `c-out`
+  - occupancy: `c-rooms`, people filter in `s-filters`
+  - nearby POI keyword: `s-keyword` (example: `清华大学`)
+  - locale and currency: `locale`, `curr`
+  - paging/session trace: `page-token` (keep as request evidence; do not infer business meaning)
+- If URL carries a landmark keyword (`s-keyword` or POI segment in `s-filters`), prioritize extracting:
+  - distance-to-keyword text
+  - nearby transport/landmark cues shown on cards
+  - hotel cards that clearly match the landmark context
+- Always echo parsed date and city constraints in the result header before listing rows.
+
 ### POI
 Use Ctrip sight or guide pages when the user wants:
 - attractions

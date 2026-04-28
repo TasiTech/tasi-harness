@@ -2,6 +2,7 @@ import type {
   AgentToolEventStream,
   AgentRunResult,
   AppInfo,
+  ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
   MemoryState,
@@ -14,13 +15,19 @@ import type {
   ScheduledTask,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
+  SessionDocumentContext,
+  SessionDocumentUploadRequest,
+  SessionDocumentUploadResult,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
   SessionRecord,
   SessionSummary,
+  SessionUpdateEvent,
   SkillDocument,
   SkillMetadata,
   SkillPatchRequest,
+  WechatChannelQrCodePayload,
+  WechatChannelLoginStatusPayload,
   SkillWriteRequest,
   ToolDefinition,
   ToolExecutionResult,
@@ -34,6 +41,8 @@ declare global {
         get(): Promise<PublicAppConfig>;
         set(partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }): Promise<PublicAppConfig>;
         test(): Promise<ToolExecutionResult>;
+        wechatQrcode(): Promise<WechatChannelQrCodePayload>;
+        wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
       };
       agent: {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
@@ -46,6 +55,8 @@ declare global {
         delete(id: string): Promise<boolean>;
         rename(id: string, title: string): Promise<SessionSummary>;
         search(query: string): Promise<SessionSummary[]>;
+        appendExternalMessage(req: ExternalSessionMessageRequest): Promise<SessionRecord>;
+        onUpdated(listener: (payload: SessionUpdateEvent) => void): () => void;
       };
       memory: {
         get(query?: MemoryQueryOptions): Promise<MemoryState>;
@@ -55,6 +66,11 @@ declare global {
         list(): Promise<PersonalKnowledgeState>;
         addDocument(req: PersonalKnowledgeUploadRequest): Promise<PersonalKnowledgeDocument>;
         deleteDocument(id: string): Promise<boolean>;
+      };
+      sessionDocs: {
+        list(sessionId: string): Promise<SessionDocumentContext[]>;
+        upload(req: SessionDocumentUploadRequest): Promise<SessionDocumentUploadResult>;
+        deleteDocument(sessionId: string, id: string): Promise<boolean>;
       };
       skills: {
         list(): Promise<SkillMetadata[]>;

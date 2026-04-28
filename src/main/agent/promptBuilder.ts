@@ -2,13 +2,15 @@ import type { AppConfig } from '../../shared/types.js';
 import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SkillManager } from '../skills/skillManager.js';
 import type { PersonalKnowledgeBase } from '../knowledge/personalKnowledgeBase.js';
+import type { SessionDocumentContextStore } from '../knowledge/sessionDocumentContextStore.js';
 
 export class PromptBuilder {
   constructor(
     private readonly memoryStore: MemoryStore,
     private readonly skillManager: SkillManager,
     private readonly personalKnowledgeBase: PersonalKnowledgeBase,
-    private readonly externalBrowserBridgeGuide?: (config: AppConfig) => string
+    private readonly externalBrowserBridgeGuide?: (config: AppConfig) => string,
+    private readonly sessionDocumentContextStore?: SessionDocumentContextStore
   ) {}
 
   async build(config: AppConfig, context?: { sessionId?: string; userInput?: string; usePersonalKnowledgeBase?: boolean }): Promise<string> {
@@ -19,6 +21,10 @@ export class PromptBuilder {
       context?.usePersonalKnowledgeBase && context.userInput
         ? await this.personalKnowledgeBase.renderPromptBlock(context.userInput, { limit: 5 })
         : '';
+    const sessionDocumentBlock = this.sessionDocumentContextStore?.renderPromptBlock(context?.sessionId, {
+      maxDocs: 2,
+      maxChars: 12_000
+    }) ?? '';
     return [
       config.systemPersona,
       '',
@@ -69,6 +75,14 @@ export class PromptBuilder {
             '## Personal knowledge snapshot',
             'Use these matched snippets when relevant. When you rely on them, cite the filename in square brackets such as [notes.md].',
             personalKnowledgeBlock || '(no personal knowledge documents)'
+          ].join('\n')
+        : '',
+      context?.sessionId
+        ? [
+            '',
+            '## Session document XML snapshot',
+            'When this section contains XML, treat it as user-uploaded source material for the current session.',
+            sessionDocumentBlock || '(no session document)'
           ].join('\n')
         : '',
       '',

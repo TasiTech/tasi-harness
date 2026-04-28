@@ -86,7 +86,9 @@ function renderInlineHtml(text: string): string {
   html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
   html = html.replace(BARE_HTTP_URL_RE, (_match, prefix: string, url: string) => {
     const safePrefix = prefix ?? '';
-    return `${safePrefix}<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`;
+    const trailing = url.match(/[.,;!?]+$/)?.[0] ?? '';
+    const normalizedUrl = trailing ? url.slice(0, -trailing.length) : url;
+    return `${safePrefix}<a href="${normalizedUrl}" target="_blank" rel="noreferrer">${normalizedUrl}</a>${trailing}`;
   });
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');

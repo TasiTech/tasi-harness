@@ -28,7 +28,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     apiStyle: 'openai',
     defaultBaseUrl: 'https://api.deepseek.com/v1',
     defaultModel: 'deepseek-chat',
-    models: ['deepseek-chat', 'deepseek-reasoner'],
+    models: ['deepseek-chat', 'deepseek-reasoner', 'deepseek-v4-flash', 'deepseek-v4-pro'],
     requiresApiKey: true
   },
   {

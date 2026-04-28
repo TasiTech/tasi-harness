@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { MemoryStore } from '../src/main/storage/memoryStore.js';
 import { SkillManager } from '../src/main/skills/skillManager.js';
 import { PersonalKnowledgeBase } from '../src/main/knowledge/personalKnowledgeBase.js';
+import { SessionDocumentContextStore } from '../src/main/knowledge/sessionDocumentContextStore.js';
 import { PromptBuilder } from '../src/main/agent/promptBuilder.js';
 import { defaultConfig } from '../src/main/storage/pathUtils.js';
 import { tempHome } from './helpers.js';
@@ -53,5 +54,29 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('A final answer that skips required skill steps is incorrect');
     expect(prompt).toContain('Before producing a final answer for a skill-driven request');
     expect(prompt).toContain('return a degraded answer rather than presenting an unverified answer as complete');
+  });
+
+  it('injects uploaded session document XML into the system prompt', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const sessionDocs = new SessionDocumentContextStore(env.home);
+    await sessionDocs.addDocument({
+      sessionId: 'session_xml',
+      filename: 'source.xml',
+      contentBase64: Buffer.from('<root><item>alpha</item></root>', 'utf8').toString('base64')
+    });
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home),
+      undefined,
+      sessionDocs
+    );
+
+    const prompt = await builder.build(defaultConfig(), { sessionId: 'session_xml', userInput: 'summarize this document' });
+
+    expect(prompt).toContain('Session document XML snapshot');
+    expect(prompt).toContain('source.xml');
+    expect(prompt).toContain('<session_document');
   });
 });

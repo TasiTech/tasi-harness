@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AgentExecutionDetails, AgentMessage, SearchResult, SessionRecord, SessionSummary, ToolEvent } from '../../shared/types.js';
+import type { AgentExecutionDetails, AgentMessage, LlmUsage, SearchResult, SessionRecord, SessionSummary, ToolEvent } from '../../shared/types.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ensureDir, safeJoin } from './pathUtils.js';
 
@@ -38,6 +38,8 @@ export class SessionStore {
     record.messageCount = record.messages.length;
     record.toolEvents = record.toolEvents ?? [];
     record.lastExecution = record.lastExecution ?? { mode: 'workspace', workspaceDir: '' };
+    record.lastUsage = record.lastUsage ?? undefined;
+    record.totalUsage = record.totalUsage ?? undefined;
     return record;
   }
 
@@ -71,6 +73,25 @@ export class SessionStore {
   replaceMessages(id: string, messages: AgentMessage[]): SessionRecord {
     const record = this.read(id) ?? this.create();
     const next = { ...record, messages, messageCount: messages.length, updatedAt: nowIso() };
+    this.write(next);
+    return next;
+  }
+
+  recordUsage(id: string, usage?: LlmUsage): SessionRecord {
+    const record = this.read(id) ?? this.create();
+    if (!usage) return record;
+    const current = record.totalUsage ?? {};
+    const nextTotal: LlmUsage = {
+      promptTokens: (current.promptTokens ?? 0) + (usage.promptTokens ?? 0),
+      completionTokens: (current.completionTokens ?? 0) + (usage.completionTokens ?? 0),
+      totalTokens: (current.totalTokens ?? 0) + (usage.totalTokens ?? 0)
+    };
+    const next: SessionRecord = {
+      ...record,
+      lastUsage: usage,
+      totalUsage: nextTotal,
+      updatedAt: nowIso()
+    };
     this.write(next);
     return next;
   }

@@ -172,4 +172,132 @@ describe('llmClient', () => {
     expect(message).not.toMatch(/<html>/i);
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+
+  it('preserves and forwards reasoning_content for openai-compatible providers', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  role: 'assistant',
+                  content: '',
+                  reasoning_content: 'internal chain',
+                  tool_calls: [
+                    {
+                      id: 'call_1',
+                      type: 'function',
+                      function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+                    }
+                  ]
+                }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'done' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek_v4_flash'
+    });
+
+    const first = await client.complete({
+      messages: [{ role: 'user', content: 'open example.com' }],
+      tools: [browserOpenTool]
+    });
+    expect(first.message.reasoning_content).toBe('internal chain');
+
+    await client.complete({
+      messages: [
+        { role: 'user', content: 'open example.com' },
+        first.message,
+        { role: 'tool', tool_call_id: 'call_1', content: 'opened' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, secondInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const secondBody = JSON.parse(String(secondInit.body));
+    expect(secondBody.messages[1].reasoning_content).toBe('internal chain');
+  });
+
+  it('drops malformed deepseek historical tool traces that miss reasoning_content', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'question 1' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'legacy_call_1',
+              type: 'function',
+              function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+            }
+          ]
+        },
+        { role: 'tool', tool_call_id: 'legacy_call_1', content: 'opened' },
+        { role: 'assistant', content: 'old final answer' },
+        { role: 'user', content: 'question 2' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    const outgoingMessages = body.messages as Array<Record<string, unknown>>;
+    const hasLegacyToolCall = outgoingMessages.some(
+      (message) => message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.some((call: any) => call?.id === 'legacy_call_1')
+    );
+    const hasLegacyToolResult = outgoingMessages.some(
+      (message) => message.role === 'tool' && message.tool_call_id === 'legacy_call_1'
+    );
+    expect(hasLegacyToolCall).toBe(false);
+    expect(hasLegacyToolResult).toBe(false);
+  });
 });

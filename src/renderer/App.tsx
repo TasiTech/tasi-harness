@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement,
 import type {
   AgentMessage,
   AppInfo,
+  LlmUsage,
   MarketplaceBrowseResult,
   MemoryDomain,
   MemoryEntry,
@@ -10,6 +11,7 @@ import type {
   PersonalKnowledgeState,
   PublicAppConfig,
   ScheduledTask,
+  SessionDocumentContext,
   SessionSummary,
   SkillDocument,
   SkillMetadata,
@@ -25,6 +27,7 @@ import {
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
+import * as QRCode from 'qrcode';
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -58,8 +61,15 @@ const defaultConfig: PublicAppConfig = {
     from: '',
     to: '',
     passwordConfigured: false
+  },
+  wechatChannel: {
+    enabled: false,
+    pluginName: 'clawbot',
+    bindUrl: 'https://ilinkai.weixin.qq.com',
+    loginStatus: 'idle'
   }
 };
+const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -307,9 +317,25 @@ export function App(): ReactElement {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | undefined>();
+  const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
+  const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
   const tr: TranslateFn = useMemo(() => (en: string, zh: string) => (language === 'zh' ? zh : en), [language]);
+
+  function formatTokensM(value?: number): string {
+    const tokens = Number(value ?? 0);
+    if (!Number.isFinite(tokens)) return '0.000M';
+    return `${(tokens / 1_000_000).toFixed(3)}M`;
+  }
+
+  function usageLabel(usage?: LlmUsage): string {
+    if (!usage) return '-';
+    const prompt = usage.promptTokens ?? 0;
+    const completion = usage.completionTokens ?? 0;
+    const total = usage.totalTokens ?? prompt + completion;
+    return `P:${formatTokensM(prompt)} C:${formatTokensM(completion)} T:${formatTokensM(total)}`;
+  }
   const nav = useMemo<Array<{ page: Page; icon: ReactElement; label: string }>>(
     () => [
       { page: 'chat', icon: <SidebarIcon kind="chat" />, label: tr('Chat', '对话') },
@@ -349,17 +375,27 @@ export function App(): ReactElement {
     document.documentElement.setAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
   }, [language]);
 
-  async function refreshAll(): Promise<void> {
-    const [cfg] = await Promise.all([
-      window.tasiHarness.config.get(),
-      refreshSessions(),
-      refreshTasks(),
-      refreshKnowledge(),
-      refreshMemory(),
-      refreshSkills()
-    ]);
-    setConfig(cfg);
-  }
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshTasks();
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [refreshTasks]);
+
+  useEffect(() => {
+    const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      if (!sessionId || payload.sessionId !== sessionId) return;
+      void window.tasiHarness.sessions.read(payload.sessionId).then((record) => {
+        if (!record) return;
+        setMessages(record.messages);
+        setLastUsage(record.lastUsage);
+        setTotalUsage(record.totalUsage);
+        setToolEvents(record.toolEvents ?? []);
+        setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
+      });
+    });
+    return off;
+  }, [sessionId, config.defaultExecutionMode]);
 
   return (
     <div className="app-shell">
@@ -386,10 +422,15 @@ export function App(): ReactElement {
           ))}
         </div>
         <div className="sidebar-footer">
-          <div className={`status-pill ${config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? 'ok' : 'warn'}`}>
-            <span className="dot" /> {config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? tr('Model ready', '模型已就绪') : tr('Configure model', '请配置模型')}
+          <div className="meta-row wrap">
+            <span className="soft-badge">{tr('Last', '本次')}: {usageLabel(lastUsage)}</span>
+            <span className="soft-badge">{tr('Total', '累计')}: {usageLabel(totalUsage)}</span>
           </div>
-          <button className="mini-button" onClick={() => void refreshAll()}>{tr('Refresh', '刷新')}</button>
+          <div className={`status-pill ${config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? 'ok' : 'warn'}`}>
+            <span className="dot" /> {config.apiKeyConfigured || !providerRequiresApiKey(config.provider)
+              ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
+              : tr('Configure model', '请配置模型')}
+          </div>
         </div>
       </aside>
       <main className="main-pane">
@@ -402,6 +443,10 @@ export function App(): ReactElement {
             setMessages={setMessages}
             sessionId={sessionId}
             setSessionId={setSessionId}
+            lastUsage={lastUsage}
+            setLastUsage={setLastUsage}
+            totalUsage={totalUsage}
+            setTotalUsage={setTotalUsage}
             toolEvents={toolEvents}
             setToolEvents={setToolEvents}
             executionMode={executionMode}
@@ -423,6 +468,8 @@ export function App(): ReactElement {
               if (record) {
                 setSessionId(record.id);
                 setMessages(record.messages);
+                setLastUsage(record.lastUsage);
+                setTotalUsage(record.totalUsage);
                 setToolEvents(record.toolEvents ?? []);
                 setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
                 setPage('chat');
@@ -523,6 +570,10 @@ function ChatPage(props: {
   setMessages: (messages: AgentMessage[]) => void;
   sessionId?: string;
   setSessionId: (id?: string) => void;
+  lastUsage?: LlmUsage;
+  setLastUsage: (usage?: LlmUsage) => void;
+  totalUsage?: LlmUsage;
+  setTotalUsage: (usage?: LlmUsage) => void;
   toolEvents: ToolEvent[];
   setToolEvents: Dispatch<SetStateAction<ToolEvent[]>>;
   executionMode: 'workspace' | 'sandbox';
@@ -535,6 +586,9 @@ function ChatPage(props: {
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [followUpQuestions, setFollowUpQuestions] = useState<string[]>([]);
+  const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
+  const [sessionDocBusy, setSessionDocBusy] = useState(false);
+  const [sessionDocError, setSessionDocError] = useState('');
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [webPreviewExpanded, setWebPreviewExpanded] = useState(false);
   const [webPreviewRect, setWebPreviewRect] = useState<PreviewRect | null>(null);
@@ -546,6 +600,7 @@ function ChatPage(props: {
   const chatContentGridRef = useRef<HTMLDivElement | null>(null);
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
+  const uploadSessionDocInputRef = useRef<HTMLInputElement | null>(null);
   const previewZoomFactorRef = useRef(1);
   const previewZoomSyncIdRef = useRef(0);
   const previewContentMetricsRef = useRef<{ contentWidth: number; contentHeight: number } | null>(null);
@@ -575,6 +630,29 @@ function ChatPage(props: {
     if (props.personalKnowledgeDocCount > 0 || !usePersonalKnowledgeBase) return;
     setUsePersonalKnowledgeBase(false);
   }, [props.personalKnowledgeDocCount, usePersonalKnowledgeBase]);
+  useEffect(() => {
+    let cancelled = false;
+    if (!props.sessionId) {
+      setSessionDocs([]);
+      setSessionDocError('');
+      return () => {
+        cancelled = true;
+      };
+    }
+    void window.tasiHarness.sessionDocs.list(props.sessionId)
+      .then((docs) => {
+        if (cancelled) return;
+        setSessionDocs(docs);
+        setSessionDocError('');
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setSessionDocError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.sessionId]);
   useEffect(() => {
     if (!shouldShowWebPreview) {
       setWebPreviewExpanded(false);
@@ -1008,6 +1086,8 @@ function ChatPage(props: {
       const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled);
       props.setSessionId(result.sessionId);
       props.setMessages(result.messages.filter((m) => m.role !== 'system'));
+      props.setLastUsage(result.usage);
+      props.setTotalUsage(result.totalUsage);
       props.setToolEvents(result.toolEvents);
       props.setExecutionMode(result.execution.mode);
       setFollowUpQuestions((result.followUpQuestions ?? []).filter((item) => item.trim()).slice(0, 4));
@@ -1176,6 +1256,49 @@ function ChatPage(props: {
     }
   }
 
+  function openSessionDocumentPicker(): void {
+    if (busy || sessionDocBusy) return;
+    if (!uploadSessionDocInputRef.current) return;
+    uploadSessionDocInputRef.current.value = '';
+    uploadSessionDocInputRef.current.click();
+  }
+
+  async function uploadSessionDocument(file: File): Promise<void> {
+    setSessionDocBusy(true);
+    setSessionDocError('');
+    try {
+      const contentBase64 = await fileToBase64(file);
+      const result = await window.tasiHarness.sessionDocs.upload({
+        sessionId: props.sessionId,
+        filename: file.name,
+        contentBase64
+      });
+      if (props.sessionId !== result.sessionId) props.setSessionId(result.sessionId);
+      const docs = await window.tasiHarness.sessionDocs.list(result.sessionId);
+      setSessionDocs(docs);
+      await props.refreshSessions();
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionDocBusy(false);
+    }
+  }
+
+  async function removeSessionDocument(id: string): Promise<void> {
+    if (!props.sessionId) return;
+    setSessionDocBusy(true);
+    setSessionDocError('');
+    try {
+      await window.tasiHarness.sessionDocs.deleteDocument(props.sessionId, id);
+      const docs = await window.tasiHarness.sessionDocs.list(props.sessionId);
+      setSessionDocs(docs);
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionDocBusy(false);
+    }
+  }
+
   return (
     <section className="page chat-page">
       <div className="chat-header">
@@ -1198,7 +1321,6 @@ function ChatPage(props: {
             <span>{props.tr('Personal KB', '个人知识库')}</span>
             <span className="soft-badge">{props.personalKnowledgeDocCount}</span>
           </label>
-          <div className={`model-badge chat-control ${connected ? 'connected' : 'disconnected'}`}><span className="dot" />{props.config.model || props.tr('No model', '未配置模型')}</div>
           <select value={props.executionMode} onChange={(e) => props.setExecutionMode(e.target.value as 'workspace' | 'sandbox')}>
             <option value="workspace">{props.tr('Workspace', '工作区')}</option>
             <option value="sandbox">{props.tr('Sandbox', '沙箱')}</option>
@@ -1212,9 +1334,13 @@ function ChatPage(props: {
             onClick={() => {
               props.setMessages([]);
               props.setSessionId(undefined);
+              props.setLastUsage(undefined);
+              props.setTotalUsage(undefined);
               props.setToolEvents([]);
               props.setExecutionMode(props.config.defaultExecutionMode);
               setFollowUpQuestions([]);
+              setSessionDocs([]);
+              setSessionDocError('');
             }}
           >
             {props.tr('New session', '新会话')}
@@ -1348,20 +1474,71 @@ function ChatPage(props: {
         </div>
       </div>
       {error && <div className="error-box">{error}</div>}
+      {sessionDocError && <div className="error-box">{sessionDocError}</div>}
       <div className="chat-input-area">
-        <textarea
-          className="chat-textarea"
+        <div className="chat-input-main">
+          <input
+            ref={uploadSessionDocInputRef}
+            className="hidden-file-input"
+            type="file"
+            accept=".docx,.pptx,.xlsx,.pdf,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (!file) return;
+              void uploadSessionDocument(file);
+            }}
+          />
+          <div className="chat-session-doc-row">
+            {sessionDocs.map((doc) => (
+              <span key={doc.id} className="chat-session-doc-chip" title={doc.filename}>
+                <span className="chat-session-doc-name">{doc.filename}</span>
+                <span className="chat-session-doc-meta">{props.tr(`${doc.commentCount} comments`, `${doc.commentCount} comments`)}</span>
+                <button
+                  className="chat-session-doc-remove"
+                  onClick={() => void removeSessionDocument(doc.id)}
+                  disabled={sessionDocBusy}
+                  title={props.tr('Remove document', 'Remove document')}
+                  aria-label={props.tr('Remove document', 'Remove document')}
+                >
+                  x
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="chat-textarea-wrap">
+          <textarea
+            className="chat-textarea"
           placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
-          value={input}
-          disabled={busy || !connected}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-        />
+            value={input}
+            disabled={busy || !connected}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+          />
+            <button
+              className="chat-attach-button"
+              onClick={openSessionDocumentPicker}
+              disabled={busy || sessionDocBusy || !connected}
+              title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+              aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
         <button
           className={`send-btn${busy ? ' stop' : ''}`}
           disabled={busy ? stopping : !input.trim() || !connected}
@@ -1410,6 +1587,7 @@ function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: Trans
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
+  const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -1433,26 +1611,35 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
       <div className="msg-bubble-wrap">
         <div className="msg-sender">{label}</div>
         <div className="msg-bubble">
-          {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
-          <div className="msg-bubble-actions">
-            <button
-              className={`msg-icon-button ${copied ? 'copied' : ''}`}
-              onClick={() => void handleCopy()}
-              title={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
-              aria-label={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
-            >
-              {copied ? (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M5 12.5 9.2 16.7 19 7.5" />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <rect x="9" y="9" width="10" height="10" rx="2" />
-                  <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
-                </svg>
-              )}
-            </button>
-          </div>
+          {isWechatPending ? (
+            <div>
+              <div className="card-subtle">{tr('WeChat message is being processed...', '微信消息处理中...')}</div>
+              <div className="typing-indicator"><span /> <span /> <span /></div>
+            </div>
+          ) : (
+            <>
+              {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
+              <div className="msg-bubble-actions">
+                <button
+                  className={`msg-icon-button ${copied ? 'copied' : ''}`}
+                  onClick={() => void handleCopy()}
+                  title={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
+                  aria-label={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
+                >
+                  {copied ? (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M5 12.5 9.2 16.7 19 7.5" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="9" y="9" width="10" height="10" rx="2" />
+                      <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </>
+          )}
         </div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
@@ -1858,6 +2045,7 @@ function normalizeSkillContent(content: string, name: string, category: string):
 function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
   const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload'>('installed');
   const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
   const [marketError, setMarketError] = useState('');
   const [notice, setNotice] = useState('');
@@ -1879,9 +2067,14 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [editorSaving, setEditorSaving] = useState(false);
 
   useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedQuery(query.trim()), 240);
+    return () => window.clearTimeout(timeout);
+  }, [query]);
+
+  useEffect(() => {
     if (activeTab !== 'marketplace') return;
     void window.tasiHarness.skills
-      .browseMarketplace(query)
+      .browseMarketplace(debouncedQuery)
       .then((result) => {
         setMarketplace(result);
         setMarketError('');
@@ -1890,7 +2083,7 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
         setMarketplace({ sources: [], skills: [] });
         setMarketError(error instanceof Error ? error.message : String(error));
       });
-  }, [query, skills, activeTab]);
+  }, [debouncedQuery, skills, activeTab]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -1932,7 +2125,7 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
 
   async function refreshMarketplaceSnapshot(): Promise<void> {
     try {
-      const latest = await window.tasiHarness.skills.browseMarketplace(query);
+      const latest = await window.tasiHarness.skills.browseMarketplace(debouncedQuery);
       setMarketplace(latest);
       setMarketError('');
     } catch (error) {
@@ -2107,6 +2300,8 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={tr('search ClawHub, SkillHub, and more', '搜索 ClawHub、SkillHub 等')} />
             {marketError && <div className="error-box market-error">{marketError}</div>}
             <div className="meta-row wrap">
+              <span className="soft-badge">{tr('Results', '结果')}: {marketplace.skills.length}</span>
+              {debouncedQuery && <span className="soft-badge">{tr('Query', '检索')}: {debouncedQuery}</span>}
               {marketplace.sources.filter((source) => source.enabled).map((source) => (
                 <span key={source.id} className="soft-badge">{source.name}</span>
               ))}
@@ -2218,6 +2413,7 @@ function TasksPage(props: {
   const [intervalMinutes, setIntervalMinutes] = useState(60);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('sandbox');
   const [notifyByEmail, setNotifyByEmail] = useState(true);
+  const [notifyByWechat, setNotifyByWechat] = useState(false);
   const [notice, setNotice] = useState('');
 
   async function createTask(): Promise<void> {
@@ -2228,7 +2424,8 @@ function TasksPage(props: {
       runAt: scheduleType === 'once' ? new Date(runAt || Date.now()).toISOString() : undefined,
       intervalMinutes: scheduleType === 'interval' ? intervalMinutes : undefined,
       executionMode,
-      notifyByEmail
+      notifyByEmail,
+      notifyByWechat
     });
     setNotice(props.tr('Scheduled task created.', '定时任务已创建。'));
     await props.refreshTasks();
@@ -2252,7 +2449,7 @@ function TasksPage(props: {
 
   return (
     <section className="page">
-      <PageHeader title={props.tr('Scheduled Tasks', '定时任务')} subtitle={props.tr('Add tasks, run them on a timer, and send completion notifications by email.', '添加任务，按计划运行，并通过邮件发送完成通知。')} />
+      <PageHeader title={props.tr('Scheduled Tasks', '定时任务')} subtitle={props.tr('Add tasks, run them on a timer, and send completion notifications by email or WeChat.', '添加任务，按计划运行，并通过邮件或微信发送完成通知。')} />
       <div className="split-grid">
         <div className="card">
           <h2>{props.tr('Create task', '创建任务')}</h2>
@@ -2282,6 +2479,7 @@ function TasksPage(props: {
             <option value="sandbox">{props.tr('Sandbox', '沙箱')}</option>
           </select>
           <label className="toggle-line"><input type="checkbox" checked={notifyByEmail} onChange={(e) => setNotifyByEmail(e.target.checked)} /> {props.tr('Email notification', '邮件通知')}</label>
+          <label className="toggle-line"><input type="checkbox" checked={notifyByWechat} onChange={(e) => setNotifyByWechat(e.target.checked)} /> {props.tr('WeChat notification', '微信通知')}</label>
           <div className="button-row">
             <button className="primary-button" onClick={() => void createTask()}>{props.tr('Create task', '创建任务')}</button>
           </div>
@@ -2308,11 +2506,15 @@ function TasksPage(props: {
                   <span className="soft-badge">{props.tr('Next', '下次')}: {prettyDate(task.nextRunAt)}</span>
                   <span className="soft-badge">{props.tr('Run in', '运行于')} {task.executionMode === 'workspace' ? props.tr('workspace', '工作区') : props.tr('sandbox', '沙箱')}</span>
                   {task.notifyByEmail && <span className="soft-badge">{props.tr('Email', '邮件')}</span>}
+                  {task.notifyByWechat && <span className="soft-badge">{props.tr('WeChat', '微信')}</span>}
+                  {typeof task.lastIterations === 'number' && <span className="soft-badge">{props.tr('Iterations', '迭代')} {task.lastIterations}</span>}
+                  {typeof task.lastToolEventCount === 'number' && <span className="soft-badge">{props.tr('Tools', '工具')} {task.lastToolEventCount}</span>}
                 </div>
                 {(task.lastResult || task.lastError) && <pre className="code-block small">{task.lastError || task.lastResult}</pre>}
+                {task.lastTrace && <pre className="code-block small">{task.lastTrace}</pre>}
                 <div className="button-row">
-                  <button className="ghost-button" onClick={() => void toggleTask(task)}>{task.enabled ? props.tr('Pause', '暂停') : props.tr('Enable', '启用')}</button>
-                  <button className="primary-button" onClick={() => void runNow(task.id)}>{props.tr('Run now', '立即运行')}</button>
+                  <button className="ghost-button" disabled={task.isRunning} onClick={() => void toggleTask(task)}>{task.enabled ? props.tr('Pause', '暂停') : props.tr('Enable', '启用')}</button>
+                  <button className="primary-button" disabled={task.isRunning} onClick={() => void runNow(task.id)}>{task.isRunning ? props.tr('Executing...', '执行中...') : props.tr('Run now', '立即运行')}</button>
                   <button className="danger-button" onClick={() => void remove(task.id)}>{props.tr('Delete', '删除')}</button>
                 </div>
               </div>
@@ -2364,14 +2566,99 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: PublicAppConfig; setConfig: (cfg: PublicAppConfig) => void }): ReactElement {
   const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
   const [testResult, setTestResult] = useState('');
-  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'email' | 'theme' | 'markets'>('model');
+  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'channels' | 'theme' | 'markets'>('model');
+  const [channelSubPage, setChannelSubPage] = useState<'email' | 'wechat'>('email');
+  const [clawbotQrDataUrl, setClawbotQrDataUrl] = useState('');
+  const [clawbotQrSource, setClawbotQrSource] = useState<'ilink-api' | 'manual-bind-url'>('manual-bind-url');
+  const [clawbotQrKey, setClawbotQrKey] = useState('');
+  const [wechatLoginStatus, setWechatLoginStatus] = useState<'idle' | 'wait' | 'scaned' | 'confirmed' | 'expired' | 'error' | 'unknown'>('idle');
+  const wechatLoginPollRef = useRef<number | null>(null);
+  const wechatLoginCheckingRef = useRef(false);
 
   useEffect(() => {
     setDraft({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
+    setWechatLoginStatus(config.wechatChannel.loginStatus ?? 'idle');
   }, [config]);
 
   const selectedProviderPreset = providerPreset(draft.provider);
   const suggestedModels = providerModelOptions(draft.provider);
+
+  function stopWechatLoginPolling(): void {
+    if (wechatLoginPollRef.current == null) return;
+    window.clearInterval(wechatLoginPollRef.current);
+    wechatLoginPollRef.current = null;
+    wechatLoginCheckingRef.current = false;
+  }
+
+  async function checkWechatLoginStatus(qrcodeKey: string): Promise<void> {
+    if (!qrcodeKey.trim()) return;
+    if (wechatLoginCheckingRef.current) return;
+    wechatLoginCheckingRef.current = true;
+    try {
+      const status = await window.tasiHarness.config.wechatQrcodeStatus(qrcodeKey);
+      setWechatLoginStatus(status.status);
+      if (status.status === 'confirmed') {
+        stopWechatLoginPolling();
+        const next = await window.tasiHarness.config.get();
+        setConfig(next);
+        setTestResult(tr('WeChat channel connected. Incoming messages will sync to chat.', '微信通道已连接，手机消息会同步到对话。'));
+      }
+    } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || /aborted/i.test(error.message))) return;
+      setWechatLoginStatus('error');
+      setTestResult(error instanceof Error ? error.message : String(error));
+    } finally {
+      wechatLoginCheckingRef.current = false;
+    }
+  }
+
+  function startWechatLoginPolling(qrcodeKey: string): void {
+    if (!qrcodeKey.trim()) return;
+    stopWechatLoginPolling();
+    void checkWechatLoginStatus(qrcodeKey);
+    wechatLoginPollRef.current = window.setInterval(() => {
+      void checkWechatLoginStatus(qrcodeKey);
+    }, 2500);
+  }
+
+  async function refreshClawbotQrCode(): Promise<void> {
+    const bindUrl = draft.wechatChannel.bindUrl.trim() || 'https://ilinkai.weixin.qq.com';
+    try {
+      const payload = await window.tasiHarness.config.wechatQrcode();
+      const content = payload.qrcodeContent.trim() || bindUrl;
+      const dataUrl = await QRCode.toDataURL(content, { width: 240, margin: 1 });
+      setClawbotQrDataUrl(dataUrl);
+      setClawbotQrSource(payload.source);
+      setClawbotQrKey(payload.qrcodeKey ?? '');
+      setWechatLoginStatus(payload.qrcodeKey ? 'wait' : 'unknown');
+      if (payload.qrcodeKey) startWechatLoginPolling(payload.qrcodeKey);
+      return;
+    } catch {
+      // fall through to local fallback
+    }
+
+    try {
+      const dataUrl = await QRCode.toDataURL(bindUrl, { width: 240, margin: 1 });
+      setClawbotQrDataUrl(dataUrl);
+      setClawbotQrSource('manual-bind-url');
+      setClawbotQrKey('');
+      setWechatLoginStatus('unknown');
+      stopWechatLoginPolling();
+    } catch {
+      setClawbotQrDataUrl('');
+      setClawbotQrSource('manual-bind-url');
+      setClawbotQrKey('');
+      setWechatLoginStatus('error');
+      stopWechatLoginPolling();
+    }
+  }
+
+  useEffect(() => {
+    if (subPage !== 'channels' || channelSubPage !== 'wechat') return;
+    void refreshClawbotQrCode();
+  }, [subPage, channelSubPage]);
+
+  useEffect(() => () => stopWechatLoginPolling(), []);
 
   function applyProviderPreset(nextProvider: PublicAppConfig['provider']): void {
     const nextPreset = providerPreset(nextProvider);
@@ -2403,46 +2690,42 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     <section className="page settings-page">
       <PageHeader
         title={tr('Settings', '设置')}
-        subtitle={tr('Provider, skill markets, email notifications, security, and execution defaults.', '模型提供方、技能市场、邮件通知、安全策略与默认执行设置。')}
-        action={(
+        subtitle={tr('Provider, channels, skill markets, security, and execution defaults.', '模型服务、通道、技能市场、安全与执行默认配置。')}
+        action={
           <div className="button-row compact">
             <button className="primary-button" onClick={() => void save()}>{tr('Save', '保存')}</button>
           </div>
-        )}
+        }
       />
       <div className="skill-tabs">
-        <button className={`skill-tab ${subPage === 'model' ? 'active' : ''}`} onClick={() => setSubPage('model')}>{tr('Model', '模型配置')}</button>
+        <button className={`skill-tab ${subPage === 'model' ? 'active' : ''}`} onClick={() => setSubPage('model')}>{tr('Model', '模型')}</button>
         <button className={`skill-tab ${subPage === 'execution' ? 'active' : ''}`} onClick={() => setSubPage('execution')}>{tr('Execution', '执行')}</button>
         <button className={`skill-tab ${subPage === 'security' ? 'active' : ''}`} onClick={() => setSubPage('security')}>{tr('Security', '安全')}</button>
-        <button className={`skill-tab ${subPage === 'email' ? 'active' : ''}`} onClick={() => setSubPage('email')}>{tr('Email', '邮件')}</button>
+        <button className={`skill-tab ${subPage === 'channels' ? 'active' : ''}`} onClick={() => setSubPage('channels')}>{tr('Channels', '通道')}</button>
         <button className={`skill-tab ${subPage === 'theme' ? 'active' : ''}`} onClick={() => setSubPage('theme')}>{tr('Theme', '主题')}</button>
         <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
       </div>
       {subPage === 'model' && (
         <div className="card">
           <h2>{tr('Model Configuration', '模型配置')}</h2>
-          <label>{tr('Provider', '提供方')}</label>
+          <label>{tr('Provider', '服务商')}</label>
           <select value={draft.provider} onChange={(e) => applyProviderPreset(e.target.value as PublicAppConfig['provider'])}>
             {PROVIDER_PRESETS.map((preset) => (
               <option key={preset.kind} value={preset.kind}>{preset.label}</option>
             ))}
           </select>
-          <label>{tr('Base URL', '基础 URL')}</label>
+          <label>{tr('Base URL', 'Base URL')}</label>
           <input value={draft.baseUrl} onChange={(e) => setDraft((old) => ({ ...old, baseUrl: e.target.value }))} />
-          <div className="card-subtle">{tr('Preset endpoint', '预设地址')}: {selectedProviderPreset.defaultBaseUrl}</div>
-          <label>{tr('API Key', 'API 密钥')} {config.apiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
+          <div className="card-subtle">{tr('Preset endpoint:', '预设端点：')} {selectedProviderPreset.defaultBaseUrl}</div>
+          <label>API Key {config.apiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
           <input
             type="password"
             value={draft.apiKey || ''}
             disabled={!providerRequiresApiKey(draft.provider)}
             onChange={(e) => setDraft((old) => ({ ...old, apiKey: e.target.value }))}
-            placeholder={
-              providerRequiresApiKey(draft.provider)
-                ? tr('leave blank to keep existing', '留空则保持现有配置')
-                : tr('Not required for this provider', '当前提供方无需 API 密钥')
-            }
+            placeholder={providerRequiresApiKey(draft.provider) ? tr('leave blank to keep existing', '留空则保持不变') : tr('Not required for this provider', '该服务商不需要')}
           />
-          <label>{tr('Suggested models', '常用模型')}</label>
+          <label>{tr('Suggested models', '推荐模型')}</label>
           <select
             value={suggestedModels.includes(draft.model) ? draft.model : ''}
             onChange={(e) => {
@@ -2462,7 +2745,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
               className="ghost-button"
               onClick={() => setDraft((old) => ({ ...old, baseUrl: selectedProviderPreset.defaultBaseUrl, model: selectedProviderPreset.defaultModel }))}
             >
-              {tr('Reset preset', '恢复预设')}
+              {tr('Reset preset', '重置预设')}
             </button>
             <button className="ghost-button" onClick={() => void test()}>{tr('Save and test model', '保存并测试模型')}</button>
           </div>
@@ -2475,7 +2758,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
           <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
-          <label>{tr('Workspace directory', '工作区目录')}</label>
+          <label>{tr('Workspace directory', '工作目录')}</label>
           <input value={draft.workspaceDir} onChange={(e) => setDraft((old) => ({ ...old, workspaceDir: e.target.value }))} />
           <label>{tr('Default execution mode', '默认执行模式')}</label>
           <select value={draft.defaultExecutionMode} onChange={(e) => setDraft((old) => ({ ...old, defaultExecutionMode: e.target.value as 'workspace' | 'sandbox' }))}>
@@ -2496,33 +2779,23 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="cdp">{tr('CDP only', '仅 CDP')}</option>
             <option value="webdriver-safari">{tr('Safari WebDriver only', '仅 Safari WebDriver')}</option>
           </select>
-          <label>{tr('CDP endpoint', 'CDP 端点')}</label>
+          <label>{tr('CDP endpoint', 'CDP 地址')}</label>
           <input
             value={draft.externalBrowserCdpEndpoint}
             onChange={(e) => setDraft((old) => ({ ...old, externalBrowserCdpEndpoint: e.target.value }))}
             placeholder="http://127.0.0.1:9222"
           />
-          <label>{tr('External browser profile', '外部浏览器配置档')}</label>
+          <label>{tr('External browser profile', '外部浏览器配置')}</label>
           <select
             value={draft.externalBrowserProfileMode}
             onChange={(e) => setDraft((old) => ({ ...old, externalBrowserProfileMode: e.target.value as PublicAppConfig['externalBrowserProfileMode'] }))}
           >
-            <option value="isolated">{tr('Isolated (safe default)', '隔离（默认更安全）')}</option>
-            <option value="system">{tr('System profile (reuse login)', '系统配置档（复用登录态）')}</option>
+            <option value="isolated">{tr('Isolated (safe default)', '隔离模式（默认更安全）')}</option>
+            <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
-          <div className="card-subtle">
-            {tr(
-              'External auto mode tries CDP first (Chromium/Chrome/Edge, including local auto-launch), then Safari WebDriver on macOS, and finally falls back to shell.openExternal.',
-              '外部自动模式会先尝试 CDP（Chromium/Chrome/Edge，含本地自动拉起），在 macOS 上再尝试 Safari WebDriver，最后回退到 shell.openExternal。'
-            )}
-          </div>
-          <div className="card-subtle">
-            {tr(
-              'System profile mode reuses website login state and will force-close running browser processes when controlled takeover is required.',
-              '系统配置档模式可复用网站登录态，并会在需要受控接管时自动强制关闭正在运行的浏览器进程。'
-            )}
-          </div>
-          <label>{tr('Persona', '系统角色')}</label>
+          <div className="card-subtle">{tr('External auto mode tries CDP first, then Safari WebDriver on macOS, then shell.openExternal.', '外部自动模式会优先尝试 CDP，其次在 macOS 使用 Safari WebDriver，最后回退到 shell.openExternal。')}</div>
+          <div className="card-subtle">{tr('System profile mode reuses login state and may force-close browser processes during controlled takeover.', '系统配置会复用登录态，在受控接管时可能强制关闭浏览器进程。')}</div>
+          <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>
       )}
@@ -2533,22 +2806,77 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label className="toggle-line"><input type="checkbox" checked={draft.enableNetworkTools} onChange={(e) => setDraft((old) => ({ ...old, enableNetworkTools: e.target.checked }))} /> {tr('Enable network tools', '启用网络工具')}</label>
         </div>
       )}
-      {subPage === 'email' && (
+      {subPage === 'channels' && (
         <div className="card">
-          <h2>{tr('Email Notifications', '邮件通知')}</h2>
-          <label className="toggle-line"><input type="checkbox" checked={draft.emailNotifications.enabled} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, enabled: e.target.checked } }))} /> {tr('Enable email notifications', '启用邮件通知')}</label>
-          <label>{tr('Email host', '邮件主机')}</label>
-          <input value={draft.emailNotifications.host} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, host: e.target.value } }))} />
-          <label>{tr('Email port', '邮件端口')}</label>
-          <input type="number" value={draft.emailNotifications.port} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, port: Number(e.target.value) } }))} />
-          <label>{tr('Email username', '邮件用户名')}</label>
-          <input value={draft.emailNotifications.username} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, username: e.target.value } }))} />
-          <label>{tr('Email password', '邮件密码')} {config.emailNotifications.passwordConfigured ? tr('(configured)', '（已配置）') : ''}</label>
-          <input type="password" value={draft.emailNotifications.password || ''} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, password: e.target.value } }))} placeholder={tr('leave blank to keep existing', '留空则保持现有配置')} />
-          <label>{tr('From address', '发件地址')}</label>
-          <input value={draft.emailNotifications.from} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, from: e.target.value } }))} />
-          <label>{tr('To address', '收件地址')}</label>
-          <input value={draft.emailNotifications.to} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, to: e.target.value } }))} />
+          <h2>{tr('Channels', '通道')}</h2>
+          <div className="skill-tabs channel-tabs">
+            <button className={`skill-tab ${channelSubPage === 'email' ? 'active' : ''}`} onClick={() => setChannelSubPage('email')}>{tr('Email', '邮件')}</button>
+            <button className={`skill-tab ${channelSubPage === 'wechat' ? 'active' : ''}`} onClick={() => setChannelSubPage('wechat')}>{tr('WeChat', '微信')}</button>
+          </div>
+          {channelSubPage === 'email' && (
+            <div className="channel-pane">
+              <label className="toggle-line"><input type="checkbox" checked={draft.emailNotifications.enabled} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, enabled: e.target.checked } }))} /> {tr('Enable email notifications', '启用邮件通知')}</label>
+              <label>{tr('Email host', '邮件服务器')}</label>
+              <input value={draft.emailNotifications.host} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, host: e.target.value } }))} />
+              <label>{tr('Email port', '邮件端口')}</label>
+              <input type="number" value={draft.emailNotifications.port} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, port: Number(e.target.value) } }))} />
+              <label>{tr('Email username', '邮件用户名')}</label>
+              <input value={draft.emailNotifications.username} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, username: e.target.value } }))} />
+              <label>{tr('Email password', '邮件密码')} {config.emailNotifications.passwordConfigured ? tr('(configured)', '（已配置）') : ''}</label>
+              <input type="password" value={draft.emailNotifications.password || ''} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, password: e.target.value } }))} placeholder={tr('leave blank to keep existing', '留空则保持不变')} />
+              <label>{tr('From address', '发件地址')}</label>
+              <input value={draft.emailNotifications.from} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, from: e.target.value } }))} />
+              <label>{tr('To address', '收件地址')}</label>
+              <input value={draft.emailNotifications.to} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, to: e.target.value } }))} />
+            </div>
+          )}
+          {channelSubPage === 'wechat' && (
+            <div className="channel-pane">
+              <label className="toggle-line">
+                <input
+                  type="checkbox"
+                  checked={draft.wechatChannel.enabled}
+                  onChange={(e) => setDraft((old) => ({ ...old, wechatChannel: { ...old.wechatChannel, enabled: e.target.checked } }))}
+                />
+                {tr('Enable WeChat channel', '启用微信通道')}
+              </label>
+              <label>{tr('Plugin', '插件')}</label>
+              <input value={draft.wechatChannel.pluginName} readOnly />
+              <div className="card-subtle">{tr('WeChat channel uses the clawbot plugin.', '微信通道使用 clawbot 插件。')}</div>
+              <label>{tr('ClawBot bind URL', 'ClawBot 绑定地址')}</label>
+              <input
+                value={draft.wechatChannel.bindUrl}
+                onChange={(e) => setDraft((old) => ({ ...old, wechatChannel: { ...old.wechatChannel, bindUrl: e.target.value } }))}
+                placeholder="https://ilinkai.weixin.qq.com"
+              />
+              <div className="channel-qr-wrap">
+                {clawbotQrDataUrl
+                  ? <img className="channel-qr-image" src={clawbotQrDataUrl} alt={tr('ClawBot QR Code', 'ClawBot 二维码')} />
+                  : <div className="card-subtle">{tr('QR code failed to load.', '二维码加载失败。')}</div>}
+                <div className="channel-qr-meta">
+                  <strong>{tr('ClawBot QR', 'ClawBot 二维码')}</strong>
+                  <p>{tr('Scan this QR code with WeChat to bind the clawbot plugin channel.', '请使用微信扫码绑定 clawbot 插件通道。')}</p>
+                  <p className="card-subtle">
+                    {tr('Login status:', '登录状态：')} {wechatLoginStatus}
+                  </p>
+                  <p className="card-subtle">
+                    {clawbotQrSource === 'ilink-api'
+                      ? tr('Source: iLink dynamic login QR (recommended).', '来源：iLink 动态登录二维码（推荐）。')
+                      : tr('Source: manual bind URL fallback.', '来源：手动绑定链接回退。')}
+                  </p>
+                  <button className="ghost-button channel-open-link" onClick={() => void checkWechatLoginStatus(clawbotQrKey)} disabled={!clawbotQrKey}>
+                    {tr('Check login status', '检查登录状态')}
+                  </button>
+                  <button className="ghost-button channel-open-link" onClick={() => void refreshClawbotQrCode()}>
+                    {tr('Refresh QR code', '刷新二维码')}
+                  </button>
+                  <a className="ghost-button channel-open-link" href={draft.wechatChannel.bindUrl.trim() || 'https://ilinkai.weixin.qq.com'} target="_blank" rel="noreferrer">
+                    {tr('Open bind URL', '打开绑定链接')}
+                  </a>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
       {subPage === 'theme' && (
@@ -2587,7 +2915,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
                   </label>
                 </div>
                 <p>{source.description}</p>
-                <label>{tr('Catalog URL', '目录 URL')}</label>
+                <label>{tr('Catalog URL', '目录地址')}</label>
                 <input
                   value={source.catalogUrl || ''}
                   onChange={(e) => {

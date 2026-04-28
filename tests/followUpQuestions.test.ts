@@ -4,7 +4,7 @@ import { defaultConfig } from '../src/main/storage/pathUtils.js';
 import type { LlmClient } from '../src/main/agent/llmClient.js';
 
 describe('followUpQuestions', () => {
-  it('returns user-voice Chinese fallback questions', async () => {
+  it('returns contextual Chinese fallback questions in user voice', async () => {
     const result = await generateFollowUpQuestions(
       () =>
         ({
@@ -17,11 +17,10 @@ describe('followUpQuestions', () => {
       }
     );
 
-    expect(result).toEqual([
-      '\u4f60\u80fd\u5e2e\u6211\u628a\u4e0a\u9762\u7684\u5185\u5bb9\u6574\u7406\u6210\u4e00\u4e2a\u5206\u6b65\u6e05\u5355\u5417\uff1f',
-      '\u6211\u5982\u679c\u73b0\u5728\u5f00\u59cb\uff0c\u7b2c\u4e00\u6b65\u5e94\u8be5\u5148\u505a\u4ec0\u4e48\uff1f',
-      '\u7ed3\u5408\u6211\u7684\u60c5\u51b5\uff0c\u6700\u9700\u8981\u6ce8\u610f\u7684\u98ce\u9669\u3001\u9650\u5236\u6216\u524d\u63d0\u662f\u4ec0\u4e48\uff1f'
-    ]);
+    expect(result).toHaveLength(3);
+    expect(result[0]).toContain('\u53d1\u5e03\u8ba1\u5212');
+    expect(new Set(result).size).toBe(3);
+    expect(result.every((item) => item.trim().endsWith('\uff1f'))).toBe(true);
   });
 
   it('filters service-style and prompt-style suggestions, then backfills with user-voice questions', async () => {
@@ -51,11 +50,10 @@ describe('followUpQuestions', () => {
       }
     );
 
-    expect(result).toEqual([
-      '\u6211\u63a5\u4e0b\u6765\u5e94\u8be5\u5148\u51c6\u5907\u4ec0\u4e48\uff1f',
-      '\u4f60\u80fd\u5e2e\u6211\u628a\u4e0a\u9762\u7684\u5185\u5bb9\u6574\u7406\u6210\u4e00\u4e2a\u5206\u6b65\u6e05\u5355\u5417\uff1f',
-      '\u6211\u5982\u679c\u73b0\u5728\u5f00\u59cb\uff0c\u7b2c\u4e00\u6b65\u5e94\u8be5\u5148\u505a\u4ec0\u4e48\uff1f'
-    ]);
+    expect(result).toHaveLength(3);
+    expect(result[0]).toBe('\u6211\u63a5\u4e0b\u6765\u5e94\u8be5\u5148\u51c6\u5907\u4ec0\u4e48\uff1f');
+    expect(result[1]).toContain('\u8fd9\u4e24\u4e2a\u65b9\u6848');
+    expect(new Set(result).size).toBe(3);
     expect(result.every((item) => !/^(Would you like me to|Need me to)/i.test(item))).toBe(true);
   });
 });

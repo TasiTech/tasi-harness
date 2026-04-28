@@ -54,6 +54,12 @@ export function defaultConfig(): AppConfig {
       from: '',
       to: ''
     },
+    wechatChannel: {
+      enabled: false,
+      pluginName: 'clawbot',
+      bindUrl: 'https://ilinkai.weixin.qq.com',
+      loginStatus: 'idle'
+    },
     enabledToolNames: [
       'memory',
       'session_search',
