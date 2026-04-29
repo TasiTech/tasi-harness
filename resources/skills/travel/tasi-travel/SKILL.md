@@ -220,7 +220,7 @@ Entry-level rules:
 1. Use name-only mode by default for simplicity and robustness.
 2. If `use_lnglat=true`, include both `name` and `lnglat` for each point to avoid ambiguity.
 3. Enforce Amap limitations: only `car` supports via points, up to 6 via points, and the total number of points (including origin and destination) must not exceed 8.
-4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. If you want to display the route more clearly and connect the locations, also provide a separate `car` link that includes all POIs as a demonstration.
+4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. To display the route more clearly and connect the locations, also provide a separate `car` link that includes all POIs as a demonstration. Do not attempt to provide via points in non-car modes since they will be ignored by Amap and may cause confusion.
 5. Map focus behavior:
   - `day` (default): generate one Amap link per day.
   - `full_trip`: attempt a single link for the whole trip (may exceed Amap point limits).
