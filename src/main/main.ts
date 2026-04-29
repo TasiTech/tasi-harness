@@ -1,6 +1,8 @@
-import { app, BrowserWindow, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { dirname, join } from 'node:path';
+import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
+import { readdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import JSZip from 'jszip';
 import { AppContext } from './appContext.js';
 import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
@@ -40,16 +42,25 @@ let lastExternalBrowserOpen: { url: string; at: number } | null = null;
 const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
 const externalFallbackUrls = new Set<string>();
 const activeChatControllers = new Map<number, AbortController>();
+const activeWechatRuns = new Map<string, AbortController>();
 let wechatPollerAbortController: AbortController | null = null;
 let wechatPollerFingerprint = '';
 const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf']);
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
     win.webContents.send('sessions:updated', event);
+  }
+}
+
+function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('agent:tool-event', payload);
   }
 }
 
@@ -81,6 +92,86 @@ function getNumberField(record: Record<string, unknown>, keys: string[]): number
     if (typeof value === 'number' && Number.isFinite(value)) return value;
   }
   return undefined;
+}
+
+function buildWechatConversationKey(sessionId: string, fromUserId: string, contextToken?: string): string {
+  const user = fromUserId.trim();
+  const token = contextToken?.trim() ?? '';
+  const scope = token || user || 'unknown';
+  return `${sessionId}::${scope}`;
+}
+
+function clearWechatRunController(conversationKey: string, controller: AbortController): void {
+  const active = activeWechatRuns.get(conversationKey);
+  if (active !== controller) return;
+  activeWechatRuns.delete(conversationKey);
+}
+
+function listFilesRecursively(rootDir: string): string[] {
+  const files: string[] = [];
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.isFile()) files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+async function importKnowledgeBuffer(
+  filename: string,
+  content: Buffer
+): Promise<{ imported: number; skipped: number; failed: Array<{ filePath: string; error: string }> }> {
+  const ext = extname(filename).toLowerCase();
+  if (ext === '.zip') {
+    try {
+      const zip = await JSZip.loadAsync(content);
+      const entries = Object.keys(zip.files)
+        .filter((path) => !zip.files[path]?.dir)
+        .sort((left, right) => left.localeCompare(right));
+      let imported = 0;
+      let skipped = 0;
+      const failed: Array<{ filePath: string; error: string }> = [];
+      for (const entryPath of entries) {
+        const file = zip.file(entryPath);
+        if (!file) continue;
+        const entryBuffer = await file.async('nodebuffer');
+        const nestedName = `${basename(filename, '.zip')}/${entryPath}`.replace(/\\/g, '/');
+        const nested = await importKnowledgeBuffer(nestedName, entryBuffer);
+        imported += nested.imported;
+        skipped += nested.skipped;
+        failed.push(...nested.failed);
+      }
+      return { imported, skipped, failed };
+    } catch (error) {
+      return {
+        imported: 0,
+        skipped: 0,
+        failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
+      };
+    }
+  }
+  if (!KNOWLEDGE_IMPORT_EXTENSIONS.has(ext)) return { imported: 0, skipped: 1, failed: [] };
+  try {
+    await context.personalKnowledgeBase.addDocument({
+      filename,
+      contentBase64: content.toString('base64')
+    });
+    return { imported: 1, skipped: 0, failed: [] };
+  } catch (error) {
+    return {
+      imported: 0,
+      skipped: 0,
+      failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
+    };
+  }
 }
 
 function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
@@ -348,6 +439,12 @@ function startWechatPoller(): void {
           const createdAt = typeof ts === 'number' ? new Date(ts).toISOString() : new Date().toISOString();
           const shadowUserId = createId('wx_shadow_user');
           const pendingAssistantId = createId('wx_pending');
+          const conversationKey = buildWechatConversationKey(sessionId, fromUser, contextToken);
+          const previousController = activeWechatRuns.get(conversationKey);
+          if (previousController) {
+            previousController.abort();
+            activeWechatRuns.delete(conversationKey);
+          }
           const updatedInbound = context.sessionStore.appendMessages(sessionId, [
             {
               id: shadowUserId,
@@ -368,12 +465,25 @@ function startWechatPoller(): void {
             updatedAt: updatedInbound.updatedAt
           });
 
+          const runController = new AbortController();
+          activeWechatRuns.set(conversationKey, runController);
           try {
             const runResult = await context.agentLoop.run({
               userInput: text,
               sessionId,
               executionMode: context.getConfig().defaultExecutionMode,
-              origin: 'scheduled'
+              origin: 'scheduled',
+              signal: runController.signal,
+              onToolEvent: (eventSessionId, toolEvent) => {
+                const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+                broadcastAgentToolEvent(payload);
+                const previewUrl = latestWebPreviewUrlFromSource(toolEvent.toolName, toolEvent.args, toolEvent.content, true);
+                if (!previewUrl) return;
+                void maybeOpenExternalBrowser(previewUrl).catch((error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  console.warn(`[wechat] failed to open external browser preview: ${message}`);
+                });
+              }
             });
             const postRunRecord = context.sessionStore.read(sessionId);
             if (postRunRecord) {
@@ -396,6 +506,19 @@ function startWechatPoller(): void {
               fromUserId: botId
             });
           } catch (error) {
+            if (runController.signal.aborted || isAbortLikeError(error)) {
+              const fallbackRecord = context.sessionStore.read(sessionId);
+              if (fallbackRecord) {
+                const cleaned = fallbackRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+                context.sessionStore.replaceMessages(sessionId, cleaned);
+                broadcastSessionUpdated({
+                  sessionId,
+                  source: 'external',
+                  updatedAt: new Date().toISOString()
+                });
+              }
+              continue;
+            }
             const fallbackRecord = context.sessionStore.read(sessionId);
             if (fallbackRecord) {
               const replaced = fallbackRecord.messages.map((item) => (
@@ -414,6 +537,11 @@ function startWechatPoller(): void {
                 loginStatus: 'error'
               }
             });
+          } finally {
+            clearWechatRunController(conversationKey, runController);
+            if (context.getConfig().browserMode === 'external' && activeChatControllers.size === 0) {
+              await closeExternalBrowserPreview();
+            }
           }
         }
       } catch (error) {
@@ -866,12 +994,43 @@ function registerIpc(): void {
   ipcMain.handle('agent:stop', async (_event) => {
     const senderId = _event.sender.id;
     const controller = activeChatControllers.get(senderId);
-    if (!controller) return { ok: true, content: 'No active chat session to stop.' };
-    controller.abort();
+    let stoppedChat = 0;
+    if (controller) {
+      controller.abort();
+      stoppedChat = 1;
+    }
+    const wechatControllers = [...activeWechatRuns.values()];
+    activeWechatRuns.clear();
+    for (const wechatController of wechatControllers) {
+      try {
+        wechatController.abort();
+      } catch {
+        // Ignore abort failures from stale controllers.
+      }
+    }
+    const stoppedWechat = wechatControllers.length;
+    const wechatSessionId = context.getConfig().wechatChannel.sessionId?.trim();
+    if (wechatSessionId) {
+      const record = context.sessionStore.read(wechatSessionId);
+      if (record) {
+        const cleaned = record.messages.filter((message) => !(message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER));
+        if (cleaned.length !== record.messages.length) {
+          context.sessionStore.replaceMessages(wechatSessionId, cleaned);
+          broadcastSessionUpdated({
+            sessionId: wechatSessionId,
+            source: 'external',
+            updatedAt: new Date().toISOString()
+          });
+        }
+      }
+    }
     if (context.getConfig().browserMode === 'external') {
       await closeExternalBrowserPreview();
     }
-    return { ok: true, content: 'Stop signal sent.' };
+    if (stoppedChat === 0 && stoppedWechat === 0) {
+      return { ok: true, content: 'No active session to stop.' };
+    }
+    return { ok: true, content: `Stop signal sent. chat=${stoppedChat}, wechat=${stoppedWechat}` };
   });
 
   ipcMain.handle('sessions:list', () => context.sessionStore.list());
@@ -902,6 +1061,40 @@ function registerIpc(): void {
   ipcMain.handle('memory:clear', (_event, request: MemoryClearRequest) => context.memoryStore.clear(request));
   ipcMain.handle('knowledge:list', () => context.personalKnowledgeBase.getState());
   ipcMain.handle('knowledge:addDocument', (_event, req: PersonalKnowledgeUploadRequest) => context.personalKnowledgeBase.addDocument(req));
+  ipcMain.handle('knowledge:addFolder', async () => {
+    const picked = await dialog.showOpenDialog({
+      title: 'Select folder to import into Personal Knowledge',
+      properties: ['openDirectory']
+    });
+    if (picked.canceled || picked.filePaths.length === 0) {
+      return { folderPath: '', discovered: 0, imported: 0, skipped: 0, failed: [] };
+    }
+    const folderPath = picked.filePaths[0];
+    const allFiles = listFilesRecursively(folderPath);
+    let imported = 0;
+    let skipped = 0;
+    const failed: Array<{ filePath: string; error: string }> = [];
+    for (const filePath of allFiles) {
+      const relName = relative(folderPath, filePath).replace(/\\/g, '/');
+      const content = readFileSync(filePath);
+      const result = await importKnowledgeBuffer(relName || basename(filePath), content);
+      imported += result.imported;
+      skipped += result.skipped;
+      for (const item of result.failed) {
+        failed.push({
+          filePath: item.filePath.includes('/') ? item.filePath : filePath,
+          error: item.error
+        });
+      }
+    }
+    return {
+      folderPath,
+      discovered: allFiles.length,
+      imported,
+      skipped,
+      failed
+    };
+  });
   ipcMain.handle('knowledge:deleteDocument', (_event, id: string) => context.personalKnowledgeBase.deleteDocument(id));
   ipcMain.handle('session-docs:list', (_event, sessionId: string) => context.sessionDocumentContextStore.list(sessionId));
   ipcMain.handle('session-docs:upload', async (_event, req: SessionDocumentUploadRequest) => {

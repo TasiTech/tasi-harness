@@ -4,6 +4,7 @@ import type {
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
+  PersonalKnowledgeFolderImportResult,
   PersonalKnowledgeUploadRequest,
   PublicAppConfig,
   ScheduledTaskCreateRequest,
@@ -59,6 +60,7 @@ const api = {
   knowledge: {
     list: () => ipcRenderer.invoke('knowledge:list'),
     addDocument: (req: PersonalKnowledgeUploadRequest) => ipcRenderer.invoke('knowledge:addDocument', req),
+    addFolder: () => ipcRenderer.invoke('knowledge:addFolder') as Promise<PersonalKnowledgeFolderImportResult>,
     deleteDocument: (id: string) => ipcRenderer.invoke('knowledge:deleteDocument', id)
   },
   sessionDocs: {

@@ -40,6 +40,7 @@ const defaultConfig: PublicAppConfig = {
   model: providerDefaultModel('openai'),
   temperature: 0.3,
   maxIterations: 8,
+  sessionDocumentMaxDocs: 10,
   workspaceDir: '',
   allowShellTools: false,
   enableNetworkTools: false,
@@ -79,6 +80,25 @@ type SettingsDraft = PublicAppConfig & {
 function prettyDate(iso?: string): string {
   if (!iso) return '';
   return new Date(iso).toLocaleString();
+}
+
+function parseIsoMs(iso?: string): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function latestRoundToolEvents(messages: AgentMessage[], events: ToolEvent[]): ToolEvent[] {
+  if (events.length === 0) return events;
+  const lastUser = [...messages].reverse().find((message) => message.role === 'user');
+  const cutoff = parseIsoMs(lastUser?.createdAt);
+  if (cutoff == null) return events;
+  const scoped = events.filter((event) => {
+    const createdMs = parseIsoMs(event.createdAt);
+    if (createdMs == null) return false;
+    return createdMs >= cutoff;
+  });
+  return scoped;
 }
 
 function safeJson(value: unknown): string {
@@ -321,6 +341,8 @@ export function App(): ReactElement {
   const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
+  const activeWechatSessionId = config.wechatChannel.sessionId?.trim() || '';
+  const isWechatSessionActive = Boolean(sessionId && activeWechatSessionId && sessionId === activeWechatSessionId);
   const tr: TranslateFn = useMemo(() => (en: string, zh: string) => (language === 'zh' ? zh : en), [language]);
 
   function formatTokensM(value?: number): string {
@@ -390,12 +412,17 @@ export function App(): ReactElement {
         setMessages(record.messages);
         setLastUsage(record.lastUsage);
         setTotalUsage(record.totalUsage);
-        setToolEvents(record.toolEvents ?? []);
+        const events = record.toolEvents ?? [];
+        if (isWechatSessionActive && payload.source === 'external') {
+          setToolEvents(latestRoundToolEvents(record.messages, events));
+        } else {
+          setToolEvents(events);
+        }
         setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
       });
     });
     return off;
-  }, [sessionId, config.defaultExecutionMode]);
+  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
 
   return (
     <div className="app-shell">
@@ -470,7 +497,9 @@ export function App(): ReactElement {
                 setMessages(record.messages);
                 setLastUsage(record.lastUsage);
                 setTotalUsage(record.totalUsage);
-                setToolEvents(record.toolEvents ?? []);
+                const isWechat = Boolean(config.wechatChannel.sessionId?.trim() && record.id === config.wechatChannel.sessionId?.trim());
+                const events = record.toolEvents ?? [];
+                setToolEvents(isWechat ? latestRoundToolEvents(record.messages, events) : events);
                 setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
                 setPage('chat');
               }
@@ -615,7 +644,10 @@ function ChatPage(props: {
     containerHeight: number;
   } | null>(null);
   const visibleMessages = useMemo(
-    () => props.messages.filter((m) => m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()))),
+    () => props.messages.filter((m) => {
+      if (m.role === 'assistant' && m.content === WECHAT_PENDING_MARKER) return false;
+      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()));
+    }),
     [props.messages]
   );
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
@@ -623,6 +655,13 @@ function ChatPage(props: {
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
+  const isWechatSession = Boolean(
+    props.sessionId
+      && props.config.wechatChannel.sessionId
+      && props.sessionId === props.config.wechatChannel.sessionId
+  );
+  const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
+  const runBusy = busy || wechatBusy;
   useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
@@ -716,13 +755,14 @@ function ChatPage(props: {
     return () => window.removeEventListener('resize', syncWithinBounds);
   }, [webPreviewExpanded]);
 
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, busy]);
+  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, runBusy]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onToolEvent((payload) => {
+      if (props.sessionId && payload.sessionId !== props.sessionId) return;
       props.setToolEvents((old) => [...old, payload.event]);
     });
     return off;
-  }, [props.setToolEvents]);
+  }, [props.sessionId, props.setToolEvents]);
   useEffect(() => {
     if (!showEmbeddedWebPreview) {
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
@@ -1112,14 +1152,15 @@ function ChatPage(props: {
   }
 
   async function stopCurrentSession(): Promise<void> {
-    if (!busy || stopping) return;
+    if ((!busy && !wechatBusy) || stopping) return;
     setStopping(true);
     setError('');
     try {
       await window.tasiHarness.agent.stop();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      setStopping(false);
+    } finally {
+      if (!busy) setStopping(false);
     }
   }
 
@@ -1257,7 +1298,7 @@ function ChatPage(props: {
   }
 
   function openSessionDocumentPicker(): void {
-    if (busy || sessionDocBusy) return;
+    if (runBusy || sessionDocBusy) return;
     if (!uploadSessionDocInputRef.current) return;
     uploadSessionDocInputRef.current.value = '';
     uploadSessionDocInputRef.current.click();
@@ -1315,7 +1356,7 @@ function ChatPage(props: {
             <input
               type="checkbox"
               checked={personalKnowledgeEnabled}
-              disabled={busy || props.personalKnowledgeDocCount === 0}
+              disabled={runBusy || props.personalKnowledgeDocCount === 0}
               onChange={(event) => setUsePersonalKnowledgeBase(event.target.checked)}
             />
             <span>{props.tr('Personal KB', '个人知识库')}</span>
@@ -1357,8 +1398,8 @@ function ChatPage(props: {
             </div>
           )}
           {visibleMessages.map((m, idx) => <MessageBubble key={`${m.id ?? idx}-${idx}`} message={m} tr={props.tr} />)}
-          {busy && <div className="typing-indicator"><span /> <span /> <span /></div>}
-          {followUpQuestions.length > 0 && !busy && (
+          {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
+          {followUpQuestions.length > 0 && !runBusy && (
             <div className="follow-up-panel">
               <div className="follow-up-label">{props.tr('Suggested next questions', '建议继续追问')}</div>
               <div className="follow-up-list">
@@ -1510,7 +1551,7 @@ function ChatPage(props: {
             className="chat-textarea"
           placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
             value={input}
-            disabled={busy || !connected}
+            disabled={runBusy || !connected}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -1522,7 +1563,7 @@ function ChatPage(props: {
             <button
               className="chat-attach-button"
               onClick={openSessionDocumentPicker}
-              disabled={busy || sessionDocBusy || !connected}
+              disabled={runBusy || sessionDocBusy || !connected}
               title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
               aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
             >
@@ -1540,18 +1581,18 @@ function ChatPage(props: {
           </div>
         </div>
         <button
-          className={`send-btn${busy ? ' stop' : ''}`}
-          disabled={busy ? stopping : !input.trim() || !connected}
-          title={busy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
+          className={`send-btn${runBusy ? ' stop' : ''}`}
+          disabled={runBusy ? stopping : !input.trim() || !connected}
+          title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
           onClick={() => {
-            if (busy) {
+            if (runBusy) {
               void stopCurrentSession();
               return;
             }
             void send();
           }}
         >
-          {busy ? (stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
+          {runBusy ? (stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
         </button>
       </div>
     </section>
@@ -1560,10 +1601,21 @@ function ChatPage(props: {
 
 function renderMarkdownContent(content: string, keyPrefix: string): ReactElement {
   const normalized = normalizeMarkdownForRender(content);
+  const handleLinkClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+    const target = event.target as Element | null;
+    const anchor = target?.closest('a[href]') as HTMLAnchorElement | null;
+    if (!anchor) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const href = anchor.getAttribute('href')?.trim() ?? '';
+    if (!/^https?:\/\//i.test(href)) return;
+    void window.tasiHarness.app.openExternalUrl(href);
+  };
   return (
     <div
       key={`${keyPrefix}-md`}
       className="msg-markdown"
+      onClick={handleLinkClick}
       dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(normalized) }}
     />
   );

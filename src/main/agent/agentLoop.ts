@@ -60,6 +60,7 @@ export class AgentLoop {
         userInput: options.userInput,
         usePersonalKnowledgeBase: options.usePersonalKnowledgeBase
       });
+      this.deps.sessions.setSystemPrompt(session.id, prompt);
       const messages: AgentMessage[] = [{ role: 'system', content: prompt }, ...history];
       const client = this.deps.createClient();
       const tools = this.deps.toolRegistry.definitions(cfg.enabledToolNames);

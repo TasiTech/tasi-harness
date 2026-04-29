@@ -7,6 +7,7 @@ import type {
   MemoryQueryOptions,
   MemoryState,
   PersonalKnowledgeDocument,
+  PersonalKnowledgeFolderImportResult,
   PersonalKnowledgeState,
   PersonalKnowledgeUploadRequest,
   MarketplaceBrowseResult,
@@ -65,6 +66,7 @@ declare global {
       knowledge: {
         list(): Promise<PersonalKnowledgeState>;
         addDocument(req: PersonalKnowledgeUploadRequest): Promise<PersonalKnowledgeDocument>;
+        addFolder(): Promise<PersonalKnowledgeFolderImportResult>;
         deleteDocument(id: string): Promise<boolean>;
       };
       sessionDocs: {

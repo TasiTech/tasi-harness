@@ -128,18 +128,27 @@ export class SessionDocumentContextStore {
     const docs = this.list(cleanSessionId);
     if (docs.length === 0) return '(no session document)';
 
-    const maxDocs = Math.max(1, options.maxDocs ?? 2);
+    const maxDocs = Math.max(1, options.maxDocs ?? 10);
     const maxChars = Math.max(1200, options.maxChars ?? 14_000);
     const lines: string[] = [
       '## Session Document XML Context',
       'The user uploaded these XML documents for this session. Use them as primary context when relevant.'
     ];
+    if (docs.length > maxDocs) {
+      lines.push(
+        `Note: ${docs.length} documents are attached; only the latest ${maxDocs} are included below due to context limits. Configure this in Settings > Execution > Session docs max.`
+      );
+    }
     let usedChars = 0;
     let renderedCount = 0;
-    for (const doc of docs.slice(0, maxDocs)) {
+    const selected = docs.slice(0, maxDocs);
+    for (const doc of selected) {
       if (!existsSync(doc.xmlPath)) continue;
       const raw = readFileSync(doc.xmlPath, 'utf8');
-      const budget = Math.max(1200, maxChars - usedChars);
+      const remainingDocs = Math.max(1, selected.length - renderedCount);
+      const remainingBudget = Math.max(1200, maxChars - usedChars);
+      // Keep a fair share for later documents so one large file does not consume all context.
+      const budget = Math.max(1200, Math.floor(remainingBudget / remainingDocs));
       const trimmed = raw.length > budget ? `${raw.slice(0, budget)}\n<!-- truncated -->\n` : raw;
       if (usedChars + trimmed.length > maxChars && renderedCount > 0) break;
       lines.push('', `### ${doc.filename} (comments: ${doc.commentCount})`, '```xml', trimmed.trimEnd(), '```');

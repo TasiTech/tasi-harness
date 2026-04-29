@@ -473,12 +473,12 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'browser_extract',
-        description: 'Extract readable text, HTML, or structured JSON from the current page in the browser automation session.',
+        description: 'Extract structured JSON from the current page in the browser automation session. Falls back to HTML when JSON is invalid.',
         parameters: {
           type: 'object',
           properties: {
             selector: { type: 'string', description: 'Optional CSS selector to scope extraction.' },
-            format: { type: 'string', enum: ['text', 'html', 'json'] },
+            format: { type: 'string', enum: ['html', 'json'] },
             max_chars: { type: 'number', description: 'Maximum characters to return.' }
           }
         }
@@ -488,13 +488,26 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const access = requireBrowserAutomation();
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
-      const formatRaw = stringArg(obj, 'format', 'text').toLowerCase();
-      const format = formatRaw === 'html' ? 'html' : formatRaw === 'json' ? 'json' : 'text';
-      const extracted = await access.browser.extract({
-        selector: stringArg(obj, 'selector', '').trim() || undefined,
+      const selector = stringArg(obj, 'selector', '').trim() || undefined;
+      const maxChars = numberArg(obj, 'max_chars', 8000);
+      const formatRaw = stringArg(obj, 'format', 'json').toLowerCase();
+      const format = formatRaw === 'html' ? 'html' : 'json';
+      let extracted = await access.browser.extract({
+        selector,
         format,
-        maxChars: numberArg(obj, 'max_chars', 8000)
+        maxChars
       });
+      if (format === 'json') {
+        try {
+          JSON.parse(extracted.content);
+        } catch {
+          extracted = await access.browser.extract({
+            selector,
+            format: 'html',
+            maxChars
+          });
+        }
+      }
       return { ok: true, content: renderBrowserExtractResult(extracted), data: extracted };
     }
   };

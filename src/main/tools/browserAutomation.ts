@@ -5,7 +5,7 @@ export interface BrowserPageState {
 
 export interface BrowserExtractResult extends BrowserPageState {
   content: string;
-  format: 'text' | 'html' | 'json';
+  format: 'html' | 'json';
   selector?: string;
 }
 
@@ -15,7 +15,7 @@ export interface BrowserAutomation {
   type(selector: string, text: string, options?: { clear?: boolean; submit?: boolean }): Promise<BrowserPageState>;
   scroll(options?: { direction?: 'up' | 'down' | 'top' | 'bottom'; amount?: number }): Promise<BrowserPageState>;
   wait(options?: { ms?: number; selector?: string; timeoutMs?: number }): Promise<BrowserPageState>;
-  extract(options?: { selector?: string; format?: 'text' | 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult>;
+  extract(options?: { selector?: string; format?: 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult>;
   state(): Promise<BrowserPageState>;
   close(): Promise<void>;
 }

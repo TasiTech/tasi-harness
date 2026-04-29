@@ -104,6 +104,7 @@ export interface AppConfig {
   model: string;
   temperature: number;
   maxIterations: number;
+  sessionDocumentMaxDocs: number;
   workspaceDir: string;
   allowShellTools: boolean;
   enableNetworkTools: boolean;
@@ -217,6 +218,7 @@ export interface SessionSummary {
 }
 
 export interface SessionRecord extends SessionSummary {
+  systemPrompt?: string;
   messages: AgentMessage[];
   toolEvents: ToolEvent[];
   lastExecution?: AgentExecutionDetails;
@@ -439,6 +441,19 @@ export interface SkillArchiveUploadRequest {
 export interface PersonalKnowledgeUploadRequest {
   filename: string;
   contentBase64: string;
+}
+
+export interface PersonalKnowledgeFolderImportFailure {
+  filePath: string;
+  error: string;
+}
+
+export interface PersonalKnowledgeFolderImportResult {
+  folderPath: string;
+  discovered: number;
+  imported: number;
+  skipped: number;
+  failed: PersonalKnowledgeFolderImportFailure[];
 }
 
 export interface SessionDocumentUploadRequest {

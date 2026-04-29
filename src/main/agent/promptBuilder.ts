@@ -22,8 +22,8 @@ export class PromptBuilder {
         ? await this.personalKnowledgeBase.renderPromptBlock(context.userInput, { limit: 5 })
         : '';
     const sessionDocumentBlock = this.sessionDocumentContextStore?.renderPromptBlock(context?.sessionId, {
-      maxDocs: 2,
-      maxChars: 12_000
+      maxDocs: config.sessionDocumentMaxDocs,
+      maxChars: 40_000
     }) ?? '';
     return [
       config.systemPersona,

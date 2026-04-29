@@ -37,6 +37,7 @@ export class SessionStore {
     const record = JSON.parse(readFileSync(file, 'utf8')) as SessionRecord;
     record.messageCount = record.messages.length;
     record.toolEvents = record.toolEvents ?? [];
+    record.systemPrompt = typeof record.systemPrompt === 'string' ? record.systemPrompt : undefined;
     record.lastExecution = record.lastExecution ?? { mode: 'workspace', workspaceDir: '' };
     record.lastUsage = record.lastUsage ?? undefined;
     record.totalUsage = record.totalUsage ?? undefined;
@@ -66,6 +67,17 @@ export class SessionStore {
       next.title = firstUser.slice(0, 64);
     }
     next.messageCount = next.messages.length;
+    this.write(next);
+    return next;
+  }
+
+  setSystemPrompt(id: string, systemPrompt: string): SessionRecord {
+    const record = this.read(id) ?? this.create();
+    const next: SessionRecord = {
+      ...record,
+      systemPrompt,
+      updatedAt: nowIso()
+    };
     this.write(next);
     return next;
   }

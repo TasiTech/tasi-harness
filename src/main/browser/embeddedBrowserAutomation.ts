@@ -261,9 +261,9 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return this.state();
   }
 
-  async extract(options?: { selector?: string; format?: 'text' | 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult> {
+  async extract(options?: { selector?: string; format?: 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult> {
     const selector = options?.selector?.trim() || undefined;
-    const format = options?.format === 'html' ? 'html' : options?.format === 'json' ? 'json' : 'text';
+    const format = options?.format === 'html' ? 'html' : 'json';
     const maxChars = clampInt(Number(options?.maxChars), DEFAULT_EXTRACT_MAX_CHARS, 200, 100000);
     const extracted = await this.evalInPage<{
       ok: boolean;
@@ -288,7 +288,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
         let content = "";
         if (format === "html") {
           content = target.outerHTML || "";
-        } else if (format === "json") {
+        } else {
           const headingSeen = new Set();
           const headings = [];
           for (const node of Array.from(target.querySelectorAll("h1,h2,h3,h4,h5,h6"))) {
@@ -324,9 +324,6 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
               links
             }
           };
-        } else {
-          const text = target.innerText || target.textContent || "";
-          content = normalizeText(text);
         }
         return { ok: true, content };
       })();`

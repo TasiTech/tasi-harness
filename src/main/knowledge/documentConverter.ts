@@ -1,4 +1,5 @@
-import { basename, extname, posix } from 'node:path';
+import { basename, dirname, extname, join, posix } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import JSZip from 'jszip';
 
 export interface ConvertedDocumentAsset {
@@ -360,6 +361,172 @@ function convertTextLikeDocument(title: string, ext: string, buffer: Buffer): Co
   return { title, markdown: finalizeMarkdown([`# ${title}`, '', text.trim()]), assets: [] };
 }
 
+function decodePdfLiteralString(raw: string): string {
+  let out = '';
+  for (let i = 0; i < raw.length; i += 1) {
+    const char = raw[i];
+    if (char !== '\\') {
+      out += char;
+      continue;
+    }
+    const next = raw[i + 1];
+    if (next == null) break;
+    i += 1;
+    if (next === 'n') out += '\n';
+    else if (next === 'r') out += '\r';
+    else if (next === 't') out += '\t';
+    else if (next === 'b') out += '\b';
+    else if (next === 'f') out += '\f';
+    else if (next === '(') out += '(';
+    else if (next === ')') out += ')';
+    else if (next === '\\') out += '\\';
+    else if (next === '\n' || next === '\r') {
+      if (next === '\r' && raw[i + 1] === '\n') i += 1;
+    } else if (/[0-7]/.test(next)) {
+      let octal = next;
+      for (let offset = 1; offset <= 2; offset += 1) {
+        const digit = raw[i + offset];
+        if (!digit || !/[0-7]/.test(digit)) break;
+        octal += digit;
+      }
+      i += octal.length - 1;
+      out += String.fromCharCode(Number.parseInt(octal, 8));
+    } else {
+      out += next;
+    }
+  }
+  return out;
+}
+
+function decodePdfHexString(raw: string): string {
+  const compact = raw.replace(/[^0-9a-fA-F]/g, '');
+  if (compact.length === 0) return '';
+  const normalized = compact.length % 2 === 0 ? compact : `${compact}0`;
+  const bytes: number[] = [];
+  for (let index = 0; index < normalized.length; index += 2) {
+    bytes.push(Number.parseInt(normalized.slice(index, index + 2), 16));
+  }
+  return Buffer.from(bytes).toString('latin1');
+}
+
+function normalizePdfExtractedText(input: string): string {
+  return input
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractPdfTextCandidates(rawPdf: string): string[] {
+  const found: string[] = [];
+  for (const match of rawPdf.matchAll(/\(((?:\\.|[^\\)])*)\)\s*(?:Tj|')/g)) {
+    const decoded = normalizePdfExtractedText(decodePdfLiteralString(match[1] ?? ''));
+    if (decoded) found.push(decoded);
+  }
+  for (const match of rawPdf.matchAll(/<([0-9a-fA-F\s]+)>\s*Tj/g)) {
+    const decoded = normalizePdfExtractedText(decodePdfHexString(match[1] ?? ''));
+    if (decoded) found.push(decoded);
+  }
+  for (const match of rawPdf.matchAll(/\[(.*?)\]\s*TJ/gs)) {
+    const body = match[1] ?? '';
+    for (const textChunk of body.matchAll(/\(((?:\\.|[^\\)])*)\)|<([0-9a-fA-F\s]+)>/g)) {
+      const rawLiteral = textChunk[1];
+      const rawHex = textChunk[2];
+      const decoded = rawLiteral != null
+        ? normalizePdfExtractedText(decodePdfLiteralString(rawLiteral))
+        : normalizePdfExtractedText(decodePdfHexString(rawHex ?? ''));
+      if (decoded) found.push(decoded);
+    }
+  }
+  const unique = new Set<string>();
+  const ordered: string[] = [];
+  for (const item of found) {
+    if (unique.has(item)) continue;
+    unique.add(item);
+    ordered.push(item);
+    if (ordered.length >= 600) break;
+  }
+  return ordered;
+}
+
+function ensureDomMatrixPolyfill(): void {
+  const globalRef = globalThis as Record<string, unknown>;
+  if (typeof globalRef.DOMMatrix === 'function') return;
+  class MinimalDOMMatrix {
+    a = 1;
+    b = 0;
+    c = 0;
+    d = 1;
+    e = 0;
+    f = 0;
+
+    multiply(_other?: unknown): MinimalDOMMatrix {
+      return this;
+    }
+  }
+  globalRef.DOMMatrix = MinimalDOMMatrix;
+}
+
+async function convertPdfWithPdfJs(title: string, buffer: Buffer): Promise<ConvertedDocument | null> {
+  try {
+    ensureDomMatrixPolyfill();
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const standardFontsPath = join(dirname(fileURLToPath(import.meta.url)), '../../../node_modules/pdfjs-dist/standard_fonts');
+    const standardFontDataUrl = `${pathToFileURL(standardFontsPath).href.replace(/\/?$/, '/')}`;
+    const loadingTask = pdfjs.getDocument({
+      data: new Uint8Array(buffer),
+      disableWorker: true,
+      isEvalSupported: false,
+      standardFontDataUrl
+    } as Record<string, unknown>);
+    const pdf = await loadingTask.promise;
+    const pageCount = Number(pdf.numPages) || 0;
+    const lines: string[] = [`# ${title}`, ''];
+    let extractedAny = false;
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const textContent = await page.getTextContent({ disableCombineTextItems: false } as Record<string, unknown>);
+      const items = (Array.isArray(textContent?.items) ? textContent.items : []) as Array<{ str?: string; hasEOL?: boolean }>;
+      const segments: string[] = [];
+      let current = '';
+      for (const item of items) {
+        const text = String(item.str ?? '').trim();
+        if (!text) continue;
+        current += current ? ` ${text}` : text;
+        if (item.hasEOL) {
+          if (current.trim()) segments.push(current.trim());
+          current = '';
+        }
+      }
+      if (current.trim()) segments.push(current.trim());
+      const content = segments.join('\n').trim();
+      if (!content) continue;
+      extractedAny = true;
+      lines.push(`## Page ${pageNumber}`, '', content, '');
+    }
+    await pdf.cleanup();
+    await pdf.destroy();
+    if (!extractedAny) return null;
+    return { title, markdown: finalizeMarkdown(lines), assets: [] };
+  } catch {
+    return null;
+  }
+}
+
+async function convertPdf(title: string, buffer: Buffer): Promise<ConvertedDocument> {
+  const viaPdfJs = await convertPdfWithPdfJs(title, buffer);
+  if (viaPdfJs) return viaPdfJs;
+  const rawPdf = buffer.toString('latin1');
+  const extractedLines = extractPdfTextCandidates(rawPdf);
+  const fallbackText = extractedLines.length > 0
+    ? extractedLines.join('\n')
+    : '(No extractable PDF text found. The file may be scanned or encoded in an unsupported way.)';
+  return {
+    title,
+    markdown: finalizeMarkdown([`# ${title}`, '', fallbackText]),
+    assets: []
+  };
+}
+
 export async function convertDocumentToMarkdown(filename: string, buffer: Buffer): Promise<ConvertedDocument> {
   const ext = extname(filename).toLowerCase();
   const title = basename(filename, ext) || 'document';
@@ -371,9 +538,10 @@ export async function convertDocumentToMarkdown(filename: string, buffer: Buffer
   if (ext === '.docx') return convertDocx(title, buffer);
   if (ext === '.xlsx') return convertXlsx(title, buffer);
   if (ext === '.pptx') return convertPptx(title, buffer);
+  if (ext === '.pdf') return convertPdf(title, buffer);
   if (['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv'].includes(ext)) {
     return convertTextLikeDocument(title, ext, buffer);
   }
 
-  throw new Error(`Unsupported document type: ${ext || '(no extension)'}. Supported types: .md, .txt, .json, .csv, .docx, .xlsx, .pptx`);
+  throw new Error(`Unsupported document type: ${ext || '(no extension)'}. Supported types: .md, .txt, .json, .csv, .docx, .xlsx, .pptx, .pdf`);
 }
