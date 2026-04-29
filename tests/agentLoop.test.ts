@@ -66,5 +66,7 @@ describe('AgentLoop', () => {
     const storedMemory = memory.getState({ target: 'memory', sessionId: result.sessionId, includeGlobal: false }).entries;
     expect(storedMemory).toHaveLength(1);
     expect(storedMemory[0]?.content).toContain('write a file');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.systemPrompt).toContain(cfg.systemPersona);
   });
 });

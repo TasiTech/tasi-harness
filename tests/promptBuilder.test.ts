@@ -79,4 +79,66 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('source.xml');
     expect(prompt).toContain('<session_document');
   });
+
+  it('includes up to ten uploaded session documents in the system prompt', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const sessionDocs = new SessionDocumentContextStore(env.home);
+    const sessionId = 'session_ten_docs';
+    for (const name of ['a.xml', 'b.xml', 'c.xml', 'd.xml', 'e.xml', 'f.xml', 'g.xml', 'h.xml', 'i.xml', 'j.xml']) {
+      await sessionDocs.addDocument({
+        sessionId,
+        filename: name,
+        contentBase64: Buffer.from(`<root><file>${name}</file></root>`, 'utf8').toString('base64')
+      });
+    }
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home),
+      undefined,
+      sessionDocs
+    );
+
+    const prompt = await builder.build(defaultConfig(), { sessionId, userInput: 'summarize uploaded files' });
+
+    expect(prompt).toContain('a.xml');
+    expect(prompt).toContain('b.xml');
+    expect(prompt).toContain('c.xml');
+    expect(prompt).toContain('d.xml');
+    expect(prompt).toContain('e.xml');
+    expect(prompt).toContain('f.xml');
+    expect(prompt).toContain('g.xml');
+    expect(prompt).toContain('h.xml');
+    expect(prompt).toContain('i.xml');
+    expect(prompt).toContain('j.xml');
+  });
+
+  it('respects configured session docs max from execution settings', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const sessionDocs = new SessionDocumentContextStore(env.home);
+    const sessionId = 'session_configured_limit';
+    for (const name of ['a.xml', 'b.xml', 'c.xml']) {
+      await sessionDocs.addDocument({
+        sessionId,
+        filename: name,
+        contentBase64: Buffer.from(`<root><file>${name}</file></root>`, 'utf8').toString('base64')
+      });
+    }
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home),
+      undefined,
+      sessionDocs
+    );
+
+    const prompt = await builder.build({ ...defaultConfig(), sessionDocumentMaxDocs: 2 }, { sessionId, userInput: 'summarize uploaded files' });
+
+    expect(prompt).toContain('c.xml');
+    expect(prompt).toContain('b.xml');
+    expect(prompt).not.toContain('a.xml');
+    expect(prompt).toContain('Settings > Execution > Session docs max');
+  });
 });

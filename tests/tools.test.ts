@@ -16,6 +16,8 @@ afterEach(() => cleanup());
 describe('builtin tools', () => {
   it('includes external browser defaults for controlled system-browser mode', () => {
     const cfg = defaultConfig();
+    expect(cfg.browserMode).toBe('external');
+    expect(cfg.sessionDocumentMaxDocs).toBe(10);
     expect(cfg.externalBrowserEngine).toBe('auto');
     expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     expect(cfg.externalBrowserProfileMode).toBe('isolated');
@@ -135,7 +137,25 @@ describe('builtin tools', () => {
         return { url: 'https://example.com', title: 'Example' };
       },
       async extract() {
-        return { url: 'https://example.com', title: 'Example', content: 'Hello world', format: 'text' as const };
+        return {
+          url: 'https://example.com',
+          title: 'Example',
+          content: JSON.stringify(
+            {
+              tool: 'browser_extract',
+              format: 'json',
+              browser_preview_url: 'https://example.com',
+              url: 'https://example.com',
+              title: 'Example',
+              text: 'Hello world',
+              headings: [],
+              links: []
+            },
+            null,
+            2
+          ),
+          format: 'json' as const
+        };
       },
       async state() {
         return { url: 'https://example.com', title: 'Example' };
@@ -162,31 +182,24 @@ describe('builtin tools', () => {
 
     const extract = await registry.execute(
       'browser_extract',
-      { format: 'text', max_chars: 2000 },
+      { max_chars: 2000 },
       { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
     );
     expect(extract.ok).toBe(true);
-    expect(extract.content).toContain('browser_extract format=text');
-    expect(extract.content).toContain('Hello world');
+    expect(JSON.parse(extract.content)).toMatchObject({
+      format: 'json',
+      text: 'Hello world',
+      url: 'https://example.com'
+    });
 
     mockBrowser.extract = async (options) => ({
       url: 'https://example.com',
       title: 'Example',
-      content: JSON.stringify(
-        {
-          tool: 'browser_extract',
-          format: 'json',
-          browser_preview_url: 'https://example.com',
-          url: 'https://example.com',
-          title: 'Example',
-          text: 'Hello world',
-          headings: [],
-          links: []
-        },
-        null,
-        2
-      ),
-      format: options?.format === 'json' ? ('json' as const) : ('text' as const)
+      content:
+        options?.format === 'json'
+          ? '{not-json'
+          : '<html><body><main id="content">fallback html</main></body></html>',
+      format: options?.format === 'html' ? ('html' as const) : ('json' as const)
     });
 
     const extractJson = await registry.execute(
@@ -195,10 +208,7 @@ describe('builtin tools', () => {
       { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
     );
     expect(extractJson.ok).toBe(true);
-    expect(JSON.parse(extractJson.content)).toMatchObject({
-      format: 'json',
-      text: 'Hello world',
-      url: 'https://example.com'
-    });
+    expect(extractJson.content).toContain('browser_extract format=html');
+    expect(extractJson.content).toContain('fallback html');
   });
 });

@@ -149,4 +149,23 @@ describe('SessionDocumentContextStore', () => {
     expect(promptBlock).toContain('report.pdf');
     expect(promptBlock).toContain('Hello PDF world');
   });
+
+  it('limits prompt injection to ten documents and adds an overflow notice', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new SessionDocumentContextStore(env.home);
+    const sessionId = 'session_overflow';
+    for (let i = 1; i <= 11; i += 1) {
+      await store.addDocument({
+        sessionId,
+        filename: `doc-${i}.xml`,
+        contentBase64: Buffer.from(`<root><id>${i}</id></root>`, 'utf8').toString('base64')
+      });
+    }
+
+    const promptBlock = store.renderPromptBlock(sessionId);
+    expect(promptBlock).toContain('only the latest 10 are included');
+    expect(promptBlock).toContain('doc-11.xml');
+    expect(promptBlock).not.toContain('doc-1.xml');
+  });
 });
