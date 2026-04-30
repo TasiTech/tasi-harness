@@ -134,7 +134,7 @@ export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifi
 
 export type MemoryTarget = 'memory' | 'user';
 export type MemoryScope = 'global' | 'session';
-export type MemoryDomain = 'finance' | 'daily_life' | 'work' | 'reading' | 'education' | 'health' | 'other';
+export type MemoryDomain = 'finance' | 'daily_life' | 'work' | 'reading' | 'education' | 'health' | 'travel' | 'other';
 
 export interface MemoryMutationOptions {
   scope?: MemoryScope;

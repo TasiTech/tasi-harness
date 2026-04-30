@@ -41,6 +41,8 @@ export class PromptBuilder {
       '- Reading skill_view only loads instructions; it does not count as completing the skill, gathering evidence, or satisfying provider/tool steps.',
       '- The content returned by skill_view is workflow guidance, not evidence. Do not paraphrase it as if it were tool-backed findings about the user request.',
       '- After calling skill_view for a relevant skill, do not skip straight to a general-knowledge answer if the skill requires evidence gathering, tool use, verification, or explicit degradation handling.',
+      '- If SKILL.md lists references/*.md files, load the references relevant to the planned provider/tool path via skill_view(name + ref_path) before issuing provider-specific or browser/tool calls.',
+      '- Prioritize reading the most relevant provider reference first (for example, browser flows should read the browser/provider reference first), then issue tool calls according to that reference.',
       '- If the only tool you have called for a skill-driven request is skill_view, you are usually not ready to give a final answer yet.',
       '- If a skill requires live data, provider lookup, or page inspection, prefer an assistant turn with tool calls immediately after reading the skill rather than a narrative response.',
       '- After reading a relevant skill, the next substantive action must be one of: required tool calls, a concise follow-up for missing critical inputs, or an explicit blocked/degraded explanation. Do not output a polished final answer before completing one of those paths.',

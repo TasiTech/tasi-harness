@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
 import type {
   AgentMessage,
   AppInfo,
@@ -1732,6 +1732,7 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
   { value: 'finance', labelEn: 'Finance', labelZh: '财经' },
   { value: 'daily_life', labelEn: 'Daily Life', labelZh: '日常' },
   { value: 'work', labelEn: 'Work', labelZh: '工作' },
+  { value: 'travel', labelEn: 'Travel', labelZh: '旅行' },
   { value: 'reading', labelEn: 'Reading', labelZh: '阅读' },
   { value: 'education', labelEn: 'Education', labelZh: '教育' },
   { value: 'health', labelEn: 'Health', labelZh: '健康' },

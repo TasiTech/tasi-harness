@@ -102,7 +102,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             session_id: { type: 'string', description: 'Optional session id for session-scoped memory.' },
             domain: {
               type: 'string',
-              enum: ['finance', 'daily_life', 'work', 'reading', 'education', 'health', 'other'],
+              enum: ['finance', 'daily_life', 'work', 'reading', 'education', 'health', 'travel', 'other'],
               description: 'Knowledge domain for retrieval.'
             },
             content: { type: 'string', description: 'New content for add.' },

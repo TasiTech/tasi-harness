@@ -30,13 +30,38 @@ const LEGACY_SEPARATOR = /\n(?:\u6402|---)\n/gm;
 const AUTO_SESSION_ENTRY_PREFIX = 'memory_auto_session_';
 
 const DOMAIN_ALIASES: Record<MemoryDomain, string[]> = {
-  finance: ['finance', 'financial', 'stock', 'invest', 'trading', 'economy', 'market'],
-  daily_life: ['daily', 'life', 'lifestyle', 'home', 'routine', 'habit'],
-  work: ['work', 'career', 'project', 'meeting', 'business', 'office'],
-  reading: ['reading', 'book', 'article', 'paper', 'literature', 'read'],
-  education: ['education', 'study', 'learning', 'school', 'course', 'training'],
-  health: ['health', 'medical', 'wellness', 'fitness', 'doctor', 'medicine'],
-  other: ['other', 'misc', 'miscellaneous', 'default', 'general']
+  finance: [
+    'finance', 'financial', 'stock', 'invest', 'trading', 'economy', 'market',
+    '\u8d22\u7ecf', '\u91d1\u878d', '\u80a1\u7968', '\u57fa\u91d1', '\u6295\u8d44', '\u7406\u8d22', '\u4ea4\u6613', '\u7ecf\u6d4e', '\u884c\u60c5', '\u8d44\u4ea7'
+  ],
+  daily_life: [
+    'daily', 'life', 'lifestyle', 'home', 'routine', 'habit',
+    '\u65e5\u5e38', '\u751f\u6d3b', '\u5c45\u5bb6', '\u5bb6\u52a1', '\u4e60\u60ef', '\u4f5c\u606f', '\u5b89\u6392'
+  ],
+  work: [
+    'work', 'career', 'project', 'meeting', 'business', 'office',
+    '\u5de5\u4f5c', '\u804c\u4e1a', '\u9879\u76ee', '\u4f1a\u8bae', '\u4e1a\u52a1', '\u529e\u516c', '\u9700\u6c42', '\u6392\u671f', '\u6c47\u62a5', '\u5ba2\u6237'
+  ],
+  travel: [
+    'travel', 'trip', 'itinerary', 'flight', 'hotel', 'train', 'vacation', 'tour', 'sightseeing',
+    '\u65c5\u884c', '\u65c5\u6e38', '\u884c\u7a0b', '\u673a\u7968', '\u9152\u5e97', '\u706b\u8f66', '\u9ad8\u94c1', '\u666f\u70b9', '\u653b\u7565',
+    '\u51fa\u884c', '\u5ea6\u5047', '\u822a\u73ed', '\u8f66\u7968', '\u4f4f\u5bbf', '\u95e8\u7968', '\u76ee\u7684\u5730', '\u6e38\u73a9',
+    '\u81ea\u9a7e', '\u5468\u8fb9\u6e38', '\u643a\u7a0b', '\u540c\u7a0b', '\u98de\u732a', '\u53bb\u54ea\u513f',
+    'ctrip', 'trip.com'
+  ],
+  reading: [
+    'reading', 'book', 'article', 'paper', 'literature', 'read',
+    '\u9605\u8bfb', '\u8bfb\u4e66', '\u4e66\u7c4d', '\u6587\u7ae0', '\u8bba\u6587', '\u6587\u732e'
+  ],
+  education: [
+    'education', 'study', 'learning', 'school', 'course', 'training',
+    '\u6559\u80b2', '\u5b66\u4e60', '\u8bfe\u7a0b', '\u5b66\u6821', '\u57f9\u8bad', '\u8003\u8bd5', '\u590d\u4e60'
+  ],
+  health: [
+    'health', 'medical', 'wellness', 'fitness', 'doctor', 'medicine',
+    '\u5065\u5eb7', '\u533b\u7597', '\u5065\u8eab', '\u8fd0\u52a8', '\u533b\u751f', '\u836f', '\u7528\u836f', '\u4f53\u68c0', '\u996e\u98df'
+  ],
+  other: ['other', 'misc', 'miscellaneous', 'default', 'general', '\u5176\u4ed6', '\u901a\u7528', '\u6742\u9879']
 };
 
 type PendingMutation =
@@ -61,11 +86,40 @@ function normalizeLineBreaks(input: string): string {
   return input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function aliasHitCount(text: string, alias: string): number {
+  const source = text.trim().toLowerCase();
+  const needle = alias.trim().toLowerCase();
+  if (!source || !needle) return 0;
+
+  const latinAlias = /^[a-z0-9._/-]+$/.test(needle);
+  if (!latinAlias) {
+    let idx = source.indexOf(needle);
+    let count = 0;
+    while (idx >= 0) {
+      count += 1;
+      idx = source.indexOf(needle, idx + needle.length);
+    }
+    return count;
+  }
+
+  const pattern = new RegExp(`(^|[^a-z0-9])${escapeRegExp(needle)}(?=$|[^a-z0-9])`, 'g');
+  let count = 0;
+  while (pattern.exec(source)) count += 1;
+  if (count > 0) return count;
+
+  return source.includes(needle) ? 1 : 0;
+}
+
 function normalizeDomainValue(input?: string): MemoryDomain {
   const raw = (input || '').trim().toLowerCase();
   if (!raw || raw === 'general') return DEFAULT_DOMAIN;
   for (const [domain, aliases] of Object.entries(DOMAIN_ALIASES) as Array<[MemoryDomain, string[]]>) {
-    if (domain === raw || aliases.some((alias) => raw.includes(alias))) return domain;
+    if (domain === raw) return domain;
+    if (aliases.some((alias) => aliasHitCount(raw, alias) > 0)) return domain;
   }
   return DEFAULT_DOMAIN;
 }
@@ -216,11 +270,16 @@ export class MemoryStore {
   inferDomains(intent: string): MemoryDomain[] {
     const normalized = normalizeLineBreaks(intent).trim().toLowerCase();
     if (!normalized) return [DEFAULT_DOMAIN];
-    const matched: MemoryDomain[] = [];
-    for (const [domain, aliases] of Object.entries(DOMAIN_ALIASES) as Array<[MemoryDomain, string[]]>) {
-      if (aliases.some((alias) => normalized.includes(alias))) matched.push(domain);
-    }
-    return matched.length > 0 ? [...new Set(matched)] : [DEFAULT_DOMAIN];
+    const scored = (Object.entries(DOMAIN_ALIASES) as Array<[MemoryDomain, string[]]>)
+      .map(([domain, aliases], index) => ({
+        domain,
+        index,
+        score: aliases.reduce((count, alias) => count + aliasHitCount(normalized, alias), 0)
+      }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.index - b.index)
+      .map((item) => item.domain);
+    return scored.length > 0 ? scored : [DEFAULT_DOMAIN];
   }
 
   renderPromptBlock(query: MemoryQueryOptions = {}): string {
@@ -298,7 +357,12 @@ export class MemoryStore {
     const clean = this.cleanContent(content);
     const resolvedScope = this.resolveScope(target, options);
     const resolvedSessionId = this.resolveSessionId(resolvedScope, options.sessionId);
-    const domain = normalizeDomainValue(options.domain ?? this.inferDomains(clean)[0]);
+    const inferredDomain = this.inferDomains(clean)[0] ?? DEFAULT_DOMAIN;
+    const requestedDomain = options.domain ? normalizeDomainValue(options.domain) : undefined;
+    // If caller passes "other" but content clearly matches a concrete domain, prefer inferred classification.
+    const domain = requestedDomain
+      ? (requestedDomain === DEFAULT_DOMAIN && inferredDomain !== DEFAULT_DOMAIN ? inferredDomain : requestedDomain)
+      : inferredDomain;
     const contentItems = target === 'memory' ? this.splitContentEntries(clean) : [clean];
     const now = nowIso();
     const additions = contentItems.map((item) => ({
@@ -424,7 +488,7 @@ export class MemoryStore {
     const inferredDomains = query?.intent ? this.inferDomains(query.intent) : [];
     const intentTerms = normalizeLineBreaks(query?.intent ?? '')
       .toLowerCase()
-      .split(/[\s,.;:!?，。；：！？]+/)
+      .split(/[\s,.;:!?，。；：！、]+/)
       .filter((term) => term.length >= 2);
 
     const filtered = entries
@@ -538,25 +602,120 @@ export class MemoryStore {
   }
 
   private buildSessionSnapshot(record: SessionRecord): { content: string; domain: MemoryDomain } | null {
-    const firstUser = compactText(
-      record.messages.find((message) => message.role === 'user' && message.content.trim())?.content ?? '',
-      96
-    );
+    const userMessages = record.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => compactText(message.content, 180))
+      .filter(Boolean);
+    const assistantMessages = record.messages
+      .filter((message) => message.role === 'assistant')
+      .map((message) => message.content)
+      .filter((content) => content.trim() && !/^Reached iteration limit\b/i.test(content))
+      .map((content) => compactText(content, 220))
+      .filter(Boolean);
+
+    const firstUser = compactText(userMessages[0] ?? '', 140);
     if (!firstUser) return null;
-    const lastAssistantRaw = [...record.messages]
-      .reverse()
-      .find((message) => message.role === 'assistant' && message.content.trim())?.content ?? '';
-    const lastAssistant = /^Reached iteration limit\b/i.test(lastAssistantRaw) ? '' : compactText(lastAssistantRaw, 72);
-    const duplicate =
-      !lastAssistant ||
-      lastAssistant.toLowerCase() === firstUser.toLowerCase() ||
-      lastAssistant.toLowerCase().includes(firstUser.toLowerCase()) ||
-      firstUser.toLowerCase().includes(lastAssistant.toLowerCase());
-    const content = duplicate ? firstUser : compactText(`${firstUser} -> ${lastAssistant}`, 180);
+
+    const latestUser = compactText(userMessages[userMessages.length - 1] ?? '', 160);
+    const lastAssistant = compactText(assistantMessages[assistantMessages.length - 1] ?? '', 220);
+    const toolSignals = this.collectToolSignals(record);
+    const constraints = this.collectConstraintSignals(userMessages);
+
+    const parts: string[] = [`Goal: ${firstUser}`];
+    if (latestUser && !this.snapshotNearDuplicate(latestUser, firstUser)) {
+      parts.push(`Latest ask: ${latestUser}`);
+    }
+    if (constraints.length > 0) {
+      parts.push(`Constraints: ${constraints.join(' ; ')}`);
+    }
+    if (toolSignals.length > 0) {
+      parts.push(`Tools: ${toolSignals.join(', ')}`);
+    }
+    if (lastAssistant && !this.snapshotNearDuplicate(lastAssistant, firstUser)) {
+      parts.push(`Outcome: ${lastAssistant}`);
+    }
+
+    const content = compactText(parts.join(' | '), 720);
+    const domainSeed = [firstUser, latestUser, lastAssistant, ...toolSignals].filter(Boolean).join(' ');
     return {
       content,
-      domain: this.inferDomains(firstUser)[0] ?? DEFAULT_DOMAIN
+      domain: this.inferDomains(domainSeed || firstUser)[0] ?? DEFAULT_DOMAIN
     };
+  }
+
+  private collectConstraintSignals(userMessages: string[]): string[] {
+    const terms = [
+      'must', 'should', 'avoid', 'deadline', 'budget', 'limit',
+      '\u5fc5\u987b', '\u4e0d\u8981', '\u4f18\u5148', '\u622a\u6b62', '\u9884\u7b97', '\u9650\u5236', '\u5c3d\u5feb', '\u5148'
+    ];
+    const picked: string[] = [];
+    const seen = new Set<string>();
+
+    for (let i = userMessages.length - 1; i >= 0; i--) {
+      const message = normalizeLineBreaks(userMessages[i] ?? '');
+      const fragments = message
+        .split(/\n|[。！？!?;；]/)
+        .map((chunk) => chunk.trim())
+        .filter(Boolean);
+      for (const fragment of fragments) {
+        const lower = fragment.toLowerCase();
+        if (!terms.some((term) => lower.includes(term))) continue;
+        const signal = compactText(fragment, 96);
+        if (!signal || seen.has(signal)) continue;
+        seen.add(signal);
+        picked.push(signal);
+        if (picked.length >= 2) return picked;
+      }
+    }
+
+    return picked;
+  }
+  private snapshotNearDuplicate(left: string, right: string): boolean {
+    const a = normalizeLineBreaks(left).replace(/\s+/g, ' ').trim().toLowerCase();
+    const b = normalizeLineBreaks(right).replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!a || !b) return false;
+    return a === b || a.includes(b) || b.includes(a);
+  }
+
+  private collectToolSignals(record: SessionRecord): string[] {
+    const seen = new Set<string>();
+    const signals: string[] = [];
+
+    for (const message of record.messages) {
+      if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
+        for (const call of message.tool_calls) {
+          const name = call?.function?.name?.trim();
+          if (!name) continue;
+          const token = `call:${name}`;
+          if (seen.has(token)) continue;
+          seen.add(token);
+          signals.push(token);
+          if (signals.length >= 4) return signals;
+        }
+      }
+
+      if (message.role !== 'tool') continue;
+      const explicitName = message.name?.trim();
+      if (explicitName) {
+        const token = `tool:${explicitName}`;
+        if (!seen.has(token)) {
+          seen.add(token);
+          signals.push(token);
+          if (signals.length >= 4) return signals;
+        }
+      }
+      const contentHint = compactText(message.content, 44);
+      if (contentHint) {
+        const token = `result:${contentHint}`;
+        if (!seen.has(token)) {
+          seen.add(token);
+          signals.push(token);
+          if (signals.length >= 4) return signals;
+        }
+      }
+    }
+
+    return signals;
   }
 
   private trimAutoSessionEntries(entries: MemoryEntry[]): MemoryEntry[] {
@@ -616,7 +775,7 @@ export class MemoryStore {
   private splitContentEntries(content: string): string[] {
     const items = normalizeLineBreaks(content)
       .split('\n')
-      .flatMap((line) => line.split(/[;；]+/))
+      .flatMap((line) => line.split(/[;；、]+/))
       .map((line) => line.trim())
       .map((line) => line.replace(/^(?:[-*]|\d+[.)])\s+/, '').trim())
       .filter(Boolean);
@@ -628,3 +787,4 @@ export class MemoryStore {
     return unique;
   }
 }
+

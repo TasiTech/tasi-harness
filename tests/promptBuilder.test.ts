@@ -48,6 +48,8 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('Reading skill_view only loads instructions; it does not count as completing the skill');
     expect(prompt).toContain('The content returned by skill_view is workflow guidance, not evidence');
     expect(prompt).toContain('do not skip straight to a general-knowledge answer');
+    expect(prompt).toContain('If SKILL.md lists references/*.md files, load the references relevant to the planned provider/tool path');
+    expect(prompt).toContain('Prioritize reading the most relevant provider reference first');
     expect(prompt).toContain('If the only tool you have called for a skill-driven request is skill_view');
     expect(prompt).toContain('prefer an assistant turn with tool calls immediately after reading the skill');
     expect(prompt).toContain('the next substantive action must be one of');
