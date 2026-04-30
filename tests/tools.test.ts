@@ -89,6 +89,44 @@ describe('builtin tools', () => {
     expect(result.content).toContain('# If this skill routes the task to provider or browser tools, your next assistant turn should usually contain those tool calls instead of a polished narrative answer.');
     expect(result.content).toContain('/scripts/check_setup.sh');
     expect(result.content).not.toContain('{SKILL_DIR}');
+    expect(result.content).toContain('## Referenced markdown files');
+  });
+
+  it('loads skill reference markdown only when ref_path is provided', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const skills = new SkillManager(env.home);
+    const skill = skills.create({
+      name: 'Travel Ref Skill',
+      category: 'local',
+      content: '---\nname: travel-ref-skill\ndescription: demo\ncategory: local\n---\n\n- provider: ./references/provider-a.md\n'
+    });
+    skills.writeSupportingFile(skill.name, 'references/provider-a.md', '# Provider A\n\nUse provider A.\n');
+
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: skills
+    })) registry.register(tool);
+
+    const skillOnly = await registry.execute('skill_view', { name: 'travel-ref-skill' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' });
+    expect(skillOnly.ok).toBe(true);
+    expect(skillOnly.content).toContain('## Referenced markdown files');
+    expect(skillOnly.content).toContain('./references/provider-a.md');
+    expect(skillOnly.content).not.toContain('Use provider A.');
+
+    const refLoaded = await registry.execute(
+      'skill_view',
+      { name: 'travel-ref-skill', ref_path: './references/provider-a.md' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r2' }
+    );
+    expect(refLoaded.ok).toBe(true);
+    expect(refLoaded.content).toContain('Reference path: ./references/provider-a.md');
+    expect(refLoaded.content).toContain('Use provider A.');
   });
 
   it('returns raw terminal output without injecting browser preview markers', async () => {

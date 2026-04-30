@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import type { AppConfig, MemoryMutationOptions, RegisteredTool, ToolExecutionContext, ToolExecutionResult } from '../../shared/types.js';
 import { createId } from '../../shared/types.js';
 import type { MemoryStore } from '../storage/memoryStore.js';
@@ -22,6 +22,38 @@ function numberArg(args: Record<string, unknown>, name: string, fallback: number
   const raw = args[name];
   const value = typeof raw === 'number' ? raw : Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function normalizePathSlashes(input: string): string {
+  return input.replace(/\\/g, '/');
+}
+
+function isPathInside(root: string, target: string): boolean {
+  const normalizedRoot = normalizePathSlashes(resolve(root)).replace(/\/+$/, '');
+  const normalizedTarget = normalizePathSlashes(resolve(target));
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`);
+}
+
+function extractReferencedMarkdownPaths(markdown: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: string) => {
+    const normalized = candidate.trim().replace(/\\/g, '/');
+    if (!normalized || !normalized.startsWith('.')) return;
+    if (!/\.md$/i.test(normalized)) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  for (const match of markdown.matchAll(/\[[^\]]*\]\((\.\.?\/[^)\s]+\.md)\)/g)) {
+    const ref = match[1];
+    if (ref) push(ref);
+  }
+  for (const match of markdown.matchAll(/(?:^|\s|`)(\.\.?\/[^\s`"'()]+\.md)(?=$|\s|`)/gm)) {
+    const ref = match[1];
+    if (ref) push(ref);
+  }
+  return out.slice(0, 16);
 }
 
 function browserStateLine(state: BrowserPageState): string {
@@ -134,20 +166,63 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         description: 'Read an installed skill by name. Skills are procedural workflow instructions: after reading one, follow it instead of skipping to a self-generated final answer.',
         parameters: {
           type: 'object',
-          properties: { name: { type: 'string', description: 'Skill name.' } },
+          properties: {
+            name: { type: 'string', description: 'Skill name.' },
+            ref_path: { type: 'string', description: 'Optional relative markdown path under references/, such as ./references/provider-ctrip-browser.md.' }
+          },
           required: ['name']
         }
       }
     },
     async execute(args) {
-      const skill = deps.skillManager.read(stringArg(objectArgs(args), 'name'));
+      const obj = objectArgs(args);
+      const skill = deps.skillManager.read(stringArg(obj, 'name'));
       if (!skill) return { ok: false, content: 'Skill not found.' };
-      const skillDir = dirname(skill.path).replace(/\\/g, '/');
+      const skillDirFs = dirname(skill.path);
+      const skillDir = normalizePathSlashes(skillDirFs);
+      const skillsRootFs = dirname(dirname(dirname(skill.path)));
+      const refPathRaw = stringArg(obj, 'ref_path', '').trim();
       const resolvedContent = skill.content
         .replace(/\{SKILL_DIR:-\.\}/g, skillDir)
         .replace(/\{SKILL_DIR\}/g, skillDir)
         .replace(/\$\{SKILL_DIR:-\.\}/g, skillDir)
         .replace(/\$\{SKILL_DIR\}/g, skillDir);
+
+      const referencedPaths = extractReferencedMarkdownPaths(resolvedContent)
+        .map((item) => item.replace(/\\/g, '/'))
+        .filter((item) => item.replace(/^\.\//, '').startsWith('references/'));
+
+      if (refPathRaw) {
+        const refPath = refPathRaw.replace(/\\/g, '/');
+        if (!/^\.\.?\/.*\.md$/i.test(refPath)) {
+          return { ok: false, content: 'ref_path must be a relative .md path, for example ./references/provider-ctrip-browser.md' };
+        }
+        const normalizedRef = refPath.replace(/^\.\//, '');
+        if (!normalizedRef.startsWith('references/')) {
+          return { ok: false, content: 'ref_path must be under references/.' };
+        }
+        const refAbsPath = resolve(skillDirFs, refPath);
+        if (!isPathInside(skillsRootFs, refAbsPath)) {
+          return { ok: false, content: 'ref_path resolves outside skills roots.' };
+        }
+        if (!existsSync(refAbsPath)) {
+          return { ok: false, content: `Reference file not found: ${refPath}` };
+        }
+        if (!statSync(refAbsPath).isFile()) {
+          return { ok: false, content: `Reference path is not a file: ${refPath}` };
+        }
+        const content = readFileSync(refAbsPath, 'utf8');
+        const bounded = content.length > 30000 ? `${content.slice(0, 30000)}\n\n...[truncated]` : content;
+        const refGuide = [
+          `# Skill reference for: ${skill.name}`,
+          `# Reference path: ${refPath}`,
+          `# Absolute reference path: ${refAbsPath}`,
+          '# This reference is loaded on demand from the skill references folder.',
+          ''
+        ].join('\n');
+        return { ok: true, content: `${refGuide}${bounded}`, data: skill };
+      }
+
       const guide = [
         `# Skill: ${skill.name}`,
         `# Absolute skill directory: ${skillDir}`,
@@ -160,9 +235,16 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         '# If this skill routes the task to provider or browser tools, your next assistant turn should usually contain those tool calls instead of a polished narrative answer.',
         '# Do not stop at reading the skill and then answer from general knowledge if the skill requires evidence gathering or verification.',
         '# Replace any SKILL_DIR placeholders with the resolved directory before running commands.',
+        '# If SKILL.md lists referenced markdown files that are relevant, you must call skill_view again with ref_path to read them before finalizing.',
+        '# Do not assume provider-specific rules before loading the relevant references/*.md file.',
         ''
       ].join('\n');
-      return { ok: true, content: `${guide}${resolvedContent}`, data: skill };
+
+      const referenceHints = referencedPaths.length === 0
+        ? '\n## Referenced markdown files\n(none detected in SKILL.md)'
+        : ['\n## Referenced markdown files', ...referencedPaths.map((item) => `- ${item}`)].join('\n');
+
+      return { ok: true, content: `${guide}${resolvedContent}${referenceHints}`, data: skill };
     }
   };
 

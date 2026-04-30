@@ -217,8 +217,14 @@ export interface SessionSummary {
   messageCount: number;
 }
 
+export interface SessionSystemPromptRecord {
+  prompt: string;
+  createdAt: string;
+}
+
 export interface SessionRecord extends SessionSummary {
   systemPrompt?: string;
+  systemPromptHistory?: SessionSystemPromptRecord[];
   messages: AgentMessage[];
   toolEvents: ToolEvent[];
   lastExecution?: AgentExecutionDetails;

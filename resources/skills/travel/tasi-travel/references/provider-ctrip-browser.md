@@ -27,6 +27,7 @@ Use these browser tools:
 
 ## Reliable Workflow
 1. Build the target Ctrip list or detail URL from normalized user constraints.
+   - Pick the URL family first: `hotels.ctrip.com` (hotel list), `flights.ctrip.com` (flight list), `trains.ctrip.com` (train list), `you.ctrip.com` (POI/guide).
 2. Open the page with `browser_open`.
 3. Confirm page state with `browser_state` when navigation or redirect behavior is ambiguous.
 4. Wait for a stable list container, detail section, or search marker with `browser_wait`.
@@ -62,21 +63,28 @@ Normalize these fields whenever available:
 - `detailUrl`
 - `sourceUrl`
 
-Hotel link hint (Ctrip mobile list pattern):
-- Prefer opening hotel search links like:
+Hotel URL templates and parameter hit rules:
+- Preferred desktop list pattern:
+  - `https://hotels.ctrip.com/hotels/list?...`
+- Also accepted mobile list pattern:
   - `https://m.ctrip.com/webapp/hotels/hotelsearch/listPage?...`
-- Validate and preserve these parameters from URL evidence whenever present:
-  - destination: `d-city`, `d-name`, `d-country`, `d-type`
-  - stay dates: `c-in`, `c-out`
-  - occupancy: `c-rooms`, people filter in `s-filters`
-  - nearby POI keyword: `s-keyword` (example: `清华大学`)
-  - locale and currency: `locale`, `curr`
-  - paging/session trace: `page-token` (keep as request evidence; do not infer business meaning)
-- If URL carries a landmark keyword (`s-keyword` or POI segment in `s-filters`), prioritize extracting:
-  - distance-to-keyword text
-  - nearby transport/landmark cues shown on cards
-  - hotel cards that clearly match the landmark context
-- Always echo parsed date and city constraints in the result header before listing rows.
+- For desktop `hotels/list`, prioritize these parameters:
+  - required hit: `city`, `checkin`, `checkout`, `adult`, `children`
+  - strongly recommended: `countryId`, `optionId`, `optionType`, `display`
+  - routing/context: `provinceId`, `directSearch`, `travelPurpose`, `domestic`, `crn`
+  - trace/version (preserve only): `ctm_ref`, `v2_mod`, `v2_version`
+- Date format normalization:
+  - hotel links use `YYYY/MM/DD` (example: `checkin=2026/04/30`, `checkout=2026/05/01`)
+- Occupancy defaults when user did not specify:
+  - `adult=1`, `children=0`
+- If user gives a landmark/keyword, keep nearby-context params when present and prioritize extraction of:
+  - distance-to-landmark text
+  - nearby transport/landmark cues
+  - hotel cards clearly matching the nearby context
+- Always echo parsed city and date constraints before listing rows.
+
+Hotel desktop example:
+- `https://hotels.ctrip.com/hotels/list?countryId=1&city=2&provinceId=0&checkin=2026/04/30&checkout=2026/05/01&optionId=2&optionType=City&display=Shanghai&crn=1&adult=1&children=0&travelPurpose=0&domestic=1`
 
 ### POI
 Use Ctrip sight or guide pages when the user wants:
@@ -102,6 +110,16 @@ Normalize these fields whenever available:
 - `detailUrl`
 - `sourceUrl`
 
+POI/guide URL patterns:
+- POI detail/list entry:
+  - `https://you.ctrip.com/sight/{citySlug}{cityId}/{poiId}.html?poiType=3`
+- Guide/article page:
+  - `https://you.ctrip.com/travels/{citySlug}{cityId}/{articleId}.html`
+- Parameter rules:
+  - preserve `poiType` when present
+  - preserve slug+id segments in path as route evidence
+  - if city path id and query city conflict, trust the visible page breadcrumb/title
+
 ### Flights and Trains
 Use Ctrip web pages as the default first pass for flights or trains.
 
@@ -112,6 +130,32 @@ Extraction rules:
 - capture only clearly visible rows;
 - keep route and date evidence visible in the output;
 - mark uncertainty when fare, seat, or policy details are partial or hidden behind follow-up interactions.
+
+Flight URL template and parameter hit rules:
+- One-way list pattern:
+  - `https://flights.ctrip.com/online/list/oneway-{dep}-{arr}?depdate=YYYY-MM-DD&cabin=y_s_c_f&adult=1&child=0&infant=0`
+- required hit: route segment `oneway-{dep}-{arr}`, `depdate`
+- strongly recommended: `cabin`, `adult`, `child`, `infant`
+- Date format: `YYYY-MM-DD`
+- Example:
+  - `https://flights.ctrip.com/online/list/oneway-bjs-syx?depdate=2026-05-02&cabin=y_s_c_f&adult=1&child=0&infant=0`
+
+Train URL template and parameter hit rules:
+- Train list pattern:
+  - `https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation={depCn}&aStation={arrCn}&dDate=YYYY-MM-DD&rDate=&trainsType=&hubCityName=&highSpeedOnly=0`
+- required hit: `dStation`, `aStation`, `dDate`
+- strongly recommended: `ticketType`, `highSpeedOnly`
+- optional filters: `rDate`, `trainsType`, `hubCityName`
+- Date format: `YYYY-MM-DD`
+- Example:
+  - `https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation=Beijing&aStation=Shanghai&dDate=2026-05-01&highSpeedOnly=0`
+
+Parameter hit checklist (all Ctrip domains):
+1. Keep user-given date format per domain (hotel `YYYY/MM/DD`; flight/train `YYYY-MM-DD`).
+2. Do not drop passenger/occupancy params (`adult`, `children`, `child`, `infant`) if user provided them.
+3. Preserve route/city identity in both path and query when both exist.
+4. Preserve non-semantic trace/version params as-is when already present; do not invent new values.
+5. If required params are missing, ask a focused follow-up instead of guessing.
 
 ## Extraction Rules
 - Prefer stable selectors or clearly bounded page regions over full-page dumps.
