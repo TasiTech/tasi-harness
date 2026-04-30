@@ -6,6 +6,8 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 
 > Tasi Harness is inspired by Hermes-Agent-style runtime patterns. It does not bundle the original Python Hermes Agent runtime.
 
+![Tasi Harness Screenshot](docs/screen_shot.png)
+
 ## Highlights
 
 - Desktop-first AI agent with local sessions, local memory, and local skill files.
@@ -31,80 +33,18 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 
 ## Installation
 
-### Requirements
+Setup, packaging, and test steps are documented here:
 
-- Node.js 20+
-- npm 10+
-- Windows, macOS, or Linux for desktop packaging/runtime
+- [Installation, Packaging, and Testing](docs/INSTALLATION_PACKAGING_TESTING.en.md)
 
-### Install dependencies
+Quick commands:
 
-```bash
-npm install
-```
-
-If you only need type-checking or tests in a restricted CI environment, you can skip the Electron binary download:
-
-```bash
-ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm install --ignore-scripts
-```
-
-### Run in development
-
-```bash
-npm run dev
-```
-
-This starts:
-
-- TypeScript compilation for Electron main/preload
-- Vite for the renderer
-- Electron after the dev server and compiled main process are ready
-
-### Build
-
-```bash
-npm run build
-```
-
-Build output is written to `dist/`.
-
-### Package desktop binaries
-
-```bash
-npm run pack
-npm run dist
-npm run dist:win
-npm run dist:mac
-npm run dist:installers
-powershell -ExecutionPolicy Bypass -File scripts/package-win-installer.ps1
-bash scripts/package-macos-installer.sh
-```
-
-Electron Builder writes packaged artifacts to `release/`.
-
-Notes:
-
-- `npm run dist:win` builds a Windows `NSIS` installer.
-- `npm run dist:mac` builds a macOS `DMG` installer.
-- `npm run dist:installers` builds both targets in one command.
-- `scripts/package-win-installer.ps1` is a Windows-focused PowerShell packager.
-- `scripts/package-macos-installer.sh` is a macOS-focused Bash packager.
-- macOS packaging should normally be run on a macOS host.
-
-### Test
-
-```bash
-npm test
-```
-
-The Vitest suite covers core flows such as:
-
-- agent-loop tool execution
-- memory behavior
-- safe workspace writes
-- skill parsing and updates
-- personal knowledge base add/search/delete flows
+- Install dependencies: `npm install`
+- Run dev app: `npm run dev`
+- Build: `npm run build`
+- Test: `npm test`
+- Package (Windows): `npm run dist:win`
+- Package (macOS): `npm run dist:mac`
 
 ## Quick Start
 
@@ -128,42 +68,19 @@ Tasi Harness ships with multiple provider presets in the UI:
 
 ### Browser automation and preview
 
-The app includes a built-in browser automation session with tools such as:
+Tasi Harness includes built-in browser and extenal browser tools modes.
 
-- `browser_open`
-- `browser_state`
-- `browser_click`
-- `browser_type`
-- `browser_scroll`
-- `browser_wait`
-- `browser_extract`
-- `browser_close`
+Detailed guide:
 
-Two browser presentation modes are supported:
-
-- `embedded`: previews pages inside the desktop app and works out of the box.
-- `external`: can surface pages in an external Chromium-based browser. Packaged builds can auto-load the bundled OpenCLI bridge extension from `resources/opencli-extension`.
+- [Browser Automation](docs/BROWSER_AUTOMATION.en.md)
 
 ### Personal knowledge base
 
-The **Knowledge** page lets you upload:
+The **Knowledge** flow supports document upload and local retrieval-augmented context injection for chat, without requiring embeddings or an external vector DB.
 
-- `md`
-- `markdown`
-- `txt`
-- `text`
-- `log`
-- `json`
-- `csv`
-- `docx`
-- `xlsx`
-- `pptx`
+Detailed guide:
 
-Uploaded files are converted to Markdown, stored locally, split into chunks, and scored with local lexical retrieval. No embedding pipeline or external vector database is required. When the **Personal KB** checkbox is enabled in chat, Tasi Harness:
-
-- extracts search terms from your question
-- optionally expands retrieval keywords with the configured LLM when available
-- injects the highest-scoring snippets into the chat prompt
+- [Personal Knowledge Base](docs/PERSONAL_KNOWLEDGE_BASE.en.md)
 
 ### Skills and skill marketplace
 
@@ -174,7 +91,7 @@ Skills are plain `SKILL.md` files with frontmatter and instructions. You can:
 - upload skill archives
 - browse marketplace catalogs such as ClawHub and SkillHub
 
-Bundled browser automation guidance is available as the `agent-browser` skill.
+Bundled browser automation guidance is available as the `tasi-browser-automation` skill.
 
 ### Sessions and memory
 
@@ -236,7 +153,7 @@ Tasi Harness is designed with conservative local defaults, but it is still a pow
 
 This is not a complete sandbox for untrusted workloads. For higher-risk automation, keep terminal access disabled or run the app inside an OS/container sandbox.
 
-More details: [docs/SECURITY.md](docs/SECURITY.md)
+More details: [docs/SECURITY.en.md](docs/SECURITY.en.md)
 
 ## Project Structure
 
@@ -255,10 +172,15 @@ docs/         Engineering and security documentation
 
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Development Guide](docs/DEVELOPMENT.md)
-- [Security](docs/SECURITY.md)
-- [Verification Notes](docs/VERIFICATION.md)
+- [Architecture](docs/ARCHITECTURE.en.md)
+- [Development Guide](docs/DEVELOPMENT.en.md)
+- [Security](docs/SECURITY.en.md)
+- [Verification Notes](docs/VERIFICATION.en.md)
+- [Installation, Packaging, and Testing](docs/INSTALLATION_PACKAGING_TESTING.en.md)
+- [Browser Automation](docs/BROWSER_AUTOMATION.en.md)
+- [Personal Knowledge Base](docs/PERSONAL_KNOWLEDGE_BASE.en.md)
+- [Release Notes (v1.2.0)](docs/release_v1.2.0.en.md)
+- [Release Notes Archive (v1.1.0)](docs/release_v1.1.0.en.md)
 
 ## References and Acknowledgements
 

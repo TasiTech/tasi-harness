@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>多日行程地图 - Tasi Travel</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 20px; background-color: #f5f5f7; display: flex; flex-direction: column; align-items: center; }
+        .main-container { width: 100%; max-width: 1200px; }
+        h1 { color: #333; margin-bottom: 24px; text-align: center; }
+        .day-container { margin-bottom: 24px; background: #fff; border: 1px solid #e0e0e0; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .day-header { background: #fafafa; padding: 16px 20px; font-weight: bold; font-size: 1.1em; color: #333; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        .day-content { display: flex; flex-direction: column; width: 100%; }
+        iframe { width: 100%; height: 600px; border: none; background-color: #f9f9f9; }
+        .iframe-fallback { display: none; padding: 40px; text-align: center; color: #666; background: #f9f9f9; height: 520px; flex-direction: column; justify-content: center; }
+        a.external-link, a.fallback-btn { color: #fff; background-color: #007bff; text-decoration: none; padding: 8px 16px; border-radius: 6px; font-size: 0.9em; transition: background-color 0.2s; }
+        a.external-link:hover, a.fallback-btn:hover { background-color: #0056b3; }
+        a.fallback-btn { display: inline-block; margin-top: 16px; }
+        .note { margin-bottom: 20px; padding: 12px; background: #e8f4fd; border-left: 4px solid #2196f3; color: #0d47a1; font-size: 0.95em; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="main-container">
+        <h1>多日行程地图预览</h1>
+        <div class="note">
+            提示：如果地图区域显示为空白或"拒绝连接"（受高德安全策略限制），请点击右上角的"在新窗口打开"按钮直接访问高德地图。
+        </div>
+        <div id="maps-container"></div>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const container = document.getElementById('maps-container');
+
+        const days = [];
+        for (const [key, value] of urlParams.entries()) {
+            if (key.startsWith('day')) {
+                const dayNum = parseInt(key.replace('day', ''), 10);
+                if (!isNaN(dayNum)) {
+                    days.push({ key: dayNum, url: value });
+                }
+            }
+        }
+        
+        days.sort((a, b) => a.key - b.key);
+        
+        if (days.length === 0) {
+            container.innerHTML = '<div class="day-container"><div class="day-header">无地图数据</div><div style="padding: 20px;">请通过 URL 参数传入地图链接，例如：?day1=经过编码的网址&day2=经过编码的网址</div></div>';
+        } else {
+            days.forEach(day => {
+                const dayTitle = `第 ${day.key} 天行程`;
+                let decodedStr = '';
+                try {
+                    decodedStr = decodeURIComponent(day.url);
+                } catch(e) {
+                    decodedStr = day.url;
+                }
+                
+                let amapUrl = decodedStr;
+                if (!decodedStr.startsWith('http')) {
+                    const pts = decodedStr.split('|').filter(p => p.trim());
+                    if (pts.length === 1) {
+                        amapUrl = `https://ditu.amap.com/search?query=${encodeURIComponent(pts[0])}`;
+                    } else if (pts.length > 1) {
+                        amapUrl = `https://ditu.amap.com/dir?from[name]=${encodeURIComponent(pts[0])}&to[name]=${encodeURIComponent(pts[pts.length-1])}&type=car`;
+                        for (let i = 1; i < pts.length - 1 && i <= 6; i++) {
+                            amapUrl += `&via[${i-1}][name]=${encodeURIComponent(pts[i])}`;
+                        }
+                    }
+                }
+                
+                const dayDiv = document.createElement('div');
+                dayDiv.className = 'day-container';
+                
+                dayDiv.innerHTML = `
+                    <div class="day-header">
+                        <span>${dayTitle}</span>
+                        <a href="${amapUrl}" target="_blank" class="external-link" rel="noopener noreferrer">在新窗口打开高德地图 ↗</a>
+                    </div>
+                    <div class="day-content">
+                        <iframe src="${amapUrl}" title="${dayTitle}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms"></iframe>
+                    </div>
+                `;
+                
+                container.appendChild(dayDiv);
+            });
+        }
+    </script>
+</body>
+</html>

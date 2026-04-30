@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
 import type {
   AgentMessage,
   AppInfo,
+  LlmUsage,
   MarketplaceBrowseResult,
   MemoryDomain,
   MemoryEntry,
@@ -10,6 +11,7 @@ import type {
   PersonalKnowledgeState,
   PublicAppConfig,
   ScheduledTask,
+  SessionDocumentContext,
   SessionSummary,
   SkillDocument,
   SkillMetadata,
@@ -24,6 +26,8 @@ import {
   providerPreset,
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
+import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
+import * as QRCode from 'qrcode';
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -36,11 +40,14 @@ const defaultConfig: PublicAppConfig = {
   model: providerDefaultModel('openai'),
   temperature: 0.3,
   maxIterations: 8,
+  sessionDocumentMaxDocs: 10,
   workspaceDir: '',
   allowShellTools: false,
   enableNetworkTools: false,
-  opencliBridgeMode: 'embedded',
-  opencliExtensionPath: '',
+  browserMode: 'embedded',
+  externalBrowserEngine: 'auto',
+  externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
+  externalBrowserProfileMode: 'isolated',
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -55,8 +62,15 @@ const defaultConfig: PublicAppConfig = {
     from: '',
     to: '',
     passwordConfigured: false
+  },
+  wechatChannel: {
+    enabled: false,
+    pluginName: 'clawbot',
+    bindUrl: 'https://ilinkai.weixin.qq.com',
+    loginStatus: 'idle'
   }
 };
+const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -66,6 +80,25 @@ type SettingsDraft = PublicAppConfig & {
 function prettyDate(iso?: string): string {
   if (!iso) return '';
   return new Date(iso).toLocaleString();
+}
+
+function parseIsoMs(iso?: string): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function latestRoundToolEvents(messages: AgentMessage[], events: ToolEvent[]): ToolEvent[] {
+  if (events.length === 0) return events;
+  const lastUser = [...messages].reverse().find((message) => message.role === 'user');
+  const cutoff = parseIsoMs(lastUser?.createdAt);
+  if (cutoff == null) return events;
+  const scoped = events.filter((event) => {
+    const createdMs = parseIsoMs(event.createdAt);
+    if (createdMs == null) return false;
+    return createdMs >= cutoff;
+  });
+  return scoped;
 }
 
 function safeJson(value: unknown): string {
@@ -114,7 +147,7 @@ function extractUrlFromValue(value: unknown, depth = 0): string | undefined {
 }
 
 function extractPreviewUrlMarker(text: string): string | undefined {
-  const marker = text.match(/(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/i);
+  const marker = text.match(/browser_preview_url:\s*(https?:\/\/[^\s"'<>`]+)/i);
   if (!marker?.[1]) return undefined;
   return marker[1].replace(/[),.;!?]+$/, '');
 }
@@ -127,13 +160,11 @@ function shouldFallbackOpenExternal(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
-  if (!combined.includes('opencli_preview_url')) return false;
-  return /bridge is disconnected|showing fallback|extension not connected/i.test(combined);
+  return false;
 }
 
 function isWebPreviewEvent(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (combined.includes('opencli')) return true;
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
   return event.toolName.toLowerCase().includes('open') && combined.includes('http');
@@ -152,42 +183,6 @@ function latestWebPreviewUrl(events: ToolEvent[], fallbackOnly = false): string 
     if (fromContent) return fromContent;
   }
   return undefined;
-}
-
-function openCliInstallGuide(tr: TranslateFn): string {
-  return tr(
-    [
-      'OpenCLI extension is required before using external browser mode.',
-      'Install steps:',
-      '1. Open Chrome/Chromium.',
-      '2. Open `chrome://extensions` and enable Developer mode.',
-      '3. Click "Load unpacked" and select your OpenCLI extension folder (with `manifest.json`).',
-      '4. Run `opencli doctor` to verify the bridge connection.'
-    ].join('\n'),
-    [
-      '切换到外部浏览器模式前，需要先安装 OpenCLI 扩展。',
-      '安装步骤：',
-      '1. 打开 Chrome/Chromium。',
-      '2. 打开 `chrome://extensions` 并开启开发者模式。',
-      '3. 点击“加载已解压的扩展程序”，选择包含 `manifest.json` 的 OpenCLI 扩展目录。',
-      '4. 运行 `opencli doctor` 验证桥接连接。'
-    ].join('\n')
-  );
-}
-
-function externalBrowserBridgeGuide(tr: TranslateFn): string {
-  return tr(
-    [
-      'External browser mode requires an external browser bridge.',
-      'Please install Agent Browser or OpenCLI, and enable the matching browser plugin or extension.',
-      'If the bridge is not ready yet, switch back to the built-in browser mode first.'
-    ].join('\n'),
-    [
-      '外部浏览器模式需要外部浏览器桥接能力。',
-      '请安装 Agent Browser 或 OpenCLI，并启用对应的浏览器插件或扩展。',
-      '如果桥接环境还没准备好，可以先切回内置浏览器模式。'
-    ].join('\n')
-  );
 }
 
 function useAsyncData<T>(loader: () => Promise<T>, fallback: T): [T, () => Promise<void>] {
@@ -342,9 +337,29 @@ export function App(): ReactElement {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | undefined>();
+  const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
+  const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatStopping, setChatStopping] = useState(false);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
+  const activeWechatSessionId = config.wechatChannel.sessionId?.trim() || '';
+  const isWechatSessionActive = Boolean(sessionId && activeWechatSessionId && sessionId === activeWechatSessionId);
   const tr: TranslateFn = useMemo(() => (en: string, zh: string) => (language === 'zh' ? zh : en), [language]);
+
+  function formatTokensM(value?: number): string {
+    const tokens = Number(value ?? 0);
+    if (!Number.isFinite(tokens)) return '0.000M';
+    return `${(tokens / 1_000_000).toFixed(3)}M`;
+  }
+
+  function usageLabel(usage?: LlmUsage): string {
+    if (!usage) return '-';
+    const prompt = usage.promptTokens ?? 0;
+    const completion = usage.completionTokens ?? 0;
+    const total = usage.totalTokens ?? prompt + completion;
+    return `P:${formatTokensM(prompt)} C:${formatTokensM(completion)} T:${formatTokensM(total)}`;
+  }
   const nav = useMemo<Array<{ page: Page; icon: ReactElement; label: string }>>(
     () => [
       { page: 'chat', icon: <SidebarIcon kind="chat" />, label: tr('Chat', '对话') },
@@ -384,17 +399,32 @@ export function App(): ReactElement {
     document.documentElement.setAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
   }, [language]);
 
-  async function refreshAll(): Promise<void> {
-    const [cfg] = await Promise.all([
-      window.tasiHarness.config.get(),
-      refreshSessions(),
-      refreshTasks(),
-      refreshKnowledge(),
-      refreshMemory(),
-      refreshSkills()
-    ]);
-    setConfig(cfg);
-  }
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshTasks();
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [refreshTasks]);
+
+  useEffect(() => {
+    const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      if (!sessionId || payload.sessionId !== sessionId) return;
+      void window.tasiHarness.sessions.read(payload.sessionId).then((record) => {
+        if (!record) return;
+        setMessages(record.messages);
+        setLastUsage(record.lastUsage);
+        setTotalUsage(record.totalUsage);
+        const events = record.toolEvents ?? [];
+        if (isWechatSessionActive && payload.source === 'external') {
+          setToolEvents(latestRoundToolEvents(record.messages, events));
+        } else {
+          setToolEvents(events);
+        }
+        setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
+      });
+    });
+    return off;
+  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
 
   return (
     <div className="app-shell">
@@ -421,10 +451,15 @@ export function App(): ReactElement {
           ))}
         </div>
         <div className="sidebar-footer">
-          <div className={`status-pill ${config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? 'ok' : 'warn'}`}>
-            <span className="dot" /> {config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? tr('Model ready', '模型已就绪') : tr('Configure model', '请配置模型')}
+          <div className="meta-row wrap">
+            <span className="soft-badge">{tr('Last', '本次')}: {usageLabel(lastUsage)}</span>
+            <span className="soft-badge">{tr('Total', '累计')}: {usageLabel(totalUsage)}</span>
           </div>
-          <button className="mini-button" onClick={() => void refreshAll()}>{tr('Refresh', '刷新')}</button>
+          <div className={`status-pill ${config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? 'ok' : 'warn'}`}>
+            <span className="dot" /> {config.apiKeyConfigured || !providerRequiresApiKey(config.provider)
+              ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
+              : tr('Configure model', '请配置模型')}
+          </div>
         </div>
       </aside>
       <main className="main-pane">
@@ -437,8 +472,16 @@ export function App(): ReactElement {
             setMessages={setMessages}
             sessionId={sessionId}
             setSessionId={setSessionId}
+            lastUsage={lastUsage}
+            setLastUsage={setLastUsage}
+            totalUsage={totalUsage}
+            setTotalUsage={setTotalUsage}
             toolEvents={toolEvents}
             setToolEvents={setToolEvents}
+            busy={chatBusy}
+            setBusy={setChatBusy}
+            stopping={chatStopping}
+            setStopping={setChatStopping}
             executionMode={executionMode}
             setExecutionMode={setExecutionMode}
             refreshSessions={refreshSessions}
@@ -446,7 +489,7 @@ export function App(): ReactElement {
           />
         )}
         {page === 'knowledge' && <KnowledgePage tr={tr} knowledge={knowledge} refreshKnowledge={refreshKnowledge} />}
-        {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} refreshMemory={refreshMemory} />}
+        {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} />}
         {page === 'skills' && <SkillsPage tr={tr} skills={skills} refreshSkills={refreshSkills} />}
         {page === 'tasks' && <TasksPage tr={tr} tasks={tasks} refreshTasks={refreshTasks} refreshSessions={refreshSessions} />}
         {page === 'sessions' && (
@@ -458,7 +501,11 @@ export function App(): ReactElement {
               if (record) {
                 setSessionId(record.id);
                 setMessages(record.messages);
-                setToolEvents(record.toolEvents ?? []);
+                setLastUsage(record.lastUsage);
+                setTotalUsage(record.totalUsage);
+                const isWechat = Boolean(config.wechatChannel.sessionId?.trim() && record.id === config.wechatChannel.sessionId?.trim());
+                const events = record.toolEvents ?? [];
+                setToolEvents(isWechat ? latestRoundToolEvents(record.messages, events) : events);
                 setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
                 setPage('chat');
               }
@@ -558,17 +605,27 @@ function ChatPage(props: {
   setMessages: (messages: AgentMessage[]) => void;
   sessionId?: string;
   setSessionId: (id?: string) => void;
+  lastUsage?: LlmUsage;
+  setLastUsage: (usage?: LlmUsage) => void;
+  totalUsage?: LlmUsage;
+  setTotalUsage: (usage?: LlmUsage) => void;
   toolEvents: ToolEvent[];
   setToolEvents: Dispatch<SetStateAction<ToolEvent[]>>;
+  busy: boolean;
+  setBusy: Dispatch<SetStateAction<boolean>>;
+  stopping: boolean;
+  setStopping: Dispatch<SetStateAction<boolean>>;
   executionMode: 'workspace' | 'sandbox';
   setExecutionMode: (mode: 'workspace' | 'sandbox') => void;
   refreshSessions: () => Promise<void>;
   personalKnowledgeDocCount: number;
 }): ReactElement {
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [followUpQuestions, setFollowUpQuestions] = useState<string[]>([]);
+  const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
+  const [sessionDocBusy, setSessionDocBusy] = useState(false);
+  const [sessionDocError, setSessionDocError] = useState('');
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [webPreviewExpanded, setWebPreviewExpanded] = useState(false);
   const [webPreviewRect, setWebPreviewRect] = useState<PreviewRect | null>(null);
@@ -580,6 +637,7 @@ function ChatPage(props: {
   const chatContentGridRef = useRef<HTMLDivElement | null>(null);
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
+  const uploadSessionDocInputRef = useRef<HTMLInputElement | null>(null);
   const previewZoomFactorRef = useRef(1);
   const previewZoomSyncIdRef = useRef(0);
   const previewContentMetricsRef = useRef<{ contentWidth: number; contentHeight: number } | null>(null);
@@ -594,14 +652,24 @@ function ChatPage(props: {
     containerHeight: number;
   } | null>(null);
   const visibleMessages = useMemo(
-    () => props.messages.filter((m) => m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()))),
+    () => props.messages.filter((m) => {
+      if (m.role === 'assistant' && m.content === WECHAT_PENDING_MARKER) return false;
+      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()));
+    }),
     [props.messages]
   );
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
-  const showEmbeddedWebPreview = props.config.opencliBridgeMode === 'embedded';
+  const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
+  const isWechatSession = Boolean(
+    props.sessionId
+      && props.config.wechatChannel.sessionId
+      && props.sessionId === props.config.wechatChannel.sessionId
+  );
+  const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
+  const runBusy = props.busy || wechatBusy;
   useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
@@ -609,6 +677,29 @@ function ChatPage(props: {
     if (props.personalKnowledgeDocCount > 0 || !usePersonalKnowledgeBase) return;
     setUsePersonalKnowledgeBase(false);
   }, [props.personalKnowledgeDocCount, usePersonalKnowledgeBase]);
+  useEffect(() => {
+    let cancelled = false;
+    if (!props.sessionId) {
+      setSessionDocs([]);
+      setSessionDocError('');
+      return () => {
+        cancelled = true;
+      };
+    }
+    void window.tasiHarness.sessionDocs.list(props.sessionId)
+      .then((docs) => {
+        if (cancelled) return;
+        setSessionDocs(docs);
+        setSessionDocError('');
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setSessionDocError(e instanceof Error ? e.message : String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [props.sessionId]);
   useEffect(() => {
     if (!shouldShowWebPreview) {
       setWebPreviewExpanded(false);
@@ -629,7 +720,7 @@ function ChatPage(props: {
     setPreviewAddress(previewUrl);
   }, [previewUrl]);
   useEffect(() => {
-    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl) {
+    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !props.busy) {
       externalPreviewOpenUrlRef.current = '';
       return;
     }
@@ -642,7 +733,7 @@ function ChatPage(props: {
     }).catch((e) => {
       setError(e instanceof Error ? e.message : String(e));
     });
-  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl]);
+  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl, props.busy]);
   useEffect(() => {
     if (!shouldShowWebPreview) return;
     previewContentMetricsRef.current = null;
@@ -672,13 +763,14 @@ function ChatPage(props: {
     return () => window.removeEventListener('resize', syncWithinBounds);
   }, [webPreviewExpanded]);
 
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, busy]);
+  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, runBusy]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onToolEvent((payload) => {
+      if (props.sessionId && payload.sessionId !== props.sessionId) return;
       props.setToolEvents((old) => [...old, payload.event]);
     });
     return off;
-  }, [props.setToolEvents]);
+  }, [props.sessionId, props.setToolEvents]);
   useEffect(() => {
     if (!showEmbeddedWebPreview) {
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
@@ -1011,11 +1103,17 @@ function ChatPage(props: {
 
   const connected = props.config.apiKeyConfigured || !providerRequiresApiKey(props.config.provider);
 
-  async function setBridgeMode(mode: PublicAppConfig['opencliBridgeMode']): Promise<void> {
-    if (mode === props.config.opencliBridgeMode) return;
+  function isStoppedByUserError(error: unknown): boolean {
+    if (!(error instanceof Error)) return false;
+    if (error.name === 'AbortError') return true;
+    return /session stopped by user|operation was aborted|aborted/i.test(error.message);
+  }
+
+  async function setBridgeMode(mode: PublicAppConfig['browserMode']): Promise<void> {
+    if (mode === props.config.browserMode) return;
     try {
       setError('');
-      const next = await window.tasiHarness.config.set({ opencliBridgeMode: mode });
+      const next = await window.tasiHarness.config.set({ browserMode: mode });
       props.setConfig(next);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1024,10 +1122,11 @@ function ChatPage(props: {
 
   async function submitMessage(rawText: string): Promise<void> {
     const text = rawText.trim();
-    if (!text || busy) return;
+    if (!text || props.busy) return;
     setInput('');
     setError('');
-    setBusy(true);
+    props.setBusy(true);
+    props.setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
     props.setMessages([...props.messages, { role: 'user', content: text, createdAt: new Date().toISOString() }]);
@@ -1035,14 +1134,41 @@ function ChatPage(props: {
       const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled);
       props.setSessionId(result.sessionId);
       props.setMessages(result.messages.filter((m) => m.role !== 'system'));
+      props.setLastUsage(result.usage);
+      props.setTotalUsage(result.totalUsage);
       props.setToolEvents(result.toolEvents);
       props.setExecutionMode(result.execution.mode);
       setFollowUpQuestions((result.followUpQuestions ?? []).filter((item) => item.trim()).slice(0, 4));
       await props.refreshSessions();
     } catch (e) {
+      if (isStoppedByUserError(e)) {
+        setError('');
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (props.config.browserMode === 'external') {
+        try {
+          await window.tasiHarness.app.closeExternalPreview();
+        } catch {
+          // Ignore cleanup errors when closing external preview window.
+        }
+      }
+      props.setStopping(false);
+      props.setBusy(false);
+    }
+  }
+
+  async function stopCurrentSession(): Promise<void> {
+    if ((!props.busy && !wechatBusy) || props.stopping) return;
+    props.setStopping(true);
+    setError('');
+    try {
+      await window.tasiHarness.agent.stop();
+    } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      if (!props.busy) props.setStopping(false);
     }
   }
 
@@ -1179,6 +1305,69 @@ function ChatPage(props: {
     }
   }
 
+  function openSessionDocumentPicker(): void {
+    if (runBusy || sessionDocBusy) return;
+    if (!uploadSessionDocInputRef.current) return;
+    uploadSessionDocInputRef.current.value = '';
+    uploadSessionDocInputRef.current.click();
+  }
+
+  async function uploadSessionDocuments(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    setSessionDocBusy(true);
+    setSessionDocError('');
+    try {
+      let activeSessionId = props.sessionId;
+      const failures: string[] = [];
+      for (const file of files) {
+        try {
+          const contentBase64 = await fileToBase64(file);
+          const result = await window.tasiHarness.sessionDocs.upload({
+            sessionId: activeSessionId,
+            filename: file.name,
+            contentBase64
+          });
+          activeSessionId = result.sessionId;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          failures.push(`${file.name}: ${message}`);
+        }
+      }
+      if (activeSessionId && props.sessionId !== activeSessionId) props.setSessionId(activeSessionId);
+      if (!activeSessionId) return;
+      const docs = await window.tasiHarness.sessionDocs.list(activeSessionId);
+      setSessionDocs(docs);
+      await props.refreshSessions();
+      if (failures.length > 0) {
+        setSessionDocError(
+          props.tr(
+            `Some files failed to upload:\n${failures.join('\n')}`,
+            `部分文件上传失败：\n${failures.join('\n')}`
+          )
+        );
+      }
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionDocBusy(false);
+    }
+  }
+
+  async function removeSessionDocument(id: string): Promise<void> {
+    if (!props.sessionId) return;
+    setSessionDocBusy(true);
+    setSessionDocError('');
+    try {
+      await window.tasiHarness.sessionDocs.deleteDocument(props.sessionId, id);
+      const docs = await window.tasiHarness.sessionDocs.list(props.sessionId);
+      setSessionDocs(docs);
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSessionDocBusy(false);
+    }
+  }
+
   return (
     <section className="page chat-page">
       <div className="chat-header">
@@ -1195,18 +1384,17 @@ function ChatPage(props: {
             <input
               type="checkbox"
               checked={personalKnowledgeEnabled}
-              disabled={busy || props.personalKnowledgeDocCount === 0}
+              disabled={runBusy || props.personalKnowledgeDocCount === 0}
               onChange={(event) => setUsePersonalKnowledgeBase(event.target.checked)}
             />
             <span>{props.tr('Personal KB', '个人知识库')}</span>
             <span className="soft-badge">{props.personalKnowledgeDocCount}</span>
           </label>
-          <div className={`model-badge chat-control ${connected ? 'connected' : 'disconnected'}`}><span className="dot" />{props.config.model || props.tr('No model', '未配置模型')}</div>
           <select value={props.executionMode} onChange={(e) => props.setExecutionMode(e.target.value as 'workspace' | 'sandbox')}>
             <option value="workspace">{props.tr('Workspace', '工作区')}</option>
             <option value="sandbox">{props.tr('Sandbox', '沙箱')}</option>
           </select>
-          <select value={props.config.opencliBridgeMode} onChange={(e) => void setBridgeMode(e.target.value as PublicAppConfig['opencliBridgeMode'])}>
+          <select value={props.config.browserMode} onChange={(e) => void setBridgeMode(e.target.value as PublicAppConfig['browserMode'])}>
             <option value="embedded">{props.tr('Built-in browser', '内部浏览器')}</option>
             <option value="external">{props.tr('External browser', '外部浏览器')}</option>
           </select>
@@ -1215,9 +1403,13 @@ function ChatPage(props: {
             onClick={() => {
               props.setMessages([]);
               props.setSessionId(undefined);
+              props.setLastUsage(undefined);
+              props.setTotalUsage(undefined);
               props.setToolEvents([]);
               props.setExecutionMode(props.config.defaultExecutionMode);
               setFollowUpQuestions([]);
+              setSessionDocs([]);
+              setSessionDocError('');
             }}
           >
             {props.tr('New session', '新会话')}
@@ -1234,8 +1426,8 @@ function ChatPage(props: {
             </div>
           )}
           {visibleMessages.map((m, idx) => <MessageBubble key={`${m.id ?? idx}-${idx}`} message={m} tr={props.tr} />)}
-          {busy && <div className="typing-indicator"><span /> <span /> <span /></div>}
-          {followUpQuestions.length > 0 && !busy && (
+          {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
+          {followUpQuestions.length > 0 && !runBusy && (
             <div className="follow-up-panel">
               <div className="follow-up-label">{props.tr('Suggested next questions', '建议继续追问')}</div>
               <div className="follow-up-list">
@@ -1351,217 +1543,111 @@ function ChatPage(props: {
         </div>
       </div>
       {error && <div className="error-box">{error}</div>}
+      {sessionDocError && <div className="error-box">{sessionDocError}</div>}
       <div className="chat-input-area">
-        <textarea
-          className="chat-textarea"
+        <div className="chat-input-main">
+          <input
+            ref={uploadSessionDocInputRef}
+            className="hidden-file-input"
+            type="file"
+            multiple
+            accept=".docx,.pptx,.xlsx,.pdf,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              if (files.length === 0) return;
+              void uploadSessionDocuments(files);
+            }}
+          />
+          <div className="chat-session-doc-row">
+            {sessionDocs.map((doc) => (
+              <span key={doc.id} className="chat-session-doc-chip" title={doc.filename}>
+                <span className="chat-session-doc-name">{doc.filename}</span>
+                <span className="chat-session-doc-meta">{props.tr(`${doc.commentCount} comments`, `${doc.commentCount} comments`)}</span>
+                <button
+                  className="chat-session-doc-remove"
+                  onClick={() => void removeSessionDocument(doc.id)}
+                  disabled={sessionDocBusy}
+                  title={props.tr('Remove document', 'Remove document')}
+                  aria-label={props.tr('Remove document', 'Remove document')}
+                >
+                  x
+                </button>
+              </span>
+            ))}
+          </div>
+          <div className="chat-textarea-wrap">
+          <textarea
+            className="chat-textarea"
           placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
-          value={input}
-          disabled={busy || !connected}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              void send();
+            value={input}
+            disabled={runBusy || !connected}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                void send();
+              }
+            }}
+          />
+            <button
+              className="chat-attach-button"
+              onClick={openSessionDocumentPicker}
+              disabled={runBusy || sessionDocBusy || !connected}
+              title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+              aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <button
+          className={`send-btn${runBusy ? ' stop' : ''}`}
+          disabled={runBusy ? props.stopping : !input.trim() || !connected}
+          title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
+          onClick={() => {
+            if (runBusy) {
+              void stopCurrentSession();
+              return;
             }
+            void send();
           }}
-        />
-        <button className="send-btn" disabled={!input.trim() || busy || !connected} onClick={() => void send()}>{busy ? '...' : props.tr('->', '->')}</button>
+        >
+          {runBusy ? (props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
+        </button>
       </div>
     </section>
   );
 }
 
-function splitTrailingUrlPunctuation(rawUrl: string): { href: string; trailing: string } {
-  const match = rawUrl.match(/^(.*?)([),.;!?。，；！？）]+)?$/);
-  if (!match) return { href: rawUrl, trailing: '' };
-  return { href: match[1] || rawUrl, trailing: match[2] || '' };
-}
-
-export function renderInlineMarkdown(input: string, keyPrefix: string): ReactElement[] {
-  const linkPattern = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-  const parts: ReactElement[] = [];
-  let cursor = 0;
-  let index = 0;
-
-  function renderEmphasis(text: string, prefix: string): ReactElement[] {
-    const tokenPattern = /(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|https?:\/\/[^\s<>"']+)/g;
-    const nodes: ReactElement[] = [];
-    let start = 0;
-    let tokenIndex = 0;
-    for (const match of text.matchAll(tokenPattern)) {
-      const raw = match[0] ?? '';
-      const matchIndex = match.index ?? 0;
-      if (matchIndex > start) {
-        nodes.push(<span key={`${prefix}-plain-${tokenIndex++}`}>{text.slice(start, matchIndex)}</span>);
-      }
-      if (raw.startsWith('`') && raw.endsWith('`')) {
-        nodes.push(<code key={`${prefix}-code-${tokenIndex++}`}>{raw.slice(1, -1)}</code>);
-      } else if (raw.startsWith('**') && raw.endsWith('**')) {
-        nodes.push(<strong key={`${prefix}-strong-${tokenIndex++}`}>{raw.slice(2, -2)}</strong>);
-      } else if (raw.startsWith('*') && raw.endsWith('*')) {
-        nodes.push(<em key={`${prefix}-em-${tokenIndex++}`}>{raw.slice(1, -1)}</em>);
-      } else if (/^https?:\/\//i.test(raw)) {
-        const { href, trailing } = splitTrailingUrlPunctuation(raw);
-        nodes.push(
-          <a key={`${prefix}-url-${tokenIndex++}`} href={href} target="_blank" rel="noreferrer">
-            {href}
-          </a>
-        );
-        if (trailing) {
-          nodes.push(<span key={`${prefix}-trail-${tokenIndex++}`}>{trailing}</span>);
-        }
-      } else {
-        nodes.push(<span key={`${prefix}-raw-${tokenIndex++}`}>{raw}</span>);
-      }
-      start = matchIndex + raw.length;
-    }
-    if (start < text.length) {
-      nodes.push(<span key={`${prefix}-plain-${tokenIndex++}`}>{text.slice(start)}</span>);
-    }
-    return nodes;
-  }
-
-  for (const match of input.matchAll(linkPattern)) {
-    const [full, label, url] = match;
-    const matchIndex = match.index ?? 0;
-    if (matchIndex > cursor) {
-      parts.push(...renderEmphasis(input.slice(cursor, matchIndex), `${keyPrefix}-txt-${index++}`));
-    }
-    parts.push(
-      <a key={`${keyPrefix}-link-${index++}`} href={url} target="_blank" rel="noreferrer">
-        {label}
-      </a>
-    );
-    cursor = matchIndex + full.length;
-  }
-  if (cursor < input.length) {
-    parts.push(...renderEmphasis(input.slice(cursor), `${keyPrefix}-txt-${index++}`));
-  }
-  return parts;
-}
-
-function renderMarkdownContent(content: string, keyPrefix: string): ReactElement[] {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const blocks: ReactElement[] = [];
-  const fencePattern = /```([\w-]*)\n([\s\S]*?)```/g;
-  let cursor = 0;
-  let blockIndex = 0;
-
-  function renderTextSection(section: string, prefix: string): void {
-    const lines = section.split('\n');
-    let i = 0;
-    while (i < lines.length) {
-      const line = lines[i] ?? '';
-      const trimmed = line.trim();
-      if (!trimmed) {
-        i += 1;
-        continue;
-      }
-
-      const heading = trimmed.match(/^(#{1,6})\s+(.*)$/);
-      if (heading) {
-        const level = Math.min(6, heading[1].length) as 1 | 2 | 3 | 4 | 5 | 6;
-        const text = heading[2] ?? '';
-        const tag = `h${level}` as 'h1' | 'h2' | 'h3' | 'h4' | 'h5' | 'h6';
-        const contentNodes = renderInlineMarkdown(text, `${prefix}-h-${i}`);
-        blocks.push(
-          tag === 'h1' ? <h1 key={`${prefix}-h1-${i}`}>{contentNodes}</h1> :
-          tag === 'h2' ? <h2 key={`${prefix}-h2-${i}`}>{contentNodes}</h2> :
-          tag === 'h3' ? <h3 key={`${prefix}-h3-${i}`}>{contentNodes}</h3> :
-          tag === 'h4' ? <h4 key={`${prefix}-h4-${i}`}>{contentNodes}</h4> :
-          tag === 'h5' ? <h5 key={`${prefix}-h5-${i}`}>{contentNodes}</h5> :
-          <h6 key={`${prefix}-h6-${i}`}>{contentNodes}</h6>
-        );
-        i += 1;
-        continue;
-      }
-
-      if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
-        blocks.push(<hr key={`${prefix}-hr-${i}`} />);
-        i += 1;
-        continue;
-      }
-
-      if (/^[-*]\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^[-*]\s+/.test(next)) break;
-          items.push(next.replace(/^[-*]\s+/, ''));
-          i += 1;
-        }
-        blocks.push(
-          <ul key={`${prefix}-ul-${i}`}>
-            {items.map((item, idx) => (
-              <li key={`${prefix}-ul-${i}-${idx}`}>{renderInlineMarkdown(item, `${prefix}-ul-inline-${i}-${idx}`)}</li>
-            ))}
-          </ul>
-        );
-        continue;
-      }
-
-      if (/^\d+\.\s+/.test(trimmed)) {
-        const items: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^\d+\.\s+/.test(next)) break;
-          items.push(next.replace(/^\d+\.\s+/, ''));
-          i += 1;
-        }
-        blocks.push(
-          <ol key={`${prefix}-ol-${i}`}>
-            {items.map((item, idx) => (
-              <li key={`${prefix}-ol-${i}-${idx}`}>{renderInlineMarkdown(item, `${prefix}-ol-inline-${i}-${idx}`)}</li>
-            ))}
-          </ol>
-        );
-        continue;
-      }
-
-      if (/^>\s+/.test(trimmed)) {
-        const quoteLines: string[] = [];
-        while (i < lines.length) {
-          const next = (lines[i] ?? '').trim();
-          if (!/^>\s+/.test(next)) break;
-          quoteLines.push(next.replace(/^>\s+/, ''));
-          i += 1;
-        }
-        const quoteText = quoteLines.join(' ');
-        blocks.push(<blockquote key={`${prefix}-q-${i}`}>{renderInlineMarkdown(quoteText, `${prefix}-q-inline-${i}`)}</blockquote>);
-        continue;
-      }
-
-      const para: string[] = [];
-      while (i < lines.length) {
-        const next = lines[i] ?? '';
-        const nextTrim = next.trim();
-        if (!nextTrim || /^(#{1,6})\s+/.test(nextTrim) || /^(?:-{3,}|\*{3,}|_{3,})$/.test(nextTrim) || /^[-*]\s+/.test(nextTrim) || /^\d+\.\s+/.test(nextTrim) || /^>\s+/.test(nextTrim)) break;
-        para.push(nextTrim);
-        i += 1;
-      }
-      blocks.push(<p key={`${prefix}-p-${i}`}>{renderInlineMarkdown(para.join(' '), `${prefix}-p-inline-${i}`)}</p>);
-    }
-  }
-
-  for (const match of normalized.matchAll(fencePattern)) {
-    const full = match[0] ?? '';
-    const lang = (match[1] ?? '').trim();
-    const code = (match[2] ?? '').replace(/\n$/, '');
-    const matchIndex = match.index ?? 0;
-    if (matchIndex > cursor) {
-      renderTextSection(normalized.slice(cursor, matchIndex), `${keyPrefix}-text-${blockIndex++}`);
-    }
-    blocks.push(
-      <pre className="msg-code-block" key={`${keyPrefix}-codeblock-${blockIndex++}`}>
-        <code className={lang ? `language-${lang}` : ''}>{code}</code>
-      </pre>
-    );
-    cursor = matchIndex + full.length;
-  }
-  if (cursor < normalized.length) {
-    renderTextSection(normalized.slice(cursor), `${keyPrefix}-text-${blockIndex++}`);
-  }
-  return blocks.length > 0 ? blocks : [<p key={`${keyPrefix}-fallback`}>{content}</p>];
+function renderMarkdownContent(content: string, keyPrefix: string): ReactElement {
+  const normalized = normalizeMarkdownForRender(content);
+  const handleLinkClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+    const target = event.target as Element | null;
+    const anchor = target?.closest('a[href]') as HTMLAnchorElement | null;
+    if (!anchor) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const href = anchor.getAttribute('href')?.trim() ?? '';
+    if (!/^https?:\/\//i.test(href)) return;
+    void window.tasiHarness.app.openExternalUrl(href);
+  };
+  return (
+    <div
+      key={`${keyPrefix}-md`}
+      className="msg-markdown"
+      onClick={handleLinkClick}
+      dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(normalized) }}
+    />
+  );
 }
 
 function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
@@ -1582,6 +1668,7 @@ function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: Trans
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
+  const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -1605,26 +1692,35 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
       <div className="msg-bubble-wrap">
         <div className="msg-sender">{label}</div>
         <div className="msg-bubble">
-          {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
-          <div className="msg-bubble-actions">
-            <button
-              className={`msg-icon-button ${copied ? 'copied' : ''}`}
-              onClick={() => void handleCopy()}
-              title={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
-              aria-label={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
-            >
-              {copied ? (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path d="M5 12.5 9.2 16.7 19 7.5" />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <rect x="9" y="9" width="10" height="10" rx="2" />
-                  <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
-                </svg>
-              )}
-            </button>
-          </div>
+          {isWechatPending ? (
+            <div>
+              <div className="card-subtle">{tr('WeChat message is being processed...', '微信消息处理中...')}</div>
+              <div className="typing-indicator"><span /> <span /> <span /></div>
+            </div>
+          ) : (
+            <>
+              {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
+              <div className="msg-bubble-actions">
+                <button
+                  className={`msg-icon-button ${copied ? 'copied' : ''}`}
+                  onClick={() => void handleCopy()}
+                  title={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
+                  aria-label={copied ? tr('Copied', '已复制') : tr('Copy message', '复制消息')}
+                >
+                  {copied ? (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M5 12.5 9.2 16.7 19 7.5" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <rect x="9" y="9" width="10" height="10" rx="2" />
+                      <path d="M15 9V7a2 2 0 0 0-2-2H7a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </>
+          )}
         </div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
@@ -1636,6 +1732,7 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
   { value: 'finance', labelEn: 'Finance', labelZh: '财经' },
   { value: 'daily_life', labelEn: 'Daily Life', labelZh: '日常' },
   { value: 'work', labelEn: 'Work', labelZh: '工作' },
+  { value: 'travel', labelEn: 'Travel', labelZh: '旅行' },
   { value: 'reading', labelEn: 'Reading', labelZh: '阅读' },
   { value: 'education', labelEn: 'Education', labelZh: '教育' },
   { value: 'health', labelEn: 'Health', labelZh: '健康' },
@@ -1645,6 +1742,7 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
 function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeState; refreshKnowledge: () => Promise<void> }): ReactElement {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [folderImportBusy, setFolderImportBusy] = useState(false);
   const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
@@ -1685,6 +1783,39 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
     }
   }
 
+  async function addFolder(): Promise<void> {
+    setFolderImportBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await window.tasiHarness.knowledge.addFolder();
+      if (!result.folderPath) {
+        setNotice(props.tr('Folder import canceled.', '已取消文件夹导入。'));
+        return;
+      }
+      const failedCount = result.failed.length;
+      setNotice(
+        props.tr(
+          `Folder import complete: ${result.imported} imported, ${result.skipped} skipped, ${failedCount} failed (scanned ${result.discovered} files).`,
+          `文件夹导入完成：成功 ${result.imported}，跳过 ${result.skipped}，失败 ${failedCount}（共扫描 ${result.discovered} 个文件）。`
+        )
+      );
+      if (failedCount > 0) {
+        const preview = result.failed
+          .slice(0, 5)
+          .map((item) => `- ${item.filePath}: ${item.error}`)
+          .join('\n');
+        const rest = failedCount > 5 ? props.tr(`\n...and ${failedCount - 5} more failures.`, `\n...以及另外 ${failedCount - 5} 个失败项。`) : '';
+        setError(props.tr(`Some files failed to import:\n${preview}${rest}`, `部分文件导入失败：\n${preview}${rest}`));
+      }
+      await props.refreshKnowledge();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setFolderImportBusy(false);
+    }
+  }
+
   async function deleteDocument(doc: PersonalKnowledgeDocument): Promise<void> {
     const confirmed = globalThis.confirm(
       props.tr(
@@ -1721,11 +1852,12 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
       <div className="split-grid knowledge-layout">
         <div className="card">
           <h2>{props.tr('Add Document', '添加文档')}</h2>
-          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX。')}</p>
+          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF。')}</p>
           <label>{props.tr('Source document', '源文档')}</label>
           <input
             type="file"
-            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx"
+            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf"
+            disabled={uploadBusy || folderImportBusy}
             onChange={(event) => {
               setUploadFile(event.target.files?.[0] ?? null);
               setError('');
@@ -1738,8 +1870,11 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
             </div>
           )}
           <div className="button-row">
-            <button className="primary-button" disabled={!uploadFile || uploadBusy} onClick={() => void addDocument()}>
+            <button className="primary-button" disabled={!uploadFile || uploadBusy || folderImportBusy} onClick={() => void addDocument()}>
               {uploadBusy ? '...' : props.tr('Add to Knowledge Base', '加入知识库')}
+            </button>
+            <button className="ghost-button" disabled={uploadBusy || folderImportBusy} onClick={() => void addFolder()}>
+              {folderImportBusy ? '...' : props.tr('Import Folder', '导入文件夹')}
             </button>
           </div>
           {notice && <div className="notice-box">{notice}</div>}
@@ -1800,7 +1935,7 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
   );
 }
 
-function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: string; refreshMemory: () => Promise<void> }): ReactElement {
+function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: string }): ReactElement {
   const [notice, setNotice] = useState('');
   const [searchIntent, setSearchIntent] = useState('');
   const [searchDomain, setSearchDomain] = useState<MemoryDomain | 'all'>('all');
@@ -1808,24 +1943,22 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
   const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
   const [activeEntryId, setActiveEntryId] = useState<string | null>(null);
   const [previewEntry, setPreviewEntry] = useState<MemoryEntry | null>(null);
-  const [clearingMode, setClearingMode] = useState<'entry' | 'domain' | 'all' | null>(null);
-
-  function toMemoryOnly(state: MemoryState): MemoryState {
-    return {
-      ...state,
-      entries: state.entries.filter((entry) => entry.target === 'memory'),
-      usage: state.usage.filter((u) => u.target === 'memory')
-    };
-  }
-
-  const [retrieved, setRetrieved] = useState<MemoryState>(toMemoryOnly(props.memory));
+  const [retrieved, setRetrieved] = useState<MemoryState>({
+    ...props.memory,
+    entries: props.memory.entries.filter((entry) => entry.target === 'memory'),
+    usage: props.memory.usage.filter((u) => u.target === 'memory')
+  });
 
   useEffect(() => {
-    setRetrieved(toMemoryOnly(props.memory));
+    setRetrieved({
+      ...props.memory,
+      entries: props.memory.entries.filter((entry) => entry.target === 'memory'),
+      usage: props.memory.usage.filter((u) => u.target === 'memory')
+    });
     if (props.sessionId && !searchSessionId) setSearchSessionId(props.sessionId);
   }, [props.memory, props.sessionId]);
 
-  async function refreshRetrieved(): Promise<MemoryState> {
+  async function refreshRetrieved(): Promise<void> {
     const next = await window.tasiHarness.memory.get({
       target: 'memory',
       sessionId: searchSessionId.trim() || undefined,
@@ -1834,9 +1967,11 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
       includeGlobal: true,
       limit: 200
     });
-    const filtered = toMemoryOnly(next);
-    setRetrieved(filtered);
-    return filtered;
+    setRetrieved({
+      ...next,
+      entries: next.entries.filter((entry) => entry.target === 'memory'),
+      usage: next.usage.filter((u) => u.target === 'memory')
+    });
   }
 
   async function retrieve(): Promise<void> {
@@ -1876,11 +2011,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     return categorizedEntries.byDomain.get(activeCategory) ?? [];
   }, [activeCategory, categorizedEntries]);
 
-  const activeCategoryLabel = useMemo(() => {
-    const found = categories.find((category) => category.value === activeCategory);
-    return found?.label ?? props.tr('Selected category', '当前分类');
-  }, [activeCategory, categories, props.tr]);
-
   useEffect(() => {
     if (activeEntryId && !visibleEntries.some((entry) => entry.id === activeEntryId)) {
       setActiveEntryId(null);
@@ -1896,98 +2026,10 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     return line.length > 60 ? `${line.slice(0, 60)}...` : line;
   }
 
-  async function syncAfterClear(successNotice: string): Promise<void> {
-    await Promise.all([props.refreshMemory(), refreshRetrieved()]);
-    setNotice(successNotice);
-  }
-
-  async function clearEntry(entry: MemoryEntry): Promise<void> {
-    const label = entryTitle(entry.content);
-    const confirmed = window.confirm(props.tr(`Delete this memory entry?\n\n${label}`, `确认删除这条记忆吗？\n\n${label}`));
-    if (!confirmed) return;
-    try {
-      setClearingMode('entry');
-      await window.tasiHarness.memory.clear({ target: 'memory', mode: 'entry', entryId: entry.id });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(props.tr('Memory entry deleted.', '记忆条目已删除。'));
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
-  async function clearCategory(): Promise<void> {
-    if (activeCategory === 'all') return;
-    const sessionId = searchSessionId.trim();
-    const confirmed = window.confirm(
-      sessionId
-        ? props.tr(
-            `Delete all "${activeCategoryLabel}" memory entries for session ${sessionId}?\n\nThis is not limited by the intent search text.`,
-            `确认删除会话 ${sessionId} 中分类“${activeCategoryLabel}”的全部记忆吗？\n\n这个操作不受意图搜索文本限制。`
-          )
-        : props.tr(
-            `Delete all "${activeCategoryLabel}" memory entries across all sessions?\n\nThis is not limited by the intent search text.`,
-            `确认删除所有会话中分类“${activeCategoryLabel}”的全部记忆吗？\n\n这个操作不受意图搜索文本限制。`
-          )
-    );
-    if (!confirmed) return;
-    try {
-      setClearingMode('domain');
-      await window.tasiHarness.memory.clear({
-        target: 'memory',
-        mode: 'domain',
-        domain: activeCategory,
-        sessionId: sessionId || undefined
-      });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(
-        sessionId
-          ? props.tr(`Cleared ${activeCategoryLabel} memory for session ${sessionId}.`, `已清除会话 ${sessionId} 的“${activeCategoryLabel}”记忆。`)
-          : props.tr(`Cleared all ${activeCategoryLabel} memory entries.`, `已清除全部“${activeCategoryLabel}”记忆。`)
-      );
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
-  async function clearAllMemory(): Promise<void> {
-    const sessionId = searchSessionId.trim();
-    const confirmed = window.confirm(
-      sessionId
-        ? props.tr(`Delete all memory entries for session ${sessionId}?`, `确认删除会话 ${sessionId} 的全部记忆吗？`)
-        : props.tr('Delete all memory entries across all sessions?', '确认删除所有会话中的全部记忆吗？')
-    );
-    if (!confirmed) return;
-    try {
-      setClearingMode('all');
-      await window.tasiHarness.memory.clear({
-        target: 'memory',
-        mode: 'all',
-        sessionId: sessionId || undefined
-      });
-      setPreviewEntry(null);
-      setActiveEntryId(null);
-      await syncAfterClear(
-        sessionId
-          ? props.tr(`Cleared all memory for session ${sessionId}.`, `已清除会话 ${sessionId} 的全部记忆。`)
-          : props.tr('Cleared all memory entries.', '已清除全部记忆。')
-      );
-    } catch (e) {
-      setNotice(e instanceof Error ? e.message : String(e));
-    } finally {
-      setClearingMode(null);
-    }
-  }
-
   return (
     <>
       <section className="page">
-      <PageHeader title={props.tr('Memory', '记忆')} subtitle={props.tr('Search, inspect, and clear saved memory. Memory is committed after one chat run or one scheduled task run completes.', '支持检索、查看和清除已保存记忆。Memory 会在一次对话或定时任务完成后统一存储。')} />
+      <PageHeader title={props.tr('Memory', '记忆')} subtitle={props.tr('Display and retrieval only. Memory is committed after one chat run or one scheduled task run completes.', '仅展示和检索。Memory 会在一次对话或定时任务完成后统一存储。')} />
       <div className="split-grid memory-layout">
         <div className="card">
           <h2>{props.tr('Search Filters', '检索条件')}</h2>
@@ -2004,26 +2046,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
           <input value={searchSessionId} onChange={(e) => setSearchSessionId(e.target.value)} placeholder={props.tr('limit retrieval to one session', '限定检索到某个会话')} />
           <div className="button-row">
             <button className="primary-button" onClick={() => void retrieve()}>{props.tr('Retrieve', '检索')}</button>
-          </div>
-          <h2>{props.tr('Clear Memory', '清除记忆')}</h2>
-          <div className="card-subtle">
-            {searchSessionId.trim()
-              ? props.tr(
-                  `Category/all clear will be limited to session ${searchSessionId.trim()}.`,
-                  `分类清除和全部清除将限制在会话 ${searchSessionId.trim()} 内。`
-                )
-              : props.tr(
-                  'Without a session filter, category/all clear affects all saved memory entries.',
-                  '未填写会话 ID 时，分类清除和全部清除会作用于全部已保存记忆。'
-                )}
-          </div>
-          <div className="button-row">
-            <button className="danger-button" disabled={activeCategory === 'all' || clearingMode !== null} onClick={() => void clearCategory()}>
-              {clearingMode === 'domain' ? '...' : props.tr('Clear category', '清除分类')}
-            </button>
-            <button className="danger-button" disabled={retrieved.entries.length === 0 || clearingMode !== null} onClick={() => void clearAllMemory()}>
-              {clearingMode === 'all' ? '...' : props.tr('Clear all', '清除全部')}
-            </button>
           </div>
           {notice && <div className="notice-box">{notice}</div>}
           <h2>{props.tr('Memory usage', '记忆用量')}</h2>
@@ -2087,11 +2109,6 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
               <span className="soft-badge">{prettyDate(previewEntry.updatedAt)}</span>
             </div>
             <pre className="code-block">{previewEntry.content}</pre>
-            <div className="button-row modal-actions">
-              <button className="danger-button" disabled={clearingMode !== null} onClick={() => void clearEntry(previewEntry)}>
-                {clearingMode === 'entry' ? '...' : props.tr('Delete this entry', '删除这条记忆')}
-              </button>
-            </div>
           </div>
         </div>
       )}
@@ -2148,6 +2165,7 @@ function normalizeSkillContent(content: string, name: string, category: string):
 function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
   const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload'>('installed');
   const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
   const [marketError, setMarketError] = useState('');
   const [notice, setNotice] = useState('');
@@ -2169,9 +2187,14 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [editorSaving, setEditorSaving] = useState(false);
 
   useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedQuery(query.trim()), 240);
+    return () => window.clearTimeout(timeout);
+  }, [query]);
+
+  useEffect(() => {
     if (activeTab !== 'marketplace') return;
     void window.tasiHarness.skills
-      .browseMarketplace(query)
+      .browseMarketplace(debouncedQuery)
       .then((result) => {
         setMarketplace(result);
         setMarketError('');
@@ -2180,7 +2203,7 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
         setMarketplace({ sources: [], skills: [] });
         setMarketError(error instanceof Error ? error.message : String(error));
       });
-  }, [query, skills, activeTab]);
+  }, [debouncedQuery, skills, activeTab]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -2222,7 +2245,7 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
 
   async function refreshMarketplaceSnapshot(): Promise<void> {
     try {
-      const latest = await window.tasiHarness.skills.browseMarketplace(query);
+      const latest = await window.tasiHarness.skills.browseMarketplace(debouncedQuery);
       setMarketplace(latest);
       setMarketError('');
     } catch (error) {
@@ -2397,6 +2420,8 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={tr('search ClawHub, SkillHub, and more', '搜索 ClawHub、SkillHub 等')} />
             {marketError && <div className="error-box market-error">{marketError}</div>}
             <div className="meta-row wrap">
+              <span className="soft-badge">{tr('Results', '结果')}: {marketplace.skills.length}</span>
+              {debouncedQuery && <span className="soft-badge">{tr('Query', '检索')}: {debouncedQuery}</span>}
               {marketplace.sources.filter((source) => source.enabled).map((source) => (
                 <span key={source.id} className="soft-badge">{source.name}</span>
               ))}
@@ -2508,6 +2533,7 @@ function TasksPage(props: {
   const [intervalMinutes, setIntervalMinutes] = useState(60);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('sandbox');
   const [notifyByEmail, setNotifyByEmail] = useState(true);
+  const [notifyByWechat, setNotifyByWechat] = useState(false);
   const [notice, setNotice] = useState('');
 
   async function createTask(): Promise<void> {
@@ -2518,7 +2544,8 @@ function TasksPage(props: {
       runAt: scheduleType === 'once' ? new Date(runAt || Date.now()).toISOString() : undefined,
       intervalMinutes: scheduleType === 'interval' ? intervalMinutes : undefined,
       executionMode,
-      notifyByEmail
+      notifyByEmail,
+      notifyByWechat
     });
     setNotice(props.tr('Scheduled task created.', '定时任务已创建。'));
     await props.refreshTasks();
@@ -2542,7 +2569,7 @@ function TasksPage(props: {
 
   return (
     <section className="page">
-      <PageHeader title={props.tr('Scheduled Tasks', '定时任务')} subtitle={props.tr('Add tasks, run them on a timer, and send completion notifications by email.', '添加任务，按计划运行，并通过邮件发送完成通知。')} />
+      <PageHeader title={props.tr('Scheduled Tasks', '定时任务')} subtitle={props.tr('Add tasks, run them on a timer, and send completion notifications by email or WeChat.', '添加任务，按计划运行，并通过邮件或微信发送完成通知。')} />
       <div className="split-grid">
         <div className="card">
           <h2>{props.tr('Create task', '创建任务')}</h2>
@@ -2572,6 +2599,7 @@ function TasksPage(props: {
             <option value="sandbox">{props.tr('Sandbox', '沙箱')}</option>
           </select>
           <label className="toggle-line"><input type="checkbox" checked={notifyByEmail} onChange={(e) => setNotifyByEmail(e.target.checked)} /> {props.tr('Email notification', '邮件通知')}</label>
+          <label className="toggle-line"><input type="checkbox" checked={notifyByWechat} onChange={(e) => setNotifyByWechat(e.target.checked)} /> {props.tr('WeChat notification', '微信通知')}</label>
           <div className="button-row">
             <button className="primary-button" onClick={() => void createTask()}>{props.tr('Create task', '创建任务')}</button>
           </div>
@@ -2598,11 +2626,15 @@ function TasksPage(props: {
                   <span className="soft-badge">{props.tr('Next', '下次')}: {prettyDate(task.nextRunAt)}</span>
                   <span className="soft-badge">{props.tr('Run in', '运行于')} {task.executionMode === 'workspace' ? props.tr('workspace', '工作区') : props.tr('sandbox', '沙箱')}</span>
                   {task.notifyByEmail && <span className="soft-badge">{props.tr('Email', '邮件')}</span>}
+                  {task.notifyByWechat && <span className="soft-badge">{props.tr('WeChat', '微信')}</span>}
+                  {typeof task.lastIterations === 'number' && <span className="soft-badge">{props.tr('Iterations', '迭代')} {task.lastIterations}</span>}
+                  {typeof task.lastToolEventCount === 'number' && <span className="soft-badge">{props.tr('Tools', '工具')} {task.lastToolEventCount}</span>}
                 </div>
                 {(task.lastResult || task.lastError) && <pre className="code-block small">{task.lastError || task.lastResult}</pre>}
+                {task.lastTrace && <pre className="code-block small">{task.lastTrace}</pre>}
                 <div className="button-row">
-                  <button className="ghost-button" onClick={() => void toggleTask(task)}>{task.enabled ? props.tr('Pause', '暂停') : props.tr('Enable', '启用')}</button>
-                  <button className="primary-button" onClick={() => void runNow(task.id)}>{props.tr('Run now', '立即运行')}</button>
+                  <button className="ghost-button" disabled={task.isRunning} onClick={() => void toggleTask(task)}>{task.enabled ? props.tr('Pause', '暂停') : props.tr('Enable', '启用')}</button>
+                  <button className="primary-button" disabled={task.isRunning} onClick={() => void runNow(task.id)}>{task.isRunning ? props.tr('Executing...', '执行中...') : props.tr('Run now', '立即运行')}</button>
                   <button className="danger-button" onClick={() => void remove(task.id)}>{props.tr('Delete', '删除')}</button>
                 </div>
               </div>
@@ -2654,14 +2686,99 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: PublicAppConfig; setConfig: (cfg: PublicAppConfig) => void }): ReactElement {
   const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
   const [testResult, setTestResult] = useState('');
-  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'email' | 'theme' | 'markets'>('model');
+  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'channels' | 'theme' | 'markets'>('model');
+  const [channelSubPage, setChannelSubPage] = useState<'email' | 'wechat'>('email');
+  const [clawbotQrDataUrl, setClawbotQrDataUrl] = useState('');
+  const [clawbotQrSource, setClawbotQrSource] = useState<'ilink-api' | 'manual-bind-url'>('manual-bind-url');
+  const [clawbotQrKey, setClawbotQrKey] = useState('');
+  const [wechatLoginStatus, setWechatLoginStatus] = useState<'idle' | 'wait' | 'scaned' | 'confirmed' | 'expired' | 'error' | 'unknown'>('idle');
+  const wechatLoginPollRef = useRef<number | null>(null);
+  const wechatLoginCheckingRef = useRef(false);
 
   useEffect(() => {
     setDraft({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
+    setWechatLoginStatus(config.wechatChannel.loginStatus ?? 'idle');
   }, [config]);
 
   const selectedProviderPreset = providerPreset(draft.provider);
   const suggestedModels = providerModelOptions(draft.provider);
+
+  function stopWechatLoginPolling(): void {
+    if (wechatLoginPollRef.current == null) return;
+    window.clearInterval(wechatLoginPollRef.current);
+    wechatLoginPollRef.current = null;
+    wechatLoginCheckingRef.current = false;
+  }
+
+  async function checkWechatLoginStatus(qrcodeKey: string): Promise<void> {
+    if (!qrcodeKey.trim()) return;
+    if (wechatLoginCheckingRef.current) return;
+    wechatLoginCheckingRef.current = true;
+    try {
+      const status = await window.tasiHarness.config.wechatQrcodeStatus(qrcodeKey);
+      setWechatLoginStatus(status.status);
+      if (status.status === 'confirmed') {
+        stopWechatLoginPolling();
+        const next = await window.tasiHarness.config.get();
+        setConfig(next);
+        setTestResult(tr('WeChat channel connected. Incoming messages will sync to chat.', '微信通道已连接，手机消息会同步到对话。'));
+      }
+    } catch (error) {
+      if (error instanceof Error && (error.name === 'AbortError' || /aborted/i.test(error.message))) return;
+      setWechatLoginStatus('error');
+      setTestResult(error instanceof Error ? error.message : String(error));
+    } finally {
+      wechatLoginCheckingRef.current = false;
+    }
+  }
+
+  function startWechatLoginPolling(qrcodeKey: string): void {
+    if (!qrcodeKey.trim()) return;
+    stopWechatLoginPolling();
+    void checkWechatLoginStatus(qrcodeKey);
+    wechatLoginPollRef.current = window.setInterval(() => {
+      void checkWechatLoginStatus(qrcodeKey);
+    }, 2500);
+  }
+
+  async function refreshClawbotQrCode(): Promise<void> {
+    const bindUrl = draft.wechatChannel.bindUrl.trim() || 'https://ilinkai.weixin.qq.com';
+    try {
+      const payload = await window.tasiHarness.config.wechatQrcode();
+      const content = payload.qrcodeContent.trim() || bindUrl;
+      const dataUrl = await QRCode.toDataURL(content, { width: 240, margin: 1 });
+      setClawbotQrDataUrl(dataUrl);
+      setClawbotQrSource(payload.source);
+      setClawbotQrKey(payload.qrcodeKey ?? '');
+      setWechatLoginStatus(payload.qrcodeKey ? 'wait' : 'unknown');
+      if (payload.qrcodeKey) startWechatLoginPolling(payload.qrcodeKey);
+      return;
+    } catch {
+      // fall through to local fallback
+    }
+
+    try {
+      const dataUrl = await QRCode.toDataURL(bindUrl, { width: 240, margin: 1 });
+      setClawbotQrDataUrl(dataUrl);
+      setClawbotQrSource('manual-bind-url');
+      setClawbotQrKey('');
+      setWechatLoginStatus('unknown');
+      stopWechatLoginPolling();
+    } catch {
+      setClawbotQrDataUrl('');
+      setClawbotQrSource('manual-bind-url');
+      setClawbotQrKey('');
+      setWechatLoginStatus('error');
+      stopWechatLoginPolling();
+    }
+  }
+
+  useEffect(() => {
+    if (subPage !== 'channels' || channelSubPage !== 'wechat') return;
+    void refreshClawbotQrCode();
+  }, [subPage, channelSubPage]);
+
+  useEffect(() => () => stopWechatLoginPolling(), []);
 
   function applyProviderPreset(nextProvider: PublicAppConfig['provider']): void {
     const nextPreset = providerPreset(nextProvider);
@@ -2693,46 +2810,42 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     <section className="page settings-page">
       <PageHeader
         title={tr('Settings', '设置')}
-        subtitle={tr('Provider, skill markets, email notifications, security, and execution defaults.', '模型提供方、技能市场、邮件通知、安全策略与默认执行设置。')}
-        action={(
+        subtitle={tr('Provider, channels, skill markets, security, and execution defaults.', '模型服务、通道、技能市场、安全与执行默认配置。')}
+        action={
           <div className="button-row compact">
             <button className="primary-button" onClick={() => void save()}>{tr('Save', '保存')}</button>
           </div>
-        )}
+        }
       />
       <div className="skill-tabs">
-        <button className={`skill-tab ${subPage === 'model' ? 'active' : ''}`} onClick={() => setSubPage('model')}>{tr('Model', '模型配置')}</button>
+        <button className={`skill-tab ${subPage === 'model' ? 'active' : ''}`} onClick={() => setSubPage('model')}>{tr('Model', '模型')}</button>
         <button className={`skill-tab ${subPage === 'execution' ? 'active' : ''}`} onClick={() => setSubPage('execution')}>{tr('Execution', '执行')}</button>
         <button className={`skill-tab ${subPage === 'security' ? 'active' : ''}`} onClick={() => setSubPage('security')}>{tr('Security', '安全')}</button>
-        <button className={`skill-tab ${subPage === 'email' ? 'active' : ''}`} onClick={() => setSubPage('email')}>{tr('Email', '邮件')}</button>
+        <button className={`skill-tab ${subPage === 'channels' ? 'active' : ''}`} onClick={() => setSubPage('channels')}>{tr('Channels', '通道')}</button>
         <button className={`skill-tab ${subPage === 'theme' ? 'active' : ''}`} onClick={() => setSubPage('theme')}>{tr('Theme', '主题')}</button>
         <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
       </div>
       {subPage === 'model' && (
         <div className="card">
           <h2>{tr('Model Configuration', '模型配置')}</h2>
-          <label>{tr('Provider', '提供方')}</label>
+          <label>{tr('Provider', '服务商')}</label>
           <select value={draft.provider} onChange={(e) => applyProviderPreset(e.target.value as PublicAppConfig['provider'])}>
             {PROVIDER_PRESETS.map((preset) => (
               <option key={preset.kind} value={preset.kind}>{preset.label}</option>
             ))}
           </select>
-          <label>{tr('Base URL', '基础 URL')}</label>
+          <label>{tr('Base URL', 'Base URL')}</label>
           <input value={draft.baseUrl} onChange={(e) => setDraft((old) => ({ ...old, baseUrl: e.target.value }))} />
-          <div className="card-subtle">{tr('Preset endpoint', '预设地址')}: {selectedProviderPreset.defaultBaseUrl}</div>
-          <label>{tr('API Key', 'API 密钥')} {config.apiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
+          <div className="card-subtle">{tr('Preset endpoint:', '预设端点：')} {selectedProviderPreset.defaultBaseUrl}</div>
+          <label>API Key {config.apiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
           <input
             type="password"
             value={draft.apiKey || ''}
             disabled={!providerRequiresApiKey(draft.provider)}
             onChange={(e) => setDraft((old) => ({ ...old, apiKey: e.target.value }))}
-            placeholder={
-              providerRequiresApiKey(draft.provider)
-                ? tr('leave blank to keep existing', '留空则保持现有配置')
-                : tr('Not required for this provider', '当前提供方无需 API 密钥')
-            }
+            placeholder={providerRequiresApiKey(draft.provider) ? tr('leave blank to keep existing', '留空则保持不变') : tr('Not required for this provider', '该服务商不需要')}
           />
-          <label>{tr('Suggested models', '常用模型')}</label>
+          <label>{tr('Suggested models', '推荐模型')}</label>
           <select
             value={suggestedModels.includes(draft.model) ? draft.model : ''}
             onChange={(e) => {
@@ -2752,7 +2865,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
               className="ghost-button"
               onClick={() => setDraft((old) => ({ ...old, baseUrl: selectedProviderPreset.defaultBaseUrl, model: selectedProviderPreset.defaultModel }))}
             >
-              {tr('Reset preset', '恢复预设')}
+              {tr('Reset preset', '重置预设')}
             </button>
             <button className="ghost-button" onClick={() => void test()}>{tr('Save and test model', '保存并测试模型')}</button>
           </div>
@@ -2764,15 +2877,53 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label>{tr('Temperature', '温度')}</label>
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
-          <input type="number" min="1" max="32" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
-          <label>{tr('Workspace directory', '工作区目录')}</label>
+          <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <label>{tr('Session document max docs', '对话文档最大数量')}</label>
+          <input
+            type="number"
+            min="1"
+            max="100"
+            value={draft.sessionDocumentMaxDocs}
+            onChange={(e) => setDraft((old) => ({ ...old, sessionDocumentMaxDocs: Number(e.target.value) }))}
+          />
+          <label>{tr('Workspace directory', '工作目录')}</label>
           <input value={draft.workspaceDir} onChange={(e) => setDraft((old) => ({ ...old, workspaceDir: e.target.value }))} />
           <label>{tr('Default execution mode', '默认执行模式')}</label>
           <select value={draft.defaultExecutionMode} onChange={(e) => setDraft((old) => ({ ...old, defaultExecutionMode: e.target.value as 'workspace' | 'sandbox' }))}>
             <option value="workspace">{tr('Workspace', '工作区')}</option>
             <option value="sandbox">{tr('Sandbox', '沙箱')}</option>
           </select>
-          <label>{tr('Persona', '系统角色')}</label>
+          <label>{tr('Browser mode', '浏览器模式')}</label>
+          <select value={draft.browserMode} onChange={(e) => setDraft((old) => ({ ...old, browserMode: e.target.value as PublicAppConfig['browserMode'] }))}>
+            <option value="embedded">{tr('Built-in browser', '内置浏览器')}</option>
+            <option value="external">{tr('External browser', '外部浏览器')}</option>
+          </select>
+          <label>{tr('External browser engine', '外部浏览器引擎')}</label>
+          <select
+            value={draft.externalBrowserEngine}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserEngine: e.target.value as PublicAppConfig['externalBrowserEngine'] }))}
+          >
+            <option value="auto">{tr('Auto (CDP first)', '自动（优先 CDP）')}</option>
+            <option value="cdp">{tr('CDP only', '仅 CDP')}</option>
+            <option value="webdriver-safari">{tr('Safari WebDriver only', '仅 Safari WebDriver')}</option>
+          </select>
+          <label>{tr('CDP endpoint', 'CDP 地址')}</label>
+          <input
+            value={draft.externalBrowserCdpEndpoint}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserCdpEndpoint: e.target.value }))}
+            placeholder="http://127.0.0.1:9222"
+          />
+          <label>{tr('External browser profile', '外部浏览器配置')}</label>
+          <select
+            value={draft.externalBrowserProfileMode}
+            onChange={(e) => setDraft((old) => ({ ...old, externalBrowserProfileMode: e.target.value as PublicAppConfig['externalBrowserProfileMode'] }))}
+          >
+            <option value="isolated">{tr('Isolated (safe default)', '隔离模式（默认更安全）')}</option>
+            <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
+          </select>
+          <div className="card-subtle">{tr('External auto mode tries CDP first, then Safari WebDriver on macOS, then shell.openExternal.', '外部自动模式会优先尝试 CDP，其次在 macOS 使用 Safari WebDriver，最后回退到 shell.openExternal。')}</div>
+          <div className="card-subtle">{tr('System profile mode reuses login state and may force-close browser processes during controlled takeover.', '系统配置会复用登录态，在受控接管时可能强制关闭浏览器进程。')}</div>
+          <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>
       )}
@@ -2783,22 +2934,77 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label className="toggle-line"><input type="checkbox" checked={draft.enableNetworkTools} onChange={(e) => setDraft((old) => ({ ...old, enableNetworkTools: e.target.checked }))} /> {tr('Enable network tools', '启用网络工具')}</label>
         </div>
       )}
-      {subPage === 'email' && (
+      {subPage === 'channels' && (
         <div className="card">
-          <h2>{tr('Email Notifications', '邮件通知')}</h2>
-          <label className="toggle-line"><input type="checkbox" checked={draft.emailNotifications.enabled} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, enabled: e.target.checked } }))} /> {tr('Enable email notifications', '启用邮件通知')}</label>
-          <label>{tr('Email host', '邮件主机')}</label>
-          <input value={draft.emailNotifications.host} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, host: e.target.value } }))} />
-          <label>{tr('Email port', '邮件端口')}</label>
-          <input type="number" value={draft.emailNotifications.port} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, port: Number(e.target.value) } }))} />
-          <label>{tr('Email username', '邮件用户名')}</label>
-          <input value={draft.emailNotifications.username} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, username: e.target.value } }))} />
-          <label>{tr('Email password', '邮件密码')} {config.emailNotifications.passwordConfigured ? tr('(configured)', '（已配置）') : ''}</label>
-          <input type="password" value={draft.emailNotifications.password || ''} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, password: e.target.value } }))} placeholder={tr('leave blank to keep existing', '留空则保持现有配置')} />
-          <label>{tr('From address', '发件地址')}</label>
-          <input value={draft.emailNotifications.from} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, from: e.target.value } }))} />
-          <label>{tr('To address', '收件地址')}</label>
-          <input value={draft.emailNotifications.to} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, to: e.target.value } }))} />
+          <h2>{tr('Channels', '通道')}</h2>
+          <div className="skill-tabs channel-tabs">
+            <button className={`skill-tab ${channelSubPage === 'email' ? 'active' : ''}`} onClick={() => setChannelSubPage('email')}>{tr('Email', '邮件')}</button>
+            <button className={`skill-tab ${channelSubPage === 'wechat' ? 'active' : ''}`} onClick={() => setChannelSubPage('wechat')}>{tr('WeChat', '微信')}</button>
+          </div>
+          {channelSubPage === 'email' && (
+            <div className="channel-pane">
+              <label className="toggle-line"><input type="checkbox" checked={draft.emailNotifications.enabled} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, enabled: e.target.checked } }))} /> {tr('Enable email notifications', '启用邮件通知')}</label>
+              <label>{tr('Email host', '邮件服务器')}</label>
+              <input value={draft.emailNotifications.host} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, host: e.target.value } }))} />
+              <label>{tr('Email port', '邮件端口')}</label>
+              <input type="number" value={draft.emailNotifications.port} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, port: Number(e.target.value) } }))} />
+              <label>{tr('Email username', '邮件用户名')}</label>
+              <input value={draft.emailNotifications.username} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, username: e.target.value } }))} />
+              <label>{tr('Email password', '邮件密码')} {config.emailNotifications.passwordConfigured ? tr('(configured)', '（已配置）') : ''}</label>
+              <input type="password" value={draft.emailNotifications.password || ''} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, password: e.target.value } }))} placeholder={tr('leave blank to keep existing', '留空则保持不变')} />
+              <label>{tr('From address', '发件地址')}</label>
+              <input value={draft.emailNotifications.from} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, from: e.target.value } }))} />
+              <label>{tr('To address', '收件地址')}</label>
+              <input value={draft.emailNotifications.to} onChange={(e) => setDraft((old) => ({ ...old, emailNotifications: { ...old.emailNotifications, to: e.target.value } }))} />
+            </div>
+          )}
+          {channelSubPage === 'wechat' && (
+            <div className="channel-pane">
+              <label className="toggle-line">
+                <input
+                  type="checkbox"
+                  checked={draft.wechatChannel.enabled}
+                  onChange={(e) => setDraft((old) => ({ ...old, wechatChannel: { ...old.wechatChannel, enabled: e.target.checked } }))}
+                />
+                {tr('Enable WeChat channel', '启用微信通道')}
+              </label>
+              <label>{tr('Plugin', '插件')}</label>
+              <input value={draft.wechatChannel.pluginName} readOnly />
+              <div className="card-subtle">{tr('WeChat channel uses the clawbot plugin.', '微信通道使用 clawbot 插件。')}</div>
+              <label>{tr('ClawBot bind URL', 'ClawBot 绑定地址')}</label>
+              <input
+                value={draft.wechatChannel.bindUrl}
+                onChange={(e) => setDraft((old) => ({ ...old, wechatChannel: { ...old.wechatChannel, bindUrl: e.target.value } }))}
+                placeholder="https://ilinkai.weixin.qq.com"
+              />
+              <div className="channel-qr-wrap">
+                {clawbotQrDataUrl
+                  ? <img className="channel-qr-image" src={clawbotQrDataUrl} alt={tr('ClawBot QR Code', 'ClawBot 二维码')} />
+                  : <div className="card-subtle">{tr('QR code failed to load.', '二维码加载失败。')}</div>}
+                <div className="channel-qr-meta">
+                  <strong>{tr('ClawBot QR', 'ClawBot 二维码')}</strong>
+                  <p>{tr('Scan this QR code with WeChat to bind the clawbot plugin channel.', '请使用微信扫码绑定 clawbot 插件通道。')}</p>
+                  <p className="card-subtle">
+                    {tr('Login status:', '登录状态：')} {wechatLoginStatus}
+                  </p>
+                  <p className="card-subtle">
+                    {clawbotQrSource === 'ilink-api'
+                      ? tr('Source: iLink dynamic login QR (recommended).', '来源：iLink 动态登录二维码（推荐）。')
+                      : tr('Source: manual bind URL fallback.', '来源：手动绑定链接回退。')}
+                  </p>
+                  <button className="ghost-button channel-open-link" onClick={() => void checkWechatLoginStatus(clawbotQrKey)} disabled={!clawbotQrKey}>
+                    {tr('Check login status', '检查登录状态')}
+                  </button>
+                  <button className="ghost-button channel-open-link" onClick={() => void refreshClawbotQrCode()}>
+                    {tr('Refresh QR code', '刷新二维码')}
+                  </button>
+                  <a className="ghost-button channel-open-link" href={draft.wechatChannel.bindUrl.trim() || 'https://ilinkai.weixin.qq.com'} target="_blank" rel="noreferrer">
+                    {tr('Open bind URL', '打开绑定链接')}
+                  </a>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
       {subPage === 'theme' && (
@@ -2837,7 +3043,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
                   </label>
                 </div>
                 <p>{source.description}</p>
-                <label>{tr('Catalog URL', '目录 URL')}</label>
+                <label>{tr('Catalog URL', '目录地址')}</label>
                 <input
                   value={source.catalogUrl || ''}
                   onChange={(e) => {
@@ -2873,5 +3079,3 @@ function AboutPage({ tr, info }: { tr: TranslateFn; info: AppInfo | null }): Rea
     </section>
   );
 }
-
-

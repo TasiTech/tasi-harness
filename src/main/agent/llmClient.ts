@@ -171,7 +171,7 @@ function formatFetchFailure(config: AppConfig, endpoint: string, error: unknown)
   } else {
     hints.push('Check Base URL, API key, proxy/firewall settings, DNS, and TLS certificate trust on this machine.');
   }
-  if (config.opencliBridgeMode === 'external') {
+  if (config.browserMode === 'external') {
     hints.push('This happened before the external browser step; verify model/network connectivity first.');
   }
   return hints.join(' ');
@@ -265,6 +265,7 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
       id: createId('msg'),
       role: 'assistant',
       content: String(msg.content ?? ''),
+      reasoning_content: typeof msg.reasoning_content === 'string' ? msg.reasoning_content : undefined,
       tool_calls: toolCalls
     },
     usage: {
@@ -274,6 +275,66 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
     },
     raw: json
   };
+}
+
+function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: AppConfig['provider']): Array<Record<string, unknown>> {
+  const normalized: Array<Record<string, unknown>> = [];
+  const droppedToolCallIds = new Set<string>();
+
+  for (const message of messages) {
+    if (message.role === 'system' || message.role === 'user') {
+      const next: Record<string, unknown> = {
+        role: message.role,
+        content: String(message.content ?? '')
+      };
+      if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
+      normalized.push(next);
+      continue;
+    }
+
+    if (message.role === 'assistant') {
+      const next: Record<string, unknown> = {
+        role: 'assistant',
+        content: String(message.content ?? '')
+      };
+      if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
+      if (typeof message.reasoning_content === 'string') next.reasoning_content = message.reasoning_content;
+
+      const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      const toolCalls = rawToolCalls
+        .map((call) => ({
+          id: String(call.id ?? createId('toolcall')),
+          type: 'function' as const,
+          function: {
+            name: String(call.function?.name ?? ''),
+            arguments: typeof call.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function?.arguments ?? {})
+          }
+        }))
+        .filter((call) => call.function.name);
+
+      const hasReasoning = typeof message.reasoning_content === 'string' && message.reasoning_content.trim().length > 0;
+      const canKeepToolCalls = toolCalls.length > 0 && (provider !== 'deepseek' || hasReasoning);
+      if (canKeepToolCalls) {
+        next.tool_calls = toolCalls;
+      } else if (toolCalls.length > 0) {
+        for (const call of toolCalls) droppedToolCallIds.add(call.id);
+      }
+
+      normalized.push(next);
+      continue;
+    }
+
+    const toolCallId = String(message.tool_call_id ?? '').trim();
+    if (!toolCallId) continue;
+    if (droppedToolCallIds.has(toolCallId)) continue;
+    normalized.push({
+      role: 'tool',
+      tool_call_id: toolCallId,
+      content: String(message.content ?? '')
+    });
+  }
+
+  return normalized;
 }
 
 function parseAnthropicCompletion(json: any): LlmCompletion {
@@ -377,7 +438,7 @@ class ModelClient implements LlmClient {
     if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
     const body = {
       model: this.config.model,
-      messages: request.messages,
+      messages: normalizeOpenAiCompatibleMessages(request.messages, this.config.provider),
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,

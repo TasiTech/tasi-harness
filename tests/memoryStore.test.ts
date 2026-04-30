@@ -73,6 +73,43 @@ describe('MemoryStore', () => {
     expect(finance.rendered).toContain('finance');
   });
 
+  it('classifies travel intents into the travel domain', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new MemoryStore(env.home);
+
+    expect(store.inferDomains('plan a 5-day trip with flight and hotel')).toContain('travel');
+    store.add('memory', 'Compare hotel options near the station and check flight prices.', { scope: 'session', sessionId: 's_trip' });
+    const trip = store.getState({ target: 'memory', sessionId: 's_trip', includeGlobal: false });
+    expect(trip.entries[0]?.domain).toBe('travel');
+  });
+
+  it('classifies Chinese intents into matching domains', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new MemoryStore(env.home);
+
+    expect(store.inferDomains('帮我做一份旅行行程和酒店机票攻略')).toContain('travel');
+    expect(store.inferDomains('整理一下股票和基金投资计划')).toContain('finance');
+    expect(store.inferDomains('下周项目排期和会议安排')).toContain('work');
+    expect(store.inferDomains('最近健身和体检提醒')).toContain('health');
+    expect(store.inferDomains('携程景点和攻略页参数整理')).toContain('travel');
+  });
+
+  it('upgrades explicit other domain when content strongly matches travel', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new MemoryStore(env.home);
+
+    store.add('memory', '携程行程：机票酒店和景点攻略安排。', {
+      scope: 'session',
+      sessionId: 's_travel',
+      domain: 'other'
+    });
+    const state = store.getState({ target: 'memory', sessionId: 's_travel', includeGlobal: false });
+    expect(state.entries[0]?.domain).toBe('travel');
+  });
+
   it('queues memory and commits only after completion', () => {
     const env = tempHome();
     cleanup = env.cleanup;
@@ -126,7 +163,56 @@ describe('MemoryStore', () => {
 
     const entries = store.getState({ target: 'memory', sessionId: 'session_demo', includeGlobal: false }).entries;
     expect(entries).toHaveLength(1);
+    expect(entries[0]?.content).toContain('Goal:');
     expect(entries[0]?.content).toContain('Fix the preview resize behavior');
+    expect(entries[0]?.content).toContain('Outcome:');
     expect(entries[0]?.content).toContain('resize logic');
+  });
+
+  it('includes tool signals in automatic session memory snapshots', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new MemoryStore(env.home);
+    const session: SessionRecord = {
+      id: 'session_tools',
+      title: 'tools',
+      createdAt: '2026-04-22T00:00:00.000Z',
+      updatedAt: '2026-04-22T00:02:00.000Z',
+      messageCount: 3,
+      messages: [
+        { id: 'm1', role: 'user', content: 'Search ctrip hotel and flight options for Shanghai', createdAt: '2026-04-22T00:00:00.000Z' },
+        {
+          id: 'm2',
+          role: 'assistant',
+          content: '',
+          createdAt: '2026-04-22T00:01:00.000Z',
+          tool_calls: [{ id: 'tc_1', type: 'function', function: { name: 'skill_view', arguments: '{"ref_path":"provider-ctrip-browser.md"}' } }]
+        },
+        {
+          id: 'm3',
+          role: 'tool',
+          name: 'skill_view',
+          tool_call_id: 'tc_1',
+          content: 'Loaded provider-ctrip-browser reference',
+          createdAt: '2026-04-22T00:01:05.000Z'
+        },
+        {
+          id: 'm4',
+          role: 'assistant',
+          content: 'Collected hotel, flight, train, and attractions URLs, then prepared tool-ready parameters.',
+          createdAt: '2026-04-22T00:02:00.000Z'
+        }
+      ],
+      toolEvents: [],
+      lastExecution: { mode: 'workspace', workspaceDir: '' }
+    };
+
+    expect(store.syncSessionMemory(session)).toBe(true);
+
+    const entry = store.getState({ target: 'memory', sessionId: 'session_tools', includeGlobal: false }).entries[0];
+    expect(entry?.content).toContain('Tools:');
+    expect(entry?.content).toContain('call:skill_view');
+    expect(entry?.content).toContain('Outcome:');
+    expect(entry?.content.length ?? 0).toBeGreaterThan(120);
   });
 });

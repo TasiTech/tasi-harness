@@ -12,17 +12,9 @@ Provide a single entry workflow for trip planning while keeping provider logic m
 This skill uses an entry-plus-modules structure:
 - Entry layer (this file): request understanding, orchestration, provider routing, and output assembly.
 - Provider layer: platform-specific retrieval and normalization.
-- Browser evidence layer: Ctrip web retrieval through Agent Browser or built-in `browser_*` tools.
-- Visualization layer: parked for now; Step 4A map artifact generation is temporarily disabled.
-- Asset layer: map runtime files under `./assets/map/` are retained for future re-enable, but are not part of the active workflow right now.
+- Browser evidence layer: Ctrip web retrieval through built-in `browser_*` tools, with runtime mode handled by the harness.
+- Visualization layer: map route link generation and formatting policy (Amap URL).
 - Capability details: kept inside provider docs to reduce fragmentation while preserving extension points.
-
-## Runtime Assets
-Skill-bundled map runtime files:
-- Python backend: `./assets/map/app.py`
-- Map frontend: `./assets/map/map.html`
-
-These files remain bundled, but the entry workflow currently does not start them because Step 4A is temporarily disabled.
 
 ## Required Inputs
 - user_request
@@ -39,10 +31,10 @@ These files remain bundled, but the entry workflow currently does not start them
 - tool_capabilities: list of available tools and keys
 - feedback_history (optional)
 - map_render_request (optional):
-  - map_enabled (bool)
-  - map_focus (city|day|full_trip)
-  - map_file_name (optional)
-  - force_refresh_routes (optional, default false)
+  - map_enabled (bool; default true)
+  - map_focus (city|day|full_trip, optional; default day)
+  - travel_mode (car|walk|bus|bike, optional; default car)
+  - use_lnglat (bool, optional; default false)
 
 ## Provider Configuration
 
@@ -56,7 +48,6 @@ These files remain bundled, but the entry workflow currently does not start them
 | POI discovery | ctrip_browser | flyai | offline_estimate |
 | Route/Distance matrix | flyai | tencent_map | offline_estimate |
 | Weather | flyai | tencent_map | offline_estimate |
-| Map rendering | disabled_temporarily | offline_sketch | N/A |
 
 ### Offline Fallback Definitions
 - `offline_sketch`: a fallback mechanism that fills content using alternative methods or offline/pre-generated data when dynamic services are unavailable.
@@ -67,7 +58,7 @@ These files remain bundled, but the entry workflow currently does not start them
 | Provider | Auth Method | Rate Limit Handling | Credential Key |
 |---|---|---|---|
 | flyai | Probe first; ask on 401/403 only | Stop retries; mark degraded; fallback | Not required unless auth error |
-| ctrip_browser | Browser-mode dependent; do not assume an external bridge exists | Stop retries; mark degraded; fallback | None |
+| ctrip_browser | Browser tools first; external mode is harness-managed (auto-detect controlled runtime, then fallback opener if needed) | Stop retries; mark degraded; fallback | None |
 | tencent_map | Check key availability for non-map capabilities only | Stop retries; mark degraded; fallback | TENCENT_KEY or TENCENT_MAP_KEY |
 
 ### Provider References
@@ -76,7 +67,7 @@ These files remain bundled, but the entry workflow currently does not start them
 - ctrip-browser: ./references/provider-ctrip-browser.md
 - Ctrip guide: ./references/ctrip-information-search-guide.md
 - Extension guide: ./references/provider-extension.md
-- Agent Browser skill: ../../browser/agent-browser/SKILL.md
+- Tasi browser automation skill: ../../browser/tasi-browser-automation/SKILL.md
 - Built-in browser operator: ../../browser/embedded-browser-operator/SKILL.md
 
 ## Provider Routing Policy
@@ -89,13 +80,13 @@ These files remain bundled, but the entry workflow currently does not start them
    - For hotel, POI, flight, and train information, try `ctrip_browser` first. If browser extraction returns no accepted rows or cannot produce usable evidence, fall back to `flyai`.
    - If all providers fail, trigger `Offline Degradation Mode`.
 3. **Browser policy**:
-   - In embedded mode, use built-in `browser_*` tools as the default Ctrip workflow.
-   - In external mode, prefer Agent Browser only when a working external bridge is clearly available.
-   - If bridge availability is unknown, disconnected, or unstable, continue with `browser_*` tools instead of blocking on bridge setup.
+   - In both embedded and external modes, use `browser_*` tools as the default Ctrip workflow.
+   - In external mode, rely on harness-managed external runtime selection (Chromium-family via CDP first; Safari via WebDriver on macOS when configured).
+   - If controlled external runtime is unavailable and the harness falls back to a plain external opener, continue workflow and keep uncertainty visible; do not block on manual runtime setup.
 
 ### Degradation Rules
 - **HTTP 429 / Rate Limit / Trial Limit**: mark category as `degraded`, stop retries for this turn, and switch to the next provider.
-- **Auth Error (401/403)**: for flyai, prompt user for credentials. For map requests, do not ask for Tencent map credentials yet because Step 4A is temporarily disabled; continue without map artifacts and note the limitation.
+- **Auth Error (401/403)**: for flyai, prompt user for credentials. For tencent_map with map_enabled=true, ask for TENCENT_KEY or confirm offline degradation.
 - **Network / Quota Failure**: treat as degraded and fall back to the next provider.
 - **Browser Failure**: if browser tools fail, the page does not load, or extraction is blocked, mark the category as degraded and fall back.
 - **All Providers Failed**: return conservative offline suggestions with explicit uncertainty marking.
@@ -108,7 +99,7 @@ Use hotel search when the user asks for nearby hotels, accommodation options, ho
 ### Tool Binding
 - Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
 - Preferred extract format: `format=json`
-- External bridge policy: in external browser mode, prefer Agent Browser only when a working external bridge is clearly available; otherwise continue with `browser_*` tools.
+- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
 - Required args: `city`, `check_in`, `check_out`
 - Optional args: `keyword`, `limit`
 - Preferred source: Ctrip hotel list or search pages that match the requested city and date range.
@@ -150,7 +141,7 @@ Use POI search when the user asks for city attractions, scenic spots, museums, l
 ### Tool Binding
 - Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
 - Preferred extract format: `format=json`
-- External bridge policy: in external browser mode, prefer Agent Browser only when a working external bridge is clearly available; otherwise continue with `browser_*` tools.
+- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
 - Required args: `city`
 - Optional args: `keyword`, `limit`
 - Preferred source: Ctrip sight or guide listing pages and clearly attributable POI detail pages.
@@ -208,7 +199,6 @@ Execute provider calls following the priority table:
 Auth and capability probe rules:
 - Run capability probe first for providers that support it.
 - Ask for credentials only on explicit auth errors (401/403), not on generic network or quota failures.
-- When `map_render_request.map_enabled=true`, acknowledge that map artifact generation is temporarily disabled in this skill version and continue without requesting map keys or starting map services.
 
 ### Step 3: Degrade Strategy
 Apply the degradation rules consistently:
@@ -223,17 +213,34 @@ Apply the degradation rules consistently:
 - Avoid overloading any single day.
 - If multiple `must_visit` items cannot be reasonably covered within the given date range due to geographic dispersion, either distribute them across available days with clear labeling or flag this in "Risks and missing information" with a recommendation to prioritize or extend the trip.
 
-### Step 4A: Map Artifact Build Disabled (Temporarily Off)
-Status: disabled for now.
+### Step 4A: Build Amap Route Links (When Map Is Requested)
+Goal: output a local HTML viewer link that embeds the Amap route URLs to display consecutive day routes together on a single page using URL parameters.
 
 Entry-level rules:
-1. Do not generate route JSON artifacts in the current workflow.
-2. Do not start or depend on `./assets/map/app.py`.
-3. Do not ask the user for Tencent map keys solely for map rendering.
-4. If the user requests a map, state that Step 4A is temporarily unavailable and continue with textual itinerary and transport guidance.
+1. Generate the Amap routing URLs using name-only mode by default for simplicity and robustness.
+2. If `use_lnglat=true`, include both `name` and `lnglat` for each point to avoid ambiguity.
+3. Enforce Amap limitations: only `car` supports via points, up to 6 via points, and the total number of points (including origin and destination) must not exceed 8.
+4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. To display the route more clearly and connect the locations on the combined map, generate a `car` link that includes all POIs as a demonstration, and use this `car` link for the multi-day viewer.
+5. Map focus behavior:
+  - `day` (default): generate one Amap link per day.
+  - `full_trip`: attempt a single link for the whole trip (may exceed Amap point limits).
+  - `city`: generate a single intra-city link when the trip stays within one city.
+6. Provide the user with a Markdown link pointing to the local static viewer containing the encoded parameters.
 
-Design notes for a future re-enable remain parked in:
-- `./references/map-rendering.md`
+Link Generation:
+- Use an absolute URL starting with `file:///` pointing to the viewer file, for example: `file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html`.
+- Encode each generated URL properly.
+- To prevent the multi-day map URL from becoming too long, use the compact pipe-separated points format `?day1=点1|点2|点3` instead of raw Amap URLs for the iframe viewer. The local HTML viewer will automatically expand it.
+Append the links as query parameters: `?day1=URL_ENCODED(Origin|Via1|Via2|Destination)&day2=URL_ENCODED(Origin|Destination)`. For `full_trip` or `city`, just use `?day1=...`.
+
+Fallback Strategy:
+- If a local `file:///` link cannot be opened or the local path is unknown, omit the viewer link.
+- Provide per-day Amap URLs (`https://ditu.amap.com/dir?...`) as plain Markdown links instead, one link per day, so the user can still open each day directly.
+
+Example:
+```markdown
+🗺️ [点击打开多日行程地图预览](file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html?day1=%E5%A4%A9%E5%AE%89%E9%97%A8%E5%B9%BF%E5%9C%BA%7C%E6%95%85%E5%AE%AB%E5%8D%9A%E7%89%A9%E9%99%A2%7C%E5%A4%A9%E5%9D%9B%E5%85%AC%E5%9B%AD&day2=%E5%8C%97%E4%BA%AC%E5%8C%97%E7%AB%99%7C%E5%85%AB%E8%BE%BE%E5%B2%AD%E9%95%BF%E5%9F%8E)
+```
 
 ### Step 5: Budget and Risks
 Provide a budget split for:
@@ -283,15 +290,52 @@ The final Markdown output must include:
 10. Itinerary compactness label (Relaxed/Moderate/Compact)
 
 When `map_render_request.map_enabled` is true, also include:
-11. Map status note (Step 4A is temporarily disabled; no artifact was generated)
+11. Amap route link notes (mode, via limits, and link formatting)
 
-### Map Artifact Contract (Temporarily Disabled)
-Do not produce or persist a map JSON artifact in the current workflow.
+### Amap Route Link Contract (When Map Is Requested)
+Generate an Amap route URL based on either name-only or lnglat-enhanced mode.
 
-If the user requested map output:
-- explicitly state that Step 4A is disabled;
-- do not mention cache policy, file names, or refresh conditions as if they were executed;
-- continue with itinerary content and textual transport notes only.
+**Base URL**: `https://ditu.amap.com/dir`
+
+#### Name-Only Mode (Recommended)
+Required:
+- `from[name]={origin}`
+- `to[name]={destination}`
+- `type={car|walk|bus|bike}`
+
+Optional (car only, up to 6 via points):
+- `via[0][name]={stop1}` ... `via[5][name]={stop6}`
+
+Template:
+```text
+https://ditu.amap.com/dir?from[name]={origin}&to[name]={destination}&type=car&via[0][name]={stop1}&via[1][name]={stop2}
+```
+
+#### Lnglat Mode (Precise Control)
+When using coordinates, always include `name` as label and `lnglat` as routing anchor.
+
+Required:
+- `from[name]={origin}`
+- `from[lnglat]={lng},{lat}`
+- `to[name]={destination}`
+- `to[lnglat]={lng},{lat}`
+- `type={car|walk|bus|bike}`
+
+Optional (car only, up to 6 via points):
+- `via[i][name]={stop}`
+- `via[i][lnglat]={lng},{lat}`
+
+Template:
+```text
+https://ditu.amap.com/dir?from[name]={origin}&from[lnglat]={lng},{lat}&to[name]={destination}&to[lnglat]={lng},{lat}&type=car&via[0][name]={stop1}&via[0][lnglat]={lng},{lat}
+```
+
+#### Rules
+- Via points are supported only when `type=car` and are ignored for `walk`, `bus`, `bike`.
+- If a walking (or other non-car) itinerary must show via points, include a separate `car` link that chains all POIs as a sample visualization.
+- Max via points: 6 (indices 0..5), total points <= 8.
+- `lnglat` order is `longitude,latitude`.
+- URL-encoding for Chinese names is recommended but not required.
 
 ### Booking Links Policy
 - Use verified links from provider results when present.

@@ -66,5 +66,17 @@ describe('AgentLoop', () => {
     const storedMemory = memory.getState({ target: 'memory', sessionId: result.sessionId, includeGlobal: false }).entries;
     expect(storedMemory).toHaveLength(1);
     expect(storedMemory[0]?.content).toContain('write a file');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.systemPrompt).toContain(cfg.systemPersona);
+    expect(storedSession?.systemPromptHistory?.length).toBe(1);
+    expect(storedSession?.systemPromptHistory?.at(-1)?.prompt).toContain(cfg.systemPersona);
+    expect(storedSession?.messages.some((message) => message.role === 'tool')).toBe(true);
+
+    const rawSession = JSON.parse(readFileSync(join(env.home, 'sessions', `${result.sessionId}.json`), 'utf8')) as Record<string, unknown>;
+    expect(Object.prototype.hasOwnProperty.call(rawSession, 'systemPrompt')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(rawSession, 'messageCount')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(rawSession, 'toolEvents')).toBe(false);
+    const rawMessages = Array.isArray(rawSession.messages) ? rawSession.messages : [];
+    expect(rawMessages.some((message) => message && typeof message === 'object' && (message as { role?: string }).role === 'tool')).toBe(true);
   });
 });

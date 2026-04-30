@@ -1,50 +1,609 @@
-import { app, BrowserWindow, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
+import { readdirSync, readFileSync } from 'node:fs';
+import { basename, dirname, extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import JSZip from 'jszip';
 import { AppContext } from './appContext.js';
 import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
   AppConfig,
+  ExternalSessionMessageRequest,
   MemoryClearRequest,
-  OpenCliExtensionStatus,
   ToolEvent,
   ToolExecutionResult,
   MemoryQueryOptions,
   PersonalKnowledgeUploadRequest,
+  SessionDocumentUploadRequest,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
+  SessionUpdateEvent,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
-  ToolRunRequest
+  ToolRunRequest,
+  WechatChannelLoginStatusPayload,
+  WechatChannelQrCodePayload
 } from '../shared/types.js';
-import { createId } from '../shared/types.js';
+import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
+import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let devToolsWindow: BrowserWindow | null = null;
 const context = new AppContext();
-let loadedOpenCliExtensionDir: string | null = null;
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
-const OPENCLI_ELECTRON_UNSUPPORTED_PERMISSIONS = new Set(['debugger', 'cookies']);
-const warnedOpenCliMessages = new Set<string>();
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
+const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
+const externalFallbackUrls = new Set<string>();
+const activeChatControllers = new Map<number, AbortController>();
+const activeWechatRuns = new Map<string, AbortController>();
+let wechatPollerAbortController: AbortController | null = null;
+let wechatPollerFingerprint = '';
+const seenWechatMessageIds: string[] = [];
+const seenWechatMessageIdSet = new Set<string>();
+const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf']);
 
-function warnOpenCliOnce(message: string): void {
-  if (warnedOpenCliMessages.has(message)) return;
-  warnedOpenCliMessages.add(message);
-  console.warn(message);
+function broadcastSessionUpdated(event: SessionUpdateEvent): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('sessions:updated', event);
+  }
+}
+
+function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('agent:tool-event', payload);
+  }
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.name === 'AbortError') return true;
+  return /operation was aborted|session stopped by user|aborted/i.test(error.message);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function getStringField(record: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function getNumberField(record: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function buildWechatConversationKey(sessionId: string, fromUserId: string, contextToken?: string): string {
+  const user = fromUserId.trim();
+  const token = contextToken?.trim() ?? '';
+  const scope = token || user || 'unknown';
+  return `${sessionId}::${scope}`;
+}
+
+function clearWechatRunController(conversationKey: string, controller: AbortController): void {
+  const active = activeWechatRuns.get(conversationKey);
+  if (active !== controller) return;
+  activeWechatRuns.delete(conversationKey);
+}
+
+function listFilesRecursively(rootDir: string): string[] {
+  const files: string[] = [];
+  const stack = [rootDir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) continue;
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+        continue;
+      }
+      if (entry.isFile()) files.push(fullPath);
+    }
+  }
+  return files;
+}
+
+async function importKnowledgeBuffer(
+  filename: string,
+  content: Buffer
+): Promise<{ imported: number; skipped: number; failed: Array<{ filePath: string; error: string }> }> {
+  const ext = extname(filename).toLowerCase();
+  if (ext === '.zip') {
+    try {
+      const zip = await JSZip.loadAsync(content);
+      const entries = Object.keys(zip.files)
+        .filter((path) => !zip.files[path]?.dir)
+        .sort((left, right) => left.localeCompare(right));
+      let imported = 0;
+      let skipped = 0;
+      const failed: Array<{ filePath: string; error: string }> = [];
+      for (const entryPath of entries) {
+        const file = zip.file(entryPath);
+        if (!file) continue;
+        const entryBuffer = await file.async('nodebuffer');
+        const nestedName = `${basename(filename, '.zip')}/${entryPath}`.replace(/\\/g, '/');
+        const nested = await importKnowledgeBuffer(nestedName, entryBuffer);
+        imported += nested.imported;
+        skipped += nested.skipped;
+        failed.push(...nested.failed);
+      }
+      return { imported, skipped, failed };
+    } catch (error) {
+      return {
+        imported: 0,
+        skipped: 0,
+        failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
+      };
+    }
+  }
+  if (!KNOWLEDGE_IMPORT_EXTENSIONS.has(ext)) return { imported: 0, skipped: 1, failed: [] };
+  try {
+    await context.personalKnowledgeBase.addDocument({
+      filename,
+      contentBase64: content.toString('base64')
+    });
+    return { imported: 1, skipped: 0, failed: [] };
+  } catch (error) {
+    return {
+      imported: 0,
+      skipped: 0,
+      failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
+    };
+  }
+}
+
+function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
+  const lines = [
+    `Iterations: ${result.iterations}`,
+    `Execution mode: ${result.execution.mode}`,
+    `Tool events: ${result.toolEvents.length}`
+  ];
+  for (const event of result.toolEvents) {
+    const preview = event.content.replace(/\s+/g, ' ').slice(0, 140);
+    lines.push(`- [${event.ok ? 'ok' : 'fail'}] ${event.toolName}${event.createdAt ? ` @ ${event.createdAt}` : ''} :: ${preview}`);
+  }
+  return lines.join('\n');
+}
+
+function buildWechatAuthHeaders(botToken: string): Record<string, string> {
+  const randomUin = Math.floor(Math.random() * 0xffffffff).toString(10);
+  return {
+    'Content-Type': 'application/json',
+    AuthorizationType: 'ilink_bot_token',
+    Authorization: `Bearer ${botToken}`,
+    'X-WECHAT-UIN': Buffer.from(randomUin).toString('base64')
+  };
+}
+
+function extractWechatTextPayload(value: unknown): string {
+  const record = asRecord(value);
+  if (!record) return '';
+  const items = Array.isArray(record.item_list) ? record.item_list : [];
+  const chunks: string[] = [];
+  for (const itemRaw of items) {
+    const item = asRecord(itemRaw);
+    if (!item) continue;
+    const type = getNumberField(item, ['type']);
+    if (type === 1) {
+      const textItem = asRecord(item.text_item);
+      const text = textItem && typeof textItem.text === 'string' ? textItem.text.trim() : '';
+      if (text) chunks.push(text);
+      continue;
+    }
+    if (type === 2) chunks.push('[image]');
+    else if (type === 3) chunks.push('[voice]');
+    else if (type === 4) chunks.push('[file]');
+    else if (type === 5) chunks.push('[video]');
+  }
+  return chunks.join('\n').trim();
+}
+
+function ensureWechatSessionId(): string {
+  const current = context.getConfig().wechatChannel;
+  const configured = current.sessionId?.trim();
+  if (configured) return configured;
+  const created = context.sessionStore.create('WeChat ClawBot');
+  context.configStore.update({
+    wechatChannel: {
+      ...current,
+      sessionId: created.id
+    }
+  });
+  return created.id;
+}
+
+function markWechatMessageSeen(messageId: string): boolean {
+  const id = messageId.trim();
+  if (!id) return false;
+  if (seenWechatMessageIdSet.has(id)) return true;
+  seenWechatMessageIdSet.add(id);
+  seenWechatMessageIds.push(id);
+  while (seenWechatMessageIds.length > 2000) {
+    const removed = seenWechatMessageIds.shift();
+    if (removed) seenWechatMessageIdSet.delete(removed);
+  }
+  return false;
+}
+
+async function sendWechatText(
+  baseUrl: string,
+  botToken: string,
+  payload: { toUserId: string; contextToken: string; text: string; fromUserId?: string }
+): Promise<void> {
+  const response = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
+    method: 'POST',
+    headers: buildWechatAuthHeaders(botToken),
+    body: JSON.stringify({
+      msg: {
+        from_user_id: payload.fromUserId ?? '',
+        to_user_id: payload.toUserId,
+        client_id: `tasi-${createId('wx')}`,
+        message_type: 2,
+        message_state: 2,
+        context_token: payload.contextToken,
+        item_list: [
+          {
+            type: 1,
+            text_item: { text: payload.text }
+          }
+        ]
+      },
+      base_info: { channel_version: '1.0.0' }
+    })
+  });
+  if (!response.ok) throw new Error(`sendmessage HTTP ${response.status}`);
+  const body = await response.json() as unknown;
+  const record = asRecord(body);
+  if (!record) throw new Error('Invalid sendmessage response.');
+  const errcode = getNumberField(record, ['errcode']);
+  if (typeof errcode === 'number' && errcode !== 0) {
+    const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `errcode=${errcode}`;
+    throw new Error(errMsg);
+  }
+  const ret = getNumberField(record, ['ret']);
+  if (typeof ret === 'number' && ret !== 0) {
+    const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`;
+    throw new Error(errMsg);
+  }
+}
+
+async function sendWechatTaskNotification(taskName: string, runAtIso: string, executionMode: 'workspace' | 'sandbox', content: string): Promise<void> {
+  const channel = context.getConfig().wechatChannel;
+  const token = channel.botToken?.trim();
+  const toUserId = channel.lastInboundUserId?.trim();
+  const contextToken = channel.lastContextToken?.trim();
+  if (!channel.enabled || !token || !toUserId || !contextToken) return;
+  const baseUrl = (channel.baseUrl?.trim() || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+  const body = [
+    `[Task] ${taskName}`,
+    `Run at: ${runAtIso}`,
+    `Execution: ${executionMode}`,
+    '',
+    content.trim()
+  ].join('\n');
+  const text = body.length > 1800 ? `${body.slice(0, 1797)}...` : body;
+  await sendWechatText(baseUrl, token, {
+    toUserId,
+    contextToken,
+    text,
+    fromUserId: channel.botId?.trim() || undefined
+  });
+}
+
+async function fetchWechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload> {
+  const clean = qrcodeKey.trim();
+  if (!clean) throw new Error('qrcodeKey is required.');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(`https://ilinkai.weixin.qq.com/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(clean)}`, {
+      method: 'GET',
+      headers: {
+        'iLink-App-ClientVersion': '1'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    const record = asRecord(body);
+    if (!record) throw new Error('Invalid iLink status response.');
+    const statusRaw = getStringField(record, ['status']) ?? 'unknown';
+    const status = ['wait', 'scaned', 'confirmed', 'expired'].includes(statusRaw) ? statusRaw as WechatChannelLoginStatusPayload['status'] : 'unknown';
+    return {
+      status,
+      botToken: getStringField(record, ['bot_token']),
+      botId: getStringField(record, ['ilink_bot_id']),
+      userId: getStringField(record, ['ilink_user_id']),
+      baseUrl: getStringField(record, ['baseurl']),
+      fetchedAt: new Date().toISOString()
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function stopWechatPoller(): void {
+  if (!wechatPollerAbortController) return;
+  wechatPollerAbortController.abort();
+  wechatPollerAbortController = null;
+  wechatPollerFingerprint = '';
+}
+
+function startWechatPoller(): void {
+  const cfg = context.getConfig().wechatChannel;
+  if (!cfg.enabled || !cfg.botToken?.trim()) {
+    stopWechatPoller();
+    return;
+  }
+  const token = cfg.botToken.trim();
+  const baseUrl = (cfg.baseUrl?.trim() || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+  const fingerprint = `${token.slice(0, 8)}:${baseUrl}`;
+  if (wechatPollerAbortController && wechatPollerFingerprint === fingerprint) return;
+  stopWechatPoller();
+  const controller = new AbortController();
+  wechatPollerAbortController = controller;
+  wechatPollerFingerprint = fingerprint;
+
+  void (async () => {
+    let cursor = cfg.cursor ?? '';
+    while (!controller.signal.aborted) {
+      try {
+        const response = await fetch(`${baseUrl}/ilink/bot/getupdates`, {
+          method: 'POST',
+          headers: buildWechatAuthHeaders(token),
+          body: JSON.stringify({
+            get_updates_buf: cursor,
+            base_info: { channel_version: '1.0.0' }
+          }),
+          signal: controller.signal
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const body = await response.json() as unknown;
+        const record = asRecord(body);
+        if (!record) throw new Error('Invalid getupdates response.');
+        const errcode = getNumberField(record, ['errcode']);
+        if (errcode === -14) {
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              enabled: false,
+              loginStatus: 'expired',
+              lastError: 'WeChat session expired. Please scan a new QR code.'
+            }
+          });
+          stopWechatPoller();
+          return;
+        }
+        const ret = getNumberField(record, ['ret']);
+        if (typeof ret === 'number' && ret !== 0) {
+          throw new Error(typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`);
+        }
+        const nextCursor = getStringField(record, ['get_updates_buf', 'sync_buf']) ?? cursor;
+        if (nextCursor !== cursor) {
+          cursor = nextCursor;
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              cursor
+            }
+          });
+        }
+        const msgs = Array.isArray(record.msgs) ? record.msgs : [];
+        if (msgs.length === 0) continue;
+        const sessionId = ensureWechatSessionId();
+        const botId = context.getConfig().wechatChannel.botId?.trim() || undefined;
+        for (const msgRaw of msgs) {
+          const msg = asRecord(msgRaw);
+          if (!msg) continue;
+          const messageType = getNumberField(msg, ['message_type']);
+          const messageState = getNumberField(msg, ['message_state']);
+          if (typeof messageType === 'number' && messageType !== 1) continue;
+          if (typeof messageState === 'number' && messageState !== 2) continue;
+          const fromUser = getStringField(msg, ['from_user_id']) ?? '';
+          if (!fromUser || fromUser.endsWith('@im.bot')) continue;
+          const contextToken = getStringField(msg, ['context_token']) ?? '';
+          const text = extractWechatTextPayload(msg);
+          if (!text) continue;
+          context.configStore.update({
+            wechatChannel: {
+              ...context.getConfig().wechatChannel,
+              lastInboundUserId: fromUser,
+              lastContextToken: contextToken || context.getConfig().wechatChannel.lastContextToken
+            }
+          });
+          const rawMessageId = getStringField(msg, ['message_id']) ?? String(getNumberField(msg, ['message_id']) ?? '');
+          if (rawMessageId && markWechatMessageSeen(rawMessageId)) continue;
+          const ts = getNumberField(msg, ['create_time_ms']);
+          const createdAt = typeof ts === 'number' ? new Date(ts).toISOString() : new Date().toISOString();
+          const shadowUserId = createId('wx_shadow_user');
+          const pendingAssistantId = createId('wx_pending');
+          const conversationKey = buildWechatConversationKey(sessionId, fromUser, contextToken);
+          const previousController = activeWechatRuns.get(conversationKey);
+          if (previousController) {
+            previousController.abort();
+            activeWechatRuns.delete(conversationKey);
+          }
+          const updatedInbound = context.sessionStore.appendMessages(sessionId, [
+            {
+              id: shadowUserId,
+              role: 'user',
+              content: `[WeChat:${fromUser}] ${text}`,
+              createdAt
+            },
+            {
+              id: pendingAssistantId,
+              role: 'assistant',
+              content: WECHAT_PENDING_MARKER,
+              createdAt: nowIso()
+            }
+          ], []);
+          broadcastSessionUpdated({
+            sessionId: updatedInbound.id,
+            source: 'external',
+            updatedAt: updatedInbound.updatedAt
+          });
+
+          const runController = new AbortController();
+          activeWechatRuns.set(conversationKey, runController);
+          try {
+            const runResult = await context.agentLoop.run({
+              userInput: text,
+              sessionId,
+              executionMode: context.getConfig().defaultExecutionMode,
+              origin: 'scheduled',
+              signal: runController.signal,
+              onToolEvent: (eventSessionId, toolEvent) => {
+                const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+                broadcastAgentToolEvent(payload);
+                const previewUrl = latestWebPreviewUrlFromSource(toolEvent.toolName, toolEvent.args, toolEvent.content, true);
+                if (!previewUrl) return;
+                void maybeOpenExternalBrowser(previewUrl).catch((error) => {
+                  const message = error instanceof Error ? error.message : String(error);
+                  console.warn(`[wechat] failed to open external browser preview: ${message}`);
+                });
+              }
+            });
+            const postRunRecord = context.sessionStore.read(sessionId);
+            if (postRunRecord) {
+              const cleaned = postRunRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+              context.sessionStore.replaceMessages(sessionId, cleaned);
+            }
+            const reply = runResult.finalResponse.trim();
+            broadcastSessionUpdated({
+              sessionId: runResult.sessionId,
+              source: 'external',
+              updatedAt: new Date().toISOString()
+            });
+            if (!reply) continue;
+            if (!contextToken) continue;
+            const outboundText = reply.length > 1800 ? `${reply.slice(0, 1797)}...` : reply;
+            await sendWechatText(baseUrl, token, {
+              toUserId: fromUser,
+              contextToken,
+              text: outboundText,
+              fromUserId: botId
+            });
+          } catch (error) {
+            if (runController.signal.aborted || isAbortLikeError(error)) {
+              const fallbackRecord = context.sessionStore.read(sessionId);
+              if (fallbackRecord) {
+                const cleaned = fallbackRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+                context.sessionStore.replaceMessages(sessionId, cleaned);
+                broadcastSessionUpdated({
+                  sessionId,
+                  source: 'external',
+                  updatedAt: new Date().toISOString()
+                });
+              }
+              continue;
+            }
+            const fallbackRecord = context.sessionStore.read(sessionId);
+            if (fallbackRecord) {
+              const replaced = fallbackRecord.messages.map((item) => (
+                item.id === pendingAssistantId
+                  ? { ...item, content: `[WeChat error] ${error instanceof Error ? error.message : String(error)}` }
+                  : item
+              ));
+              context.sessionStore.replaceMessages(sessionId, replaced);
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[wechat] auto-reply failed: ${message}`);
+            context.configStore.update({
+              wechatChannel: {
+                ...context.getConfig().wechatChannel,
+                lastError: `[auto-reply] ${message}`,
+                loginStatus: 'error'
+              }
+            });
+          } finally {
+            clearWechatRunController(conversationKey, runController);
+            if (context.getConfig().browserMode === 'external' && activeChatControllers.size === 0) {
+              await closeExternalBrowserPreview();
+            }
+          }
+        }
+      } catch (error) {
+        if (controller.signal.aborted || isAbortLikeError(error)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        context.configStore.update({
+          wechatChannel: {
+            ...context.getConfig().wechatChannel,
+            lastError: message,
+            loginStatus: 'error'
+          }
+        });
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    }
+  })();
+}
+
+async function fetchWechatChannelQrCode(fallbackBindUrl: string): Promise<WechatChannelQrCodePayload> {
+  const fallback = fallbackBindUrl.trim() || 'https://ilinkai.weixin.qq.com';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    const response = await fetch('https://ilinkai.weixin.qq.com/ilink/bot/get_bot_qrcode?bot_type=3', {
+      method: 'GET',
+      headers: {
+        'iLink-App-ClientVersion': '1'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const body = await response.json() as unknown;
+    const record = asRecord(body);
+    if (!record) throw new Error('Invalid iLink response.');
+    if (typeof record.ret === 'number' && record.ret !== 0) {
+      const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `ret=${record.ret}`;
+      throw new Error(errMsg);
+    }
+    if (typeof record.errcode === 'number' && record.errcode !== 0) {
+      const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `errcode=${record.errcode}`;
+      throw new Error(errMsg);
+    }
+    const qrcodeContent = getStringField(record, ['qrcode_img_content', 'qrcodeUrl', 'qrcode_url', 'qrcode']);
+    if (!qrcodeContent) throw new Error('Missing qrcode content.');
+    const qrcodeKey = getStringField(record, ['qrcode']);
+    return {
+      qrcodeContent,
+      qrcodeKey,
+      source: 'ilink-api',
+      fetchedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[wechat] Failed to fetch iLink qrcode, fallback to configured bind URL: ${message}`);
+    return {
+      qrcodeContent: fallback,
+      source: 'manual-bind-url',
+      fetchedAt: new Date().toISOString()
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function getDevToolsWindowMetrics(parent: BrowserWindow): { bounds: Rectangle; minWidth: number; minHeight: number } {
@@ -169,17 +728,6 @@ function sessionPartition(target: WebContents): string {
   return '';
 }
 
-function extractWebPreviewUrls(content: string): string[] {
-  const urls: string[] = [];
-  const pattern = /(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/gi;
-  for (const match of content.matchAll(pattern)) {
-    const raw = (match[1] ?? '').trim();
-    if (!raw) continue;
-    urls.push(raw.replace(/[),.;!?]+$/, ''));
-  }
-  return urls;
-}
-
 function findFirstHttpUrl(text: string): string | undefined {
   const match = text.match(/https?:\/\/[^\s"'<>`)\]}]+/i);
   if (!match) return undefined;
@@ -218,7 +766,7 @@ function extractUrlFromValue(value: unknown, depth = 0): string | undefined {
 }
 
 function extractPreviewUrlMarker(text: string): string | undefined {
-  const marker = text.match(/(?:opencli_preview_url|browser_preview_url):\s*(https?:\/\/[^\s"'<>`]+)/i);
+  const marker = text.match(/browser_preview_url:\s*(https?:\/\/[^\s"'<>`]+)/i);
   if (!marker?.[1]) return undefined;
   return marker[1].replace(/[),.;!?]+$/, '');
 }
@@ -237,13 +785,11 @@ function shouldFallbackOpenExternal(toolName: string, args: unknown, content: st
   const combined = previewSourceText(toolName, args, content);
   if (toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
-  if (!combined.includes('opencli_preview_url')) return false;
-  return /bridge is disconnected|showing fallback|extension not connected/i.test(combined);
+  return false;
 }
 
 function isWebPreviewEvent(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (combined.includes('opencli')) return true;
   if (event.toolName.startsWith('browser_')) return true;
   if (combined.includes('browser_preview_url')) return true;
   return event.toolName.toLowerCase().includes('open') && combined.includes('http');
@@ -270,204 +816,47 @@ function latestWebPreviewUrlFromEvents(events: ToolEvent[], fallbackOnly = false
 
 async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResult> {
   if (!url) return { ok: false, content: 'No preview URL available to open.' };
-  if (context.getConfig().opencliBridgeMode !== 'external') {
+  const config = context.getConfig();
+  if (config.browserMode !== 'external') {
     return { ok: false, content: 'External browser mode is not active.' };
   }
   const now = Date.now();
   if (lastExternalBrowserOpen && lastExternalBrowserOpen.url === url && now - lastExternalBrowserOpen.at < 1500) {
     return { ok: true, content: `External browser already opened recently for ${url}.` };
   }
-  try {
-    await shell.openExternal(
-      url,
-      process.platform === 'win32'
-        ? {
-            workingDirectory: context.harnessHome,
-            logUsage: true
-          }
-        : undefined
-    );
+  const managed = await externalBrowserBridge.open(url, config);
+  if (managed.ok) {
     lastExternalBrowserOpen = { url, at: now };
-    return { ok: true, content: `Opened ${url} in the external browser.` };
+    return managed;
+  }
+  console.warn(`[browser][external] managed open failed for ${url}; fallback=shell.openExternal; reason=${managed.content}`);
+  try {
+    await shell.openExternal(url);
+    externalFallbackUrls.add(url);
+    lastExternalBrowserOpen = { url, at: now };
+    return {
+      ok: true,
+      content: `Managed external open failed (${managed.content}); fell back to shell.openExternal for ${url}.`
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[opencli] failed to open external browser for ${url}: ${message}`);
-    return { ok: false, content: `Failed to open ${url} in the external browser: ${message}` };
+    console.warn(`[browser] failed to open system default browser for ${url}: ${message}`);
+    return {
+      ok: false,
+      content: `Failed both managed and fallback open for ${url}. managed=${managed.content}; fallback=${message}`
+    };
   }
 }
 
-function openCliExtensionCandidates(cfg: AppConfig): string[] {
-  const explicit = cfg.opencliExtensionPath?.trim();
-  const candidates = [
-    explicit || '',
-    resolve(context.harnessHome, 'extensions', 'opencli-extension'),
-    resolve(process.cwd(), 'resources', 'opencli-extension'),
-    resolve(app.getAppPath(), 'resources', 'opencli-extension'),
-    resolve(process.resourcesPath ?? '', 'opencli-extension')
-  ].filter(Boolean);
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const item of candidates) {
-    const normalized = resolve(item);
-    if (seen.has(normalized)) continue;
-    seen.add(normalized);
-    unique.push(normalized);
-  }
-  return unique;
-}
-
-function findManifestInDirectory(path: string): string | null {
-  if (!existsSync(path)) return null;
-  const direct = resolve(path, 'manifest.json');
-  if (existsSync(direct)) return resolve(path);
-  if (!statSync(path).isDirectory()) return null;
-  for (const name of readdirSync(path)) {
-    const child = resolve(path, name);
-    if (!existsSync(child) || !statSync(child).isDirectory()) continue;
-    if (existsSync(resolve(child, 'manifest.json'))) return child;
-  }
-  return null;
-}
-
-function readExtensionManifest(extensionDir: string): { permissions: string[] } | null {
-  const manifestPath = resolve(extensionDir, 'manifest.json');
-  if (!existsSync(manifestPath)) return null;
-  try {
-    const raw = readFileSync(manifestPath, 'utf8');
-    const parsed = JSON.parse(raw) as { permissions?: unknown };
-    const permissions = Array.isArray(parsed.permissions) ? parsed.permissions.filter((item): item is string => typeof item === 'string') : [];
-    return { permissions };
-  } catch {
-    return null;
-  }
-}
-
-function detectOpenCliElectronCompatibility(extensionDir: string): { compatible: boolean; message?: string } {
-  const manifest = readExtensionManifest(extensionDir);
-  if (!manifest) {
-    return { compatible: false, message: `Cannot read manifest.json from ${extensionDir}.` };
-  }
-  const unsupported = manifest.permissions.filter((permission) => OPENCLI_ELECTRON_UNSUPPORTED_PERMISSIONS.has(permission));
-  if (unsupported.length === 0) return { compatible: true };
+async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
+  const managedResult = await externalBrowserBridge.close();
+  const fallbackCount = externalFallbackUrls.size;
+  externalFallbackUrls.clear();
+  lastExternalBrowserOpen = null;
+  if (fallbackCount <= 0) return managedResult;
   return {
-    compatible: false,
-    message: `OpenCLI extension requests unsupported Electron APIs (${unsupported.join(', ')}). Use external browser mode for full bridge support.`
-  };
-}
-
-async function loadExtensionCompat(extensionDir: string): Promise<void> {
-  if (!mainWindow) throw new Error('Main window is not ready yet.');
-  const currentSession = mainWindow.webContents.session as unknown as {
-    loadExtension?: (path: string, options?: { allowFileAccess?: boolean }) => Promise<unknown>;
-    extensions?: { loadExtension?: (path: string, options?: { allowFileAccess?: boolean }) => Promise<unknown> };
-  };
-  if (currentSession.extensions?.loadExtension) {
-    await currentSession.extensions.loadExtension(extensionDir, { allowFileAccess: true });
-    return;
-  }
-  if (currentSession.loadExtension) {
-    await currentSession.loadExtension(extensionDir, { allowFileAccess: true });
-    return;
-  }
-  throw new Error('No extension loader API found on current Electron session.');
-}
-
-function findOpenCliExtensionDir(cfg: AppConfig): string | null {
-  for (const candidate of openCliExtensionCandidates(cfg)) {
-    if (!existsSync(candidate)) continue;
-    if (statSync(candidate).isFile() && candidate.toLowerCase().endsWith('manifest.json')) return dirname(candidate);
-    const found = findManifestInDirectory(candidate);
-    if (found) return found;
-  }
-  return null;
-}
-
-async function ensureOpenCliExtensionLoaded(): Promise<void> {
-  if (!mainWindow) return;
-  const cfg = context.getConfig();
-  if (cfg.opencliBridgeMode !== 'embedded') return;
-  const extensionDir = findOpenCliExtensionDir(cfg);
-  if (!extensionDir) {
-    if (cfg.opencliExtensionPath?.trim()) {
-      warnOpenCliOnce(`[opencli] extension manifest not found under: ${cfg.opencliExtensionPath}`);
-    }
-    return;
-  }
-  const compatibility = detectOpenCliElectronCompatibility(extensionDir);
-  if (!compatibility.compatible) {
-    warnOpenCliOnce(`[opencli] skipped loading extension from ${extensionDir}: ${compatibility.message}`);
-    return;
-  }
-  if (loadedOpenCliExtensionDir === extensionDir) return;
-  try {
-    await loadExtensionCompat(extensionDir);
-    loadedOpenCliExtensionDir = extensionDir;
-    console.info(`[opencli] loaded browser bridge extension from ${extensionDir}`);
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (/already loaded/i.test(msg)) {
-      loadedOpenCliExtensionDir = extensionDir;
-      return;
-    }
-    console.warn(`[opencli] failed to load browser bridge extension from ${extensionDir}: ${msg}`);
-  }
-}
-
-function openCliExtensionStatus(): OpenCliExtensionStatus {
-  const cfg = context.getConfig();
-  const detected = findOpenCliExtensionDir(cfg);
-  const compatibility = detected ? detectOpenCliElectronCompatibility(detected) : { compatible: false as const };
-  const loadedPath = loadedOpenCliExtensionDir ? resolve(loadedOpenCliExtensionDir) : '';
-  const detectedPath = detected ? resolve(detected) : '';
-  const loaded = Boolean(loadedPath) && (!detectedPath || loadedPath === detectedPath);
-  const available = Boolean(detectedPath);
-  if (cfg.opencliBridgeMode === 'external') {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: 'External browser mode is active. Extension status is optional in this mode.'
-    };
-  }
-  if (available && !compatibility.compatible) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded: false,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: compatibility.message || 'OpenCLI extension is not compatible with Electron embedded mode.'
-    };
-  }
-  if (loaded) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: `OpenCLI extension is loaded${loadedPath ? ` from ${loadedPath}` : ''}.`
-    };
-  }
-  if (available) {
-    return {
-      mode: cfg.opencliBridgeMode,
-      loaded,
-      available,
-      detectedPath: detectedPath || undefined,
-      loadedPath: loadedPath || undefined,
-      message: `Extension files were detected at ${detectedPath}, but are not loaded yet.`
-    };
-  }
-  return {
-    mode: cfg.opencliBridgeMode,
-    loaded,
-    available,
-    detectedPath: undefined,
-    loadedPath: loadedPath || undefined,
-    message: 'OpenCLI extension files were not found.'
+    ok: managedResult.ok,
+    content: `${managedResult.content} ${fallbackCount} fallback URL(s) were opened via shell.openExternal and cannot be auto-closed.`
   };
 }
 
@@ -489,8 +878,6 @@ async function createWindow(): Promise<void> {
       webviewTag: true
     }
   });
-  await ensureOpenCliExtensionLoaded();
-
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.webContents.once('did-finish-load', () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -508,36 +895,142 @@ function registerIpc(): void {
     const sanitized = { ...partial };
     if (typeof sanitized.apiKey !== 'string') delete sanitized.apiKey;
     const next = context.configStore.update(sanitized);
-    await ensureOpenCliExtensionLoaded();
+    startWechatPoller();
+    if (next.browserMode !== 'external') await closeExternalBrowserPreview();
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
   ipcMain.handle('config:test', async () => testLlmConnection(context.getConfig()));
+  ipcMain.handle('config:wechatQrcode', async () => {
+    const payload = await fetchWechatChannelQrCode(context.getConfig().wechatChannel.bindUrl);
+    if (payload.qrcodeKey) {
+      context.configStore.update({
+        wechatChannel: {
+          ...context.getConfig().wechatChannel,
+          lastQrcodeKey: payload.qrcodeKey,
+          loginStatus: 'wait',
+          lastError: ''
+        }
+      });
+    }
+    return payload;
+  });
+  ipcMain.handle('config:wechatQrcodeStatus', async (_event, qrcodeKey: string) => {
+    try {
+      const status = await fetchWechatQrcodeStatus(qrcodeKey);
+      const current = context.getConfig().wechatChannel;
+      if (status.status === 'confirmed' && status.botToken) {
+        context.configStore.update({
+          wechatChannel: {
+            ...current,
+            enabled: true,
+            botToken: status.botToken,
+            botId: status.botId,
+            userId: status.userId,
+            baseUrl: status.baseUrl || current.baseUrl || 'https://ilinkai.weixin.qq.com',
+            cursor: '',
+            loginStatus: 'confirmed',
+            lastError: ''
+          }
+        });
+        startWechatPoller();
+      } else {
+        context.configStore.update({
+          wechatChannel: {
+            ...current,
+            loginStatus: status.status === 'unknown' ? 'error' : status.status
+          }
+        });
+      }
+      return status;
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        return { status: 'unknown', fetchedAt: new Date().toISOString() };
+      }
+      throw error;
+    }
+  });
 
   ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
     if (!input || !input.trim()) throw new Error('Message cannot be empty.');
+    const senderId = _event.sender.id;
+    if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
+    const controller = new AbortController();
+    activeChatControllers.set(senderId, controller);
     try {
       const result = await context.agentLoop.run({
         userInput: input,
         sessionId,
         executionMode,
-      usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
-      origin: 'chat',
-      onToolEvent: (eventSessionId, toolEvent) => {
-        void maybeOpenExternalBrowser(latestWebPreviewUrlFromEvents([toolEvent], true));
-        const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-        _event.sender.send('agent:tool-event', payload);
-      }
-    });
+        usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
+        origin: 'chat',
+        signal: controller.signal,
+        onToolEvent: (eventSessionId, toolEvent) => {
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+          _event.sender.send('agent:tool-event', payload);
+        }
+      });
       const followUpQuestions = await generateFollowUpQuestions(
         () => createLlmClient(context.getConfig()),
         context.getConfig(),
         { userInput: input, finalResponse: result.finalResponse }
       );
-      await maybeOpenExternalBrowser(latestWebPreviewUrlFromEvents(result.toolEvents, true));
-      return { ...result, followUpQuestions };
+      const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
+      broadcastSessionUpdated({
+        sessionId: result.sessionId,
+        source: 'chat',
+        updatedAt: new Date().toISOString()
+      });
+      return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
     } catch (error) {
+      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
       throw new Error(error instanceof Error ? error.message : String(error));
+    } finally {
+      const active = activeChatControllers.get(senderId);
+      if (active === controller) activeChatControllers.delete(senderId);
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
     }
+  });
+
+  ipcMain.handle('agent:stop', async (_event) => {
+    const senderId = _event.sender.id;
+    const controller = activeChatControllers.get(senderId);
+    let stoppedChat = 0;
+    if (controller) {
+      controller.abort();
+      stoppedChat = 1;
+    }
+    const wechatControllers = [...activeWechatRuns.values()];
+    activeWechatRuns.clear();
+    for (const wechatController of wechatControllers) {
+      try {
+        wechatController.abort();
+      } catch {
+        // Ignore abort failures from stale controllers.
+      }
+    }
+    const stoppedWechat = wechatControllers.length;
+    const wechatSessionId = context.getConfig().wechatChannel.sessionId?.trim();
+    if (wechatSessionId) {
+      const record = context.sessionStore.read(wechatSessionId);
+      if (record) {
+        const cleaned = record.messages.filter((message) => !(message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER));
+        if (cleaned.length !== record.messages.length) {
+          context.sessionStore.replaceMessages(wechatSessionId, cleaned);
+          broadcastSessionUpdated({
+            sessionId: wechatSessionId,
+            source: 'external',
+            updatedAt: new Date().toISOString()
+          });
+        }
+      }
+    }
+    if (context.getConfig().browserMode === 'external') {
+      await closeExternalBrowserPreview();
+    }
+    if (stoppedChat === 0 && stoppedWechat === 0) {
+      return { ok: true, content: 'No active session to stop.' };
+    }
+    return { ok: true, content: `Stop signal sent. chat=${stoppedChat}, wechat=${stoppedWechat}` };
   });
 
   ipcMain.handle('sessions:list', () => context.sessionStore.list());
@@ -545,12 +1038,77 @@ function registerIpc(): void {
   ipcMain.handle('sessions:delete', (_event, id: string) => context.sessionStore.delete(id));
   ipcMain.handle('sessions:rename', (_event, id: string, title: string) => context.sessionStore.rename(id, title));
   ipcMain.handle('sessions:search', (_event, query: string) => context.sessionStore.search(query).map((r) => r.item));
+  ipcMain.handle('sessions:appendExternalMessage', (_event, req: ExternalSessionMessageRequest) => {
+    const content = req.content?.trim();
+    if (!content) throw new Error('content is required.');
+    const role = req.role === 'assistant' ? 'assistant' : 'user';
+    const existing = req.sessionId?.trim() ? context.sessionStore.read(req.sessionId.trim()) : null;
+    const session = existing ?? context.sessionStore.create(req.title?.trim() || 'WeChat session');
+    const updated = context.sessionStore.appendMessages(session.id, [{
+      role,
+      content,
+      createdAt: req.createdAt
+    }], []);
+    broadcastSessionUpdated({
+      sessionId: updated.id,
+      source: 'external',
+      updatedAt: updated.updatedAt
+    });
+    return updated;
+  });
 
   ipcMain.handle('memory:get', (_event, query?: MemoryQueryOptions) => context.memoryStore.getState(query));
   ipcMain.handle('memory:clear', (_event, request: MemoryClearRequest) => context.memoryStore.clear(request));
   ipcMain.handle('knowledge:list', () => context.personalKnowledgeBase.getState());
   ipcMain.handle('knowledge:addDocument', (_event, req: PersonalKnowledgeUploadRequest) => context.personalKnowledgeBase.addDocument(req));
+  ipcMain.handle('knowledge:addFolder', async () => {
+    const picked = await dialog.showOpenDialog({
+      title: 'Select folder to import into Personal Knowledge',
+      properties: ['openDirectory']
+    });
+    if (picked.canceled || picked.filePaths.length === 0) {
+      return { folderPath: '', discovered: 0, imported: 0, skipped: 0, failed: [] };
+    }
+    const folderPath = picked.filePaths[0];
+    const allFiles = listFilesRecursively(folderPath);
+    let imported = 0;
+    let skipped = 0;
+    const failed: Array<{ filePath: string; error: string }> = [];
+    for (const filePath of allFiles) {
+      const relName = relative(folderPath, filePath).replace(/\\/g, '/');
+      const content = readFileSync(filePath);
+      const result = await importKnowledgeBuffer(relName || basename(filePath), content);
+      imported += result.imported;
+      skipped += result.skipped;
+      for (const item of result.failed) {
+        failed.push({
+          filePath: item.filePath.includes('/') ? item.filePath : filePath,
+          error: item.error
+        });
+      }
+    }
+    return {
+      folderPath,
+      discovered: allFiles.length,
+      imported,
+      skipped,
+      failed
+    };
+  });
   ipcMain.handle('knowledge:deleteDocument', (_event, id: string) => context.personalKnowledgeBase.deleteDocument(id));
+  ipcMain.handle('session-docs:list', (_event, sessionId: string) => context.sessionDocumentContextStore.list(sessionId));
+  ipcMain.handle('session-docs:upload', async (_event, req: SessionDocumentUploadRequest) => {
+    const session = req.sessionId
+      ? context.sessionStore.read(req.sessionId) ?? context.sessionStore.create()
+      : context.sessionStore.create();
+    const document = await context.sessionDocumentContextStore.addDocument({
+      ...req,
+      sessionId: session.id,
+      workspaceDir: context.getConfig().workspaceDir
+    });
+    return { sessionId: session.id, document };
+  });
+  ipcMain.handle('session-docs:delete', (_event, sessionId: string, id: string) => context.sessionDocumentContextStore.deleteDocument(sessionId, id));
 
   ipcMain.handle('skills:list', () => context.skillManager.list());
   ipcMain.handle('skills:read', (_event, name: string) => context.skillManager.read(name));
@@ -569,22 +1127,66 @@ function registerIpc(): void {
   ipcMain.handle('tasks:runNow', async (_event, id: string) => {
     const task = context.scheduledTaskStore.list().find((item) => item.id === id);
     if (!task) throw new Error(`Task not found: ${id}`);
-    const result = await context.agentLoop.run({
-      userInput: task.prompt,
-      sessionId: task.sessionId,
-      executionMode: task.executionMode,
-      origin: 'scheduled',
-      scheduledTaskId: task.id
-    });
-    const updated = context.scheduledTaskStore.markRun(id, { sessionId: result.sessionId, output: result.finalResponse });
-    if (updated.notifyByEmail) {
-      await context.emailNotifier.send(
-        context.getConfig().emailNotifications,
-        `[Tasi Harness] ${updated.name}`,
-        [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
-      );
+    context.scheduledTaskStore.setRunning(id, true);
+    try {
+      const result = await context.agentLoop.run({
+        userInput: task.prompt,
+        sessionId: task.sessionId,
+        executionMode: task.executionMode,
+        origin: 'scheduled',
+        scheduledTaskId: task.id
+      });
+      const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
+      const updated = context.scheduledTaskStore.markRun(id, {
+        sessionId: result.sessionId,
+        output: result.finalResponse,
+        iterations: result.iterations,
+        toolEventCount: result.toolEvents.length,
+        trace: buildTaskTrace(result)
+      });
+      if (updated.notifyByEmail) {
+        await context.emailNotifier.send(
+          context.getConfig().emailNotifications,
+          `[Tasi Harness] ${updated.name}`,
+          [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
+        );
+      }
+      if (updated.notifyByWechat) {
+        try {
+          await sendWechatTaskNotification(
+            updated.name,
+            updated.lastRunAt ?? updated.updatedAt,
+            result.execution.mode,
+            result.finalResponse
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const cfg = context.getConfig();
+          const shouldResetContext = /ret=-2|parameter/i.test(message);
+          context.configStore.update({
+            wechatChannel: {
+              ...cfg.wechatChannel,
+              lastError: `[runNow-wechat-notify] ${message}`,
+              lastContextToken: shouldResetContext ? '' : cfg.wechatChannel.lastContextToken
+            }
+          });
+        }
+      }
+      broadcastSessionUpdated({
+        sessionId: result.sessionId,
+        source: 'scheduled',
+        updatedAt: new Date().toISOString()
+      });
+      return { ...result, totalUsage: usageRecord.totalUsage };
+    } catch (error) {
+      context.scheduledTaskStore.markRun(id, {
+        error: error instanceof Error ? error.message : String(error),
+        trace: error instanceof Error ? error.stack || error.message : String(error)
+      });
+      throw error;
+    } finally {
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
     }
-    return result;
   });
 
   ipcMain.handle('tools:list', () => context.toolRegistry.definitions(context.getConfig().enabledToolNames));
@@ -611,6 +1213,7 @@ function registerIpc(): void {
     return { ok: !err, content: err || 'Opened.' };
   });
   ipcMain.handle('app:openExternalUrl', async (_event, url: string) => maybeOpenExternalBrowser(url));
+  ipcMain.handle('app:closeExternalPreview', async () => closeExternalBrowserPreview());
   ipcMain.handle('app:setEmbeddedPreviewWebContentsId', (_event, id: number | null) => {
     if (id == null) {
       embeddedPreviewWebContentsId = null;
@@ -632,11 +1235,14 @@ function registerIpc(): void {
     target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
   });
-  ipcMain.handle('app:openCliExtensionStatus', () => openCliExtensionStatus());
 }
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  for (const controller of activeChatControllers.values()) controller.abort();
+  activeChatControllers.clear();
+  stopWechatPoller();
+  void closeExternalBrowserPreview();
 });
 
 app.whenReady().then(() => {
@@ -645,9 +1251,15 @@ app.whenReady().then(() => {
   app.on('web-contents-created', (_event, contents) => {
     contents.once('destroyed', () => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;
+      const controller = activeChatControllers.get(contents.id);
+      if (controller) {
+        controller.abort();
+        activeChatControllers.delete(contents.id);
+      }
     });
   });
   registerIpc();
+  startWechatPoller();
   void createWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow();

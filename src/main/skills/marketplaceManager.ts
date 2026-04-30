@@ -8,6 +8,9 @@ const CLAWHUB_FALLBACK_CONVEX_URL = 'https://wry-manatee-359.convex.cloud';
 const SKILLHUB_BASE_URL = 'https://skillhub.builders';
 const REMOTE_TIMEOUT_MS = 12_000;
 const MAX_CLAWHUB_SKILLS = 80;
+const SEARCH_SYNONYM_GROUPS = [
+  ['\u5c0f\u7ea2\u4e66', 'xiaohongshu', 'rednote']
+];
 
 interface CatalogFile {
   market?: {
@@ -54,6 +57,30 @@ interface ClawHubBrowseResponse {
   };
 }
 
+interface ClawHubSearchSkillItem {
+  skill?: {
+    _id?: string;
+    slug?: string;
+    displayName?: string;
+    summary?: string;
+    capabilityTags?: unknown;
+    latestVersionId?: string;
+  };
+  version?: {
+    _id?: string;
+    version?: string;
+  } | null;
+  owner?: {
+    handle?: string;
+  };
+  ownerHandle?: string;
+}
+
+interface ClawHubSearchResponse {
+  status?: string;
+  value?: unknown[];
+}
+
 interface ClawHubReadmeResponse {
   status?: string;
   value?: {
@@ -79,13 +106,13 @@ export class MarketplaceManager {
 
   async browse(query = ''): Promise<MarketplaceBrowseResult> {
     const installed = this.skillManager.list();
-    const text = query.trim().toLowerCase();
+    const searchTerms = this.expandSearchTerms(query);
     const loadedSkills = await Promise.all(
       this.getSources()
         .filter((source) => source.enabled)
         .map(async (source) => {
           try {
-            return await this.loadSource(source);
+            return await this.loadSource(source, searchTerms);
           } catch (error) {
             console.warn(`[marketplace] failed to load source ${source.id}:`, error);
             return [];
@@ -95,9 +122,9 @@ export class MarketplaceManager {
     const skills = loadedSkills
       .flat()
       .filter((skill) => {
-        if (!text) return true;
+        if (searchTerms.length === 0) return true;
         const haystack = `${skill.name}\n${skill.description}\n${skill.category}\n${skill.readme}\n${skill.sourceName}\n${skill.sourceId}`.toLowerCase();
-        return haystack.includes(text);
+        return searchTerms.some((term) => haystack.includes(term));
       })
       .map((skill) => {
         const installedSkill = installed.find((item) => item.marketplaceSourceId === skill.sourceId && item.marketplaceSkillId === skill.id);
@@ -170,9 +197,9 @@ export class MarketplaceManager {
     return this.skillManager.delete(name);
   }
 
-  private async loadSource(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
+  private async loadSource(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
     if (source.id.toLowerCase() === 'clawhub') {
-      return this.loadClawHubSource(source);
+      return this.loadClawHubSource(source, searchTerms);
     }
     if (source.id.toLowerCase() === 'skillhub') {
       return this.loadSkillHubSource(source);
@@ -208,14 +235,74 @@ export class MarketplaceManager {
     }));
   }
 
-  private async loadClawHubSource(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
+  private async loadClawHubSource(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
     try {
+      if (searchTerms.length > 0) {
+        const searched = await this.loadClawHubSearchRemote(source, searchTerms);
+        if (searched.length > 0) return searched;
+      }
       const remote = await this.loadClawHubRemote(source);
       if (remote.length > 0) return remote;
     } catch (error) {
       console.warn('[marketplace] ClawHub remote fetch failed, fallback to local catalog:', error);
     }
     return this.loadCatalogSource(source);
+  }
+
+  private async loadClawHubSearchRemote(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
+    const convexUrl = await this.resolveClawHubConvexUrl(source);
+    const skills: MarketplaceSkill[] = [];
+    const settled = await Promise.allSettled(
+      searchTerms.map((query) => this.postJson<ClawHubSearchResponse>(`${convexUrl}/api/action`, {
+        path: 'search:searchSkills',
+        args: {
+          query,
+          limit: MAX_CLAWHUB_SKILLS,
+          highlightedOnly: false,
+          nonSuspiciousOnly: false
+        }
+      }))
+    );
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') continue;
+      const items = Array.isArray(result.value.value) ? result.value.value : [];
+      for (const item of items as ClawHubSearchSkillItem[]) {
+        const sourceSkill = item.skill ?? {};
+        const slug = this.cleanText(String(sourceSkill.slug ?? sourceSkill._id ?? ''));
+        if (!slug) continue;
+        const name = this.cleanText(String(sourceSkill.displayName ?? slug));
+        const description = this.cleanText(String(sourceSkill.summary ?? 'No description provided by ClawHub.'));
+        const category = this.pickClawHubCategory(sourceSkill.capabilityTags);
+        const version = this.cleanText(String(item.version?.version ?? 'latest'));
+        const versionId = this.cleanText(String(item.version?._id ?? sourceSkill.latestVersionId ?? ''));
+        const owner = this.cleanText(String(item.ownerHandle ?? item.owner?.handle ?? ''));
+        const homepage = `${CLAWHUB_BASE_URL}/skills/${encodeURIComponent(slug)}`;
+        skills.push({
+          id: slug,
+          sourceId: source.id,
+          sourceName: source.name,
+          name,
+          description,
+          category,
+          version,
+          readme: description,
+          skillContent: this.buildGeneratedSkillContent({
+            name: slug,
+            title: name,
+            description,
+            category,
+            sourceName: source.name,
+            homepage,
+            installCommand: owner ? `clawhub install ${owner}/${slug}` : undefined
+          }),
+          homepage,
+          remoteVersionId: versionId || undefined,
+          installCommand: owner ? `clawhub install ${owner}/${slug}` : undefined,
+          installed: false
+        });
+      }
+    }
+    return this.dedupeBySourceSkillId(skills);
   }
 
   private async loadClawHubRemote(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
@@ -519,6 +606,18 @@ export class MarketplaceManager {
     return [...byKey.values()];
   }
 
+  private expandSearchTerms(query: string): string[] {
+    const text = this.cleanText(query).toLowerCase();
+    if (!text) return [];
+    const terms = new Set<string>([text]);
+    for (const group of SEARCH_SYNONYM_GROUPS) {
+      if (group.some((word) => text.includes(word))) {
+        for (const word of group) terms.add(word);
+      }
+    }
+    return [...terms];
+  }
+
   private extractFirst(input: string, pattern: RegExp): string | undefined {
     const match = input.match(pattern);
     if (!match || match.length < 2) return undefined;
@@ -563,3 +662,4 @@ export class MarketplaceManager {
       .trim();
   }
 }
+

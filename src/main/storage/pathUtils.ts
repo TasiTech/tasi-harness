@@ -19,11 +19,14 @@ export function defaultConfig(): AppConfig {
     model: providerDefaultModel('openai'),
     temperature: 0.3,
     maxIterations: 8,
+    sessionDocumentMaxDocs: 10,
     workspaceDir: join(DEFAULT_HOME, 'workspace'),
     allowShellTools: false,
     enableNetworkTools: false,
-    opencliBridgeMode: 'embedded',
-    opencliExtensionPath: '',
+    browserMode: 'external',
+    externalBrowserEngine: 'auto',
+    externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
+    externalBrowserProfileMode: 'isolated',
     theme: 'dark',
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
@@ -51,6 +54,12 @@ export function defaultConfig(): AppConfig {
       password: '',
       from: '',
       to: ''
+    },
+    wechatChannel: {
+      enabled: false,
+      pluginName: 'clawbot',
+      bindUrl: 'https://ilinkai.weixin.qq.com',
+      loginStatus: 'idle'
     },
     enabledToolNames: [
       'memory',

@@ -1,14 +1,14 @@
 # Ctrip Information Retrieval Guide
 
 ## Status
-The primary `tasi-travel` path now uses Agent Browser or built-in `browser_*` tools for Ctrip retrieval.
+The primary `tasi-travel` path now uses built-in `browser_*` tools for Ctrip retrieval.
 
 This guide is browser-only.
 
 ## Preferred Runtime Modes
 - Embedded mode: use built-in `browser_*` tools and the built-in preview by default.
-- External mode: prefer Agent Browser only when a working external bridge is clearly available.
-- If bridge availability is unknown or unstable, continue with `browser_*` tools instead of blocking on extension setup.
+- External mode: continue using `browser_*`; the harness auto-selects controlled system browser runtime when available.
+- If controlled external runtime is unavailable, the harness may fall back to a plain opener; continue extraction workflow and mark degraded status when evidence is insufficient.
 
 ## Search Coverage
 | Capability | Preferred Path | Notes |
@@ -35,5 +35,5 @@ This guide is browser-only.
 
 ## Related Active Docs
 - Browser-first provider: `./provider-ctrip-browser.md`
-- Agent Browser skill: `../../../browser/agent-browser/SKILL.md`
+- Tasi browser automation skill: `../../../browser/tasi-browser-automation/SKILL.md`
 - Built-in browser operator: `../../../browser/embedded-browser-operator/SKILL.md`

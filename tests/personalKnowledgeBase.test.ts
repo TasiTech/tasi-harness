@@ -3,6 +3,22 @@ import { describe, expect, it, vi } from 'vitest';
 import { PersonalKnowledgeBase } from '../src/main/knowledge/personalKnowledgeBase.js';
 import { tempHome } from './helpers.js';
 
+function createPdfWithText(text: string): Buffer {
+  const escaped = text.replace(/[()\\]/g, '\\$&');
+  const body = [
+    '%PDF-1.4',
+    '1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj',
+    '2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj',
+    '3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R >> endobj',
+    `4 0 obj << /Length ${escaped.length + 30} >> stream`,
+    `BT /F1 12 Tf 72 200 Td (${escaped}) Tj ET`,
+    'endstream endobj',
+    'trailer << /Root 1 0 R >>',
+    '%%EOF'
+  ].join('\n');
+  return Buffer.from(body, 'latin1');
+}
+
 describe('PersonalKnowledgeBase', () => {
   it('adds, searches, and deletes markdown documents', async () => {
     const env = tempHome();
@@ -69,6 +85,27 @@ describe('PersonalKnowledgeBase', () => {
       expect(keywordExtractor).toHaveBeenCalledTimes(1);
       expect(promptBlock).toContain('packing.md');
       expect(promptBlock.toLowerCase()).toContain('passport copies');
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('imports pdf documents into markdown for retrieval', async () => {
+    const env = tempHome();
+    try {
+      const knowledgeBase = new PersonalKnowledgeBase(env.home);
+      const pdf = createPdfWithText('Hello PDF world');
+
+      const doc = await knowledgeBase.addDocument({
+        filename: 'report.pdf',
+        contentBase64: pdf.toString('base64')
+      });
+
+      expect(doc.filename).toBe('report.pdf');
+      expect(existsSync(doc.markdownPath)).toBe(true);
+      expect(readFileSync(doc.markdownPath, 'utf8')).toContain('Hello PDF world');
+      const hits = await knowledgeBase.search('PDF world', 3);
+      expect(hits.length).toBeGreaterThan(0);
     } finally {
       env.cleanup();
     }

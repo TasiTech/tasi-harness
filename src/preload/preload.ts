@@ -1,16 +1,22 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
+  ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
+  PersonalKnowledgeFolderImportResult,
   PersonalKnowledgeUploadRequest,
   PublicAppConfig,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
+  SessionDocumentUploadRequest,
+  SessionUpdateEvent,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  WechatChannelQrCodePayload,
+  WechatChannelLoginStatusPayload,
   ToolRunRequest
 } from '../shared/types.js';
 
@@ -18,11 +24,14 @@ const api = {
   config: {
     get: () => ipcRenderer.invoke('config:get') as Promise<PublicAppConfig>,
     set: (partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }) => ipcRenderer.invoke('config:set', partial) as Promise<PublicAppConfig>,
-    test: () => ipcRenderer.invoke('config:test')
+    test: () => ipcRenderer.invoke('config:test'),
+    wechatQrcode: () => ipcRenderer.invoke('config:wechatQrcode') as Promise<WechatChannelQrCodePayload>,
+    wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
   },
   agent: {
     chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) =>
       ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase),
+    stop: () => ipcRenderer.invoke('agent:stop'),
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';
       const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentToolEventStream) => listener(payload);
@@ -35,7 +44,14 @@ const api = {
     read: (id: string) => ipcRenderer.invoke('sessions:read', id),
     delete: (id: string) => ipcRenderer.invoke('sessions:delete', id),
     rename: (id: string, title: string) => ipcRenderer.invoke('sessions:rename', id, title),
-    search: (query: string) => ipcRenderer.invoke('sessions:search', query)
+    search: (query: string) => ipcRenderer.invoke('sessions:search', query),
+    appendExternalMessage: (req: ExternalSessionMessageRequest) => ipcRenderer.invoke('sessions:appendExternalMessage', req),
+    onUpdated: (listener: (payload: SessionUpdateEvent) => void) => {
+      const channel = 'sessions:updated';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: SessionUpdateEvent) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    }
   },
   memory: {
     get: (query?: MemoryQueryOptions) => ipcRenderer.invoke('memory:get', query),
@@ -44,7 +60,13 @@ const api = {
   knowledge: {
     list: () => ipcRenderer.invoke('knowledge:list'),
     addDocument: (req: PersonalKnowledgeUploadRequest) => ipcRenderer.invoke('knowledge:addDocument', req),
+    addFolder: () => ipcRenderer.invoke('knowledge:addFolder') as Promise<PersonalKnowledgeFolderImportResult>,
     deleteDocument: (id: string) => ipcRenderer.invoke('knowledge:deleteDocument', id)
+  },
+  sessionDocs: {
+    list: (sessionId: string) => ipcRenderer.invoke('session-docs:list', sessionId),
+    upload: (req: SessionDocumentUploadRequest) => ipcRenderer.invoke('session-docs:upload', req),
+    deleteDocument: (sessionId: string, id: string) => ipcRenderer.invoke('session-docs:delete', sessionId, id)
   },
   skills: {
     list: () => ipcRenderer.invoke('skills:list'),
@@ -72,8 +94,8 @@ const api = {
     info: () => ipcRenderer.invoke('app:info'),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
     openExternalUrl: (url: string) => ipcRenderer.invoke('app:openExternalUrl', url),
-    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id),
-    openCliExtensionStatus: () => ipcRenderer.invoke('app:openCliExtensionStatus')
+    closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
+    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
   }
 };
 

@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import type { AppConfig, MemoryMutationOptions, RegisteredTool, ToolExecutionContext, ToolExecutionResult } from '../../shared/types.js';
 import { createId } from '../../shared/types.js';
 import type { MemoryStore } from '../storage/memoryStore.js';
@@ -18,100 +18,42 @@ export interface BuiltinToolDeps {
   browserAutomation?: BrowserAutomation;
 }
 
-type OpenCliPreviewKind = 'browser_open' | 'search';
-
-interface OpenCliPreviewTarget {
-  url: string;
-  kind: OpenCliPreviewKind;
-}
-
-function splitShellWords(command: string): string[] {
-  const tokens = command.match(/"([^"\\]|\\.)*"|'([^'\\]|\\.)*'|\S+/g) ?? [];
-  return tokens.map((token) => {
-    if (token.startsWith('"') && token.endsWith('"')) return token.slice(1, -1).replace(/\\"/g, '"');
-    if (token.startsWith("'") && token.endsWith("'")) return token.slice(1, -1);
-    return token;
-  });
-}
-
-function inferOpenCliPreviewTarget(command: string): OpenCliPreviewTarget | null {
-  const words = splitShellWords(command);
-  const openCliIndex = words.findIndex((word) => /(^|[\\/])opencli(?:\.cmd|\.exe)?$/i.test(word));
-  if (openCliIndex < 0) return null;
-  const args = words.slice(openCliIndex + 1);
-  if (args.length < 2) return null;
-  const platform = args[0].toLowerCase();
-  const action = args[1].toLowerCase();
-  if (platform === 'browser' && action === 'open') {
-    const raw = (args[2] ?? '').trim();
-    if (!raw) return null;
-    return { kind: 'browser_open', url: /^https?:\/\//i.test(raw) ? raw : `https://${raw}` };
-  }
-  if (action !== 'search') return null;
-  const queryTokens: string[] = [];
-  for (const token of args.slice(2)) {
-    if (token.startsWith('-')) break;
-    queryTokens.push(token);
-  }
-  const query = queryTokens.join(' ').trim();
-  if (!query) return null;
-  const encoded = encodeURIComponent(query);
-  const engines: Record<string, (q: string) => string> = {
-    baidu: (q) => `https://www.baidu.com/s?wd=${q}`,
-    bing: (q) => `https://www.bing.com/search?q=${q}`,
-    google: (q) => `https://www.google.com/search?q=${q}`,
-    duckduckgo: (q) => `https://duckduckgo.com/?q=${q}`,
-    brave: (q) => `https://search.brave.com/search?q=${q}`,
-    yahoo: (q) => `https://search.yahoo.com/search?p=${q}`,
-    browser: (q) => `https://www.google.com/search?q=${q}`
-  };
-  const toUrl = engines[platform] ?? engines.google;
-  return { kind: 'search', url: toUrl(encoded) };
-}
-
-function isOpenCliCommand(command: string): boolean {
-  const words = splitShellWords(command);
-  return words.some((word) => /(^|[\\/])opencli(?:\.cmd|\.exe)?$/i.test(word));
-}
-
-function appendOpenCliResultHints(command: string, result: ToolExecutionResult, bridgeMode: AppConfig['opencliBridgeMode']): ToolExecutionResult {
-  if (!command.trim()) return result;
-  if (/terminal tool is disabled|blocked dangerous command pattern/i.test(result.content)) return result;
-  if (!isOpenCliCommand(command)) return result;
-
-  const bridgeDisconnected = /browser bridge extension not connected|extension not connected/i.test(result.content);
-  const target = inferOpenCliPreviewTarget(command);
-  const hasPreviewUrl = /opencli_preview_url:\s*https?:\/\/\S+/i.test(result.content);
-  const hasUrlInOutput = /https?:\/\/\S+/i.test(result.content);
-  const lines = [result.content];
-  let changed = false;
-
-  if (target && !hasPreviewUrl && (bridgeDisconnected || !hasUrlInOutput)) {
-    lines.push('', `opencli_preview_url: ${target.url}`);
-    changed = true;
-    if (bridgeDisconnected) {
-      lines.push('opencli bridge is disconnected, showing fallback in built-in web preview.');
-    }
-  }
-
-  if (bridgeDisconnected) {
-    lines.push(
-      '',
-      bridgeMode === 'embedded'
-        ? 'bridge_mode=embedded: external Chrome extension install is not required for this mode. Use the built-in preview when opencli_preview_url is present.'
-        : 'bridge_mode=external: ensure Chrome/Chromium is running and the OpenCLI extension is enabled. If the bridge is unavailable, fall back to browser_* tools; the harness can still open the final URL in the user browser.'
-    );
-    changed = true;
-  }
-
-  if (!changed) return result;
-  return { ...result, content: lines.join('\n') };
-}
-
 function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
   const raw = args[name];
   const value = typeof raw === 'number' ? raw : Number(raw);
   return Number.isFinite(value) ? value : fallback;
+}
+
+function normalizePathSlashes(input: string): string {
+  return input.replace(/\\/g, '/');
+}
+
+function isPathInside(root: string, target: string): boolean {
+  const normalizedRoot = normalizePathSlashes(resolve(root)).replace(/\/+$/, '');
+  const normalizedTarget = normalizePathSlashes(resolve(target));
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`);
+}
+
+function extractReferencedMarkdownPaths(markdown: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: string) => {
+    const normalized = candidate.trim().replace(/\\/g, '/');
+    if (!normalized || !normalized.startsWith('.')) return;
+    if (!/\.md$/i.test(normalized)) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+  for (const match of markdown.matchAll(/\[[^\]]*\]\((\.\.?\/[^)\s]+\.md)\)/g)) {
+    const ref = match[1];
+    if (ref) push(ref);
+  }
+  for (const match of markdown.matchAll(/(?:^|\s|`)(\.\.?\/[^\s`"'()]+\.md)(?=$|\s|`)/gm)) {
+    const ref = match[1];
+    if (ref) push(ref);
+  }
+  return out.slice(0, 16);
 }
 
 function browserStateLine(state: BrowserPageState): string {
@@ -160,7 +102,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             session_id: { type: 'string', description: 'Optional session id for session-scoped memory.' },
             domain: {
               type: 'string',
-              enum: ['finance', 'daily_life', 'work', 'reading', 'education', 'health', 'other'],
+              enum: ['finance', 'daily_life', 'work', 'reading', 'education', 'health', 'travel', 'other'],
               description: 'Knowledge domain for retrieval.'
             },
             content: { type: 'string', description: 'New content for add.' },
@@ -224,20 +166,63 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         description: 'Read an installed skill by name. Skills are procedural workflow instructions: after reading one, follow it instead of skipping to a self-generated final answer.',
         parameters: {
           type: 'object',
-          properties: { name: { type: 'string', description: 'Skill name.' } },
+          properties: {
+            name: { type: 'string', description: 'Skill name.' },
+            ref_path: { type: 'string', description: 'Optional relative markdown path under references/, such as ./references/provider-ctrip-browser.md.' }
+          },
           required: ['name']
         }
       }
     },
     async execute(args) {
-      const skill = deps.skillManager.read(stringArg(objectArgs(args), 'name'));
+      const obj = objectArgs(args);
+      const skill = deps.skillManager.read(stringArg(obj, 'name'));
       if (!skill) return { ok: false, content: 'Skill not found.' };
-      const skillDir = dirname(skill.path).replace(/\\/g, '/');
+      const skillDirFs = dirname(skill.path);
+      const skillDir = normalizePathSlashes(skillDirFs);
+      const skillsRootFs = dirname(dirname(dirname(skill.path)));
+      const refPathRaw = stringArg(obj, 'ref_path', '').trim();
       const resolvedContent = skill.content
         .replace(/\{SKILL_DIR:-\.\}/g, skillDir)
         .replace(/\{SKILL_DIR\}/g, skillDir)
         .replace(/\$\{SKILL_DIR:-\.\}/g, skillDir)
         .replace(/\$\{SKILL_DIR\}/g, skillDir);
+
+      const referencedPaths = extractReferencedMarkdownPaths(resolvedContent)
+        .map((item) => item.replace(/\\/g, '/'))
+        .filter((item) => item.replace(/^\.\//, '').startsWith('references/'));
+
+      if (refPathRaw) {
+        const refPath = refPathRaw.replace(/\\/g, '/');
+        if (!/^\.\.?\/.*\.md$/i.test(refPath)) {
+          return { ok: false, content: 'ref_path must be a relative .md path, for example ./references/provider-ctrip-browser.md' };
+        }
+        const normalizedRef = refPath.replace(/^\.\//, '');
+        if (!normalizedRef.startsWith('references/')) {
+          return { ok: false, content: 'ref_path must be under references/.' };
+        }
+        const refAbsPath = resolve(skillDirFs, refPath);
+        if (!isPathInside(skillsRootFs, refAbsPath)) {
+          return { ok: false, content: 'ref_path resolves outside skills roots.' };
+        }
+        if (!existsSync(refAbsPath)) {
+          return { ok: false, content: `Reference file not found: ${refPath}` };
+        }
+        if (!statSync(refAbsPath).isFile()) {
+          return { ok: false, content: `Reference path is not a file: ${refPath}` };
+        }
+        const content = readFileSync(refAbsPath, 'utf8');
+        const bounded = content.length > 30000 ? `${content.slice(0, 30000)}\n\n...[truncated]` : content;
+        const refGuide = [
+          `# Skill reference for: ${skill.name}`,
+          `# Reference path: ${refPath}`,
+          `# Absolute reference path: ${refAbsPath}`,
+          '# This reference is loaded on demand from the skill references folder.',
+          ''
+        ].join('\n');
+        return { ok: true, content: `${refGuide}${bounded}`, data: skill };
+      }
+
       const guide = [
         `# Skill: ${skill.name}`,
         `# Absolute skill directory: ${skillDir}`,
@@ -250,9 +235,16 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         '# If this skill routes the task to provider or browser tools, your next assistant turn should usually contain those tool calls instead of a polished narrative answer.',
         '# Do not stop at reading the skill and then answer from general knowledge if the skill requires evidence gathering or verification.',
         '# Replace any SKILL_DIR placeholders with the resolved directory before running commands.',
+        '# If SKILL.md lists referenced markdown files that are relevant, you must call skill_view again with ref_path to read them before finalizing.',
+        '# Do not assume provider-specific rules before loading the relevant references/*.md file.',
         ''
       ].join('\n');
-      return { ok: true, content: `${guide}${resolvedContent}`, data: skill };
+
+      const referenceHints = referencedPaths.length === 0
+        ? '\n## Referenced markdown files\n(none detected in SKILL.md)'
+        : ['\n## Referenced markdown files', ...referencedPaths.map((item) => `- ${item}`)].join('\n');
+
+      return { ok: true, content: `${guide}${resolvedContent}${referenceHints}`, data: skill };
     }
   };
 
@@ -563,12 +555,12 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'browser_extract',
-        description: 'Extract readable text, HTML, or structured JSON from the current page in the browser automation session.',
+        description: 'Extract structured JSON from the current page in the browser automation session. Falls back to HTML when JSON is invalid.',
         parameters: {
           type: 'object',
           properties: {
             selector: { type: 'string', description: 'Optional CSS selector to scope extraction.' },
-            format: { type: 'string', enum: ['text', 'html', 'json'] },
+            format: { type: 'string', enum: ['html', 'json'] },
             max_chars: { type: 'number', description: 'Maximum characters to return.' }
           }
         }
@@ -578,13 +570,26 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const access = requireBrowserAutomation();
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
-      const formatRaw = stringArg(obj, 'format', 'text').toLowerCase();
-      const format = formatRaw === 'html' ? 'html' : formatRaw === 'json' ? 'json' : 'text';
-      const extracted = await access.browser.extract({
-        selector: stringArg(obj, 'selector', '').trim() || undefined,
+      const selector = stringArg(obj, 'selector', '').trim() || undefined;
+      const maxChars = numberArg(obj, 'max_chars', 8000);
+      const formatRaw = stringArg(obj, 'format', 'json').toLowerCase();
+      const format = formatRaw === 'html' ? 'html' : 'json';
+      let extracted = await access.browser.extract({
+        selector,
         format,
-        maxChars: numberArg(obj, 'max_chars', 8000)
+        maxChars
       });
+      if (format === 'json') {
+        try {
+          JSON.parse(extracted.content);
+        } catch {
+          extracted = await access.browser.extract({
+            selector,
+            format: 'html',
+            maxChars
+          });
+        }
+      }
       return { ok: true, content: renderBrowserExtractResult(extracted), data: extracted };
     }
   };
@@ -629,14 +634,13 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const cfg = deps.getConfig();
       const obj = objectArgs(args);
       const cwd = safeJoin(cfg.workspaceDir, stringArg(obj, 'cwd', '.'));
-      const command = stringArg(obj, 'command');
       const result = await runTerminalCommand({
-        command,
+        command: stringArg(obj, 'command'),
         cwd,
         timeoutMs: Number(obj.timeout_ms) || 120000,
         allowShellTools: cfg.allowShellTools
       });
-      return appendOpenCliResultHints(command, result, cfg.opencliBridgeMode);
+      return result;
     }
   };
 

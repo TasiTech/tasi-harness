@@ -9,7 +9,9 @@ export type ProviderKind =
   | 'anthropic-compatible'
   | 'ollama'
   | 'mock';
-export type OpenCliBridgeMode = 'embedded' | 'external';
+export type BrowserMode = 'embedded' | 'external';
+export type ExternalBrowserEngine = 'auto' | 'cdp' | 'webdriver-safari';
+export type ExternalBrowserProfileMode = 'isolated' | 'system';
 
 export type AgentRole = 'system' | 'user' | 'assistant' | 'tool';
 
@@ -28,6 +30,7 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  reasoning_content?: string;
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -66,15 +69,6 @@ export interface ToolExecutionResult {
   data?: unknown;
 }
 
-export interface OpenCliExtensionStatus {
-  mode: OpenCliBridgeMode;
-  loaded: boolean;
-  available: boolean;
-  detectedPath?: string;
-  loadedPath?: string;
-  message: string;
-}
-
 export type ToolExecutor = (args: unknown, context: ToolExecutionContext) => Promise<ToolExecutionResult>;
 
 export interface RegisteredTool {
@@ -110,17 +104,21 @@ export interface AppConfig {
   model: string;
   temperature: number;
   maxIterations: number;
+  sessionDocumentMaxDocs: number;
   workspaceDir: string;
   allowShellTools: boolean;
   enableNetworkTools: boolean;
-  opencliBridgeMode: OpenCliBridgeMode;
-  opencliExtensionPath: string;
+  browserMode: BrowserMode;
+  externalBrowserEngine: ExternalBrowserEngine;
+  externalBrowserCdpEndpoint: string;
+  externalBrowserProfileMode: ExternalBrowserProfileMode;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];
   defaultExecutionMode: ExecutionMode;
   skillMarketSources: SkillMarketplaceSource[];
   emailNotifications: EmailNotificationSettings;
+  wechatChannel: WechatChannelSettings;
 }
 
 export interface PublicEmailNotificationSettings extends Omit<EmailNotificationSettings, 'password'> {
@@ -136,7 +134,7 @@ export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifi
 
 export type MemoryTarget = 'memory' | 'user';
 export type MemoryScope = 'global' | 'session';
-export type MemoryDomain = 'finance' | 'daily_life' | 'work' | 'reading' | 'education' | 'health' | 'other';
+export type MemoryDomain = 'finance' | 'daily_life' | 'work' | 'reading' | 'education' | 'health' | 'travel' | 'other';
 
 export interface MemoryMutationOptions {
   scope?: MemoryScope;
@@ -219,10 +217,33 @@ export interface SessionSummary {
   messageCount: number;
 }
 
+export interface SessionSystemPromptRecord {
+  prompt: string;
+  createdAt: string;
+}
+
 export interface SessionRecord extends SessionSummary {
+  systemPrompt?: string;
+  systemPromptHistory?: SessionSystemPromptRecord[];
   messages: AgentMessage[];
   toolEvents: ToolEvent[];
   lastExecution?: AgentExecutionDetails;
+  lastUsage?: LlmUsage;
+  totalUsage?: LlmUsage;
+}
+
+export interface SessionUpdateEvent {
+  sessionId: string;
+  source: 'chat' | 'scheduled' | 'external';
+  updatedAt: string;
+}
+
+export interface ExternalSessionMessageRequest {
+  sessionId?: string;
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt?: string;
+  title?: string;
 }
 
 export interface AgentRunOptions {
@@ -241,6 +262,7 @@ export interface AgentRunResult {
   toolEvents: ToolEvent[];
   followUpQuestions?: string[];
   usage?: LlmUsage;
+  totalUsage?: LlmUsage;
   iterations: number;
   execution: AgentExecutionDetails;
 }
@@ -313,6 +335,39 @@ export interface EmailNotificationSettings {
   to: string;
 }
 
+export interface WechatChannelSettings {
+  enabled: boolean;
+  pluginName: 'clawbot';
+  bindUrl: string;
+  botToken?: string;
+  botId?: string;
+  userId?: string;
+  baseUrl?: string;
+  cursor?: string;
+  sessionId?: string;
+  loginStatus?: 'idle' | 'wait' | 'scaned' | 'confirmed' | 'expired' | 'error';
+  lastError?: string;
+  lastQrcodeKey?: string;
+  lastInboundUserId?: string;
+  lastContextToken?: string;
+}
+
+export interface WechatChannelQrCodePayload {
+  qrcodeContent: string;
+  qrcodeKey?: string;
+  source: 'ilink-api' | 'manual-bind-url';
+  fetchedAt: string;
+}
+
+export interface WechatChannelLoginStatusPayload {
+  status: 'wait' | 'scaned' | 'confirmed' | 'expired' | 'unknown';
+  botToken?: string;
+  botId?: string;
+  userId?: string;
+  baseUrl?: string;
+  fetchedAt: string;
+}
+
 export interface ScheduledTask {
   id: string;
   name: string;
@@ -322,12 +377,18 @@ export interface ScheduledTask {
   intervalMinutes?: number;
   nextRunAt: string;
   enabled: boolean;
+  isRunning?: boolean;
+  runStartedAt?: string;
   executionMode: ExecutionMode;
   notifyByEmail: boolean;
+  notifyByWechat: boolean;
   sessionId?: string;
   lastRunAt?: string;
   lastResult?: string;
   lastError?: string;
+  lastIterations?: number;
+  lastToolEventCount?: number;
+  lastTrace?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -340,6 +401,7 @@ export interface ScheduledTaskCreateRequest {
   intervalMinutes?: number;
   executionMode: ExecutionMode;
   notifyByEmail: boolean;
+  notifyByWechat?: boolean;
 }
 
 export interface ScheduledTaskPatchRequest {
@@ -351,6 +413,7 @@ export interface ScheduledTaskPatchRequest {
   intervalMinutes?: number;
   executionMode?: ExecutionMode;
   notifyByEmail?: boolean;
+  notifyByWechat?: boolean;
   enabled?: boolean;
 }
 
@@ -384,6 +447,44 @@ export interface SkillArchiveUploadRequest {
 export interface PersonalKnowledgeUploadRequest {
   filename: string;
   contentBase64: string;
+}
+
+export interface PersonalKnowledgeFolderImportFailure {
+  filePath: string;
+  error: string;
+}
+
+export interface PersonalKnowledgeFolderImportResult {
+  folderPath: string;
+  discovered: number;
+  imported: number;
+  skipped: number;
+  failed: PersonalKnowledgeFolderImportFailure[];
+}
+
+export interface SessionDocumentUploadRequest {
+  sessionId?: string;
+  filename: string;
+  contentBase64: string;
+}
+
+export interface SessionDocumentContext {
+  id: string;
+  sessionId: string;
+  filename: string;
+  sourceExt: string;
+  xmlPath: string;
+  workspaceCopyPath?: string;
+  commentCount: number;
+  charCount: number;
+  excerpt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SessionDocumentUploadResult {
+  sessionId: string;
+  document: SessionDocumentContext;
 }
 
 export interface PersonalKnowledgeDocument {
