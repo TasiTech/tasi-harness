@@ -86,13 +86,15 @@ Hotel URL templates and parameter hit rules:
 Hotel desktop example:
 - `https://hotels.ctrip.com/hotels/list?countryId=1&city=2&provinceId=0&checkin=2026/04/30&checkout=2026/05/01&optionId=2&optionType=City&display=Shanghai&crn=1&adult=1&children=0&travelPurpose=0&domestic=1`
 
-### POI
-Use Ctrip sight or guide pages when the user wants:
+### POI and Travel Guides
+Use Ctrip sight or travel-guide pages when the user wants:
 - attractions
 - museums
 - scenic spots
 - landmarks
 - ticket ideas
+- destination guides
+- itinerary inspiration from real travel notes
 
 Required inputs:
 - `city`
@@ -101,24 +103,65 @@ Optional inputs:
 - `keyword`
 - `limit`
 
-Normalize these fields whenever available:
+Normalize these POI fields whenever available:
 - `name`
 - `category`
 - `rating`
+- `commentCount`
 - `price`
 - `address`
 - `detailUrl`
 - `sourceUrl`
 
-POI/guide URL patterns:
+Normalize these guide/article fields whenever available:
+- `title`
+- `publishDate`
+- `readCountText`
+- `startMonthText`
+- `tripDaysText`
+- `perCapitaCostText`
+- `travelWithText`
+- `keyItinerary`
+- `relatedPoiLinks`
+- `sourceUrl`
+
+POI/guide URL patterns (from `you.ctrip.com`):
+- City destination page (city-level POI hub):
+  - `https://you.ctrip.com/place/{citySlug}{cityId}.html`
 - POI detail/list entry:
   - `https://you.ctrip.com/sight/{citySlug}{cityId}/{poiId}.html?poiType=3`
+- POI list pagination (common pattern):
+  - `https://you.ctrip.com/sight/{citySlug}{cityId}/s0-p{page}.html`
 - Guide/article page:
   - `https://you.ctrip.com/travels/{citySlug}{cityId}/{articleId}.html`
+  - also seen numeric city route variants:
+    - `https://you.ctrip.com/travels/{cityNumericId}/{articleId}.html`
 - Parameter rules:
   - preserve `poiType` when present
   - preserve slug+id segments in path as route evidence
   - if city path id and query city conflict, trust the visible page breadcrumb/title
+
+POI extraction hints:
+- On `place/*` city pages, prioritize extracting city-scoped modules such as:
+  - 热门景点 / 必玩景点
+  - 分区或主题景点入口
+  - 跳转到 `sight/*` 的景点详情链接
+- Prefer extracting from visible POI title/header area, score/comment widgets, ticket/price blocks, and address/opening-time sections.
+- Keep nearby booking links if present (`hotel`, `ticket`, `sight` related links) as evidence links, not as fabricated recommendations.
+
+Guide extraction hints:
+- On `travels/*/*.html`, prioritize structured labels often shown on page:
+  - `出发时间` (start month/time)
+  - `行程天数` (trip days)
+  - `人均花费` (per-capita cost)
+  - `和谁出行` (travel companion type)
+- Extract itinerary bullets/day plans from visible article body only.
+- Capture referenced internal links in the article body (especially `you.ctrip.com/sight/*` and `you.ctrip.com/travels/*`) as `relatedPoiLinks`.
+
+POI/guide quality gate:
+- If extracted content is mostly global navigation/copyright text and lacks POI/article core fields, treat it as unusable extraction.
+- In that case, do a bounded retry (`browser_wait` + one targeted interaction/scroll), then re-extract.
+- If still unusable, mark degraded and fall back according to routing policy.
 
 ### Flights and Trains
 Use Ctrip web pages as the default first pass for flights or trains.

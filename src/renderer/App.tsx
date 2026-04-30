@@ -340,6 +340,8 @@ export function App(): ReactElement {
   const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
   const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatStopping, setChatStopping] = useState(false);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
   const activeWechatSessionId = config.wechatChannel.sessionId?.trim() || '';
   const isWechatSessionActive = Boolean(sessionId && activeWechatSessionId && sessionId === activeWechatSessionId);
@@ -476,6 +478,10 @@ export function App(): ReactElement {
             setTotalUsage={setTotalUsage}
             toolEvents={toolEvents}
             setToolEvents={setToolEvents}
+            busy={chatBusy}
+            setBusy={setChatBusy}
+            stopping={chatStopping}
+            setStopping={setChatStopping}
             executionMode={executionMode}
             setExecutionMode={setExecutionMode}
             refreshSessions={refreshSessions}
@@ -605,14 +611,16 @@ function ChatPage(props: {
   setTotalUsage: (usage?: LlmUsage) => void;
   toolEvents: ToolEvent[];
   setToolEvents: Dispatch<SetStateAction<ToolEvent[]>>;
+  busy: boolean;
+  setBusy: Dispatch<SetStateAction<boolean>>;
+  stopping: boolean;
+  setStopping: Dispatch<SetStateAction<boolean>>;
   executionMode: 'workspace' | 'sandbox';
   setExecutionMode: (mode: 'workspace' | 'sandbox') => void;
   refreshSessions: () => Promise<void>;
   personalKnowledgeDocCount: number;
 }): ReactElement {
   const [input, setInput] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState('');
   const [followUpQuestions, setFollowUpQuestions] = useState<string[]>([]);
   const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
@@ -661,7 +669,7 @@ function ChatPage(props: {
       && props.sessionId === props.config.wechatChannel.sessionId
   );
   const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
-  const runBusy = busy || wechatBusy;
+  const runBusy = props.busy || wechatBusy;
   useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
@@ -712,7 +720,7 @@ function ChatPage(props: {
     setPreviewAddress(previewUrl);
   }, [previewUrl]);
   useEffect(() => {
-    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !busy) {
+    if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !props.busy) {
       externalPreviewOpenUrlRef.current = '';
       return;
     }
@@ -725,7 +733,7 @@ function ChatPage(props: {
     }).catch((e) => {
       setError(e instanceof Error ? e.message : String(e));
     });
-  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl, busy]);
+  }, [showEmbeddedWebPreview, externalFallbackPreviewUrl, props.busy]);
   useEffect(() => {
     if (!shouldShowWebPreview) return;
     previewContentMetricsRef.current = null;
@@ -1114,11 +1122,11 @@ function ChatPage(props: {
 
   async function submitMessage(rawText: string): Promise<void> {
     const text = rawText.trim();
-    if (!text || busy) return;
+    if (!text || props.busy) return;
     setInput('');
     setError('');
-    setBusy(true);
-    setStopping(false);
+    props.setBusy(true);
+    props.setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
     props.setMessages([...props.messages, { role: 'user', content: text, createdAt: new Date().toISOString() }]);
@@ -1146,21 +1154,21 @@ function ChatPage(props: {
           // Ignore cleanup errors when closing external preview window.
         }
       }
-      setStopping(false);
-      setBusy(false);
+      props.setStopping(false);
+      props.setBusy(false);
     }
   }
 
   async function stopCurrentSession(): Promise<void> {
-    if ((!busy && !wechatBusy) || stopping) return;
-    setStopping(true);
+    if ((!props.busy && !wechatBusy) || props.stopping) return;
+    props.setStopping(true);
     setError('');
     try {
       await window.tasiHarness.agent.stop();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (!busy) setStopping(false);
+      if (!props.busy) props.setStopping(false);
     }
   }
 
@@ -1603,7 +1611,7 @@ function ChatPage(props: {
         </div>
         <button
           className={`send-btn${runBusy ? ' stop' : ''}`}
-          disabled={runBusy ? stopping : !input.trim() || !connected}
+          disabled={runBusy ? props.stopping : !input.trim() || !connected}
           title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
           onClick={() => {
             if (runBusy) {
@@ -1613,7 +1621,7 @@ function ChatPage(props: {
             void send();
           }}
         >
-          {runBusy ? (stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
+          {runBusy ? (props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
         </button>
       </div>
     </section>
