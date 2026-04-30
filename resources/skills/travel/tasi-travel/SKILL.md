@@ -214,17 +214,33 @@ Apply the degradation rules consistently:
 - If multiple `must_visit` items cannot be reasonably covered within the given date range due to geographic dispersion, either distribute them across available days with clear labeling or flag this in "Risks and missing information" with a recommendation to prioritize or extend the trip.
 
 ### Step 4A: Build Amap Route Links (When Map Is Requested)
-Goal: output an Amap route URL instead of generating map artifacts.
+Goal: output a local HTML viewer link that embeds the Amap route URLs to display consecutive day routes together on a single page using URL parameters.
 
 Entry-level rules:
-1. Use name-only mode by default for simplicity and robustness.
+1. Generate the Amap routing URLs using name-only mode by default for simplicity and robustness.
 2. If `use_lnglat=true`, include both `name` and `lnglat` for each point to avoid ambiguity.
 3. Enforce Amap limitations: only `car` supports via points, up to 6 via points, and the total number of points (including origin and destination) must not exceed 8.
-4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. To display the route more clearly and connect the locations, also provide a separate `car` link that includes all POIs as a demonstration. Do not attempt to provide via points in non-car modes since they will be ignored by Amap and may cause confusion.
+4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. To display the route more clearly and connect the locations on the combined map, generate a `car` link that includes all POIs as a demonstration, and use this `car` link for the multi-day viewer.
 5. Map focus behavior:
   - `day` (default): generate one Amap link per day.
   - `full_trip`: attempt a single link for the whole trip (may exceed Amap point limits).
   - `city`: generate a single intra-city link when the trip stays within one city.
+6. Provide the user with a Markdown link pointing to the local static viewer containing the encoded parameters.
+
+Link Generation:
+- Use an absolute URL starting with `file:///` pointing to the viewer file, for example: `file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html`.
+- Encode each generated URL properly.
+- To prevent the multi-day map URL from becoming too long, use the compact pipe-separated points format `?day1=点1|点2|点3` instead of raw Amap URLs for the iframe viewer. The local HTML viewer will automatically expand it.
+Append the links as query parameters: `?day1=URL_ENCODED(Origin|Via1|Via2|Destination)&day2=URL_ENCODED(Origin|Destination)`. For `full_trip` or `city`, just use `?day1=...`.
+
+Fallback Strategy:
+- If a local `file:///` link cannot be opened or the local path is unknown, omit the viewer link.
+- Provide per-day Amap URLs (`https://ditu.amap.com/dir?...`) as plain Markdown links instead, one link per day, so the user can still open each day directly.
+
+Example:
+```markdown
+🗺️ [点击打开多日行程地图预览](file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html?day1=%E5%A4%A9%E5%AE%89%E9%97%A8%E5%B9%BF%E5%9C%BA%7C%E6%95%85%E5%AE%AB%E5%8D%9A%E7%89%A9%E9%99%A2%7C%E5%A4%A9%E5%9D%9B%E5%85%AC%E5%9B%AD&day2=%E5%8C%97%E4%BA%AC%E5%8C%97%E7%AB%99%7C%E5%85%AB%E8%BE%BE%E5%B2%AD%E9%95%BF%E5%9F%8E)
+```
 
 ### Step 5: Budget and Risks
 Provide a budget split for:

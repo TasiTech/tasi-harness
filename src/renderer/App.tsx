@@ -1304,20 +1304,40 @@ function ChatPage(props: {
     uploadSessionDocInputRef.current.click();
   }
 
-  async function uploadSessionDocument(file: File): Promise<void> {
+  async function uploadSessionDocuments(files: File[]): Promise<void> {
+    if (files.length === 0) return;
     setSessionDocBusy(true);
     setSessionDocError('');
     try {
-      const contentBase64 = await fileToBase64(file);
-      const result = await window.tasiHarness.sessionDocs.upload({
-        sessionId: props.sessionId,
-        filename: file.name,
-        contentBase64
-      });
-      if (props.sessionId !== result.sessionId) props.setSessionId(result.sessionId);
-      const docs = await window.tasiHarness.sessionDocs.list(result.sessionId);
+      let activeSessionId = props.sessionId;
+      const failures: string[] = [];
+      for (const file of files) {
+        try {
+          const contentBase64 = await fileToBase64(file);
+          const result = await window.tasiHarness.sessionDocs.upload({
+            sessionId: activeSessionId,
+            filename: file.name,
+            contentBase64
+          });
+          activeSessionId = result.sessionId;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          failures.push(`${file.name}: ${message}`);
+        }
+      }
+      if (activeSessionId && props.sessionId !== activeSessionId) props.setSessionId(activeSessionId);
+      if (!activeSessionId) return;
+      const docs = await window.tasiHarness.sessionDocs.list(activeSessionId);
       setSessionDocs(docs);
       await props.refreshSessions();
+      if (failures.length > 0) {
+        setSessionDocError(
+          props.tr(
+            `Some files failed to upload:\n${failures.join('\n')}`,
+            `部分文件上传失败：\n${failures.join('\n')}`
+          )
+        );
+      }
     } catch (e) {
       setSessionDocError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1522,11 +1542,12 @@ function ChatPage(props: {
             ref={uploadSessionDocInputRef}
             className="hidden-file-input"
             type="file"
+            multiple
             accept=".docx,.pptx,.xlsx,.pdf,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
             onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (!file) return;
-              void uploadSessionDocument(file);
+              const files = Array.from(event.target.files ?? []);
+              if (files.length === 0) return;
+              void uploadSessionDocuments(files);
             }}
           />
           <div className="chat-session-doc-row">
@@ -1712,6 +1733,7 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
 function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeState; refreshKnowledge: () => Promise<void> }): ReactElement {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [folderImportBusy, setFolderImportBusy] = useState(false);
   const [deletingDocId, setDeletingDocId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
@@ -1752,6 +1774,39 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
     }
   }
 
+  async function addFolder(): Promise<void> {
+    setFolderImportBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      const result = await window.tasiHarness.knowledge.addFolder();
+      if (!result.folderPath) {
+        setNotice(props.tr('Folder import canceled.', '已取消文件夹导入。'));
+        return;
+      }
+      const failedCount = result.failed.length;
+      setNotice(
+        props.tr(
+          `Folder import complete: ${result.imported} imported, ${result.skipped} skipped, ${failedCount} failed (scanned ${result.discovered} files).`,
+          `文件夹导入完成：成功 ${result.imported}，跳过 ${result.skipped}，失败 ${failedCount}（共扫描 ${result.discovered} 个文件）。`
+        )
+      );
+      if (failedCount > 0) {
+        const preview = result.failed
+          .slice(0, 5)
+          .map((item) => `- ${item.filePath}: ${item.error}`)
+          .join('\n');
+        const rest = failedCount > 5 ? props.tr(`\n...and ${failedCount - 5} more failures.`, `\n...以及另外 ${failedCount - 5} 个失败项。`) : '';
+        setError(props.tr(`Some files failed to import:\n${preview}${rest}`, `部分文件导入失败：\n${preview}${rest}`));
+      }
+      await props.refreshKnowledge();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setFolderImportBusy(false);
+    }
+  }
+
   async function deleteDocument(doc: PersonalKnowledgeDocument): Promise<void> {
     const confirmed = globalThis.confirm(
       props.tr(
@@ -1788,11 +1843,12 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
       <div className="split-grid knowledge-layout">
         <div className="card">
           <h2>{props.tr('Add Document', '添加文档')}</h2>
-          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX。')}</p>
+          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF。')}</p>
           <label>{props.tr('Source document', '源文档')}</label>
           <input
             type="file"
-            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx"
+            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf"
+            disabled={uploadBusy || folderImportBusy}
             onChange={(event) => {
               setUploadFile(event.target.files?.[0] ?? null);
               setError('');
@@ -1805,8 +1861,11 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
             </div>
           )}
           <div className="button-row">
-            <button className="primary-button" disabled={!uploadFile || uploadBusy} onClick={() => void addDocument()}>
+            <button className="primary-button" disabled={!uploadFile || uploadBusy || folderImportBusy} onClick={() => void addDocument()}>
               {uploadBusy ? '...' : props.tr('Add to Knowledge Base', '加入知识库')}
+            </button>
+            <button className="ghost-button" disabled={uploadBusy || folderImportBusy} onClick={() => void addFolder()}>
+              {folderImportBusy ? '...' : props.tr('Import Folder', '导入文件夹')}
             </button>
           </div>
           {notice && <div className="notice-box">{notice}</div>}
@@ -2810,6 +2869,14 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
           <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <label>{tr('Session document max docs', '对话文档最大数量')}</label>
+          <input
+            type="number"
+            min="1"
+            max="100"
+            value={draft.sessionDocumentMaxDocs}
+            onChange={(e) => setDraft((old) => ({ ...old, sessionDocumentMaxDocs: Number(e.target.value) }))}
+          />
           <label>{tr('Workspace directory', '工作目录')}</label>
           <input value={draft.workspaceDir} onChange={(e) => setDraft((old) => ({ ...old, workspaceDir: e.target.value }))} />
           <label>{tr('Default execution mode', '默认执行模式')}</label>
