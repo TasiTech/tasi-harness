@@ -297,6 +297,12 @@ export interface SkillMarketplaceSource {
   enabled: boolean;
 }
 
+export interface SkillSupportingFile {
+  path: string;
+  content?: string;
+  contentBase64?: string;
+}
+
 export interface MarketplaceSkill {
   id: string;
   sourceId: string;
@@ -307,6 +313,7 @@ export interface MarketplaceSkill {
   version: string;
   readme: string;
   skillContent: string;
+  supportingFiles?: SkillSupportingFile[];
   homepage?: string;
   remoteVersionId?: string;
   installCommand?: string;
@@ -319,9 +326,26 @@ export interface MarketplaceBrowseResult {
   skills: MarketplaceSkill[];
 }
 
+export interface MarketplaceSkillSnapshot {
+  id: string;
+  sourceId: string;
+  sourceName: string;
+  name: string;
+  description: string;
+  category: string;
+  version: string;
+  readme: string;
+  skillContent: string;
+  supportingFiles?: SkillSupportingFile[];
+  homepage?: string;
+  remoteVersionId?: string;
+  installCommand?: string;
+}
+
 export interface SkillInstallRequest {
   sourceId: string;
   skillId: string;
+  skill?: MarketplaceSkillSnapshot;
 }
 
 export interface EmailNotificationSettings {

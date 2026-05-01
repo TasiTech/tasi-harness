@@ -1,10 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { MarketplaceBrowseResult, MarketplaceSkill, SkillInstallRequest, SkillMarketplaceSource } from '../../shared/types.js';
+import type { MarketplaceBrowseResult, MarketplaceSkill, MarketplaceSkillSnapshot, SkillInstallRequest, SkillMarketplaceSource, SkillSupportingFile } from '../../shared/types.js';
 import { parseSkillMarkdown, SkillManager } from './skillManager.js';
 
 const CLAWHUB_BASE_URL = 'https://clawhub.ai';
 const CLAWHUB_FALLBACK_CONVEX_URL = 'https://wry-manatee-359.convex.cloud';
+const CLAWHUB_FALLBACK_CONVEX_SITE_URL = 'https://wry-manatee-359.convex.site';
 const SKILLHUB_BASE_URL = 'https://skillhub.builders';
 const REMOTE_TIMEOUT_MS = 12_000;
 const MAX_CLAWHUB_SKILLS = 80;
@@ -26,6 +27,8 @@ interface CatalogFile {
     version?: string;
     readme?: string;
     skillContent: string;
+    supportingFiles?: SkillSupportingFile[];
+    files?: SkillSupportingFile[];
     homepage?: string;
   }>;
 }
@@ -141,7 +144,7 @@ export class MarketplaceManager {
   }
 
   async install(req: SkillInstallRequest): Promise<MarketplaceSkill> {
-    const catalogSkill = (await this.browse()).skills.find((skill) => skill.sourceId === req.sourceId && skill.id === req.skillId);
+    const catalogSkill = await this.resolveSkillForInstall(req);
     if (!catalogSkill) throw new Error('Marketplace skill not found.');
     const sourceId = req.sourceId.toLowerCase();
     let skillContent = catalogSkill.skillContent;
@@ -150,6 +153,18 @@ export class MarketplaceManager {
     let installCommand = catalogSkill.installCommand;
 
     if (sourceId === 'clawhub') {
+      const installedFromArchive = await this.installClawHubArchive(catalogSkill, req);
+      if (installedFromArchive) {
+        return {
+          ...catalogSkill,
+          version,
+          readme,
+          skillContent,
+          installCommand,
+          installed: true,
+          installedSkillName: installedFromArchive.name
+        };
+      }
       const readmeText = await this.fetchClawHubReadme(catalogSkill.remoteVersionId);
       if (readmeText) {
         skillContent = readmeText;
@@ -182,6 +197,7 @@ export class MarketplaceManager {
       category: String(frontmatter.category),
       content
     });
+    this.writeSupportingFiles(doc.name, catalogSkill.supportingFiles);
     return {
       ...catalogSkill,
       version,
@@ -195,6 +211,15 @@ export class MarketplaceManager {
 
   uninstall(name: string): boolean {
     return this.skillManager.delete(name);
+  }
+
+  private async resolveSkillForInstall(req: SkillInstallRequest): Promise<MarketplaceSkill | null> {
+    const browsed = (await this.browse()).skills.find((skill) => skill.sourceId === req.sourceId && skill.id === req.skillId);
+    if (browsed) return browsed;
+    if (req.skill && req.skill.sourceId === req.sourceId && req.skill.id === req.skillId) {
+      return this.snapshotToMarketplaceSkill(req.skill);
+    }
+    return null;
   }
 
   private async loadSource(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
@@ -230,6 +255,7 @@ export class MarketplaceManager {
       version: skill.version ?? '1.0.0',
       readme: skill.readme ?? '',
       skillContent: skill.skillContent,
+      supportingFiles: skill.supportingFiles ?? skill.files,
       homepage: skill.homepage,
       installed: false
     }));
@@ -405,6 +431,115 @@ export class MarketplaceManager {
       return text;
     } catch {
       return null;
+    }
+  }
+
+  private async installClawHubArchive(catalogSkill: MarketplaceSkill, req: SkillInstallRequest): Promise<{ name: string } | null> {
+    const archive = await this.fetchClawHubArchive(catalogSkill);
+    if (!archive) return null;
+    try {
+      const doc = await this.skillManager.installArchive(
+        {
+          filename: `${catalogSkill.id}.zip`,
+          contentBase64: archive.toString('base64'),
+          category: catalogSkill.category
+        },
+        {
+          marketplace_source_id: req.sourceId,
+          marketplace_skill_id: req.skillId,
+          version: catalogSkill.version
+        }
+      );
+      return { name: doc.name };
+    } catch (error) {
+      console.warn('[marketplace] ClawHub archive install failed, fallback to SKILL.md:', error);
+      return null;
+    }
+  }
+
+  private async fetchClawHubArchive(catalogSkill: MarketplaceSkill): Promise<Buffer | null> {
+    const baseUrls = await this.clawHubDownloadBaseUrls(catalogSkill);
+    const urls = baseUrls.flatMap((baseUrl) => this.clawHubDownloadUrls(baseUrl, catalogSkill.id, catalogSkill.version));
+    for (const url of urls) {
+      try {
+        const response = await this.fetchWithTimeout(url, {
+          headers: {
+            Accept: 'application/zip,application/octet-stream;q=0.9,*/*;q=0.8'
+          }
+        });
+        if (!response.ok) continue;
+        const contentType = response.headers.get('content-type') ?? '';
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.length === 0) continue;
+        if (contentType && !/zip|octet-stream|application\/x-zip-compressed/i.test(contentType)) {
+          continue;
+        }
+        return buffer;
+      } catch {
+        // Try the next known ClawHub download shape.
+      }
+    }
+    return null;
+  }
+
+  private async clawHubDownloadBaseUrls(catalogSkill: MarketplaceSkill): Promise<string[]> {
+    const urls = [
+      this.baseUrlFromHomepage(catalogSkill.homepage),
+      CLAWHUB_BASE_URL,
+      this.clawHubConvexUrl ? this.toConvexSiteUrl(this.clawHubConvexUrl) : null,
+      this.toConvexSiteUrl(await this.resolveClawHubConvexUrl({ id: 'clawhub', name: 'ClawHub', description: '', enabled: true })),
+      CLAWHUB_FALLBACK_CONVEX_SITE_URL
+    ];
+    return [...new Set(urls.filter((url): url is string => Boolean(url)))];
+  }
+
+  private clawHubDownloadUrls(baseUrl: string, slug: string, version?: string): string[] {
+    const urls: string[] = [];
+    const add = (path: string, params?: Record<string, string | undefined>) => {
+      const url = new URL(path, baseUrl);
+      for (const [key, value] of Object.entries(params ?? {})) {
+        if (value) url.searchParams.set(key, value);
+      }
+      urls.push(url.toString());
+    };
+    const requestedVersion = version && version !== 'latest' ? version : undefined;
+    add('/api/v1/download', { slug, version: requestedVersion, tag: requestedVersion ? undefined : 'latest' });
+    add('/api/v1/download', { slug, version: requestedVersion });
+    add(`/api/v1/download/${encodeURIComponent(slug)}`, { version: requestedVersion });
+    add('/api/download', { slug, version: requestedVersion });
+    return [...new Set(urls)];
+  }
+
+  private toConvexSiteUrl(url: string): string | null {
+    try {
+      const parsed = new URL(url);
+      if (parsed.hostname.endsWith('.convex.site')) return `${parsed.protocol}//${parsed.host}`;
+      if (parsed.hostname.endsWith('.convex.cloud')) return `${parsed.protocol}//${parsed.host.replace(/\.convex\.cloud$/i, '.convex.site')}`;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  private baseUrlFromHomepage(homepage?: string): string | null {
+    if (!homepage) return null;
+    try {
+      const parsed = new URL(homepage);
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {
+      return null;
+    }
+  }
+
+  private writeSupportingFiles(name: string, files?: SkillSupportingFile[]): void {
+    for (const file of files ?? []) {
+      const path = file.path?.trim();
+      if (!path) continue;
+      if (typeof file.contentBase64 === 'string' && file.contentBase64.trim()) {
+        this.skillManager.writeSupportingFile(name, path, Buffer.from(file.contentBase64, 'base64'));
+      } else if (typeof file.content === 'string') {
+        this.skillManager.writeSupportingFile(name, path, file.content);
+      }
     }
   }
 
@@ -598,6 +733,13 @@ export class MarketplaceManager {
     return JSON.stringify(this.cleanText(value));
   }
 
+  private snapshotToMarketplaceSkill(skill: MarketplaceSkillSnapshot): MarketplaceSkill {
+    return {
+      ...skill,
+      installed: false
+    };
+  }
+
   private dedupeBySourceSkillId(skills: MarketplaceSkill[]): MarketplaceSkill[] {
     const byKey = new Map<string, MarketplaceSkill>();
     for (const skill of skills) {
@@ -662,4 +804,3 @@ export class MarketplaceManager {
       .trim();
   }
 }
-

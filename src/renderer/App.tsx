@@ -4,6 +4,7 @@ import type {
   AppInfo,
   LlmUsage,
   MarketplaceBrowseResult,
+  MarketplaceSkill,
   MemoryDomain,
   MemoryEntry,
   MemoryState,
@@ -2168,6 +2169,7 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
   const [marketError, setMarketError] = useState('');
+  const [marketActionKey, setMarketActionKey] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadName, setUploadName] = useState('uploaded-skill');
@@ -2321,21 +2323,58 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
-  async function install(sourceId: string, skillId: string): Promise<void> {
-    const installed = await window.tasiHarness.skills.installFromMarketplace({ sourceId, skillId });
-    setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
-    await refreshSkills();
-    await refreshMarketplaceSnapshot();
-    await openInstalledSkill(installed.installedSkillName ?? installed.name);
+  async function install(skill: MarketplaceSkill): Promise<void> {
+    const { sourceId, id: skillId } = skill;
+    const actionKey = `install:${sourceId}:${skillId}`;
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      const installed = await window.tasiHarness.skills.installFromMarketplace({
+        sourceId,
+        skillId,
+        skill: {
+          id: skill.id,
+          sourceId: skill.sourceId,
+          sourceName: skill.sourceName,
+          name: skill.name,
+          description: skill.description,
+          category: skill.category,
+          version: skill.version,
+          readme: skill.readme,
+          skillContent: skill.skillContent,
+          supportingFiles: skill.supportingFiles,
+          homepage: skill.homepage,
+          remoteVersionId: skill.remoteVersionId,
+          installCommand: skill.installCommand
+        }
+      });
+      setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
+      await refreshSkills();
+      await refreshMarketplaceSnapshot();
+      await openInstalledSkill(installed.installedSkillName ?? installed.name);
+    } catch (error) {
+      setMarketError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
   }
 
   async function uninstall(name: string): Promise<void> {
     if (!name) return;
-    await window.tasiHarness.skills.uninstallMarketplaceSkill(name);
-    setNotice(`Removed ${name}.`);
-    if (editorOpen && editorOriginalName === name) setEditorOpen(false);
-    await refreshSkills();
-    await refreshMarketplaceSnapshot();
+    const actionKey = `uninstall:${name}`;
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      await window.tasiHarness.skills.uninstallMarketplaceSkill(name);
+      setNotice(`Removed ${name}.`);
+      if (editorOpen && editorOriginalName === name) setEditorOpen(false);
+      await refreshSkills();
+      await refreshMarketplaceSnapshot();
+    } catch (error) {
+      setMarketError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
   }
 
   async function uploadArchive(): Promise<void> {
@@ -2429,17 +2468,29 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             <div className="marketplace-list">
               {marketplace.skills.map((skill) => (
                 <div key={`${skill.sourceId}-${skill.id}`} className="marketplace-card">
+                  {(() => {
+                    const installActionKey = `install:${skill.sourceId}:${skill.id}`;
+                    const uninstallActionKey = `uninstall:${skill.installedSkillName ?? ''}`;
+                    const installBusy = marketActionKey === installActionKey;
+                    const uninstallBusy = marketActionKey === uninstallActionKey;
+                    return (
                   <div className="marketplace-card-top">
                     <div>
                       <strong>{skill.name}</strong>
                       <div className="card-subtle">{skill.sourceName} | {skill.category} | v{skill.version}</div>
                     </div>
                     {skill.installed && skill.installedSkillName ? (
-                      <button className="danger-button" onClick={() => void uninstall(skill.installedSkillName ?? '')}>{tr('Uninstall', '卸载')}</button>
+                      <button className="danger-button" disabled={uninstallBusy || marketActionKey !== null} onClick={() => void uninstall(skill.installedSkillName ?? '')}>
+                        {uninstallBusy ? tr('Uninstalling...', '卸载中...') : tr('Uninstall', '卸载')}
+                      </button>
                     ) : (
-                      <button className="primary-button" onClick={() => void install(skill.sourceId, skill.id)}>{tr('Install', '安装')}</button>
+                      <button className="primary-button" disabled={installBusy || marketActionKey !== null} onClick={() => void install(skill)}>
+                        {installBusy ? tr('Installing...', '安装中...') : tr('Install', '安装')}
+                      </button>
                     )}
                   </div>
+                    );
+                  })()}
                   <p>{skill.description}</p>
                   <pre className="code-block small">{skill.readme || skill.skillContent}</pre>
                 </div>
