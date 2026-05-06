@@ -2,6 +2,10 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
   AssistantMessageExportRequest,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachGenerateSkillResult,
+  BrowserCoachRecording,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -79,6 +83,13 @@ const api = {
     browseMarketplace: (query?: string) => ipcRenderer.invoke('skills:market:browse', query),
     installFromMarketplace: (req: SkillInstallRequest) => ipcRenderer.invoke('skills:market:install', req),
     uninstallMarketplaceSkill: (name: string) => ipcRenderer.invoke('skills:market:uninstall', name)
+  },
+  browserCoach: {
+    start: (req?: BrowserCoachStartRequest) => ipcRenderer.invoke('browser-coach:start', req) as Promise<BrowserCoachRecording>,
+    stop: () => ipcRenderer.invoke('browser-coach:stop') as Promise<BrowserCoachRecording>,
+    status: () => ipcRenderer.invoke('browser-coach:status') as Promise<BrowserCoachRecording>,
+    clear: () => ipcRenderer.invoke('browser-coach:clear') as Promise<BrowserCoachRecording>,
+    generateSkill: (req: BrowserCoachGenerateSkillRequest) => ipcRenderer.invoke('browser-coach:generateSkill', req) as Promise<BrowserCoachGenerateSkillResult>
   },
   tasks: {
     list: () => ipcRenderer.invoke('tasks:list'),

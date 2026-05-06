@@ -996,6 +996,85 @@ progress::-webkit-progress-value { background: var(--accent); }
   text-decoration: none;
 }
 .upload-file-row { margin-top: 10px; }
+.coach-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(360px, 1.2fr);
+  gap: 16px;
+  align-items: start;
+}
+.coach-controls {
+  min-width: 0;
+}
+.coach-trace {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+.coach-trace-head {
+  min-height: 44px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-secondary);
+}
+.coach-trace-head strong {
+  color: var(--text-primary);
+}
+.coach-trace-head span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.coach-trace-head-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+.coach-trace-head-actions .mini-button {
+  padding: 5px 9px;
+  font-size: 11px;
+  line-height: 1.2;
+}
+.coach-trace-list {
+  max-height: 520px;
+  overflow: auto;
+  display: grid;
+}
+.coach-event {
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+}
+.coach-event:last-child {
+  border-bottom: 0;
+}
+.coach-event strong,
+.coach-event span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.coach-event strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+.coach-event span,
+.coach-event time {
+  color: var(--text-muted);
+  font-size: 11px;
+}
 .knowledge-layout { align-items: start; }
 .knowledge-stats { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
 .knowledge-library { margin-top: 18px; }
@@ -1149,6 +1228,7 @@ progress::-webkit-progress-value { background: var(--accent); }
   .chat-actions { width: 100%; flex-wrap: wrap; }
   .skill-editor-textarea { min-height: 300px; max-height: 50vh; }
   .memory-layout { grid-template-columns: 1fr; }
+  .coach-layout { grid-template-columns: 1fr; }
   .memory-browser { grid-template-columns: 1fr; }
   .memory-category-list, .memory-entry-list { max-height: 240px; }
   .channel-qr-wrap { grid-template-columns: 1fr; }

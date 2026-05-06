@@ -476,6 +476,49 @@ export interface SkillArchiveUploadRequest {
   category?: string;
 }
 
+export type BrowserCoachEventType = 'navigation' | 'click' | 'input' | 'change' | 'submit' | 'keydown' | 'window_closed';
+
+export interface BrowserCoachRecordedEvent {
+  id: string;
+  index: number;
+  type: BrowserCoachEventType;
+  url: string;
+  title?: string;
+  selector?: string;
+  tag?: string;
+  role?: string;
+  name?: string;
+  text?: string;
+  value?: string;
+  key?: string;
+  createdAt: string;
+}
+
+export interface BrowserCoachRecording {
+  id: string;
+  startUrl: string;
+  startedAt: string;
+  endedAt?: string;
+  active: boolean;
+  events: BrowserCoachRecordedEvent[];
+}
+
+export interface BrowserCoachStartRequest {
+  url?: string;
+}
+
+export interface BrowserCoachGenerateSkillRequest {
+  name: string;
+  category: string;
+  description?: string;
+}
+
+export interface BrowserCoachGenerateSkillResult {
+  skill: SkillDocument;
+  recording: BrowserCoachRecording;
+  recordingReferencePath: string;
+}
+
 export interface PersonalKnowledgeUploadRequest {
   filename: string;
   contentBase64: string;

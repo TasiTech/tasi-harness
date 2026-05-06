@@ -10,6 +10,8 @@ import type {
   AgentToolEventStream,
   AssistantMessageExportRequest,
   AppConfig,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   ToolEvent,
@@ -32,11 +34,14 @@ import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
 import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
+import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
+import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let devToolsWindow: BrowserWindow | null = null;
 const context = new AppContext();
+const browserCoachRecorder = new BrowserCoachRecorder(join(__dirname, '..', 'preload', 'browserCoachPreload.js'));
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
@@ -179,6 +184,34 @@ async function importKnowledgeBuffer(
       failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
     };
   }
+}
+
+function readOptionalUtf8(filePath: string): string {
+  try {
+    return readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function buildBuiltinSkillCreatorGuide(): string {
+  const skill = context.skillManager.readBundled('skill-creator') ?? context.skillManager.read('skill-creator');
+  if (!skill?.content.trim()) return '';
+  const root = dirname(skill.path);
+  const references = [
+    ['references/workflows.md', join(root, 'references', 'workflows.md')],
+    ['references/output-patterns.md', join(root, 'references', 'output-patterns.md')]
+  ]
+    .map(([label, filePath]) => {
+      const content = readOptionalUtf8(filePath);
+      return content.trim() ? `# ${label}\n${content.trim()}` : '';
+    })
+    .filter(Boolean);
+  return [
+    '# skill-creator/SKILL.md',
+    skill.content.trim(),
+    ...references
+  ].join('\n\n');
 }
 
 function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
@@ -962,6 +995,7 @@ async function createWindow(): Promise<void> {
 }
 
 function registerIpc(): void {
+  ipcMain.on('browser-coach:event', (event, payload) => browserCoachRecorder.acceptEvent(event, payload));
   ipcMain.handle('config:get', () => context.configStore.publicConfig(false));
   ipcMain.handle('config:set', async (_event, partial: Partial<AppConfig>) => {
     const sanitized = { ...partial };
@@ -1191,6 +1225,20 @@ function registerIpc(): void {
   ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));
   ipcMain.handle('skills:market:uninstall', (_event, name: string) => context.marketplaceManager.uninstall(name));
+  ipcMain.handle('browser-coach:start', (_event, req?: BrowserCoachStartRequest) => browserCoachRecorder.start(req));
+  ipcMain.handle('browser-coach:stop', () => browserCoachRecorder.stop());
+  ipcMain.handle('browser-coach:status', () => browserCoachRecorder.status());
+  ipcMain.handle('browser-coach:clear', () => browserCoachRecorder.clear());
+  ipcMain.handle('browser-coach:generateSkill', async (_event, req: BrowserCoachGenerateSkillRequest) => browserCoachRecorder.generateSkill(
+    req,
+    context.skillManager,
+    (request, recording) => buildBrowserCoachSkillContentWithModel(
+      request,
+      recording,
+      createLlmClient(context.getConfig()),
+      buildBuiltinSkillCreatorGuide()
+    )
+  ));
 
   ipcMain.handle('tasks:list', () => context.scheduledTaskStore.list());
   ipcMain.handle('tasks:create', (_event, req: ScheduledTaskCreateRequest) => context.scheduledTaskStore.create(req));
@@ -1323,6 +1371,7 @@ function registerIpc(): void {
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  browserCoachRecorder.close();
   for (const controller of activeChatControllers.values()) controller.abort();
   activeChatControllers.clear();
   stopWechatPoller();

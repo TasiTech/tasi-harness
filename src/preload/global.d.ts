@@ -3,6 +3,10 @@ import type {
   AgentRunResult,
   AppInfo,
   AssistantMessageExportRequest,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachGenerateSkillResult,
+  BrowserCoachRecording,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -85,6 +89,13 @@ declare global {
         browseMarketplace(query?: string): Promise<MarketplaceBrowseResult>;
         installFromMarketplace(req: SkillInstallRequest): Promise<MarketplaceSkill>;
         uninstallMarketplaceSkill(name: string): Promise<boolean>;
+      };
+      browserCoach: {
+        start(req?: BrowserCoachStartRequest): Promise<BrowserCoachRecording>;
+        stop(): Promise<BrowserCoachRecording>;
+        status(): Promise<BrowserCoachRecording>;
+        clear(): Promise<BrowserCoachRecording>;
+        generateSkill(req: BrowserCoachGenerateSkillRequest): Promise<BrowserCoachGenerateSkillResult>;
       };
       tasks: {
         list(): Promise<ScheduledTask[]>;

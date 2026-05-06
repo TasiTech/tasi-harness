@@ -2,6 +2,8 @@
 import type {
   AgentMessage,
   AppInfo,
+  BrowserCoachRecordedEvent,
+  BrowserCoachRecording,
   LlmUsage,
   MarketplaceBrowseResult,
   MarketplaceSkill,
@@ -2417,8 +2419,22 @@ function normalizeSkillContent(content: string, name: string, category: string):
   return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, '---', '', body, ''].join('\n');
 }
 
+const emptyCoachRecording: BrowserCoachRecording = {
+  id: '',
+  startUrl: '',
+  startedAt: '',
+  active: false,
+  events: []
+};
+
+function formatCoachEvent(event: BrowserCoachRecordedEvent): string {
+  const target = event.name || event.text || event.selector || event.tag || '';
+  const detail = event.value ? ` = ${event.value}` : event.key ? ` key=${event.key}` : '';
+  return `${event.index}. ${event.type}${target ? ` | ${target}` : ''}${detail}`;
+}
+
 function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
-  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload'>('installed');
+  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach'>('installed');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
@@ -2431,6 +2447,14 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadNotice, setUploadNotice] = useState('');
   const [uploadError, setUploadError] = useState('');
+  const [coachUrl, setCoachUrl] = useState('https://www.baidu.com');
+  const [coachRecording, setCoachRecording] = useState<BrowserCoachRecording>(emptyCoachRecording);
+  const [coachSkillName, setCoachSkillName] = useState('recorded-browser-workflow');
+  const [coachCategory, setCoachCategory] = useState('browser');
+  const [coachDescription, setCoachDescription] = useState('');
+  const [coachBusy, setCoachBusy] = useState(false);
+  const [coachNotice, setCoachNotice] = useState('');
+  const [coachError, setCoachError] = useState('');
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorMode, setEditorMode] = useState<'create' | 'edit'>('create');
   const [editorName, setEditorName] = useState('my-workflow');
@@ -2460,6 +2484,26 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
         setMarketError(error instanceof Error ? error.message : String(error));
       });
   }, [debouncedQuery, skills, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'coach') return;
+    let canceled = false;
+    const refresh = () => {
+      void window.tasiHarness.browserCoach.status()
+        .then((recording) => {
+          if (!canceled) setCoachRecording(recording);
+        })
+        .catch((error) => {
+          if (!canceled) setCoachError(error instanceof Error ? error.message : String(error));
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 900);
+    return () => {
+      canceled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTab]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -2665,6 +2709,79 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
+  async function startCoach(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      const recording = await window.tasiHarness.browserCoach.start({ url: coachUrl });
+      setCoachRecording(recording);
+      setCoachNotice(tr('Browser coach started. Operate in the opened browser window.', '教练已开始。请在弹出的浏览器窗口中操作。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function stopCoach(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    try {
+      setCoachRecording(await window.tasiHarness.browserCoach.stop());
+      setCoachNotice(tr('Browser coach stopped.', '教练已停止。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function clearCoachTrace(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      setCoachRecording(await window.tasiHarness.browserCoach.clear());
+      setCoachNotice(tr('Browser trace cleared.', '浏览器操作轨迹已清除。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function generateCoachSkill(): Promise<void> {
+    const name = coachSkillName.trim();
+    const category = coachCategory.trim() || 'browser';
+    if (!name) {
+      setCoachError(tr('Skill name is required.', '请填写技能名称。'));
+      return;
+    }
+    if (coachRecording.events.length === 0) {
+      setCoachError(tr('Record at least one browser action before generating a skill.', '请至少记录一个浏览器操作后再生成技能。'));
+      return;
+    }
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      const result = await window.tasiHarness.browserCoach.generateSkill({
+        name,
+        category,
+        description: coachDescription.trim() || undefined
+      });
+      setNotice(tr(`Generated skill ${result.skill.name}.`, `已生成技能 ${result.skill.name}。`));
+      setCoachNotice(tr(`Generated skill ${result.skill.name}; recording saved to ${result.recordingReferencePath}.`, `已生成技能 ${result.skill.name}；轨迹已保存到 ${result.recordingReferencePath}。`));
+      await refreshSkills();
+      await openInstalledSkill(result.skill.name);
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
   return (
     <section className="page">
       <PageHeader
@@ -2682,6 +2799,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
           </button>
           <button className={`skill-tab ${activeTab === 'upload' ? 'active' : ''}`} onClick={() => setActiveTab('upload')}>
             {tr('Upload', '上传')}
+          </button>
+          <button className={`skill-tab ${activeTab === 'coach' ? 'active' : ''}`} onClick={() => setActiveTab('coach')}>
+            {tr('Coach', '教练')}
           </button>
         </div>
         {activeTab === 'installed' && (
@@ -2786,6 +2906,72 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             </div>
             {uploadError && <div className="error-box market-error">{uploadError}</div>}
             {uploadNotice && <div className="notice-box">{uploadNotice}</div>}
+          </>
+        )}
+        {activeTab === 'coach' && (
+          <>
+            <h2>{tr('Browser Coach', '浏览器教练')}</h2>
+            <div className="coach-layout">
+              <div className="coach-controls">
+                <label>{tr('Start URL', '起始网址')}</label>
+                <input value={coachUrl} onChange={(event) => setCoachUrl(event.target.value)} placeholder="https://www.baidu.com" />
+                <div className="button-row">
+                  <button className="primary-button" disabled={coachBusy || coachRecording.active} onClick={() => void startCoach()}>
+                    {coachRecording.active ? tr('Recording...', '记录中...') : tr('Start', '开始')}
+                  </button>
+                  <button className="ghost-button" disabled={coachBusy || !coachRecording.active} onClick={() => void stopCoach()}>
+                    {tr('Stop', '停止')}
+                  </button>
+                  <span className={`soft-badge ${coachRecording.active ? 'badge-ok' : 'badge-muted'}`}>
+                    {coachRecording.active ? tr('Recording', '记录中') : tr('Idle', '空闲')}
+                  </span>
+                  <span className="soft-badge">{tr('Events', '事件')}: {coachRecording.events.length}</span>
+                </div>
+                <label>{tr('Skill name', '技能名')}</label>
+                <input value={coachSkillName} onChange={(event) => setCoachSkillName(event.target.value)} placeholder="recorded-browser-workflow" />
+                <label>{tr('Category', '分类')}</label>
+                <input value={coachCategory} onChange={(event) => setCoachCategory(event.target.value)} placeholder="browser" />
+                <label>{tr('Description', '描述')}</label>
+                <input value={coachDescription} onChange={(event) => setCoachDescription(event.target.value)} placeholder={tr('optional skill trigger description', '可选，用于触发技能的描述')} />
+                <div className="button-row">
+                  <button className="primary-button" disabled={coachBusy || coachRecording.events.length === 0} onClick={() => void generateCoachSkill()}>
+                    {coachBusy ? tr('Working...', '处理中...') : tr('Generate Skill', '生成技能')}
+                  </button>
+                </div>
+              </div>
+              <div className="coach-trace">
+                <div className="coach-trace-head">
+                  <strong>{tr('Recorded Browser Trace', '浏览器操作轨迹')}</strong>
+                  <div className="coach-trace-head-actions">
+                    {coachRecording.startedAt && <span>{prettyDate(coachRecording.startedAt)}</span>}
+                    <button
+                      className="mini-button"
+                      disabled={coachBusy || coachRecording.events.length === 0}
+                      onClick={() => void clearCoachTrace()}
+                    >
+                      {tr('Clear', '清除')}
+                    </button>
+                  </div>
+                </div>
+                {coachRecording.events.length === 0 ? (
+                  <div className="tool-empty">{tr('Click Start, operate in the browser window, and actions will appear here.', '点击开始，在弹出的浏览器中操作，轨迹会显示在这里。')}</div>
+                ) : (
+                  <div className="coach-trace-list">
+                    {coachRecording.events.slice(-120).map((event) => (
+                      <div key={event.id || `${event.index}-${event.createdAt}`} className="coach-event">
+                        <div>
+                          <strong>{formatCoachEvent(event)}</strong>
+                          <span>{event.url}</span>
+                        </div>
+                        <time>{prettyDate(event.createdAt)}</time>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            {coachError && <div className="error-box market-error">{coachError}</div>}
+            {coachNotice && <div className="notice-box">{coachNotice}</div>}
           </>
         )}
         {notice && <div className="notice-box">{notice}</div>}
@@ -3227,9 +3413,6 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
           <label className="toggle-line"><input type="checkbox" checked={draft.browserHeadless} onChange={(e) => setDraft((old) => ({ ...old, browserHeadless: e.target.checked }))} /> {tr('Run external CDP browser headless', '以无头模式运行外部 CDP 浏览器')}</label>
-          <div className="card-subtle">{tr('External auto mode tries CDP first, then Safari WebDriver on macOS, then shell.openExternal.', '外部自动模式会优先尝试 CDP，其次在 macOS 使用 Safari WebDriver，最后回退到 shell.openExternal。')}</div>
-          <div className="card-subtle">{tr('System profile mode reuses login state and may force-close browser processes during controlled takeover.', '系统配置会复用登录态，在受控接管时可能强制关闭浏览器进程。')}</div>
-          <div className="card-subtle">{tr('Headless mode applies to managed CDP launches only; use browser_snapshot, browser_extract, and browser_screenshot to inspect pages.', '无头模式仅作用于受管 CDP 自启动浏览器；请使用 browser_snapshot、browser_extract 和 browser_screenshot 检查页面。')}</div>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>

@@ -80,6 +80,16 @@ export class SkillManager {
     return this.documentFromFile(file, file.startsWith(this.localRoot), file.startsWith(this.localRoot) ? 'local' : 'bundled');
   }
 
+  readBundled(name: string): SkillDocument | null {
+    if (!this.bundledRoot || !existsSync(this.bundledRoot)) return null;
+    const slug = slugifyName(name);
+    const file = this.findSkillFiles(this.bundledRoot).find((candidate) => {
+      const metadata = this.metadataFromFile(candidate, true, 'bundled');
+      return slugifyName(metadata.name) === slug || basename(dirname(candidate)) === slug;
+    });
+    return file ? this.documentFromFile(file, true, 'bundled') : null;
+  }
+
   create(req: SkillWriteRequest): SkillDocument {
     const slug = slugifyName(req.name);
     const category = slugifyName(req.category || 'local');
