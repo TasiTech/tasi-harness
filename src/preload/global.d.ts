@@ -2,6 +2,7 @@ import type {
   AgentToolEventStream,
   AgentRunResult,
   AppInfo,
+  AssistantMessageExportRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -98,8 +99,9 @@ declare global {
       };
       app: {
         info(): Promise<AppInfo>;
+        exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult>;
         openPath(path: string): Promise<ToolExecutionResult>;
-        openExternalUrl(url: string): Promise<ToolExecutionResult>;
+        openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
       };

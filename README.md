@@ -24,7 +24,7 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 | --- | --- |
 | Agent runtime | Runs a tool-aware chat loop with prompt building, iterative tool execution, and session persistence. |
 | Memory | Stores durable facts in local JSON-backed memory entries and injects relevant memory into prompts. |
-| Browser automation | Supports `browser_open`, `browser_click`, `browser_type`, `browser_scroll`, `browser_wait`, `browser_extract`, and `browser_close`. |
+| Browser automation | Supports navigation, CDP-backed external Chromium automation with optional headless launches, snapshots with `@e` refs, semantic lookup, keyboard/mouse/form actions, extraction, screenshots/PDF, storage/cookies, console, network, viewport, and close/reset tools. |
 | Personal knowledge base | Converts local documents to Markdown, stores extracted assets, chunks content locally, and retrieves snippets with lexical search plus optional keyword expansion, without embeddings or an external vector DB. |
 | Skills | Reads, creates, patches, uploads, and installs `SKILL.md` workflows from local files and marketplace catalogs. |
 | Sessions | Keeps searchable local conversation history in JSON. |

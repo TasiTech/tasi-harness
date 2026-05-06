@@ -6,7 +6,7 @@ import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SessionStore } from '../storage/sessionStore.js';
 import { safeJoin } from '../storage/pathUtils.js';
 import type { SkillManager } from '../skills/skillManager.js';
-import type { BrowserAutomation, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
+import type { BrowserAutomation, BrowserBinaryResult, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
 import { booleanArg, objectArgs, stringArg } from './toolRegistry.js';
 import { runTerminalCommand } from './terminalRunner.js';
 
@@ -76,6 +76,28 @@ function renderBrowserExtractResult(result: BrowserExtractResult): string {
     ''
   ];
   return `${header.join('\n')}${result.content}`;
+}
+
+function renderBrowserJsonTool(tool: string, state: BrowserPageState, payload: unknown): string {
+  return JSON.stringify(
+    {
+      tool,
+      browser_preview_url: state.url,
+      ...state,
+      payload
+    },
+    null,
+    2
+  );
+}
+
+function saveBrowserBinary(result: BrowserBinaryResult, context: ToolExecutionContext, requestedPath: string): string {
+  const fallbackName = `${context.requestId || createId('browser')}.${result.extension}`;
+  const relPath = requestedPath.trim() || join('browser-artifacts', fallbackName);
+  const target = safeJoin(context.workspaceDir, relPath);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, result.data);
+  return relative(context.workspaceDir, target);
 }
 
 export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
@@ -497,8 +519,9 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         parameters: {
           type: 'object',
           properties: {
-            direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
-            amount: { type: 'number', description: 'Scroll amount in pixels for up/down.' }
+            direction: { type: 'string', enum: ['up', 'down', 'left', 'right', 'top', 'bottom'] },
+            amount: { type: 'number', description: 'Scroll amount in pixels for directional scrolling.' },
+            selector: { type: 'string', description: 'Optional CSS selector or @e ref for a scrollable element.' }
           }
         }
       }
@@ -508,10 +531,14 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
       const directionRaw = stringArg(obj, 'direction', 'down');
-      const direction = directionRaw === 'up' || directionRaw === 'top' || directionRaw === 'bottom' ? directionRaw : 'down';
+      const direction =
+        directionRaw === 'up' || directionRaw === 'left' || directionRaw === 'right' || directionRaw === 'top' || directionRaw === 'bottom'
+          ? directionRaw
+          : 'down';
       const state = await access.browser.scroll({
         direction,
-        amount: numberArg(obj, 'amount', 800)
+        amount: numberArg(obj, 'amount', 800),
+        selector: stringArg(obj, 'selector', '').trim() || undefined
       });
       return { ok: true, content: withBrowserPreview(`Scrolled ${direction}.`, state), data: state };
     }
@@ -523,12 +550,17 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'browser_wait',
-        description: 'Wait for a duration or selector in the browser automation session.',
+        description: 'Wait for a duration, selector, text, URL pattern, load state, or JavaScript condition in the browser automation session.',
         parameters: {
           type: 'object',
           properties: {
             ms: { type: 'number', description: 'Milliseconds to wait.' },
-            selector: { type: 'string', description: 'Wait until this selector appears.' },
+            selector: { type: 'string', description: 'Wait until this selector condition is satisfied.' },
+            text: { type: 'string', description: 'Wait until this text appears in the page body.' },
+            url: { type: 'string', description: 'Wait until the current URL contains this text or matches a * glob.' },
+            state: { type: 'string', enum: ['attached', 'visible', 'hidden', 'detached'], description: 'Selector state to wait for.' },
+            load_state: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'], description: 'Wait for page load settling.' },
+            function: { type: 'string', description: 'JavaScript boolean expression to poll, such as window.ready === true.' },
             timeout_ms: { type: 'number', description: 'Timeout for selector waiting.' }
           }
         }
@@ -539,13 +571,25 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
       const selector = stringArg(obj, 'selector', '').trim() || undefined;
-      const ms = numberArg(obj, 'ms', selector ? 0 : 250);
-      const state = await access.browser.wait({
+      const text = stringArg(obj, 'text', '').trim() || undefined;
+      const url = stringArg(obj, 'url', '').trim() || undefined;
+      const loadStateRaw = stringArg(obj, 'load_state', '').trim();
+      const loadState = loadStateRaw === 'load' || loadStateRaw === 'domcontentloaded' || loadStateRaw === 'networkidle' ? loadStateRaw : undefined;
+      const stateRaw = stringArg(obj, 'state', '').trim();
+      const selectorState = stateRaw === 'visible' || stateRaw === 'hidden' || stateRaw === 'detached' ? stateRaw : 'attached';
+      const fn = stringArg(obj, 'function', '').trim() || undefined;
+      const ms = numberArg(obj, 'ms', selector || text || url || loadState || fn ? 0 : 250);
+      const pageState = await access.browser.wait({
         ms,
         selector,
+        text,
+        url,
+        state: selectorState,
+        loadState,
+        function: fn,
         timeoutMs: numberArg(obj, 'timeout_ms', 20000)
       });
-      return { ok: true, content: withBrowserPreview(`Wait completed.${selector ? ` selector=${selector}` : ''}`, state), data: state };
+      return { ok: true, content: withBrowserPreview(`Wait completed.${selector ? ` selector=${selector}` : ''}`, pageState), data: pageState };
     }
   };
 
@@ -591,6 +635,469 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         }
       }
       return { ok: true, content: renderBrowserExtractResult(extracted), data: extracted };
+    }
+  };
+
+  const browserSnapshot: RegisteredTool = {
+    safety: 'read-only',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_snapshot',
+        description: 'Capture an agent-friendly page snapshot with stable @e element refs, roles, names, links, images, headings, and viewport data.',
+        parameters: {
+          type: 'object',
+          properties: {
+            selector: { type: 'string', description: 'Optional CSS selector or @e ref to scope the snapshot.' },
+            max_elements: { type: 'number', description: 'Maximum elements to include.' },
+            max_chars: { type: 'number', description: 'Maximum characters to return.' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const result = await access.browser.snapshot({
+        selector: stringArg(obj, 'selector', '').trim() || undefined,
+        maxElements: numberArg(obj, 'max_elements', 80),
+        maxChars: numberArg(obj, 'max_chars', 20000)
+      });
+      return { ok: true, content: result.content, data: result };
+    }
+  };
+
+  const browserFind: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_find',
+        description: 'Find an element semantically by role, text, label, placeholder, alt text, title, test id, or CSS, then optionally act on it.',
+        parameters: {
+          type: 'object',
+          properties: {
+            by: { type: 'string', enum: ['role', 'text', 'label', 'placeholder', 'alt', 'title', 'testid', 'css'] },
+            value: { type: 'string', description: 'Semantic query value, role name, or CSS selector.' },
+            action: { type: 'string', enum: ['snapshot', 'text', 'click', 'type', 'fill', 'focus', 'hover', 'check', 'uncheck', 'select'] },
+            text: { type: 'string', description: 'Text/value for type, fill, or select.' },
+            name: { type: 'string', description: 'Accessible name filter for role lookup.' },
+            exact: { type: 'boolean', description: 'Use exact text matching.' },
+            index: { type: 'number', description: 'Zero-based match index.' },
+            wait_for_navigation: { type: 'boolean', description: 'Wait after click-like actions.' },
+            timeout_ms: { type: 'number', description: 'Navigation wait timeout.' }
+          },
+          required: ['by', 'value']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const byRaw = stringArg(obj, 'by', 'css');
+      const by =
+        byRaw === 'role' ||
+        byRaw === 'text' ||
+        byRaw === 'label' ||
+        byRaw === 'placeholder' ||
+        byRaw === 'alt' ||
+        byRaw === 'title' ||
+        byRaw === 'testid'
+          ? byRaw
+          : 'css';
+      const actionRaw = stringArg(obj, 'action', 'snapshot');
+      const action =
+        actionRaw === 'text' ||
+        actionRaw === 'click' ||
+        actionRaw === 'type' ||
+        actionRaw === 'fill' ||
+        actionRaw === 'focus' ||
+        actionRaw === 'hover' ||
+        actionRaw === 'check' ||
+        actionRaw === 'uncheck' ||
+        actionRaw === 'select'
+          ? actionRaw
+          : 'snapshot';
+      const result = await access.browser.find({
+        by,
+        value: stringArg(obj, 'value'),
+        action,
+        text: stringArg(obj, 'text', ''),
+        name: stringArg(obj, 'name', '').trim() || undefined,
+        exact: booleanArg(obj, 'exact', false),
+        index: numberArg(obj, 'index', 0),
+        waitForNavigation: booleanArg(obj, 'wait_for_navigation', false),
+        timeoutMs: numberArg(obj, 'timeout_ms', 20000)
+      });
+      return {
+        ok: true,
+        content: withBrowserPreview(renderBrowserJsonTool('browser_find', result, { ref: result.ref, selector: result.selector, text: result.text, element: result.element }), result),
+        data: result
+      };
+    }
+  };
+
+  const browserHover: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_hover',
+        description: 'Hover an element using a CSS selector or @e ref.',
+        parameters: {
+          type: 'object',
+          properties: {
+            selector: { type: 'string' },
+            index: { type: 'number' }
+          },
+          required: ['selector']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const selector = stringArg(obj, 'selector').trim();
+      if (!selector) return { ok: false, content: 'selector is required.' };
+      const state = await access.browser.hover(selector, { index: numberArg(obj, 'index', 0) });
+      return { ok: true, content: withBrowserPreview(`Hovered selector: ${selector}`, state), data: state };
+    }
+  };
+
+  const browserSelect: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_select',
+        description: 'Select an option value in a select element using a CSS selector or @e ref.',
+        parameters: {
+          type: 'object',
+          properties: {
+            selector: { type: 'string' },
+            value: { type: 'string' },
+            index: { type: 'number' }
+          },
+          required: ['selector', 'value']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const selector = stringArg(obj, 'selector').trim();
+      if (!selector) return { ok: false, content: 'selector is required.' };
+      const state = await access.browser.select(selector, stringArg(obj, 'value'), { index: numberArg(obj, 'index', 0) });
+      return { ok: true, content: withBrowserPreview(`Selected value for selector: ${selector}`, state), data: state };
+    }
+  };
+
+  const browserCheck: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_check',
+        description: 'Check or uncheck a checkbox/radio using a CSS selector or @e ref.',
+        parameters: {
+          type: 'object',
+          properties: {
+            selector: { type: 'string' },
+            checked: { type: 'boolean', description: 'Defaults to true.' },
+            index: { type: 'number' }
+          },
+          required: ['selector']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const selector = stringArg(obj, 'selector').trim();
+      if (!selector) return { ok: false, content: 'selector is required.' };
+      const checked = booleanArg(obj, 'checked', true);
+      const state = await access.browser.check(selector, checked, { index: numberArg(obj, 'index', 0) });
+      return { ok: true, content: withBrowserPreview(`${checked ? 'Checked' : 'Unchecked'} selector: ${selector}`, state), data: state };
+    }
+  };
+
+  const browserPress: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_press',
+        description: 'Press a key or keyboard shortcut, or insert text into the focused/selected element.',
+        parameters: {
+          type: 'object',
+          properties: {
+            key: { type: 'string', description: 'Key or shortcut, such as Enter, Tab, Control+a.' },
+            selector: { type: 'string', description: 'Optional selector or @e ref to focus before pressing.' },
+            text: { type: 'string', description: 'Optional text to insert instead of a key press.' }
+          },
+          required: ['key']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const key = stringArg(obj, 'key').trim();
+      if (!key) return { ok: false, content: 'key is required.' };
+      const state = await access.browser.press(key, {
+        selector: stringArg(obj, 'selector', '').trim() || undefined,
+        text: typeof obj.text === 'string' ? obj.text : undefined
+      });
+      return { ok: true, content: withBrowserPreview(`Pressed key: ${key}`, state), data: state };
+    }
+  };
+
+  const browserScreenshot: RegisteredTool = {
+    safety: 'writes-workspace',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_screenshot',
+        description: 'Capture a PNG screenshot of the current browser page and save it inside the workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Optional workspace-relative output path.' },
+            full_page: { type: 'boolean', description: 'Reserved for compatibility; captures the visible page in this runtime.' }
+          }
+        }
+      }
+    },
+    async execute(args, context) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const result = await access.browser.screenshot({ fullPage: booleanArg(obj, 'full_page', false) });
+      const relPath = saveBrowserBinary(result, context, stringArg(obj, 'path', ''));
+      return { ok: true, content: withBrowserPreview(`Saved browser screenshot to ${relPath}.`, result), data: { path: relPath, url: result.url, title: result.title } };
+    }
+  };
+
+  const browserPdf: RegisteredTool = {
+    safety: 'writes-workspace',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_pdf',
+        description: 'Print the current browser page to a PDF file inside the workspace.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Optional workspace-relative output path.' }
+          }
+        }
+      }
+    },
+    async execute(args, context) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const result = await access.browser.pdf();
+      const relPath = saveBrowserBinary(result, context, stringArg(objectArgs(args), 'path', ''));
+      return { ok: true, content: withBrowserPreview(`Saved browser PDF to ${relPath}.`, result), data: { path: relPath, url: result.url, title: result.title } };
+    }
+  };
+
+  const browserStorage: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_storage',
+        description: 'Read, set, or clear localStorage/sessionStorage for the current page.',
+        parameters: {
+          type: 'object',
+          properties: {
+            area: { type: 'string', enum: ['local', 'session'] },
+            action: { type: 'string', enum: ['get', 'set', 'clear'] },
+            key: { type: 'string' },
+            value: { type: 'string' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const areaRaw = stringArg(obj, 'area', 'local');
+      const actionRaw = stringArg(obj, 'action', 'get');
+      const result = await access.browser.storage({
+        area: areaRaw === 'session' ? 'session' : 'local',
+        action: actionRaw === 'set' || actionRaw === 'clear' ? actionRaw : 'get',
+        key: stringArg(obj, 'key', '').trim() || undefined,
+        value: stringArg(obj, 'value', '')
+      });
+      return { ok: true, content: withBrowserPreview(result.content, result), data: result };
+    }
+  };
+
+  const browserCookies: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_cookies',
+        description: 'Read, set, or clear cookies for the current page URL.',
+        parameters: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['get', 'set', 'clear'] },
+            name: { type: 'string' },
+            value: { type: 'string' },
+            url: { type: 'string' },
+            domain: { type: 'string' },
+            path: { type: 'string' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const actionRaw = stringArg(obj, 'action', 'get');
+      const result = await access.browser.cookies({
+        action: actionRaw === 'set' || actionRaw === 'clear' ? actionRaw : 'get',
+        name: stringArg(obj, 'name', '').trim() || undefined,
+        value: stringArg(obj, 'value', ''),
+        url: stringArg(obj, 'url', '').trim() || undefined,
+        domain: stringArg(obj, 'domain', '').trim() || undefined,
+        path: stringArg(obj, 'path', '').trim() || undefined
+      });
+      return { ok: true, content: withBrowserPreview(result.content, result), data: result };
+    }
+  };
+
+  const browserConsole: RegisteredTool = {
+    safety: 'read-only',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_console',
+        description: 'Read or clear captured browser console messages and page errors.',
+        parameters: {
+          type: 'object',
+          properties: {
+            level: { type: 'string', enum: ['all', 'log', 'info', 'warning', 'error'] },
+            clear: { type: 'boolean' },
+            max_items: { type: 'number' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const levelRaw = stringArg(obj, 'level', 'all');
+      const result = await access.browser.console({
+        level: levelRaw === 'log' || levelRaw === 'info' || levelRaw === 'warning' || levelRaw === 'error' ? levelRaw : 'all',
+        clear: booleanArg(obj, 'clear', false),
+        maxItems: numberArg(obj, 'max_items', 100)
+      });
+      return { ok: true, content: withBrowserPreview(result.content, result), data: result };
+    }
+  };
+
+  const browserNetwork: RegisteredTool = {
+    safety: 'read-only',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_network',
+        description: 'Inspect performance/network resource entries for the current page.',
+        parameters: {
+          type: 'object',
+          properties: {
+            filter: { type: 'string', description: 'Filter by URL substring.' },
+            type: { type: 'string', description: 'Comma-separated initiator types such as fetch,xhr,script,img.' },
+            max_items: { type: 'number' },
+            clear: { type: 'boolean' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const result = await access.browser.network({
+        filter: stringArg(obj, 'filter', '').trim() || undefined,
+        type: stringArg(obj, 'type', '').trim() || undefined,
+        maxItems: numberArg(obj, 'max_items', 100),
+        clear: booleanArg(obj, 'clear', false)
+      });
+      return { ok: true, content: withBrowserPreview(result.content, result), data: result };
+    }
+  };
+
+  const browserEval: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_eval',
+        description: 'Evaluate a JavaScript expression in the current page and return a bounded result.',
+        parameters: {
+          type: 'object',
+          properties: {
+            script: { type: 'string', description: 'JavaScript expression. Example: document.title' },
+            max_chars: { type: 'number' }
+          },
+          required: ['script']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const script = stringArg(obj, 'script').trim();
+      if (!script) return { ok: false, content: 'script is required.' };
+      const result = await access.browser.evaluate(script, { maxChars: numberArg(obj, 'max_chars', 8000) });
+      return { ok: true, content: withBrowserPreview(result.content, result), data: result };
+    }
+  };
+
+  const browserViewport: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_viewport',
+        description: 'Set the browser viewport size and optional zoom scale.',
+        parameters: {
+          type: 'object',
+          properties: {
+            width: { type: 'number' },
+            height: { type: 'number' },
+            scale: { type: 'number' }
+          },
+          required: ['width', 'height']
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const obj = objectArgs(args);
+      const state = await access.browser.setViewport({
+        width: numberArg(obj, 'width', 1280),
+        height: numberArg(obj, 'height', 900),
+        scale: numberArg(obj, 'scale', 1)
+      });
+      return { ok: true, content: withBrowserPreview(`Set browser viewport to ${numberArg(obj, 'width', 1280)}x${numberArg(obj, 'height', 900)}.`, state), data: state };
     }
   };
 
@@ -690,6 +1197,20 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     browserScroll,
     browserWait,
     browserExtract,
+    browserSnapshot,
+    browserFind,
+    browserHover,
+    browserSelect,
+    browserCheck,
+    browserPress,
+    browserScreenshot,
+    browserPdf,
+    browserStorage,
+    browserCookies,
+    browserConsole,
+    browserNetwork,
+    browserEval,
+    browserViewport,
     browserClose,
     terminal,
     diagnostics

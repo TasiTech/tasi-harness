@@ -27,6 +27,7 @@ export function defaultConfig(): AppConfig {
     externalBrowserEngine: 'auto',
     externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
     externalBrowserProfileMode: 'isolated',
+    browserHeadless: false,
     theme: 'dark',
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
@@ -76,6 +77,20 @@ export function defaultConfig(): AppConfig {
       'browser_scroll',
       'browser_wait',
       'browser_extract',
+      'browser_snapshot',
+      'browser_find',
+      'browser_hover',
+      'browser_select',
+      'browser_check',
+      'browser_press',
+      'browser_screenshot',
+      'browser_pdf',
+      'browser_storage',
+      'browser_cookies',
+      'browser_console',
+      'browser_network',
+      'browser_eval',
+      'browser_viewport',
       'browser_close',
       'terminal'
     ]

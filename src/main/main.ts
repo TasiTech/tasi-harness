@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { readdirSync, readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -8,6 +8,7 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AssistantMessageExportRequest,
   AppConfig,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
@@ -30,7 +31,7 @@ import type {
 import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
-import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
+import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
@@ -39,7 +40,6 @@ const context = new AppContext();
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
-const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
 const externalFallbackUrls = new Set<string>();
 const activeChatControllers = new Map<number, AbortController>();
 const activeWechatRuns = new Map<string, AbortController>();
@@ -48,7 +48,7 @@ let wechatPollerFingerprint = '';
 const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
-const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf']);
+const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf', '.ofd']);
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -76,6 +76,13 @@ function isAbortLikeError(error: unknown): boolean {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function escapeHtmlText(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function getStringField(record: Record<string, unknown>, keys: string[]): string | undefined {
@@ -783,7 +790,7 @@ function previewSourceText(toolName: string, args: unknown, content: string): st
 
 function shouldFallbackOpenExternal(toolName: string, args: unknown, content: string): boolean {
   const combined = previewSourceText(toolName, args, content);
-  if (toolName.startsWith('browser_')) return true;
+  if (toolName.startsWith('browser_')) return false;
   if (combined.includes('browser_preview_url')) return true;
   return false;
 }
@@ -824,7 +831,7 @@ async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResu
   if (lastExternalBrowserOpen && lastExternalBrowserOpen.url === url && now - lastExternalBrowserOpen.at < 1500) {
     return { ok: true, content: `External browser already opened recently for ${url}.` };
   }
-  const managed = await externalBrowserBridge.open(url, config);
+  const managed = await context.externalBrowserBridge.open(url, config);
   if (managed.ok) {
     lastExternalBrowserOpen = { url, at: now };
     return managed;
@@ -849,7 +856,7 @@ async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResu
 }
 
 async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
-  const managedResult = await externalBrowserBridge.close();
+  const managedResult = await context.externalBrowserBridge.close();
   const fallbackCount = externalFallbackUrls.size;
   externalFallbackUrls.clear();
   lastExternalBrowserOpen = null;
@@ -858,6 +865,71 @@ async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
     ok: managedResult.ok,
     content: `${managedResult.content} ${fallbackCount} fallback URL(s) were opened via shell.openExternal and cannot be auto-closed.`
   };
+}
+
+async function renderHtmlToPdfBuffer(html: string): Promise<Buffer> {
+  const win = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+  try {
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    const data = await win.webContents.printToPDF({
+      printBackground: true,
+      pageSize: 'A4',
+      margins: {
+        marginType: 'custom',
+        top: 0.35,
+        bottom: 0.35,
+        left: 0.35,
+        right: 0.35
+      }
+    });
+    return Buffer.from(data);
+  } finally {
+    if (!win.isDestroyed()) win.destroy();
+  }
+}
+
+async function exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult> {
+  const format = req.format;
+  if (format !== 'pdf' && format !== 'docx') {
+    return { ok: false, content: `Unsupported export format: ${String(format)}` };
+  }
+  const content = req.content?.trim() ?? '';
+  if (!content) return { ok: false, content: 'Nothing to export.' };
+
+  const title = req.title?.trim() || 'Assistant Reply';
+  const ext = format === 'pdf' ? 'pdf' : 'docx';
+  const filters = format === 'pdf'
+    ? [{ name: 'PDF Document', extensions: ['pdf'] }]
+    : [{ name: 'Word Document', extensions: ['docx'] }];
+  const saveOptions = {
+    title: `Export assistant reply as ${ext.toUpperCase()}`,
+    defaultPath: `${safeExportBasename(title)}.${ext}`,
+    filters
+  };
+  const picked = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showSaveDialog(mainWindow, saveOptions)
+    : await dialog.showSaveDialog(saveOptions);
+  if (picked.canceled || !picked.filePath) {
+    return { ok: true, content: 'Export canceled.' };
+  }
+
+  if (format === 'pdf') {
+    const html = buildAssistantMessageExportHtml(title, req.html?.trim() || `<pre>${escapeHtmlText(content)}</pre>`);
+    writeFileSync(picked.filePath, await renderHtmlToPdfBuffer(html));
+  } else {
+    writeFileSync(picked.filePath, await buildAssistantMessageDocx(title, content, req.html));
+  }
+  return { ok: true, content: `Exported ${picked.filePath}` };
 }
 
 async function createWindow(): Promise<void> {
@@ -1208,11 +1280,23 @@ function registerIpc(): void {
     node: process.versions.node,
     harnessHome: context.harnessHome
   }));
+  ipcMain.handle('app:exportAssistantMessage', async (_event, req: AssistantMessageExportRequest) => exportAssistantMessage(req));
   ipcMain.handle('app:openPath', async (_event, path: string) => {
     const err = await shell.openPath(path);
     return { ok: !err, content: err || 'Opened.' };
   });
-  ipcMain.handle('app:openExternalUrl', async (_event, url: string) => maybeOpenExternalBrowser(url));
+  ipcMain.handle('app:openExternalUrl', async (_event, url: string, options?: { system?: boolean }) => {
+    if (options?.system) {
+      try {
+        await shell.openExternal(url);
+        return { ok: true, content: `Opened ${url} in the system browser.` };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, content: `Failed to open ${url}: ${message}` };
+      }
+    }
+    return maybeOpenExternalBrowser(url);
+  });
   ipcMain.handle('app:closeExternalPreview', async () => closeExternalBrowserPreview());
   ipcMain.handle('app:setEmbeddedPreviewWebContentsId', (_event, id: number | null) => {
     if (id == null) {

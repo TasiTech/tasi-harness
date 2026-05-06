@@ -21,6 +21,7 @@ describe('builtin tools', () => {
     expect(cfg.externalBrowserEngine).toBe('auto');
     expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     expect(cfg.externalBrowserProfileMode).toBe('isolated');
+    expect(cfg.browserHeadless).toBe(false);
   });
 
   it('writes only inside workspace and rejects escaped paths', async () => {
@@ -194,6 +195,57 @@ describe('builtin tools', () => {
           ),
           format: 'json' as const
         };
+      },
+      async snapshot() {
+        return {
+          url: 'https://example.com',
+          title: 'Example',
+          content: JSON.stringify({ tool: 'browser_snapshot', browser_preview_url: 'https://example.com', elements: [] }),
+          elements: [],
+          headings: [],
+          links: [],
+          images: [],
+          viewport: { width: 1280, height: 720, scrollX: 0, scrollY: 0 }
+        };
+      },
+      async find() {
+        return { url: 'https://example.com', title: 'Example', ref: '@e1', selector: '#demo', text: 'Hello world' };
+      },
+      async hover() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async select() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async check() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async press() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async screenshot() {
+        return { url: 'https://example.com', title: 'Example', data: Buffer.from('png'), mimeType: 'image/png', extension: 'png' };
+      },
+      async pdf() {
+        return { url: 'https://example.com', title: 'Example', data: Buffer.from('pdf'), mimeType: 'application/pdf', extension: 'pdf' };
+      },
+      async storage() {
+        return { url: 'https://example.com', title: 'Example', area: 'local' as const, content: '{}' };
+      },
+      async cookies() {
+        return { url: 'https://example.com', title: 'Example', content: '[]' };
+      },
+      async console() {
+        return { url: 'https://example.com', title: 'Example', content: '{"console":[]}' };
+      },
+      async network() {
+        return { url: 'https://example.com', title: 'Example', content: '[]' };
+      },
+      async evaluate() {
+        return { url: 'https://example.com', title: 'Example', content: '"ok"' };
+      },
+      async setViewport() {
+        return { url: 'https://example.com', title: 'Example' };
       },
       async state() {
         return { url: 'https://example.com', title: 'Example' };

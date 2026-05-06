@@ -56,6 +56,8 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('A final answer that skips required skill steps is incorrect');
     expect(prompt).toContain('Before producing a final answer for a skill-driven request');
     expect(prompt).toContain('return a degraded answer rather than presenting an unverified answer as complete');
+    expect(prompt).toContain('2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。');
+    expect(prompt).toContain('inline citations near claims are required for web-backed answers');
   });
 
   it('injects uploaded session document XML into the system prompt', async () => {

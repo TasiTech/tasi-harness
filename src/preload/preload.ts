@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
+  AssistantMessageExportRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -92,8 +93,9 @@ const api = {
   },
   app: {
     info: () => ipcRenderer.invoke('app:info'),
+    exportAssistantMessage: (req: AssistantMessageExportRequest) => ipcRenderer.invoke('app:exportAssistantMessage', req),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
-    openExternalUrl: (url: string) => ipcRenderer.invoke('app:openExternalUrl', url),
+    openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),
     closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
     setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
   }

@@ -49,6 +49,7 @@ const defaultConfig: PublicAppConfig = {
   externalBrowserEngine: 'auto',
   externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
   externalBrowserProfileMode: 'isolated',
+  browserHeadless: false,
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -159,7 +160,7 @@ function previewSourceText(toolName: string, args: unknown, content: string): st
 
 function shouldFallbackOpenExternal(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (event.toolName.startsWith('browser_')) return true;
+  if (event.toolName.startsWith('browser_')) return false;
   if (combined.includes('browser_preview_url')) return true;
   return false;
 }
@@ -324,6 +325,7 @@ export function App(): ReactElement {
     const saved = globalThis.localStorage?.getItem('tasi_harness_ui_language');
     return saved === 'zh' ? 'zh' : 'en';
   });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_sidebar_collapsed') === '1');
   const [config, setConfig] = useState<PublicAppConfig>(defaultConfig);
   const [sessions, refreshSessions] = useAsyncData<SessionSummary[]>(() => window.tasiHarness.sessions.list(), []);
   const [tasks, refreshTasks] = useAsyncData<ScheduledTask[]>(() => window.tasiHarness.tasks.list(), []);
@@ -367,7 +369,7 @@ export function App(): ReactElement {
       { page: 'memory', icon: <SidebarIcon kind="memory" />, label: tr('Memory', '记忆') },
       { page: 'skills', icon: <SidebarIcon kind="skills" />, label: tr('Skills', '技能') },
       { page: 'tasks', icon: <SidebarIcon kind="tasks" />, label: tr('Tasks', '任务') },
-      { page: 'sessions', icon: <SidebarIcon kind="sessions" />, label: tr('Sessions', '会话') },
+      { page: 'sessions', icon: <SidebarIcon kind="sessions" />, label: tr('History', '历史') },
       { page: 'settings', icon: <SidebarIcon kind="settings" />, label: tr('Settings', '设置') },
       { page: 'about', icon: <SidebarIcon kind="about" />, label: tr('About', '关于') }
     ],
@@ -399,6 +401,9 @@ export function App(): ReactElement {
     globalThis.localStorage?.setItem('tasi_harness_ui_language', language);
     document.documentElement.setAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
   }, [language]);
+  useEffect(() => {
+    globalThis.localStorage?.setItem('tasi_harness_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -428,11 +433,11 @@ export function App(): ReactElement {
   }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-logo">
           <div className="logo-icon">TH</div>
-          <div>
+          <div className="logo-copy">
             <div className="logo-head">
               <div className="logo-text">Tasi Harness</div>
               <button className="lang-toggle" onClick={() => setLanguage((current) => (current === 'zh' ? 'en' : 'zh'))}>
@@ -443,7 +448,17 @@ export function App(): ReactElement {
           </div>
         </div>
         <div className="nav-section">
-          <div className="nav-label">{tr('Workspace', '工作区')}</div>
+          <div className="nav-toolbar">
+            <div className="nav-label">{tr('Workspace', '工作区')}</div>
+            <button
+              className="sidebar-collapse-button"
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              title={sidebarCollapsed ? tr('Expand workspace sidebar', '展开工作区侧栏') : tr('Collapse workspace sidebar', '收起工作区侧栏')}
+              aria-label={sidebarCollapsed ? tr('Expand workspace sidebar', '展开工作区侧栏') : tr('Collapse workspace sidebar', '收起工作区侧栏')}
+            >
+              {sidebarCollapsed ? '›' : '‹'}
+            </button>
+          </div>
           {sidebarNav.map((item) => (
             <button key={item.page} className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => setPage(item.page)}>
               <span className="nav-icon">{item.icon}</span>
@@ -628,6 +643,8 @@ function ChatPage(props: {
   const [sessionDocBusy, setSessionDocBusy] = useState(false);
   const [sessionDocError, setSessionDocError] = useState('');
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
+  const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
+  const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
   const [webPreviewExpanded, setWebPreviewExpanded] = useState(false);
   const [webPreviewRect, setWebPreviewRect] = useState<PreviewRect | null>(null);
   const [previewAddress, setPreviewAddress] = useState('');
@@ -661,6 +678,11 @@ function ChatPage(props: {
   );
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
+  const latestAssistantContent = useMemo(() => {
+    const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
+    return latest?.content ?? '';
+  }, [visibleMessages]);
+  const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
@@ -1417,7 +1439,7 @@ function ChatPage(props: {
           </button>
         </div>
       </div>
-      <div className="chat-content-grid" ref={chatContentGridRef}>
+      <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef}>
         <div className="chat-messages">
           {visibleMessages.length === 0 && (
             <div className="empty-state">
@@ -1442,13 +1464,77 @@ function ChatPage(props: {
           )}
           <div ref={endRef} />
         </div>
-        <div className="tool-panel">
+        <div className={`tool-panel ${toolPanelCollapsed ? 'collapsed' : ''}`}>
+          {toolPanelCollapsed ? (
+            <button
+              className="tool-panel-expand-button"
+              onClick={() => setToolPanelCollapsed(false)}
+              title={props.tr('Expand side panel', '展开侧边栏')}
+              aria-label={props.tr('Expand side panel', '展开侧边栏')}
+            >
+              <span>‹</span>
+              <strong>{props.tr('Trace', '轨迹')}</strong>
+            </button>
+          ) : (
+            <>
           <div className="tool-panel-header">
-            <strong>{props.tr('Tool Trace', '工具轨迹')}</strong>
-            <span>{props.tr(`${props.toolEvents.length} events`, `${props.toolEvents.length} 条事件`)}</span>
+            <button
+              className="tool-panel-collapse-button"
+              onClick={() => setToolPanelCollapsed(true)}
+              title={props.tr('Collapse side panel', '收起侧边栏')}
+              aria-label={props.tr('Collapse side panel', '收起侧边栏')}
+            >
+              ›
+            </button>
+            <div className="tool-panel-tabs" role="tablist" aria-label={props.tr('Side panel', '侧边栏')}>
+              <button
+                className={`tool-panel-tab ${toolPanelTab === 'tools' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'tools'}
+                onClick={() => setToolPanelTab('tools')}
+              >
+                {props.tr('Tool Trace', '工具轨迹')}
+                <span>{props.toolEvents.length}</span>
+              </button>
+              <button
+                className={`tool-panel-tab ${toolPanelTab === 'sources' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'sources'}
+                onClick={() => setToolPanelTab('sources')}
+              >
+                {props.tr('Referenced Pages', '引用网页')}
+                <span>{referencedPages.length}</span>
+              </button>
+            </div>
           </div>
           <div className="tool-panel-body">
-            {props.toolEvents.length === 0 ? (
+            {toolPanelTab === 'sources' ? (
+              referencedPages.length === 0 ? (
+                <div className="tool-empty">{props.tr('Referenced webpages from the latest answer will appear here.', '最新回复中的引用网页会显示在这里。')}</div>
+              ) : (
+                <div className="reference-panel">
+                  <div className="reference-summary">
+                    <strong>{props.tr(`Read ${referencedPages.length} webpages`, `已引用 ${referencedPages.length} 个网页`)}</strong>
+                    <div className="reference-favicons">
+                      {referencedPages.slice(0, 5).map((page) => (
+                        <ReferenceFavicon key={page.href} page={page} compact />
+                      ))}
+                    </div>
+                  </div>
+                  {referencedPages.map((page) => (
+                    <button key={`${page.label}-${page.href}`} className="reference-card" onClick={() => void window.tasiHarness.app.openExternalUrl(page.href, { system: true })}>
+                      <div className="reference-card-top">
+                        <span className="reference-index">{page.label}</span>
+                        <ReferenceFavicon page={page} />
+                        <strong>{page.host}</strong>
+                      </div>
+                      {page.excerpt && <p>{page.excerpt}</p>}
+                      <span>{page.href}</span>
+                    </button>
+                  ))}
+                </div>
+              )
+            ) : props.toolEvents.length === 0 ? (
               <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
             ) : (
               props.toolEvents.map((event) => (
@@ -1541,6 +1627,8 @@ function ChatPage(props: {
               </div>
             </div>
           )}
+            </>
+          )}
         </div>
       </div>
       {error && <div className="error-box">{error}</div>}
@@ -1552,7 +1640,7 @@ function ChatPage(props: {
             className="hidden-file-input"
             type="file"
             multiple
-            accept=".docx,.pptx,.xlsx,.pdf,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
+            accept=".docx,.pptx,.xlsx,.pdf,.ofd,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
             onChange={(event) => {
               const files = Array.from(event.target.files ?? []);
               if (files.length === 0) return;
@@ -1639,7 +1727,7 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
     event.stopPropagation();
     const href = anchor.getAttribute('href')?.trim() ?? '';
     if (!/^https?:\/\//i.test(href)) return;
-    void window.tasiHarness.app.openExternalUrl(href);
+    void window.tasiHarness.app.openExternalUrl(href, { system: true });
   };
   return (
     <div
@@ -1651,14 +1739,132 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
-function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
+interface CitationLink {
+  label: string;
+  href: string;
+  host: string;
+  excerpt?: string;
+}
+
+function extractCitationLinks(content: string): CitationLink[] {
+  const out: CitationLink[] = [];
+  const seen = new Set<string>();
+  const citationRe = /\[(\d+)\]\((https?:\/\/[^\s)]+)\)/g;
+  for (const match of content.matchAll(citationRe)) {
+    const label = match[1] ?? '';
+    const href = match[2] ?? '';
+    if (!label || !href || seen.has(href)) continue;
+    const matchIndex = typeof match.index === 'number' ? match.index : 0;
+    const sentenceStartCandidates = [
+      content.lastIndexOf('\n', matchIndex),
+      content.lastIndexOf('。', matchIndex),
+      content.lastIndexOf('.', matchIndex),
+      content.lastIndexOf('；', matchIndex),
+      content.lastIndexOf(';', matchIndex)
+    ];
+    const sentenceStart = Math.max(...sentenceStartCandidates) + 1;
+    const sentenceEndCandidates = ['\n', '。', '.', '；', ';']
+      .map((token) => content.indexOf(token, matchIndex + match[0].length))
+      .filter((index) => index >= 0);
+    const sentenceEnd = sentenceEndCandidates.length > 0 ? Math.min(...sentenceEndCandidates) + 1 : Math.min(content.length, matchIndex + 180);
+    const excerpt = content
+      .slice(sentenceStart, sentenceEnd)
+      .replace(/\[(\d+)\]\((https?:\/\/[^\s)]+)\)/g, '[$1]')
+      .replace(/[*_`>#|]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180);
+    let host = href;
+    try {
+      host = new URL(href).hostname.replace(/^www\./, '');
+    } catch {
+      host = href;
+    }
+    out.push({ label, href, host, excerpt });
+    seen.add(href);
+  }
+  return out;
+}
+
+function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactElement | null {
+  if (citations.length === 0) return null;
+  return (
+    <div className="msg-citation-strip" aria-label="Referenced webpages">
+      {citations.map((citation) => (
+        <button
+          key={`${citation.label}-${citation.href}`}
+          className="msg-citation-chip"
+          title={`${citation.label}. ${citation.host}`}
+          aria-label={`${citation.label}. ${citation.host}`}
+          onClick={() => void window.tasiHarness.app.openExternalUrl(citation.href, { system: true })}
+        >
+          <span className="msg-citation-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
+              <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1" />
+            </svg>
+          </span>
+          <span>{citation.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function faviconCandidates(page: CitationLink): string[] {
+  const candidates: string[] = [];
+  try {
+    const url = new URL(page.href);
+    candidates.push(`${url.origin}/favicon.ico`);
+    candidates.push(`https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(page.href)}&sz=32`);
+  } catch {
+    // Fall back to host-based services below.
+  }
+  if (page.host) {
+    candidates.push(`https://www.google.com/s2/favicons?domain=${encodeURIComponent(page.host)}&sz=32`);
+    candidates.push(`https://icons.duckduckgo.com/ip3/${encodeURIComponent(page.host)}.ico`);
+  }
+  return [...new Set(candidates)];
+}
+
+function ReferenceFavicon({ page, compact = false }: { page: CitationLink; compact?: boolean }): ReactElement {
+  const candidates = useMemo(() => faviconCandidates(page), [page]);
+  const [index, setIndex] = useState(0);
+  const src = candidates[index];
+  const fallbackText = (page.host || page.label || '?').replace(/^www\./, '').slice(0, 1).toUpperCase();
+
+  useEffect(() => {
+    setIndex(0);
+  }, [page.href]);
+
+  if (!src) {
+    return <span className={`reference-favicon-fallback ${compact ? 'compact' : ''}`}>{fallbackText}</span>;
+  }
+
+  return (
+    <img
+      className="reference-favicon"
+      src={src}
+      alt=""
+      onError={() => setIndex((old) => old + 1)}
+    />
+  );
+}
+
+function assistantExportTitle(content: string): string {
+  const lines = normalizeMarkdownForRender(content).split('\n');
+  const heading = lines.find((line) => /^#{1,3}\s+\S/.test(line.trim()))?.replace(/^#{1,6}\s+/, '').trim();
+  if (heading) return heading.slice(0, 80);
+  const firstText = lines.find((line) => line.trim() && !/^```/.test(line.trim()))?.trim() ?? 'Assistant Reply';
+  return firstText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1').slice(0, 80);
+}
+
+function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
-  const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'U'}</div>
+      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
       <div className="msg-bubble-wrap">
-        <div className="msg-sender">{label}</div>
         <div className="msg-bubble">{renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}</div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
@@ -1668,9 +1874,10 @@ function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: Trans
 
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
-  const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
+  const citations = message.role === 'assistant' ? extractCitationLinks(message.content) : [];
   const [copied, setCopied] = useState(false);
+  const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
 
   useEffect(() => {
     if (!copied) return;
@@ -1687,11 +1894,35 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
     }
   }
 
+  async function handleExport(format: 'pdf' | 'docx'): Promise<void> {
+    if (message.role !== 'assistant' || exportBusy) return;
+    const exportAssistantMessage = window.tasiHarness.app.exportAssistantMessage;
+    if (typeof exportAssistantMessage !== 'function') {
+      window.alert(tr('Export is not available in this window yet. Please restart Tasi Harness once so the updated preload API is loaded.', '当前窗口尚未加载导出接口。请重启一次 Tasi Harness，让新的 preload API 生效。'));
+      return;
+    }
+    setExportBusy(format);
+    try {
+      const normalized = normalizeMarkdownForRender(message.content);
+      const html = renderMarkdownToHtml(normalized);
+      const result = await exportAssistantMessage({
+        format,
+        title: assistantExportTitle(message.content),
+        content: normalized,
+        html
+      });
+      if (!result.ok) window.alert(result.content);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExportBusy(null);
+    }
+  }
+
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'U'}</div>
+      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
       <div className="msg-bubble-wrap">
-        <div className="msg-sender">{label}</div>
         <div className="msg-bubble">
           {isWechatPending ? (
             <div>
@@ -1700,8 +1931,31 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
             </div>
           ) : (
             <>
+              <CitationLinkStrip citations={citations} />
               {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
               <div className="msg-bubble-actions">
+                {message.role === 'assistant' && (
+                  <>
+                    <button
+                      className="msg-export-button"
+                      onClick={() => void handleExport('pdf')}
+                      disabled={exportBusy != null}
+                      title={tr('Export as PDF', '导出为 PDF')}
+                      aria-label={tr('Export as PDF', '导出为 PDF')}
+                    >
+                      {exportBusy === 'pdf' ? '...' : 'P'}
+                    </button>
+                    <button
+                      className="msg-export-button"
+                      onClick={() => void handleExport('docx')}
+                      disabled={exportBusy != null}
+                      title={tr('Export as Word', '导出为 Word')}
+                      aria-label={tr('Export as Word', '导出为 Word')}
+                    >
+                      {exportBusy === 'docx' ? '...' : 'W'}
+                    </button>
+                  </>
+                )}
                 <button
                   className={`msg-icon-button ${copied ? 'copied' : ''}`}
                   onClick={() => void handleCopy()}
@@ -1857,7 +2111,7 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
           <label>{props.tr('Source document', '源文档')}</label>
           <input
             type="file"
-            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf"
+            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf,.ofd"
             disabled={uploadBusy || folderImportBusy}
             onChange={(event) => {
               setUploadFile(event.target.files?.[0] ?? null);
@@ -2712,9 +2966,9 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 
   return (
     <section className="page">
-      <PageHeader title={tr('Sessions', '会话')} subtitle={tr('Local JSON session history with simple full-text search.', '本地 JSON 会话历史，支持简单全文筛选。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history with simple full-text search.', '本地 JSON 会话历史，支持简单全文筛选。')} />
       <div className="card">
-        <input className="wide-input" placeholder={tr('Filter sessions', '筛选会话')} value={query} onChange={(e) => setQuery(e.target.value)} />
+        <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
         <div className="session-list">
           {filtered.map((s) => (
             <div className="session-card" key={s.id}>
@@ -2972,8 +3226,10 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="isolated">{tr('Isolated (safe default)', '隔离模式（默认更安全）')}</option>
             <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
+          <label className="toggle-line"><input type="checkbox" checked={draft.browserHeadless} onChange={(e) => setDraft((old) => ({ ...old, browserHeadless: e.target.checked }))} /> {tr('Run external CDP browser headless', '以无头模式运行外部 CDP 浏览器')}</label>
           <div className="card-subtle">{tr('External auto mode tries CDP first, then Safari WebDriver on macOS, then shell.openExternal.', '外部自动模式会优先尝试 CDP，其次在 macOS 使用 Safari WebDriver，最后回退到 shell.openExternal。')}</div>
           <div className="card-subtle">{tr('System profile mode reuses login state and may force-close browser processes during controlled takeover.', '系统配置会复用登录态，在受控接管时可能强制关闭浏览器进程。')}</div>
+          <div className="card-subtle">{tr('Headless mode applies to managed CDP launches only; use browser_snapshot, browser_extract, and browser_screenshot to inspect pages.', '无头模式仅作用于受管 CDP 自启动浏览器；请使用 browser_snapshot、browser_extract 和 browser_screenshot 检查页面。')}</div>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>

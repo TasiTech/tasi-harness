@@ -81,9 +81,16 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function renderMarkdownLink(label: string, href: string): string {
+  if (/^\d+$/.test(label.trim())) {
+    return `<a class="msg-cite" href="${href}" target="_blank" rel="noreferrer" title="${href}">${label}</a>`;
+  }
+  return `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`;
+}
+
 function renderInlineHtml(text: string): string {
   let html = escapeHtml(text);
-  html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_match, label: string, href: string) => renderMarkdownLink(label, href));
   html = html.replace(BARE_HTTP_URL_RE, (_match, prefix: string, url: string) => {
     const safePrefix = prefix ?? '';
     const trailing = url.match(/[.,;!?]+$/)?.[0] ?? '';

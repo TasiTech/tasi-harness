@@ -42,7 +42,7 @@ function decodeXmlEntities(input: string): string {
 
 function decodeXmlText(input: string): string {
   return decodeXmlEntities(input)
-    .replace(/<[^>]+>/g, '')
+    .replace(/<[^>]+>/g, '\n')
     .replace(/\u00a0/g, ' ');
 }
 
@@ -352,6 +352,79 @@ async function convertPptx(title: string, buffer: Buffer): Promise<ConvertedDocu
   return { title, markdown: finalizeMarkdown(lines), assets };
 }
 
+function extractOfdXmlText(input: string): string {
+  const textCodes = Array.from(input.matchAll(/<(?:[A-Za-z_][\w.-]*:)?TextCode\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?TextCode>/g))
+    .map((match) => decodeXmlText(match[1] ?? '').trim())
+    .filter(Boolean);
+  const rawText = textCodes.length > 0 ? textCodes.join('\n') : decodeXmlText(input);
+  return normalizeLineBreaks(rawText)
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function rankOfdEntry(path: string): number {
+  const lower = path.toLowerCase();
+  if (/content\.xml$/.test(lower) || /page_\d+\.xml$/.test(lower) || /\/pages?\//.test(lower)) return 0;
+  if (/document\.xml$/.test(lower) || lower.endsWith('/ofd.xml') || lower === 'ofd.xml') return 1;
+  if (lower.endsWith('.xml')) return 2;
+  if (lower.endsWith('.txt')) return 3;
+  return 4;
+}
+
+async function extractOfdTextParts(buffer: Buffer): Promise<Array<{ name: string; text: string }>> {
+  const zip = await JSZip.loadAsync(buffer);
+  const entries = Object.keys(zip.files)
+    .filter((path) => {
+      const entry = zip.files[path];
+      if (!entry || entry.dir) return false;
+      const lower = path.toLowerCase();
+      return lower.endsWith('.xml') || lower.endsWith('.txt');
+    })
+    .sort((left, right) => {
+      const rankDelta = rankOfdEntry(left) - rankOfdEntry(right);
+      return rankDelta || left.localeCompare(right);
+    });
+
+  const parts: Array<{ name: string; text: string }> = [];
+  let totalChars = 0;
+  for (const entryName of entries) {
+    if (parts.length >= 60 || totalChars >= 250_000) break;
+    const file = zip.file(entryName);
+    if (!file) continue;
+    const raw = await file.async('string');
+    const lower = entryName.toLowerCase();
+    const text = lower.endsWith('.xml')
+      ? extractOfdXmlText(raw)
+      : normalizeLineBreaks(raw).replace(/\u00a0/g, ' ').trim();
+    if (!text) continue;
+    const remaining = 250_000 - totalChars;
+    const clipped = text.length > remaining ? `${text.slice(0, remaining).trim()}\n...(truncated)` : text;
+    parts.push({ name: entryName, text: clipped });
+    totalChars += clipped.length;
+  }
+  return parts;
+}
+
+async function convertOfd(title: string, buffer: Buffer): Promise<ConvertedDocument> {
+  const parts = await extractOfdTextParts(buffer);
+  const lines: string[] = [
+    `# ${title}`,
+    '',
+    'OFD text extraction is best-effort from package XML and text entries.',
+    ''
+  ];
+  if (parts.length === 0) {
+    lines.push('(No extractable OFD text found. The file may require a dedicated OFD renderer or OCR.)');
+    return { title, markdown: finalizeMarkdown(lines), assets: [] };
+  }
+  for (const part of parts) {
+    lines.push(`## ${part.name}`, '', part.text, '');
+  }
+  return { title, markdown: finalizeMarkdown(lines), assets: [] };
+}
+
 function convertTextLikeDocument(title: string, ext: string, buffer: Buffer): ConvertedDocument {
   const text = buffer.toString('utf8');
   if (ext === '.md' || ext === '.markdown') return { title, markdown: normalizeLineBreaks(text).trim() + '\n', assets: [] };
@@ -539,9 +612,10 @@ export async function convertDocumentToMarkdown(filename: string, buffer: Buffer
   if (ext === '.xlsx') return convertXlsx(title, buffer);
   if (ext === '.pptx') return convertPptx(title, buffer);
   if (ext === '.pdf') return convertPdf(title, buffer);
+  if (ext === '.ofd') return convertOfd(title, buffer);
   if (['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv'].includes(ext)) {
     return convertTextLikeDocument(title, ext, buffer);
   }
 
-  throw new Error(`Unsupported document type: ${ext || '(no extension)'}. Supported types: .md, .txt, .json, .csv, .docx, .xlsx, .pptx, .pdf`);
+  throw new Error(`Unsupported document type: ${ext || '(no extension)'}. Supported types: .md, .txt, .json, .csv, .docx, .xlsx, .pptx, .pdf, .ofd`);
 }

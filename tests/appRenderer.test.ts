@@ -23,4 +23,12 @@ describe('renderMarkdownToHtml', () => {
     expect(html).not.toContain(`href="${escapeAttr(`${url}.`)}"`);
     expect(html).toContain(`>${escapeAttr(url)}</a>.`);
   });
+
+  it('renders numeric markdown links as citation badges', () => {
+    const url = 'https://example.com/source';
+    const html = renderMarkdownToHtml(normalizeMarkdownForRender(`Claim[3](${url}) and [source](${url}).`));
+
+    expect(html).toContain(`<a class="msg-cite" href="${url}" target="_blank" rel="noreferrer" title="${url}">3</a>`);
+    expect(html).toContain(`<a href="${url}" target="_blank" rel="noreferrer">source</a>`);
+  });
 });

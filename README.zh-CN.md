@@ -23,7 +23,7 @@ Tasi Harness 是一个本地优先的桌面 AI Agent，基于 Electron、TypeScr
 | --- | --- |
 | Agent 运行时 | 支持工具感知的多轮执行循环、Prompt 组装与会话持久化。 |
 | 记忆系统 | 将长期事实写入本地 JSON 记忆，并在对话时注入相关上下文。 |
-| 浏览器自动化 | 内置 `browser_open`、`browser_click`、`browser_type`、`browser_extract` 等工具。 |
+| 浏览器自动化 | 支持导航、基于 CDP 的外部 Chromium 自动化与可选无头启动、带 `@e` 引用的快照、语义查找、键盘/鼠标/表单操作、提取、截图/PDF、存储/Cookie、控制台、网络、视口与关闭重置工具。 |
 | 个人知识库 | 将本地文档转换并切分后做本地检索，无需 embedding 或外部向量库。 |
 | 技能系统 | 支持读取、创建、修改、上传、安装 `SKILL.md` 技能。 |
 | 会话管理 | 本地保存并检索历史会话。 |

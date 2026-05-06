@@ -13,6 +13,14 @@ interface SessionDocumentPart {
   content: string;
 }
 
+const XML_ENTITY_MAP: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'"
+};
+
 function escapeXmlAttr(input: string): string {
   return input
     .replace(/&/g, '&amp;')
@@ -33,6 +41,31 @@ async function readZipTextOptional(zip: JSZip, path: string): Promise<string | n
 
 function countCommentLikeElements(input: string): number {
   return (input.match(/<(?:[A-Za-z_][\w.-]*:)?(?:comment|cm)\b/g) ?? []).length;
+}
+
+function normalizeLineBreaks(input: string): string {
+  return input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function decodeXmlEntities(input: string): string {
+  return input.replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (_match, entity: string) => {
+    if (entity in XML_ENTITY_MAP) return XML_ENTITY_MAP[entity];
+    if (entity.startsWith('#x')) {
+      const code = Number.parseInt(entity.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : '';
+    }
+    if (entity.startsWith('#')) {
+      const code = Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : '';
+    }
+    return '';
+  });
+}
+
+function decodeXmlText(input: string): string {
+  return decodeXmlEntities(input)
+    .replace(/<[^>]+>/g, '\n')
+    .replace(/\u00a0/g, ' ');
 }
 
 function buildSessionXmlDocument(
@@ -128,6 +161,69 @@ async function convertOpenXmlPackageToXml(
   }
   const commentCount = parts.reduce((total, part) => total + countCommentLikeElements(part.content), 0);
   return buildSessionXmlDocument(filename, sourceExt, parts, commentCount);
+}
+
+function extractOfdXmlText(input: string): string {
+  const textCodes = Array.from(input.matchAll(/<(?:[A-Za-z_][\w.-]*:)?TextCode\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?TextCode>/g))
+    .map((match) => decodeXmlText(match[1] ?? '').trim())
+    .filter(Boolean);
+  const rawText = textCodes.length > 0 ? textCodes.join('\n') : decodeXmlText(input);
+  return normalizeLineBreaks(rawText)
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+function rankOfdEntry(path: string): number {
+  const lower = path.toLowerCase();
+  if (/content\.xml$/.test(lower) || /page_\d+\.xml$/.test(lower) || /\/pages?\//.test(lower)) return 0;
+  if (/document\.xml$/.test(lower) || lower.endsWith('/ofd.xml') || lower === 'ofd.xml') return 1;
+  if (lower.endsWith('.xml')) return 2;
+  if (lower.endsWith('.txt')) return 3;
+  return 4;
+}
+
+async function convertOfdToXml(filename: string, buffer: Buffer): Promise<ConvertedSessionDocumentXml> {
+  const zip = await JSZip.loadAsync(buffer);
+  const entries = Object.keys(zip.files)
+    .filter((path) => {
+      const entry = zip.files[path];
+      if (!entry || entry.dir) return false;
+      const lower = path.toLowerCase();
+      return lower.endsWith('.xml') || lower.endsWith('.txt');
+    })
+    .sort((left, right) => {
+      const rankDelta = rankOfdEntry(left) - rankOfdEntry(right);
+      return rankDelta || left.localeCompare(right);
+    });
+  const parts: SessionDocumentPart[] = [];
+  let totalChars = 0;
+  for (const entryName of entries) {
+    if (parts.length >= 60 || totalChars >= 250_000) break;
+    const file = zip.file(entryName);
+    if (!file) continue;
+    const raw = await file.async('string');
+    const lower = entryName.toLowerCase();
+    const text = lower.endsWith('.xml')
+      ? extractOfdXmlText(raw)
+      : normalizeLineBreaks(raw).replace(/\u00a0/g, ' ').trim();
+    if (!text) continue;
+    const remaining = 250_000 - totalChars;
+    const clipped = text.length > remaining ? `${text.slice(0, remaining).trim()}\n...(truncated)` : text;
+    parts.push({ name: `ofd/extracted-text/${entryName}`, content: clipped });
+    totalChars += clipped.length;
+  }
+  if (parts.length === 0) {
+    parts.push({
+      name: 'ofd/extracted-text.txt',
+      content: '(No extractable OFD text found. The file may require a dedicated OFD renderer or OCR.)'
+    });
+  }
+  return buildSessionXmlDocument(filename, '.ofd', parts, 0, {
+    extraction: 'best-effort',
+    package_text_part_count: parts.length
+  });
 }
 
 function decodePdfLiteralString(raw: string): string {
@@ -435,10 +531,11 @@ export async function convertDocumentToSessionXml(filename: string, buffer: Buff
   if (sourceExt === '.pptx') return convertOpenXmlPackageToXml(filename, '.pptx', buffer, 'ppt', 'ppt/presentation.xml');
   if (sourceExt === '.xlsx') return convertOpenXmlPackageToXml(filename, '.xlsx', buffer, 'xl', 'xl/workbook.xml');
   if (sourceExt === '.pdf') return convertPdfToXml(filename, buffer);
+  if (sourceExt === '.ofd') return convertOfdToXml(filename, buffer);
   if (['.xml', '.txt', '.md', '.markdown', '.json', '.csv', '.log', '.text'].includes(sourceExt)) {
     return convertTextLikeToXml(filename, buffer, sourceExt || '.txt');
   }
   throw new Error(
-    `Unsupported document type: ${sourceExt || '(no extension)'}. Supported types: .docx, .pptx, .xlsx, .pdf, .xml, .txt, .md, .json, .csv`
+    `Unsupported document type: ${sourceExt || '(no extension)'}. Supported types: .docx, .pptx, .xlsx, .pdf, .ofd, .xml, .txt, .md, .json, .csv`
   );
 }

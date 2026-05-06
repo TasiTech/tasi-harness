@@ -112,6 +112,7 @@ export interface AppConfig {
   externalBrowserEngine: ExternalBrowserEngine;
   externalBrowserCdpEndpoint: string;
   externalBrowserProfileMode: ExternalBrowserProfileMode;
+  browserHeadless: boolean;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];
@@ -447,6 +448,13 @@ export interface AppInfo {
   electron: string;
   node: string;
   harnessHome: string;
+}
+
+export interface AssistantMessageExportRequest {
+  format: 'pdf' | 'docx';
+  title?: string;
+  content: string;
+  html?: string;
 }
 
 export interface SkillWriteRequest {

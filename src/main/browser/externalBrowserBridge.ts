@@ -76,6 +76,15 @@ export class ExternalBrowserBridge {
     this.runtimeDir = options.runtimeDir?.trim() || join(tmpdir(), 'tasi-harness', 'external-browser');
   }
 
+  activeCdpTargetId(): string | null {
+    const ids = [...this.cdpOpenedTargetIds];
+    return ids.length > 0 ? ids[ids.length - 1] : null;
+  }
+
+  cdpEndpointHint(config: AppConfig): string {
+    return this.cdpEndpoint || this.cdpManagedEndpoint || config.externalBrowserCdpEndpoint || 'http://127.0.0.1:9222';
+  }
+
   async open(url: string, config: AppConfig): Promise<ToolExecutionResult> {
     if (!url.trim()) return { ok: false, content: 'No external URL provided.' };
     const attempts = this.resolveEngineAttempts(config);
@@ -124,10 +133,16 @@ export class ExternalBrowserBridge {
   }
 
   private async openViaCdp(url: string, config: AppConfig): Promise<ToolExecutionResult> {
-    const connection = await this.resolveCdpConnectionWithAutoDetect(config, config.externalBrowserCdpEndpoint, config.externalBrowserEngine === 'auto');
-    const result = await this.sendCdpCommand(connection.browserWsUrl, 'Target.createTarget', { url });
+    const connection = await this.resolveCdpConnectionWithAutoDetect(config, config.externalBrowserCdpEndpoint, true);
+    const result = await this.sendCdpCommand(connection.browserWsUrl, 'Target.createTarget', {
+      url,
+      background: false
+    });
     const targetId = typeof result?.targetId === 'string' ? result.targetId : '';
     if (!targetId) return { ok: false, content: 'CDP did not return a target id.' };
+    await this.sendCdpCommand(connection.browserWsUrl, 'Target.activateTarget', { targetId }).catch((error) => {
+      console.warn(`${this.logPrefix} failed to activate CDP target ${targetId}: ${formatError(error)}`);
+    });
     this.cdpOpenedTargetIds.add(targetId);
     this.cdpEndpoint = connection.endpoint;
     this.cdpBrowserName = connection.browserName;
@@ -237,10 +252,10 @@ export class ExternalBrowserBridge {
         '--remote-allow-origins=*',
         '--no-first-run',
         '--no-default-browser-check',
+        ...(config.browserHeadless ? ['--headless=new', '--disable-gpu'] : []),
         `--user-data-dir=${launchProfile.userDataDir}`,
         ...(launchProfile.profileDir ? [`--profile-directory=${launchProfile.profileDir}`] : []),
-        ...(launchProfile.mode === 'isolated' ? ['--disable-sync', '--disable-features=msEdgeSigninPrompt'] : []),
-        '--no-startup-window'
+        ...(launchProfile.mode === 'isolated' ? ['--disable-sync', '--disable-features=msEdgeSigninPrompt'] : [])
       ];
       if (launchProfile.autoLaunchState) this.cdpAutoLaunchState = launchProfile.autoLaunchState;
       console.info(

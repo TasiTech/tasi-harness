@@ -55,6 +55,9 @@ export class PromptBuilder {
         ? '- In embedded browser mode, use browser_* tools as the default web workflow and rely on the built-in preview.'
         : '- In external browser mode, use browser_* tools as the default workflow and let the harness surface pages in the system browser when needed.',
       bridgeGuide,
+      '- When a final answer relies on browser/search/webpage evidence, cite each supported claim with numbered inline Markdown links in this exact style: `2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。`',
+      '- Assign web citation numbers in first-use order, reuse the same number for the same URL, and cite only pages that were opened/inspected or otherwise provided as trusted source material.',
+      '- Put web citations immediately after the claim, table cell, or sentence they support. A final Sources/来源 list is optional, but inline citations near claims are required for web-backed answers.',
       '- Terminal access may be disabled; when disabled, explain the required command instead of pretending it ran.',
       '- Save durable facts via the memory tool: user preferences, project conventions, environment facts, and stable workflow lessons.',
       '- If you discover a repeatable non-trivial workflow, consider creating or patching a skill using skill_manage.',

@@ -31,6 +31,7 @@ export class ConfigStore {
     const cdpEndpoint = typeof merged.externalBrowserCdpEndpoint === 'string' ? merged.externalBrowserCdpEndpoint.trim() : '';
     merged.externalBrowserCdpEndpoint = cdpEndpoint || defaults.externalBrowserCdpEndpoint;
     merged.externalBrowserProfileMode = merged.externalBrowserProfileMode === 'system' ? 'system' : 'isolated';
+    merged.browserHeadless = merged.browserHeadless === true;
     merged.skillMarketSources = Array.isArray(merged.skillMarketSources) && merged.skillMarketSources.length > 0 ? merged.skillMarketSources : defaults.skillMarketSources;
     const configuredTools = Array.isArray(merged.enabledToolNames) ? merged.enabledToolNames.filter((name): name is string => typeof name === 'string' && name.trim().length > 0) : [];
     merged.enabledToolNames = [...new Set([...configuredTools, ...defaults.enabledToolNames])];
