@@ -42,7 +42,7 @@ const defaultConfig: PublicAppConfig = {
   apiKeyConfigured: false,
   model: providerDefaultModel('openai'),
   temperature: 0.3,
-  maxIterations: 8,
+  maxIterations: 100,
   sessionDocumentMaxDocs: 10,
   workspaceDir: '',
   allowShellTools: false,
@@ -3368,7 +3368,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label>{tr('Temperature', '温度')}</label>
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
-          <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <input type="number" min="1" max="100" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
           <label>{tr('Session document max docs', '对话文档最大数量')}</label>
           <input
             type="number"

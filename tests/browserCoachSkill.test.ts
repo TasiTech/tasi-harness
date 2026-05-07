@@ -11,7 +11,7 @@ import {
 function sampleRecording(): BrowserCoachRecording {
   return {
     id: 'rec_1',
-    startUrl: 'https://example.com/login',
+    startUrl: 'https://example.com/login?channel=web&token=secret-token',
     startedAt: '2026-05-06T00:00:00.000Z',
     active: false,
     events: [
@@ -19,7 +19,7 @@ function sampleRecording(): BrowserCoachRecording {
         id: 'evt_1',
         index: 1,
         type: 'navigation',
-        url: 'https://example.com/login',
+        url: 'https://example.com/login?channel=web&token=secret-token',
         title: 'Login',
         createdAt: '2026-05-06T00:00:01.000Z'
       },
@@ -27,7 +27,7 @@ function sampleRecording(): BrowserCoachRecording {
         id: 'evt_2',
         index: 2,
         type: 'input',
-        url: 'https://example.com/login',
+        url: 'https://example.com/login?channel=web&token=secret-token',
         title: 'Login',
         selector: 'input[name="q"]',
         tag: 'input',
@@ -39,7 +39,7 @@ function sampleRecording(): BrowserCoachRecording {
         id: 'evt_3',
         index: 3,
         type: 'click',
-        url: 'https://example.com/login',
+        url: 'https://example.com/results?channel=web&q=invoice%20123',
         title: 'Login',
         selector: 'button[type="submit"]',
         tag: 'button',
@@ -66,6 +66,12 @@ describe('browser coach skill generation', () => {
     expect(content).toContain('category: browser');
     expect(content).toContain('Repeat example.com search workflow.');
     expect(content).toContain('input[name="q"]');
+    expect(content).toContain('Recorded Links And Parameters');
+    expect(content).toContain('channel=web');
+    expect(content).toContain('token=[redacted]');
+    expect(content).toContain('Search = `invoice 123`');
+    expect(content).toContain('Browser Reliability Rules');
+    expect(content).toContain('Do not guess provider result URLs');
     expect(content).toContain('./references/recording.json');
   });
 
@@ -114,10 +120,19 @@ describe('browser coach skill generation', () => {
     const prompt = capturedRequest?.messages.map((message) => message.content).join('\n') ?? '';
     expect(prompt).toContain('Built-in skill-creator guidance to follow');
     expect(prompt).toContain('SKILL CREATOR GUIDE');
+    expect(prompt).toContain('prevent the my-travel failure pattern');
+    expect(prompt).toContain('mark live-data failures as degraded');
+    expect(prompt).toContain('Recorded Links And Parameters');
+    expect(prompt).toContain('linksAndParams');
+    expect(prompt).toContain('"channel"');
     expect(prompt).toContain('Recorded workflow summary JSON');
     expect(content).toContain('name: example-search-coach');
     expect(content).toContain('category: browser');
     expect(content).toContain('Inputs/Variables');
+    expect(content).toContain('Recorded Links And Parameters');
+    expect(content).toContain('channel=web');
+    expect(content).toContain('Browser Reliability Rules');
+    expect(content).toContain('Do not guess provider result URLs');
     expect(content).toContain('./references/recording.json');
   });
 

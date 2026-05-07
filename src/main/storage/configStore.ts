@@ -19,7 +19,7 @@ export class ConfigStore {
     const merged = { ...defaults, ...this.store.read() };
     merged.provider = normalizeProviderKind(merged.provider);
     merged.temperature = Number.isFinite(merged.temperature) ? merged.temperature : defaults.temperature;
-    merged.maxIterations = Math.max(1, Math.min(50, Number(merged.maxIterations) || defaults.maxIterations));
+    merged.maxIterations = Math.max(1, Math.min(100, Number(merged.maxIterations) || defaults.maxIterations));
     merged.sessionDocumentMaxDocs = Math.max(1, Math.min(100, Number(merged.sessionDocumentMaxDocs) || defaults.sessionDocumentMaxDocs));
     if (!merged.workspaceDir) merged.workspaceDir = defaults.workspaceDir;
     merged.defaultExecutionMode = merged.defaultExecutionMode === 'sandbox' ? 'sandbox' : 'workspace';

@@ -18,7 +18,7 @@ export function defaultConfig(): AppConfig {
     apiKey: '',
     model: providerDefaultModel('openai'),
     temperature: 0.3,
-    maxIterations: 8,
+    maxIterations: 100,
     sessionDocumentMaxDocs: 10,
     workspaceDir: join(DEFAULT_HOME, 'workspace'),
     allowShellTools: false,
