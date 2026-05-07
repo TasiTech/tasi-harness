@@ -475,7 +475,6 @@ export function App(): ReactElement {
         </div>
         <div className="nav-section">
           <div className="nav-toolbar">
-            <div className="nav-label">{tr('Workspace', '工作区')}</div>
             <button
               className="sidebar-collapse-button"
               onClick={() => setSidebarCollapsed((value) => !value)}
@@ -1420,6 +1419,21 @@ function ChatPage(props: {
     uploadSessionDocInputRef.current.click();
   }
 
+  async function openWorkspaceDirectory(): Promise<void> {
+    const workspaceDir = props.config.workspaceDir.trim();
+    if (!workspaceDir) {
+      setError(props.tr('Workspace directory is not configured.', '尚未配置工作区目录。'));
+      return;
+    }
+    setError('');
+    try {
+      const result = await window.tasiHarness.app.openPath(workspaceDir);
+      if (!result.ok) setError(result.content || props.tr('Failed to open workspace directory.', '打开工作区目录失败。'));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function uploadSessionDocuments(files: File[]): Promise<void> {
     if (files.length === 0) return;
     setSessionDocBusy(true);
@@ -1521,6 +1535,9 @@ function ChatPage(props: {
             }}
           >
             {props.tr('New session', '新会话')}
+          </button>
+          <button className="ghost-button" onClick={() => void openWorkspaceDirectory()}>
+            {props.tr('Open workspace', '打开工作区')}
           </button>
         </div>
       </div>
@@ -2079,6 +2096,10 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
   { value: 'other', labelEn: 'Other', labelZh: '其他' }
 ];
 
+function knownMemoryDomain(value?: string): MemoryDomain {
+  return MEMORY_DOMAINS.some((item) => item.value === value) ? (value as MemoryDomain) : 'other';
+}
+
 function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeState; refreshKnowledge: () => Promise<void> }): ReactElement {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadBusy, setUploadBusy] = useState(false);
@@ -2328,7 +2349,7 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     for (const item of MEMORY_DOMAINS) byDomain.set(item.value, []);
     const allSorted = [...retrieved.entries].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     for (const entry of allSorted) {
-      const domain = MEMORY_DOMAINS.some((item) => item.value === entry.domain) ? (entry.domain as MemoryDomain) : 'other';
+      const domain = knownMemoryDomain(entry.domain);
       byDomain.get(domain)?.push(entry);
     }
     return { allSorted, byDomain };
@@ -3223,10 +3244,23 @@ function TasksPage(props: {
 
 function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: TranslateFn; sessions: SessionSummary[]; onOpen: (id: string) => Promise<void>; refreshSessions: () => Promise<void> }): ReactElement {
   const [query, setQuery] = useState('');
+  const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<MemoryDomain | 'all', number>([['all', sessions.length]]);
+    for (const session of sessions) {
+      const domain = knownMemoryDomain(session.domain);
+      counts.set(domain, (counts.get(domain) ?? 0) + 1);
+    }
+    return counts;
+  }, [sessions]);
   const filtered = useMemo(() => {
-    if (!query.trim()) return sessions;
-    return sessions.filter((s) => s.title.toLowerCase().includes(query.toLowerCase()));
-  }, [sessions, query]);
+    const needle = query.trim().toLowerCase();
+    return sessions.filter((s) => {
+      if (activeCategory !== 'all' && knownMemoryDomain(s.domain) !== activeCategory) return false;
+      if (!needle) return true;
+      return s.title.toLowerCase().includes(needle);
+    });
+  }, [sessions, query, activeCategory]);
 
   async function remove(id: string): Promise<void> {
     await window.tasiHarness.sessions.delete(id);
@@ -3235,22 +3269,49 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 
   return (
     <section className="page">
-      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history with simple full-text search.', '本地 JSON 会话历史，支持简单全文筛选。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by the same domains as memory.', '本地 JSON 会话历史，按记忆相同分类展示。')} />
       <div className="card">
         <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
-        <div className="session-list">
-          {filtered.map((s) => (
-            <div className="session-card" key={s.id}>
-              <div>
-                <strong>{s.title}</strong>
-                <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+        <div className="memory-browser session-browser">
+          <div className="memory-category-list">
+            <button className={`memory-category-item ${activeCategory === 'all' ? 'active' : ''}`} onClick={() => setActiveCategory('all')}>
+              <span>{tr('All', '全部')}</span>
+              <span className="soft-badge">{categoryCounts.get('all') ?? 0}</span>
+            </button>
+            {MEMORY_DOMAINS.map((category) => (
+              <button
+                key={category.value}
+                className={`memory-category-item ${activeCategory === category.value ? 'active' : ''}`}
+                onClick={() => setActiveCategory(category.value)}
+              >
+                <span>{tr(category.labelEn, category.labelZh)}</span>
+                <span className="soft-badge">{categoryCounts.get(category.value) ?? 0}</span>
+              </button>
+            ))}
+          </div>
+          <div className="session-list">
+            {filtered.map((s) => {
+              const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
+              return (
+                <div className="session-card" key={s.id}>
+                  <div>
+                    <strong>{s.title}</strong>
+                    <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+                    {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
+                  </div>
+                  <div className="button-row compact">
+                    <button className="primary-button" onClick={() => void onOpen(s.id)}>{tr('Open', '打开')}</button>
+                    <button className="danger-button" onClick={() => void remove(s.id)}>{tr('Delete', '删除')}</button>
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && (
+              <div className="tool-empty">
+                {tr('No sessions matched this category or filter.', '没有匹配该分类或筛选条件的会话。')}
               </div>
-              <div className="button-row compact">
-                <button className="primary-button" onClick={() => void onOpen(s.id)}>{tr('Open', '打开')}</button>
-                <button className="danger-button" onClick={() => void remove(s.id)}>{tr('Delete', '删除')}</button>
-              </div>
-            </div>
-          ))}
+            )}
+          </div>
         </div>
       </div>
     </section>

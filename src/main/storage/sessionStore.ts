@@ -4,6 +4,7 @@ import type {
   AgentExecutionDetails,
   AgentMessage,
   LlmUsage,
+  MemoryDomain,
   SearchResult,
   SessionRecord,
   SessionSummary,
@@ -11,6 +12,7 @@ import type {
   ToolEvent
 } from '../../shared/types.js';
 import { createId, nowIso } from '../../shared/types.js';
+import { inferMemoryDomains, normalizeMemoryDomain } from '../../shared/memoryDomains.js';
 import { ensureDir, safeJoin } from './pathUtils.js';
 
 export class SessionStore {
@@ -30,6 +32,7 @@ export class SessionStore {
       createdAt: ts,
       updatedAt: ts,
       messageCount: 0,
+      domain: 'other',
       systemPromptHistory: [],
       messages: [],
       toolEvents: [],
@@ -49,6 +52,7 @@ export class SessionStore {
     const history = this.buildSystemPromptHistory(record);
     record.messages = record.messages ?? [];
     record.messageCount = record.messages.length;
+    record.domain = normalizeMemoryDomain(record.domain || this.inferRecordDomain(record));
     record.toolEvents = this.buildToolEvents(record.messages, record.toolEvents);
     record.systemPromptHistory = history;
     record.systemPrompt = history.at(-1)?.prompt;
@@ -81,6 +85,7 @@ export class SessionStore {
       next.title = firstUser.slice(0, 64);
     }
     next.messageCount = next.messages.length;
+    next.domain = this.inferRecordDomain(next);
     this.write(next);
     return next;
   }
@@ -104,6 +109,7 @@ export class SessionStore {
   replaceMessages(id: string, messages: AgentMessage[]): SessionRecord {
     const record = this.read(id) ?? this.create();
     const next = { ...record, messages, messageCount: messages.length, updatedAt: nowIso() };
+    next.domain = this.inferRecordDomain(next);
     this.write(next);
     return next;
   }
@@ -130,6 +136,7 @@ export class SessionStore {
   rename(id: string, title: string): SessionSummary {
     const record = this.mustRead(id);
     const next = { ...record, title: title.trim() || record.title, updatedAt: nowIso() };
+    next.domain = this.inferRecordDomain(next);
     this.write(next);
     return this.summary(next);
   }
@@ -193,8 +200,22 @@ export class SessionStore {
       title: record.title,
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
-      messageCount: record.messages.length
+      messageCount: record.messages.length,
+      domain: normalizeMemoryDomain(record.domain || this.inferRecordDomain(record))
     };
+  }
+
+  private inferRecordDomain(record: Pick<SessionRecord, 'title' | 'messages'>): MemoryDomain {
+    const seed = [
+      record.title,
+      ...record.messages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .slice(0, 8)
+        .map((message) => message.content)
+    ]
+      .filter(Boolean)
+      .join('\n');
+    return inferMemoryDomains(seed)[0] ?? 'other';
   }
 
   private normalizeSystemPromptHistory(

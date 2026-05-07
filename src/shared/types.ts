@@ -218,7 +218,7 @@ export interface MemoryEntry {
   target: MemoryTarget;
   scope: MemoryScope;
   sessionId?: string;
-  domain: MemoryDomain | string;
+  domain?: MemoryDomain | string;
   content: string;
   createdAt: string;
   updatedAt: string;
@@ -263,6 +263,7 @@ export interface SessionSummary {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  domain?: MemoryDomain | string;
 }
 
 export interface SessionSystemPromptRecord {
