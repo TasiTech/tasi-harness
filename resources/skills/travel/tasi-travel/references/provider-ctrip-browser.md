@@ -18,6 +18,7 @@ Related browser skill references:
 Use these browser tools:
 - `browser_open`
 - `browser_wait`
+- `browser_hover`
 - `browser_click`
 - `browser_type`
 - `browser_scroll`
@@ -67,11 +68,77 @@ Normalize these fields whenever available:
 Hotel URL pattern:
 - Preferred desktop list pattern:
   - `https://hotels.ctrip.com/hotels/list?...`
+- City hotel landing/list fallback:
+  - `https://hotels.ctrip.com/hotel/{citySlugOrCityId}`
+  - examples from search-indexable Ctrip pages include `https://hotels.ctrip.com/hotel/city10`, `https://hotels.ctrip.com/hotel/xi-an10`, and `https://hotels.ctrip.com/hotel/xi%27an10`
+- Hotel detail pattern:
+  - `https://hotels.ctrip.com/hotels/detail/?cityId={cityId}&hotelId={hotelId}&checkIn=YYYY-MM-DD&checkOut=YYYY-MM-DD...`
 
 Hotel search strategy:
 - Prefer desktop `hotels/list` URLs over generic keyword-only hotel search pages.
 - When the user already provides a working Ctrip hotel list URL, preserve that URL structure and only adjust user-requested constraints.
 - Treat hotel search on Ctrip as a scoped list search. The model should preserve the full search scope instead of collapsing it into a plain keyword query.
+- If the user provides a Ctrip hotel city-list URL like `hotels/list?...city=10&optionType=City&display=西安...`, treat it as a city-scoped hotel search prompt.
+- If the user provides a Ctrip hotel detail URL with `hotelId`, treat it as a request for that specific hotel plus room/date availability context, not as a generic city hotel list.
+- If starting from `https://www.ctrip.com/`, the hotel home form may submit directly to `hotels/list`; after form submission, use the resulting URL as city/date evidence instead of reconstructing it from memory.
+
+City-scoped hotel list hints from `hotels/list`:
+- Preserve city identity params together when present:
+  - `city` or `cityId`
+  - `provinceId`
+  - `countryId`
+  - `optionId`
+  - `optionType=City`
+  - `display`
+  - `domestic`
+- Preserve date and occupancy params:
+  - `checkin`
+  - `checkout`
+  - `crn`
+  - `adult`
+  - `children`
+- Preserve search mode params when present:
+  - `directSearch`
+  - `searchBoxArg`
+  - `travelPurpose`
+  - `ctm_ref`
+- Example city-list prompt:
+  - user URL has `city=10`, `optionId=10`, `optionType=City`, `display=西安, 陕西, 中国`, `checkin=2026/05/07`, `checkout=2026/05/08`
+  - infer intent as: search hotels in Xi'an for 2026/05/07-2026/05/08, 1 room, 1 adult, 0 children
+  - keep date separators as `/` because the working URL uses `YYYY/MM/DD`
+
+Hotel detail hints from `hotels/detail`:
+- Preserve item identity:
+  - `hotelId`
+  - `cityId`
+  - `cityEnName`
+- Preserve stay context:
+  - `checkIn`
+  - `checkOut`
+  - `adult`
+  - `children`
+  - `crn`
+  - `ages`
+- Preserve currency and detail filters when present:
+  - `curr`
+  - `barcurr`
+  - `detailFilters`
+  - `hotelType`
+  - `display`
+  - `isFlexible`
+- Normalize these hotel-detail fields whenever visible:
+  - `hotelName`
+  - `address`
+  - `score`
+  - `reviewCount`
+  - `facilityHighlights`
+  - `roomTypes`
+  - `roomPrice`
+  - `bookingPolicy`
+  - `nearbyPoiOrTransport`
+  - `sourceUrl`
+- For detail pages, prioritize visible header, address/map text, score/review block, facility icons, room cards, date/occupancy selectors, and policy text.
+- Do not merge fields from a city list into a specific hotel detail unless the detail page visibly links back to that context.
 
 Parameter hit rules for desktop `hotels/list`:
 - Always preserve stay dates:
@@ -186,6 +253,42 @@ Normalize these guide/article fields whenever available:
 - `relatedPoiLinks`
 - `sourceUrl`
 
+City and attraction search hints from `you.ctrip.com/globalsearch`:
+- Use global search when the user provides or asks for a broad Ctrip city/POI search URL:
+  - `https://you.ctrip.com/globalsearch/?keyword={keyword}`
+- Treat `keyword` as the primary visible search prompt. Decode it before reasoning.
+  - example: `keyword=西安` means the user is searching for Xi'an across destination, attractions, guides, and related travel content.
+- When global search results show a city/destination card, prefer opening the city destination URL before building deeper URLs:
+  - `/place/{citySlug}{cityId}.html`
+  - then reuse the detected city slug/id for POI list/detail or guide pages.
+- When global search results show attraction/scenic spot cards, prefer opening the concrete `sight/*` result instead of guessing a POI id.
+- Preserve visible result type labels:
+  - city / destination
+  - attraction / scenic spot
+  - guide / travel note
+  - hotel or nearby booking entry
+- If global search is noisy, extract only the top bounded results and classify them into:
+  - `cityCandidates`
+  - `poiCandidates`
+  - `guideCandidates`
+- Normalize city candidate fields:
+  - `cityName`
+  - `provinceOrCountry`
+  - `cityId`
+  - `cityUrl`
+  - `sourceUrl`
+- Normalize attraction candidate fields:
+  - `name`
+  - `category`
+  - `cityName`
+  - `rating`
+  - `commentCount`
+  - `price`
+  - `detailUrl`
+  - `sourceUrl`
+- For prompts like “搜索西安城市和景点”, first open global search, then follow the best city result to the city page and the best attraction results to `sight/*` pages only when detail is needed.
+- Do not fabricate city ids from the keyword alone. Use visible links or page URLs as route evidence.
+
 POI/guide URL patterns (from `you.ctrip.com`):
 - City destination page (city-level POI hub):
   - `https://you.ctrip.com/place/{citySlug}{cityId}.html`
@@ -207,6 +310,9 @@ POI/guide URL patterns (from `you.ctrip.com`):
     - `https://you.ctrip.com/place/newyork248.html` -> `cityId=248`
 - How to obtain `cityId` from homepage or search results:
   - if starting from `https://you.ctrip.com/`, first open the city link from the homepage, destination list, or search result
+  - on the homepage, city/destination links may appear only after hovering over a destination selector, city tab, region tile, or hot-destination menu; use `browser_state` to identify likely hover targets, then call `browser_hover` on the target before clicking
+  - after `browser_hover` exposes a city menu, run a bounded `browser_extract` and capture the visible anchor hrefs before navigating; prefer real `/place/*` links over text-only city names
+  - verify the hover/dropdown state with `browser_state` or `browser_extract`; only use `browser_click` after the concrete city link is visible
   - once the city page is open, treat the `/place/*` URL as the primary city-id evidence
   - if multiple internal links are visible, prefer in this order:
     - `/place/{citySlug}{cityId}.html`
@@ -258,9 +364,16 @@ Flight URL template and parameter hit rules:
   - `https://flights.ctrip.com/online/list/oneway-{dep}-{arr}?depdate=YYYY-MM-DD&cabin=y_s_c_f&adult=1&child=0&infant=0`
 - required hit: route segment `oneway-{dep}-{arr}`, `depdate`
 - strongly recommended: `cabin`, `adult`, `child`, `infant`
+- Round-trip list pattern:
+  - `https://flights.ctrip.com/online/list/round-{dep}-{arr}?depdate=YYYY-MM-DD_YYYY-MM-DD&cabin=y_s_c_f&adult=1&child=0&infant=0`
+- round-trip required hit: route segment `round-{dep}-{arr}`, `depdate` with outbound and return dates separated by `_`
+- `cabin` may appear as `Y_S_C_F` or `y_s_c_f`; preserve the case used by the working URL.
+- Ignore or preserve cache-only params such as `_` when already present, but do not treat them as route, passenger, or pricing evidence.
 - Date format: `YYYY-MM-DD`
 - Example:
   - `https://flights.ctrip.com/online/list/oneway-bjs-syx?depdate=2026-05-02&cabin=y_s_c_f&adult=1&child=0&infant=0`
+- Round-trip example observed from form submission:
+  - `https://flights.ctrip.com/online/list/round-sha-bjs?depdate=2026-05-07_2026-05-10&cabin=y_s_c_f&adult=1&child=0&infant=0`
 
 Train URL template and parameter hit rules:
 - Train list pattern:
@@ -268,9 +381,13 @@ Train URL template and parameter hit rules:
 - required hit: `dStation`, `aStation`, `dDate`
 - strongly recommended: `ticketType`, `highSpeedOnly`
 - optional filters: `rDate`, `trainsType`, `hubCityName`
+- `trainsType=gaotie-dongche` means high-speed rail / EMU filtering; preserve it when the user selects or asks for 高铁/动车 only.
+- `rDate` is the return-date slot; keep it empty for one-way train searches unless the user explicitly asks for a return journey.
 - Date format: `YYYY-MM-DD`
 - Example:
   - `https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation=Beijing&aStation=Shanghai&dDate=2026-05-01&highSpeedOnly=0`
+- High-speed/EMU example:
+  - `https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation=%E5%8C%97%E4%BA%AC&aStation=%E4%B8%8A%E6%B5%B7&dDate=2026-05-09&rDate=&trainsType=gaotie-dongche&hubCityName=&highSpeedOnly=0`
 
 Parameter hit checklist (all Ctrip domains):
 1. Keep user-given date format per domain. Flight/train are `YYYY-MM-DD`; hotel links should preserve the format already used by the working Ctrip URL.
@@ -278,6 +395,20 @@ Parameter hit checklist (all Ctrip domains):
 3. Preserve route/city identity in both path and query when both exist.
 4. Preserve non-semantic trace/version params as-is when already present; do not invent new values.
 5. If required params are missing, ask a focused follow-up instead of guessing.
+
+Observed channel and form-entry URLs:
+- Ctrip homepage entry:
+  - `https://www.ctrip.com/`
+- Flight channel entry:
+  - `https://flights.ctrip.com/online/channel/domestic`
+- Train channel entry:
+  - `https://trains.ctrip.com/`
+- Hotel channel/list entry:
+  - `https://hotels.ctrip.com/hotels/list`
+- Travel guide / POI channel entry:
+  - `https://you.ctrip.com/`
+- When using these entry pages, prefer semantic labels, placeholders, aria labels, and current snapshot refs over brittle `nth-of-type` selectors.
+- After typing into city, hotel, search, date, or other autocomplete fields, select a concrete suggestion/dropdown option and verify the selected value before submitting.
 
 ## Extraction Rules
 - Prefer stable selectors or clearly bounded page regions over full-page dumps.

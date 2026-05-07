@@ -70,18 +70,17 @@ export function buildAssistantMessageExportHtml(title: string, bodyHtml: string)
   ].join('');
 }
 
-function inlineMarkdownToText(input: string): string {
+interface WordExportContext {
+  relationships: Array<{ id: string; target: string }>;
+}
+
+function cleanInlineMarkdown(input: string): string {
   return input
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label: string, href: string) => {
-      const trimmed = label.trim();
-      return /^\d+$/.test(trimmed) ? `[${trimmed}] ${href}` : `${trimmed} (${href})`;
-    })
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
     .replace(/__([^_]+)__/g, '$1')
-    .replace(/_([^_]+)_/g, '$1')
-    .trim();
+    .replace(/_([^_]+)_/g, '$1');
 }
 
 function decodeHtmlEntities(input: string): string {
@@ -117,6 +116,30 @@ function htmlToPlainText(input: string): string {
     .trim();
 }
 
+function htmlToMarkdownInline(input: string): string {
+  const parts: string[] = [];
+  const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let cursor = 0;
+  for (const match of input.matchAll(anchorRe)) {
+    const index = match.index ?? 0;
+    const before = htmlToPlainText(input.slice(cursor, index));
+    if (before) parts.push(before);
+    const href = decodeHtmlEntities(match[1] ?? '').trim();
+    const label = htmlToPlainText(match[2] ?? '').trim() || href;
+    parts.push(/^https?:\/\//i.test(href) ? `[${label}](${href})` : label);
+    cursor = index + match[0].length;
+  }
+  const tail = htmlToPlainText(input.slice(cursor));
+  if (tail) parts.push(tail);
+  return parts.join(' ').trim();
+}
+
+function createHyperlinkRelationship(ctx: WordExportContext, href: string): string {
+  const id = `rId${ctx.relationships.length + 1}`;
+  ctx.relationships.push({ id, target: href });
+  return id;
+}
+
 function runXml(text: string, options: { bold?: boolean; size?: number; font?: string } = {}): string {
   const props: string[] = [];
   if (options.bold) props.push('<w:b/>');
@@ -130,15 +153,90 @@ function runXml(text: string, options: { bold?: boolean; size?: number; font?: s
   ].join('');
 }
 
-function paragraphXml(text: string, options: { heading?: number; code?: boolean } = {}): string {
+function hyperlinkXml(label: string, href: string, ctx: WordExportContext): string {
+  const id = createHyperlinkRelationship(ctx, href);
+  return [
+    `<w:hyperlink r:id="${id}" w:history="1">`,
+    '<w:r>',
+    '<w:rPr><w:rStyle w:val="Hyperlink"/><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr>',
+    `<w:t xml:space="preserve">${escapeXml(label)}</w:t>`,
+    '</w:r>',
+    '</w:hyperlink>'
+  ].join('');
+}
+
+function inlineMarkdownXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string } = {}): string {
+  const source = input.trim();
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
+  const bareUrlRe = /https?:\/\/[^\s<]+/g;
+  const parts: string[] = [];
+  let cursor = 0;
+
+  for (const match of source.matchAll(linkRe)) {
+    const index = match.index ?? 0;
+    const before = source.slice(cursor, index);
+    if (before) parts.push(inlineMarkdownBareUrlXml(before, ctx, options, bareUrlRe));
+    const rawLabel = cleanInlineMarkdown(match[1] ?? '').trim() || match[2] || '';
+    const label = /^\d+$/.test(rawLabel) ? `[${rawLabel}]` : rawLabel;
+    const href = match[2] ?? '';
+    parts.push(hyperlinkXml(label, href, ctx));
+    cursor = index + match[0].length;
+  }
+
+  const tail = source.slice(cursor);
+  if (tail) parts.push(inlineMarkdownBareUrlXml(tail, ctx, options, bareUrlRe));
+  return parts.join('') || runXml('', options);
+}
+
+function inlineMarkdownBareUrlXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }, bareUrlRe: RegExp): string {
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const match of input.matchAll(bareUrlRe)) {
+    const index = match.index ?? 0;
+    const before = input.slice(cursor, index);
+    if (before) parts.push(runXml(cleanInlineMarkdown(before), options));
+    const href = (match[0] ?? '').replace(/[),.;:]+$/, '');
+    const trailing = (match[0] ?? '').slice(href.length);
+    parts.push(hyperlinkXml(href, href, ctx));
+    if (trailing) parts.push(runXml(trailing, options));
+    cursor = index + match[0].length;
+  }
+  const tail = input.slice(cursor);
+  if (tail) parts.push(runXml(cleanInlineMarkdown(tail), options));
+  return parts.join('');
+}
+
+function htmlInlineXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string } = {}): string {
+  const parts: string[] = [];
+  const anchorRe = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let cursor = 0;
+  for (const match of input.matchAll(anchorRe)) {
+    const index = match.index ?? 0;
+    const before = htmlToPlainText(input.slice(cursor, index));
+    if (before) parts.push(runXml(before, options));
+    const href = decodeHtmlEntities(match[1] ?? '').trim();
+    const label = htmlToPlainText(match[2] ?? '').trim() || href;
+    if (/^https?:\/\//i.test(href)) parts.push(hyperlinkXml(label, href, ctx));
+    else if (label) parts.push(runXml(label, options));
+    cursor = index + match[0].length;
+  }
+  const tail = htmlToPlainText(input.slice(cursor));
+  if (tail) parts.push(runXml(tail, options));
+  return parts.join('') || runXml('', options);
+}
+
+function paragraphXml(text: string, options: { heading?: number; code?: boolean; ctx?: WordExportContext } = {}): string {
   const size = options.heading ? Math.max(24, 36 - (options.heading - 1) * 3) : undefined;
   const spacing = options.heading ? '<w:spacing w:before="240" w:after="120"/>' : '<w:spacing w:after="120"/>';
   const paragraphProps = `<w:pPr>${spacing}</w:pPr>`;
-  return `<w:p>${paragraphProps}${runXml(text, {
+  const runContent = options.ctx && !options.code
+    ? inlineMarkdownXml(text, options.ctx, { bold: Boolean(options.heading), size })
+    : runXml(text, {
     bold: Boolean(options.heading),
     size,
     font: options.code ? 'Consolas' : undefined
-  })}</w:p>`;
+  });
+  return `<w:p>${paragraphProps}${runContent}</w:p>`;
 }
 
 function looksLikeTableRow(line: string): boolean {
@@ -189,16 +287,16 @@ function splitMarkdownTableCells(line: string): string[] {
   return cells;
 }
 
-function tableCellXml(text: string, options: { header?: boolean; width?: number } = {}): string {
+function tableCellXml(text: string, ctx: WordExportContext, options: { header?: boolean; width?: number } = {}): string {
   return [
     '<w:tc>',
     `<w:tcPr><w:tcW w:w="${options.width ?? 2400}" w:type="dxa"/><w:tcBorders><w:top w:val="single" w:sz="4" w:color="DCE1E8"/><w:left w:val="single" w:sz="4" w:color="DCE1E8"/><w:bottom w:val="single" w:sz="4" w:color="DCE1E8"/><w:right w:val="single" w:sz="4" w:color="DCE1E8"/></w:tcBorders>${options.header ? '<w:shd w:fill="F5F6F8"/>' : ''}</w:tcPr>`,
-    `<w:p><w:pPr><w:spacing w:after="80"/></w:pPr>${runXml(inlineMarkdownToText(text), { bold: options.header })}</w:p>`,
+    `<w:p><w:pPr><w:spacing w:after="80"/></w:pPr>${inlineMarkdownXml(text, ctx, { bold: options.header })}</w:p>`,
     '</w:tc>'
   ].join('');
 }
 
-function tableRowsXml(rows: string[][]): string {
+function tableRowsXml(rows: string[][], ctx: WordExportContext): string {
   const columnCount = Math.max(1, ...rows.map((row) => row.length));
   const cellWidth = Math.max(1200, Math.floor(9360 / columnCount));
   const grid = Array.from({ length: columnCount }, () => `<w:gridCol w:w="${cellWidth}"/>`).join('');
@@ -206,7 +304,7 @@ function tableRowsXml(rows: string[][]): string {
     const padded = [...row, ...Array.from({ length: columnCount - row.length }, () => '')];
     const cells = padded
       .slice(0, columnCount)
-      .map((cell) => tableCellXml(cell, { header: rowIndex === 0, width: cellWidth }))
+      .map((cell) => tableCellXml(cell, ctx, { header: rowIndex === 0, width: cellWidth }))
       .join('');
     return `<w:tr>${cells}</w:tr>`;
   });
@@ -219,11 +317,11 @@ function tableRowsXml(rows: string[][]): string {
   ].join('');
 }
 
-function tableXml(tableLines: string[]): string {
+function tableXml(tableLines: string[], ctx: WordExportContext): string {
   const rows = tableLines
     .filter((line, index) => index !== 1 || !isTableSeparator(line))
     .map((line) => splitMarkdownTableCells(line));
-  return tableRowsXml(rows);
+  return tableRowsXml(rows, ctx);
 }
 
 function htmlTableToRows(tableHtml: string): string[][] {
@@ -232,50 +330,51 @@ function htmlTableToRows(tableHtml: string): string[][] {
     const rowHtml = rowMatch[1] ?? '';
     const cells: string[] = [];
     for (const cellMatch of rowHtml.matchAll(/<t[hd]\b[^>]*>([\s\S]*?)<\/t[hd]>/gi)) {
-      cells.push(htmlToPlainText(cellMatch[1] ?? ''));
+      cells.push(htmlToMarkdownInline(cellMatch[1] ?? ''));
     }
     if (cells.some((cell) => cell.trim())) rows.push(cells);
   }
   return rows;
 }
 
-function htmlSegmentToWordBlocks(html: string): string[] {
+function htmlSegmentToWordBlocks(html: string, ctx: WordExportContext): string[] {
   const blocks: string[] = [];
   for (const match of html.matchAll(/<(h[1-6]|p|li|blockquote|pre)\b[^>]*>([\s\S]*?)<\/\1>/gi)) {
     const tag = (match[1] ?? '').toLowerCase();
-    const text = htmlToPlainText(match[2] ?? '');
+    const rawBody = match[2] ?? '';
+    const text = htmlToPlainText(rawBody);
     if (!text) continue;
     if (/^h[1-6]$/.test(tag)) {
-      blocks.push(paragraphXml(text, { heading: Number(tag.slice(1)) }));
+      blocks.push(paragraphXml(text, { heading: Number(tag.slice(1)), ctx }));
     } else if (tag === 'li') {
-      blocks.push(paragraphXml(`- ${text}`));
+      blocks.push(`<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>${runXml('- ')}${htmlInlineXml(rawBody, ctx)}</w:p>`);
     } else if (tag === 'blockquote') {
-      blocks.push(paragraphXml(`> ${text}`));
+      blocks.push(`<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>${runXml('> ')}${htmlInlineXml(rawBody, ctx)}</w:p>`);
     } else if (tag === 'pre') {
       for (const line of text.split('\n')) blocks.push(paragraphXml(line, { code: true }));
     } else {
-      blocks.push(paragraphXml(text));
+      blocks.push(`<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>${htmlInlineXml(rawBody, ctx)}</w:p>`);
     }
   }
   return blocks;
 }
 
-function htmlToWordBlocks(html: string): string[] {
+function htmlToWordBlocks(html: string, ctx: WordExportContext): string[] {
   const blocks: string[] = [];
   const tableRe = /<table\b[^>]*>[\s\S]*?<\/table>/gi;
   let cursor = 0;
   for (const match of html.matchAll(tableRe)) {
     const index = match.index ?? 0;
-    blocks.push(...htmlSegmentToWordBlocks(html.slice(cursor, index)));
+    blocks.push(...htmlSegmentToWordBlocks(html.slice(cursor, index), ctx));
     const rows = htmlTableToRows(match[0]);
-    if (rows.length > 0) blocks.push(tableRowsXml(rows));
+    if (rows.length > 0) blocks.push(tableRowsXml(rows, ctx));
     cursor = index + match[0].length;
   }
-  blocks.push(...htmlSegmentToWordBlocks(html.slice(cursor)));
+  blocks.push(...htmlSegmentToWordBlocks(html.slice(cursor), ctx));
   return blocks;
 }
 
-function markdownToWordBlocks(markdown: string): string[] {
+function markdownToWordBlocks(markdown: string, ctx: WordExportContext): string[] {
   const normalized = markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = normalized.split('\n');
   const blocks: string[] = [];
@@ -306,47 +405,54 @@ function markdownToWordBlocks(markdown: string): string[] {
         index += 1;
       }
       index -= 1;
-      blocks.push(tableXml(tableLines));
+      blocks.push(tableXml(tableLines, ctx));
       continue;
     }
     if (/^#{1,6}\s+/.test(trimmed)) {
       const level = Math.min(trimmed.match(/^#+/)?.[0].length ?? 1, 6);
-      blocks.push(paragraphXml(inlineMarkdownToText(trimmed.replace(/^#{1,6}\s+/, '')), { heading: level }));
+      blocks.push(paragraphXml(trimmed.replace(/^#{1,6}\s+/, ''), { heading: level, ctx }));
       continue;
     }
     if (/^[-*]\s+/.test(trimmed)) {
-      blocks.push(paragraphXml(`- ${inlineMarkdownToText(trimmed.replace(/^[-*]\s+/, ''))}`));
+      blocks.push(paragraphXml(`- ${trimmed.replace(/^[-*]\s+/, '')}`, { ctx }));
       continue;
     }
     if (/^\d+\.\s+/.test(trimmed)) {
-      blocks.push(paragraphXml(inlineMarkdownToText(trimmed)));
+      blocks.push(paragraphXml(trimmed, { ctx }));
       continue;
     }
     if (trimmed.startsWith('>')) {
-      blocks.push(paragraphXml(`> ${inlineMarkdownToText(trimmed.replace(/^>\s?/, ''))}`));
+      blocks.push(paragraphXml(`> ${trimmed.replace(/^>\s?/, '')}`, { ctx }));
       continue;
     }
     if (/^\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|$/.test(trimmed)) {
       continue;
     }
-    blocks.push(paragraphXml(inlineMarkdownToText(line)));
+    blocks.push(paragraphXml(line, { ctx }));
   }
   return blocks.length > 0 ? blocks : [paragraphXml('(empty reply)')];
 }
 
 export async function buildAssistantMessageDocx(title: string, markdown: string, html?: string): Promise<Buffer> {
   const zip = new JSZip();
-  const htmlBlocks = html?.trim() ? htmlToWordBlocks(html) : [];
-  const contentBlocks = htmlBlocks.length > 0 ? htmlBlocks : markdownToWordBlocks(markdown);
+  const ctx: WordExportContext = { relationships: [] };
+  const htmlBlocks = html?.trim() ? htmlToWordBlocks(html, ctx) : [];
+  const contentBlocks = htmlBlocks.length > 0 ? htmlBlocks : markdownToWordBlocks(markdown, ctx);
   const documentXml = [
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
     '<w:body>',
     paragraphXml(title, { heading: 1 }),
     ...contentBlocks,
     '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>',
     '</w:body>',
     '</w:document>'
+  ].join('');
+  const documentRelsXml = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ...ctx.relationships.map((rel) => `<Relationship Id="${rel.id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXml(rel.target)}" TargetMode="External"/>`),
+    '</Relationships>'
   ].join('');
 
   zip.file(
@@ -358,5 +464,6 @@ export async function buildAssistantMessageDocx(title: string, markdown: string,
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>'
   );
   zip.file('word/document.xml', documentXml);
+  zip.file('word/_rels/document.xml.rels', documentRelsXml);
   return zip.generateAsync({ type: 'nodebuffer' });
 }

@@ -14,10 +14,13 @@ describe('message export helpers', () => {
     const docx = await buildAssistantMessageDocx('Answer', '# Heading\n\nClaim[1](https://example.com/source)\n\n- Item');
     const zip = await JSZip.loadAsync(docx);
     const documentXml = await zip.file('word/document.xml')?.async('string');
+    const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string');
 
     expect(zip.file('[Content_Types].xml')).toBeTruthy();
     expect(documentXml).toContain('Heading');
-    expect(documentXml).toContain('[1] https://example.com/source');
+    expect(documentXml).toContain('<w:hyperlink');
+    expect(documentXml).toContain('[1]');
+    expect(relsXml).toContain('https://example.com/source');
     expect(documentXml).toContain('- Item');
   });
 
@@ -63,6 +66,23 @@ describe('message export helpers', () => {
     expect(documentXml).toContain('42');
     expect(documentXml).toContain('After table');
     expect(documentXml).not.toContain('fallback text');
+  });
+
+  it('exports markdown and html links as clickable Word hyperlinks', async () => {
+    const html = [
+      '<p>Open <a href="https://example.com/day1">Day 1 map</a></p>',
+      '<table><tbody><tr><td><a href="https://example.com/hotel">Hotel</a></td></tr></tbody></table>'
+    ].join('');
+    const docx = await buildAssistantMessageDocx('Answer', '[fallback](https://example.com/fallback)', html);
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string');
+    const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string');
+
+    expect(documentXml).toContain('<w:hyperlink');
+    expect(documentXml).toContain('Day 1 map');
+    expect(documentXml).toContain('Hotel');
+    expect(relsXml).toContain('https://example.com/day1');
+    expect(relsXml).toContain('https://example.com/hotel');
   });
 
   it('sanitizes export filenames', () => {
