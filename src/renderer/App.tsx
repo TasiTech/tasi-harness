@@ -18,6 +18,7 @@ import type {
   SessionSummary,
   SkillDocument,
   SkillMetadata,
+  ToolApprovalRequest,
   ToolEvent
 } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
@@ -47,6 +48,12 @@ const defaultConfig: PublicAppConfig = {
   workspaceDir: '',
   allowShellTools: false,
   enableNetworkTools: false,
+  safetyApproval: {
+    enabled: true,
+    approveRiskyTerminalCommands: true,
+    timeoutMs: 60000,
+    neverAskAgainKeys: []
+  },
   browserMode: 'embedded',
   externalBrowserEngine: 'auto',
   externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
@@ -345,6 +352,7 @@ export function App(): ReactElement {
   const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
   const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const [approvalRequest, setApprovalRequest] = useState<ToolApprovalRequest | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatStopping, setChatStopping] = useState(false);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
@@ -433,6 +441,22 @@ export function App(): ReactElement {
     });
     return off;
   }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
+
+  useEffect(() => {
+    const off = window.tasiHarness.security.onToolApprovalRequest((request) => {
+      setApprovalRequest(request);
+    });
+    return off;
+  }, []);
+
+  async function resolveApproval(request: ToolApprovalRequest, approved: boolean, neverAskAgain = false): Promise<void> {
+    setApprovalRequest((current) => (current?.id === request.id ? null : current));
+    await window.tasiHarness.security.resolveToolApproval({ id: request.id, approved, neverAskAgain });
+    if (approved && neverAskAgain) {
+      const next = await window.tasiHarness.config.get();
+      setConfig(next);
+    }
+  }
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -534,6 +558,65 @@ export function App(): ReactElement {
         {page === 'settings' && <SettingsPage tr={tr} config={config} setConfig={setConfig} />}
         {page === 'about' && <AboutPage tr={tr} info={info} />}
       </main>
+      {approvalRequest && (
+        <ToolApprovalModal
+          tr={tr}
+          request={approvalRequest}
+          onApprove={() => void resolveApproval(approvalRequest, true)}
+          onApproveNever={() => void resolveApproval(approvalRequest, true, true)}
+          onDeny={() => void resolveApproval(approvalRequest, false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ToolApprovalModal(props: { tr: TranslateFn; request: ToolApprovalRequest; onApprove: () => void; onApproveNever: () => void; onDeny: () => void }): ReactElement {
+  const [remainingMs, setRemainingMs] = useState(props.request.timeoutMs);
+  useEffect(() => {
+    setRemainingMs(props.request.timeoutMs);
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      const next = Math.max(0, props.request.timeoutMs - (Date.now() - started));
+      setRemainingMs(next);
+      if (next <= 0) {
+        window.clearInterval(timer);
+        props.onDeny();
+      }
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [props.request]);
+  const riskLabel = props.request.risk === 'workspace-delete'
+    ? props.tr('Workspace delete', '工作区删除')
+    : props.request.risk === 'outside-read'
+      ? props.tr('Outside read', '工作区外读取')
+      : props.request.risk === 'outside-write'
+        ? props.tr('Outside write', '工作区外写入')
+        : props.request.risk === 'outside-delete'
+          ? props.tr('Outside delete', '工作区外删除')
+          : props.tr('Risky command', '风险命令');
+  return (
+    <div className="modal-backdrop approval-backdrop" onClick={props.onDeny}>
+      <div className="modal-card approval-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h2>{props.tr('Approval Required', '需要审批')}</h2>
+            <div className="card-subtle">{props.tr('Review this action before Tasi Harness continues.', '请在继续前确认此操作。')}</div>
+          </div>
+          <span className="soft-badge">{riskLabel}</span>
+        </div>
+        <div className="approval-summary">{props.request.summary}</div>
+        <div className="meta-row wrap">
+          <span className="soft-badge">{props.tr('Tool', '工具')} {props.request.toolName}</span>
+          <span className="soft-badge">{props.tr('Timeout', '超时')} {Math.ceil(remainingMs / 1000)}s</span>
+        </div>
+        <pre className="code-block small approval-args">{JSON.stringify(props.request.args, null, 2)}</pre>
+        <div className="button-row modal-actions">
+          <button className="ghost-button" onClick={props.onDeny}>{props.tr('Deny', '拒绝')}</button>
+          <button className="ghost-button" onClick={props.onApproveNever}>{props.tr('Allow and do not ask again', '允许且不再需要审批')}</button>
+          <button className="primary-button" onClick={props.onApprove}>{props.tr('Allow once', '允许一次')}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3422,6 +3505,52 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <h2>{tr('Security', '安全')}</h2>
           <label className="toggle-line"><input type="checkbox" checked={draft.allowShellTools} onChange={(e) => setDraft((old) => ({ ...old, allowShellTools: e.target.checked }))} /> {tr('Enable terminal tool', '启用终端工具')}</label>
           <label className="toggle-line"><input type="checkbox" checked={draft.enableNetworkTools} onChange={(e) => setDraft((old) => ({ ...old, enableNetworkTools: e.target.checked }))} /> {tr('Enable network tools', '启用网络工具')}</label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.safetyApproval.enabled}
+              onChange={(e) => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, enabled: e.target.checked } }))}
+            />
+            {tr('Enable safety approval', '启用安全审批')}
+          </label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.safetyApproval.approveRiskyTerminalCommands}
+              onChange={(e) => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, approveRiskyTerminalCommands: e.target.checked } }))}
+            />
+            {tr('Approve risky terminal commands', '风险终端命令需要审批')}
+          </label>
+          <label>{tr('Approval timeout seconds', '审批超时秒数')}</label>
+          <input
+            type="number"
+            min="5"
+            max="300"
+            value={Math.round(draft.safetyApproval.timeoutMs / 1000)}
+            onChange={(e) => setDraft((old) => ({
+              ...old,
+              safetyApproval: {
+                ...old.safetyApproval,
+                timeoutMs: Math.max(5, Math.min(300, Number(e.target.value) || 60)) * 1000
+              }
+            }))}
+          />
+          <div className="card-subtle">
+            {tr(
+              'Rules: workspace deletes require approval; outside-workspace reads, writes, and deletes require approval; low-risk terminal commands do not.',
+              '规则：工作区内仅删除需要审批；工作区外读取、写入、删除需要审批；低风险终端命令不需要审批。'
+            )}
+          </div>
+          <div className="button-row">
+            <button
+              className="ghost-button"
+              onClick={() => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, neverAskAgainKeys: [] } }))}
+              disabled={draft.safetyApproval.neverAskAgainKeys.length === 0}
+            >
+              {tr('Clear remembered approvals', '清空不再审批记录')}
+            </button>
+            <span className="soft-badge">{tr('Remembered', '已记住')} {draft.safetyApproval.neverAskAgainKeys.length}</span>
+          </div>
         </div>
       )}
       {subPage === 'channels' && (

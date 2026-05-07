@@ -23,6 +23,12 @@ export function defaultConfig(): AppConfig {
     workspaceDir: join(DEFAULT_HOME, 'workspace'),
     allowShellTools: false,
     enableNetworkTools: false,
+    safetyApproval: {
+      enabled: true,
+      approveRiskyTerminalCommands: true,
+      timeoutMs: 60000,
+      neverAskAgainKeys: []
+    },
     browserMode: 'external',
     externalBrowserEngine: 'auto',
     externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
@@ -70,6 +76,7 @@ export function defaultConfig(): AppConfig {
       'file_list',
       'file_read',
       'file_write',
+      'file_delete',
       'browser_open',
       'browser_state',
       'browser_click',

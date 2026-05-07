@@ -1196,6 +1196,23 @@ progress::-webkit-progress-value { background: var(--accent); }
   justify-content: flex-end;
   margin-top: 14px;
 }
+.approval-modal {
+  width: min(720px, 94vw);
+}
+.approval-summary {
+  margin-top: 14px;
+  padding: 13px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 176, 32, 0.34);
+  background: rgba(255, 176, 32, 0.08);
+  color: var(--text-primary);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.approval-args {
+  margin-top: 12px;
+}
 .modal-note, .modal-error { margin-top: 12px; }
 .modal-error {
   margin-left: 0;

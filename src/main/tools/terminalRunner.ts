@@ -13,6 +13,40 @@ const DANGEROUS_PATTERNS = [
   /format\s+[a-z]:/i
 ];
 
+const RISKY_PATTERNS = [
+  /\brm\b/i,
+  /\bdel(?:ete)?\b/i,
+  /\berase\b/i,
+  /\brmdir\b/i,
+  /\bRemove-Item\b/i,
+  /\bmv\b|\bmove\b|\bMove-Item\b/i,
+  /\bcp\b|\bcopy\b|\bCopy-Item\b/i,
+  /\bSet-Content\b|\bAdd-Content\b|\bOut-File\b|>>|>/i,
+  /\bchmod\b|\bchown\b|\bicacls\b/i,
+  /\bsudo\b|\brunas\b/i,
+  /\breg(?:\.exe)?\b|\bSet-ItemProperty\b|\bNew-ItemProperty\b/i,
+  /\bgit\s+(?:clean|reset)\b/i,
+  /\b(?:npm|pnpm|yarn|pip|uv|cargo|gem|go)\s+(?:install|add|remove|uninstall)\b/i
+];
+
+export interface TerminalCommandSafety {
+  blocked: boolean;
+  requiresApproval: boolean;
+  reason: string;
+}
+
+export function classifyTerminalCommandSafety(command: string): TerminalCommandSafety {
+  const trimmed = command.trim();
+  if (!trimmed) return { blocked: false, requiresApproval: false, reason: 'empty' };
+  if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return { blocked: true, requiresApproval: false, reason: 'Blocked dangerous command pattern.' };
+  }
+  if (RISKY_PATTERNS.some((pattern) => pattern.test(trimmed))) {
+    return { blocked: false, requiresApproval: true, reason: 'Command may modify files, permissions, packages, or system settings.' };
+  }
+  return { blocked: false, requiresApproval: false, reason: 'Command appears read-only or low-risk.' };
+}
+
 export interface TerminalRunOptions {
   command: string;
   cwd: string;
@@ -29,7 +63,7 @@ export async function runTerminalCommand(options: TerminalRunOptions): Promise<T
       content: 'Terminal tool is disabled. Enable allowShellTools in Settings before running shell commands.'
     };
   }
-  if (DANGEROUS_PATTERNS.some((pattern) => pattern.test(command))) {
+  if (classifyTerminalCommandSafety(command).blocked) {
     return { ok: false, content: 'Blocked dangerous command pattern.' };
   }
 

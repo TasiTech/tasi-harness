@@ -20,6 +20,8 @@ import type {
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   ToolRunRequest
@@ -43,6 +45,15 @@ const api = {
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }
+  },
+  security: {
+    onToolApprovalRequest: (listener: (payload: ToolApprovalRequest) => void) => {
+      const channel = 'tool-approval:request';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: ToolApprovalRequest) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    },
+    resolveToolApproval: (decision: ToolApprovalDecision) => ipcRenderer.invoke('tool-approval:decision', decision) as Promise<ToolApprovalDecision>
   },
   sessions: {
     list: () => ipcRenderer.invoke('sessions:list'),

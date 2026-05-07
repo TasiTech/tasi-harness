@@ -32,6 +32,8 @@ import type {
   SkillDocument,
   SkillMetadata,
   SkillPatchRequest,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   SkillWriteRequest,
@@ -54,6 +56,10 @@ declare global {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
+      };
+      security: {
+        onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;
+        resolveToolApproval(decision: ToolApprovalDecision): Promise<ToolApprovalDecision>;
       };
       sessions: {
         list(): Promise<SessionSummary[]>;

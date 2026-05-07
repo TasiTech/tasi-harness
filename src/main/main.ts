@@ -15,6 +15,8 @@ import type {
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   ToolEvent,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   ToolExecutionResult,
   MemoryQueryOptions,
   PersonalKnowledgeUploadRequest,
@@ -54,6 +56,12 @@ const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf', '.ofd']);
+const pendingToolApprovals = new Map<string, {
+  senderId: number;
+  request: ToolApprovalRequest;
+  resolve: (decision: ToolApprovalDecision) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}>();
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -67,6 +75,48 @@ function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
     if (win.isDestroyed()) continue;
     win.webContents.send('agent:tool-event', payload);
   }
+}
+
+function rememberToolApproval(key: string): void {
+  const cfg = context.getConfig();
+  if (cfg.safetyApproval.neverAskAgainKeys.includes(key)) return;
+  context.configStore.update({
+    safetyApproval: {
+      ...cfg.safetyApproval,
+      neverAskAgainKeys: [...cfg.safetyApproval.neverAskAgainKeys, key]
+    }
+  });
+}
+
+function requestInteractiveToolApproval(sender: WebContents, request: ToolApprovalRequest): Promise<ToolApprovalDecision> {
+  if (sender.isDestroyed()) return Promise.resolve({ id: request.id, approved: false });
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      pendingToolApprovals.delete(request.id);
+      resolve({ id: request.id, approved: false });
+    }, request.timeoutMs);
+    pendingToolApprovals.set(request.id, { senderId: sender.id, request, resolve, timeout });
+    sender.send('tool-approval:request', request);
+  });
+}
+
+function resolveToolApproval(senderId: number, decision: ToolApprovalDecision): ToolApprovalDecision {
+  const pending = pendingToolApprovals.get(decision.id);
+  if (!pending || pending.senderId !== senderId) return { id: decision.id, approved: false };
+  clearTimeout(pending.timeout);
+  pendingToolApprovals.delete(decision.id);
+  const normalized = { id: decision.id, approved: decision.approved === true, neverAskAgain: decision.neverAskAgain === true };
+  if (normalized.approved && normalized.neverAskAgain) rememberToolApproval(pending.request.key);
+  pending.resolve(normalized);
+  return normalized;
+}
+
+function denyPendingToolApprovals(): void {
+  for (const [id, pending] of pendingToolApprovals) {
+    clearTimeout(pending.timeout);
+    pending.resolve({ id, approved: false });
+  }
+  pendingToolApprovals.clear();
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -1056,6 +1106,10 @@ function registerIpc(): void {
     }
   });
 
+  ipcMain.handle('tool-approval:decision', (_event, decision: ToolApprovalDecision) => {
+    return resolveToolApproval(_event.sender.id, decision);
+  });
+
   ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
     if (!input || !input.trim()) throw new Error('Message cannot be empty.');
     const senderId = _event.sender.id;
@@ -1070,6 +1124,7 @@ function registerIpc(): void {
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
         origin: 'chat',
         signal: controller.signal,
+        requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
           _event.sender.send('agent:tool-event', payload);
@@ -1315,7 +1370,9 @@ function registerIpc(): void {
     const result = await context.toolRegistry.execute(req.name, req.args, {
       sessionId: req.sessionId || 'manual',
       workspaceDir: req.executionMode === 'sandbox' ? context.sandboxManager.prepare('sandbox', cfg.workspaceDir, createId('manual-run')).workspaceDir : cfg.workspaceDir,
-      requestId: createId('manual')
+      requestId: createId('manual'),
+      safetyApproval: context.getConfig().safetyApproval,
+      requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request)
     });
     await maybeOpenExternalBrowser(latestWebPreviewUrlFromSource(req.name, req.args, result.content, true));
     return result;
@@ -1371,6 +1428,7 @@ function registerIpc(): void {
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  denyPendingToolApprovals();
   browserCoachRecorder.close();
   for (const controller of activeChatControllers.values()) controller.abort();
   activeChatControllers.clear();

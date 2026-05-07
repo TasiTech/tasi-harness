@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import type { AppConfig, MemoryMutationOptions, RegisteredTool, ToolExecutionContext, ToolExecutionResult } from '../../shared/types.js';
 import { createId } from '../../shared/types.js';
@@ -7,7 +7,7 @@ import type { SessionStore } from '../storage/sessionStore.js';
 import { safeJoin } from '../storage/pathUtils.js';
 import type { SkillManager } from '../skills/skillManager.js';
 import type { BrowserAutomation, BrowserBinaryResult, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
-import { booleanArg, objectArgs, stringArg } from './toolRegistry.js';
+import { booleanArg, isPathInside, objectArgs, resolveToolPath, stringArg } from './toolRegistry.js';
 import { runTerminalCommand } from './terminalRunner.js';
 
 export interface BuiltinToolDeps {
@@ -26,12 +26,6 @@ function numberArg(args: Record<string, unknown>, name: string, fallback: number
 
 function normalizePathSlashes(input: string): string {
   return input.replace(/\\/g, '/');
-}
-
-function isPathInside(root: string, target: string): boolean {
-  const normalizedRoot = normalizePathSlashes(resolve(root)).replace(/\/+$/, '');
-  const normalizedTarget = normalizePathSlashes(resolve(target));
-  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`);
 }
 
 function extractReferencedMarkdownPaths(markdown: string): string[] {
@@ -326,7 +320,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'file_list',
-        description: 'List files inside the configured workspace directory.',
+        description: 'List files in a directory. Relative paths resolve inside the workspace; outside-workspace paths require approval.',
         parameters: {
           type: 'object',
           properties: { path: { type: 'string', description: 'Relative workspace path.' } }
@@ -335,12 +329,18 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     },
     async execute(args) {
       const cfg = deps.getConfig();
-      const target = safeJoin(cfg.workspaceDir, stringArg(objectArgs(args), 'path', '.'));
+      const target = resolveToolPath(cfg.workspaceDir, stringArg(objectArgs(args), 'path', '.'));
       if (!existsSync(target)) return { ok: false, content: 'Path not found.' };
+      if (!statSync(target).isDirectory()) return { ok: false, content: 'Path is not a directory.' };
       const items = readdirSync(target).map((name) => {
         const file = join(target, name);
         const stat = statSync(file);
-        return { name, path: relative(cfg.workspaceDir, file), type: stat.isDirectory() ? 'directory' : 'file', size: stat.size };
+        return {
+          name,
+          path: isPathInside(cfg.workspaceDir, file) ? relative(cfg.workspaceDir, file) : file,
+          type: stat.isDirectory() ? 'directory' : 'file',
+          size: stat.size
+        };
       });
       return { ok: true, content: JSON.stringify(items, null, 2), data: items };
     }
@@ -352,17 +352,17 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'file_read',
-        description: 'Read a UTF-8 text file inside the configured workspace directory.',
+        description: 'Read a UTF-8 text file. Relative paths resolve inside the workspace; outside-workspace paths require approval.',
         parameters: {
           type: 'object',
-          properties: { path: { type: 'string', description: 'Relative workspace file path.' } },
+          properties: { path: { type: 'string', description: 'Workspace-relative or absolute file path.' } },
           required: ['path']
         }
       }
     },
     async execute(args) {
       const cfg = deps.getConfig();
-      const target = safeJoin(cfg.workspaceDir, stringArg(objectArgs(args), 'path'));
+      const target = resolveToolPath(cfg.workspaceDir, stringArg(objectArgs(args), 'path'));
       if (!existsSync(target)) return { ok: false, content: 'File not found.' };
       if (statSync(target).isDirectory()) return { ok: false, content: 'Path is a directory.' };
       return { ok: true, content: readFileSync(target, 'utf8') };
@@ -375,11 +375,11 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'file_write',
-        description: 'Write a UTF-8 text file inside the configured workspace directory. Creates parent directories.',
+        description: 'Write a UTF-8 text file. Relative paths resolve inside the workspace; outside-workspace paths require approval.',
         parameters: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'Relative workspace file path.' },
+            path: { type: 'string', description: 'Workspace-relative or absolute file path.' },
             content: { type: 'string', description: 'File content.' }
           },
           required: ['path', 'content']
@@ -389,10 +389,52 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     async execute(args) {
       const cfg = deps.getConfig();
       const obj = objectArgs(args);
-      const target = safeJoin(cfg.workspaceDir, stringArg(obj, 'path'));
+      const target = resolveToolPath(cfg.workspaceDir, stringArg(obj, 'path'));
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, stringArg(obj, 'content'), 'utf8');
-      return { ok: true, content: `Wrote ${relative(cfg.workspaceDir, target)}.` };
+      return { ok: true, content: `Wrote ${isPathInside(cfg.workspaceDir, target) ? relative(cfg.workspaceDir, target) : target}.` };
+    }
+  };
+
+  const fileDelete: RegisteredTool = {
+    safety: 'writes-workspace',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'file_delete',
+        description: 'Delete a file or directory. Workspace deletes and all outside-workspace deletes require approval. Directories require recursive=true.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Workspace-relative or absolute path to delete.' },
+            recursive: { type: 'boolean', description: 'Required when deleting a directory.' },
+            permanent: { type: 'boolean', description: 'Permanently remove instead of moving workspace files to .tasi-trash.' }
+          },
+          required: ['path']
+        }
+      }
+    },
+    async execute(args) {
+      const cfg = deps.getConfig();
+      const obj = objectArgs(args);
+      const target = resolveToolPath(cfg.workspaceDir, stringArg(obj, 'path'));
+      if (target === resolveToolPath(cfg.workspaceDir, '.')) return { ok: false, content: 'Refusing to delete the workspace root.' };
+      if (!existsSync(target)) return { ok: false, content: 'Path not found.' };
+      const stat = statSync(target);
+      if (stat.isDirectory() && !booleanArg(obj, 'recursive', false)) {
+        return { ok: false, content: 'Path is a directory. Set recursive=true to delete it.' };
+      }
+      const inside = isPathInside(cfg.workspaceDir, target);
+      const label = inside ? relative(cfg.workspaceDir, target) : target;
+      if (inside && !booleanArg(obj, 'permanent', false)) {
+        const trashName = `${label.replace(/[\\/:"*?<>|]+/g, '__')}.${Date.now()}`;
+        const trashPath = safeJoin(cfg.workspaceDir, join('.tasi-trash', trashName));
+        mkdirSync(dirname(trashPath), { recursive: true });
+        renameSync(target, trashPath);
+        return { ok: true, content: `Moved ${label} to .tasi-trash/${trashName}.` };
+      }
+      rmSync(target, { recursive: stat.isDirectory(), force: false });
+      return { ok: true, content: `Deleted ${label}.` };
     }
   };
 
@@ -1190,6 +1232,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     fileList,
     fileRead,
     fileWrite,
+    fileDelete,
     browserOpen,
     browserState,
     browserClick,

@@ -22,6 +22,15 @@ export class ConfigStore {
     merged.maxIterations = Math.max(1, Math.min(100, Number(merged.maxIterations) || defaults.maxIterations));
     merged.sessionDocumentMaxDocs = Math.max(1, Math.min(100, Number(merged.sessionDocumentMaxDocs) || defaults.sessionDocumentMaxDocs));
     if (!merged.workspaceDir) merged.workspaceDir = defaults.workspaceDir;
+    const approval = merged.safetyApproval ?? defaults.safetyApproval;
+    merged.safetyApproval = {
+      enabled: approval.enabled !== false,
+      approveRiskyTerminalCommands: approval.approveRiskyTerminalCommands !== false,
+      timeoutMs: Math.max(5000, Math.min(300000, Number(approval.timeoutMs) || defaults.safetyApproval.timeoutMs)),
+      neverAskAgainKeys: Array.isArray(approval.neverAskAgainKeys)
+        ? [...new Set(approval.neverAskAgainKeys.filter((key): key is string => typeof key === 'string' && key.trim().length > 0))]
+        : []
+    };
     merged.defaultExecutionMode = merged.defaultExecutionMode === 'sandbox' ? 'sandbox' : 'workspace';
     merged.browserMode = merged.browserMode === 'external' ? 'external' : 'embedded';
     merged.externalBrowserEngine =
@@ -70,6 +79,11 @@ export class ConfigStore {
       ...current,
       ...partial,
       enabledToolNames: partial.enabledToolNames ?? current.enabledToolNames,
+      safetyApproval: {
+        ...current.safetyApproval,
+        ...(partial.safetyApproval ?? {}),
+        neverAskAgainKeys: partial.safetyApproval?.neverAskAgainKeys ?? current.safetyApproval.neverAskAgainKeys
+      },
       skillMarketSources: partial.skillMarketSources ?? current.skillMarketSources,
       emailNotifications: {
         ...current.emailNotifications,

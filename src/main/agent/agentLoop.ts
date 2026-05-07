@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
@@ -16,6 +16,7 @@ function parseToolArgs(raw: string): unknown {
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
+  requestToolApproval?: ToolApprovalRequester;
   signal?: AbortSignal;
 }
 
@@ -90,7 +91,9 @@ export class AgentLoop {
           const result = await this.deps.toolRegistry.execute(call.function.name, args, {
             sessionId: session.id,
             workspaceDir: execution.workspaceDir,
-            requestId: call.id
+            requestId: call.id,
+            safetyApproval: this.deps.getConfig().safetyApproval,
+            requestToolApproval: options.requestToolApproval
           });
           throwIfAborted(options.signal);
           const event: ToolEvent = {
@@ -99,6 +102,7 @@ export class AgentLoop {
             args,
             ok: result.ok,
             content: result.content,
+            approval: result.approval,
             createdAt: nowIso()
           };
           toolEvents.push(event);

@@ -61,12 +61,15 @@ export interface ToolExecutionContext {
   sessionId: string;
   workspaceDir: string;
   requestId: string;
+  safetyApproval?: SafetyApprovalSettings;
+  requestToolApproval?: ToolApprovalRequester;
 }
 
 export interface ToolExecutionResult {
   ok: boolean;
   content: string;
   data?: unknown;
+  approval?: ToolApprovalRecord;
 }
 
 export type ToolExecutor = (args: unknown, context: ToolExecutionContext) => Promise<ToolExecutionResult>;
@@ -76,6 +79,49 @@ export interface RegisteredTool {
   execute: ToolExecutor;
   safety: 'read-only' | 'writes-workspace' | 'executes-command' | 'network' | 'stateful';
 }
+
+export type ToolSafety = RegisteredTool['safety'];
+export type ToolApprovalRisk = 'workspace-delete' | 'outside-read' | 'outside-write' | 'outside-delete' | 'terminal-risk';
+export type ToolApprovalStatus = 'not_required' | 'approved' | 'denied' | 'unavailable' | 'remembered' | 'blocked';
+
+export interface SafetyApprovalSettings {
+  enabled: boolean;
+  approveRiskyTerminalCommands: boolean;
+  timeoutMs: number;
+  neverAskAgainKeys: string[];
+}
+
+export interface ToolApprovalRequest {
+  id: string;
+  key: string;
+  toolName: string;
+  safety: ToolSafety;
+  risk: ToolApprovalRisk;
+  summary: string;
+  args: unknown;
+  workspaceDir: string;
+  sessionId: string;
+  requestId: string;
+  createdAt: string;
+  timeoutMs: number;
+  allowNeverAskAgain: boolean;
+}
+
+export interface ToolApprovalDecision {
+  id: string;
+  approved: boolean;
+  neverAskAgain?: boolean;
+}
+
+export interface ToolApprovalRecord {
+  status: ToolApprovalStatus;
+  key?: string;
+  risk?: ToolApprovalRisk;
+  summary?: string;
+  requestId?: string;
+}
+
+export type ToolApprovalRequester = (request: ToolApprovalRequest) => Promise<ToolApprovalDecision>;
 
 export interface LlmUsage {
   promptTokens?: number;
@@ -108,6 +154,7 @@ export interface AppConfig {
   workspaceDir: string;
   allowShellTools: boolean;
   enableNetworkTools: boolean;
+  safetyApproval: SafetyApprovalSettings;
   browserMode: BrowserMode;
   externalBrowserEngine: ExternalBrowserEngine;
   externalBrowserCdpEndpoint: string;
@@ -274,6 +321,7 @@ export interface ToolEvent {
   args: unknown;
   ok: boolean;
   content: string;
+  approval?: ToolApprovalRecord;
   createdAt: string;
 }
 
