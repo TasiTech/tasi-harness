@@ -1,4 +1,7 @@
+import { normalizeCitationHref } from './citations.js';
+
 const BARE_HTTP_URL_RE = /(^|[\s(>])((https?:\/\/[^\s<)]+))/gi;
+const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)\n]+)\)/g;
 
 function restoreFlattenedTableLine(line: string): string {
   const pipeCount = (line.match(/\|/g) ?? []).length;
@@ -82,15 +85,17 @@ function escapeHtml(text: string): string {
 }
 
 function renderMarkdownLink(label: string, href: string): string {
+  const normalizedHref = /^https?:\/\//i.test(href) ? normalizeCitationHref(href) : href.trim();
+  const escapedHref = escapeHtml(normalizedHref);
   if (/^\d+$/.test(label.trim())) {
-    return `<a class="msg-cite" href="${href}" target="_blank" rel="noreferrer" title="${href}">${label}</a>`;
+    return `<sup class="msg-cite-ref"><a href="${escapedHref}" target="_blank" rel="noreferrer" title="${escapedHref}">${label}</a></sup>`;
   }
-  return `<a href="${href}" target="_blank" rel="noreferrer">${label}</a>`;
+  return `<a href="${escapedHref}" target="_blank" rel="noreferrer">${label}</a>`;
 }
 
 function renderInlineHtml(text: string): string {
   let html = escapeHtml(text);
-  html = html.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_match, label: string, href: string) => renderMarkdownLink(label, href));
+  html = html.replace(MARKDOWN_LINK_RE, (_match, label: string, href: string) => renderMarkdownLink(label, href));
   html = html.replace(BARE_HTTP_URL_RE, (_match, prefix: string, url: string) => {
     const safePrefix = prefix ?? '';
     const trailing = url.match(/[.,;!?]+$/)?.[0] ?? '';

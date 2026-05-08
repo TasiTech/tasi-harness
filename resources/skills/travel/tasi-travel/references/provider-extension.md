@@ -22,9 +22,21 @@ Each provider should expose these capabilities:
   "items": [],
   "booking_links": [],
   "uncertainty": [],
-  "evidence_ref": "string"
+  "evidence_ref": "string",
+  "sources": [
+    {
+      "sourceId": "string",
+      "sourceTitle": "string",
+      "publisherOrSite": "string",
+      "sourceUrl": "https://example.com/source",
+      "observedAt": "YYYY-MM-DDTHH:mm:ss.sssZ",
+      "supports": ["field_or_claim"]
+    }
+  ]
 }
 ```
+
+Each item should either carry its own `sourceId` / `sourceUrl` fields or be traceable to an entry in `sources`. Downstream itinerary output depends on this mapping for inline citations.
 
 ## Onboarding Checklist for New Platform
 1. Add a new provider reference file under this folder.
@@ -32,7 +44,8 @@ Each provider should expose these capabilities:
 3. Define quota/rate-limit and retry strategy.
 4. Map raw fields into normalized contract.
 5. Define booking link validation rules.
-6. Update entry routing table in [../SKILL.md](../SKILL.md).
+6. Define evidence/source fields and which raw fields they support.
+7. Update entry routing table in [../SKILL.md](../SKILL.md).
 
 ## Auth Contract (Extensible)
 Each provider doc should explicitly define:
@@ -55,3 +68,5 @@ Prompting rules:
 - Keep provider-specific parameters inside provider docs.
 - Keep entry file provider-agnostic.
 - Never mix raw provider fields into final output without normalization.
+- Never drop source URLs when converting provider rows into itinerary rows.
+- Keep action links distinguishable from evidence links.

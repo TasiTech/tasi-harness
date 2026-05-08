@@ -30,6 +30,7 @@ import {
   providerPreset,
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
+import { extractCitationLinks, type CitationLink } from './citations.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
 
@@ -1841,53 +1842,6 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
-interface CitationLink {
-  label: string;
-  href: string;
-  host: string;
-  excerpt?: string;
-}
-
-function extractCitationLinks(content: string): CitationLink[] {
-  const out: CitationLink[] = [];
-  const seen = new Set<string>();
-  const citationRe = /\[(\d+)\]\((https?:\/\/[^\s)]+)\)/g;
-  for (const match of content.matchAll(citationRe)) {
-    const label = match[1] ?? '';
-    const href = match[2] ?? '';
-    if (!label || !href || seen.has(href)) continue;
-    const matchIndex = typeof match.index === 'number' ? match.index : 0;
-    const sentenceStartCandidates = [
-      content.lastIndexOf('\n', matchIndex),
-      content.lastIndexOf('。', matchIndex),
-      content.lastIndexOf('.', matchIndex),
-      content.lastIndexOf('；', matchIndex),
-      content.lastIndexOf(';', matchIndex)
-    ];
-    const sentenceStart = Math.max(...sentenceStartCandidates) + 1;
-    const sentenceEndCandidates = ['\n', '。', '.', '；', ';']
-      .map((token) => content.indexOf(token, matchIndex + match[0].length))
-      .filter((index) => index >= 0);
-    const sentenceEnd = sentenceEndCandidates.length > 0 ? Math.min(...sentenceEndCandidates) + 1 : Math.min(content.length, matchIndex + 180);
-    const excerpt = content
-      .slice(sentenceStart, sentenceEnd)
-      .replace(/\[(\d+)\]\((https?:\/\/[^\s)]+)\)/g, '[$1]')
-      .replace(/[*_`>#|]/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 180);
-    let host = href;
-    try {
-      host = new URL(href).hostname.replace(/^www\./, '');
-    } catch {
-      host = href;
-    }
-    out.push({ label, href, host, excerpt });
-    seen.add(href);
-  }
-  return out;
-}
-
 function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactElement | null {
   if (citations.length === 0) return null;
   return (
@@ -1896,8 +1850,8 @@ function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactE
         <button
           key={`${citation.label}-${citation.href}`}
           className="msg-citation-chip"
-          title={`${citation.label}. ${citation.host}`}
-          aria-label={`${citation.label}. ${citation.host}`}
+          title={[`${citation.label}. ${citation.host}`, citation.excerpt].filter(Boolean).join(' - ')}
+          aria-label={[`${citation.label}. ${citation.host}`, citation.excerpt].filter(Boolean).join(' - ')}
           onClick={() => void window.tasiHarness.app.openExternalUrl(citation.href, { system: true })}
         >
           <span className="msg-citation-icon" aria-hidden="true">
@@ -1907,6 +1861,7 @@ function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactE
             </svg>
           </span>
           <span>{citation.label}</span>
+          <span className="msg-citation-host">{citation.host}</span>
         </button>
       ))}
     </div>

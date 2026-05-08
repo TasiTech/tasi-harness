@@ -691,8 +691,8 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
           type: 'object',
           properties: {
             selector: { type: 'string', description: 'Optional CSS selector or @e ref to scope the snapshot.' },
-            max_elements: { type: 'number', description: 'Maximum elements to include.' },
-            max_chars: { type: 'number', description: 'Maximum characters to return.' }
+            max_elements: { type: 'number', description: 'Maximum elements to include. Omit to include all discovered elements.' },
+            max_chars: { type: 'number', description: 'Maximum characters to return. Defaults to a large snapshot budget.' }
           }
         }
       }
@@ -701,10 +701,11 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const access = requireBrowserAutomation();
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
+      const hasMaxElements = Object.prototype.hasOwnProperty.call(obj, 'max_elements');
       const result = await access.browser.snapshot({
         selector: stringArg(obj, 'selector', '').trim() || undefined,
-        maxElements: numberArg(obj, 'max_elements', 80),
-        maxChars: numberArg(obj, 'max_chars', 20000)
+        maxElements: hasMaxElements ? numberArg(obj, 'max_elements', 0) : undefined,
+        maxChars: numberArg(obj, 'max_chars', 100000)
       });
       return { ok: true, content: result.content, data: result };
     }

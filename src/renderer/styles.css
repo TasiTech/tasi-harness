@@ -697,10 +697,21 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   font-size: 12px;
   font-weight: 800;
 }
+.msg-citation-host {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-weight: 700;
+}
 .msg-citation-chip:hover {
   border-color: var(--accent);
   color: var(--accent);
   background: rgba(0, 212, 170, 0.1);
+}
+.msg-citation-chip:hover .msg-citation-host {
+  color: var(--accent);
 }
 .msg-citation-icon {
   width: 14px;
@@ -717,27 +728,32 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   stroke-linejoin: round;
 }
 .msg-bubble a { color: inherit; text-decoration: underline; }
-.msg-bubble a.msg-cite {
+.msg-bubble .msg-cite-ref {
+  display: inline-flex;
+  vertical-align: super;
+  margin-left: 2px;
+  line-height: 0;
+}
+.msg-bubble .msg-cite-ref a {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 17px;
-  height: 17px;
-  padding: 0 5px;
-  margin: 0 2px;
-  border-radius: 999px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
   border: 1px solid var(--border-active);
+  border-radius: 999px;
   background: var(--accent-dim);
   color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
+  font-size: 10px;
+  font-weight: 900;
   line-height: 1;
   text-decoration: none;
-  vertical-align: 0.08em;
 }
-.msg-bubble a.msg-cite:hover {
+.msg-bubble .msg-cite-ref a:hover {
   border-color: var(--accent);
   background: rgba(0, 212, 170, 0.2);
+  color: var(--accent-strong);
 }
 .msg-bubble code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

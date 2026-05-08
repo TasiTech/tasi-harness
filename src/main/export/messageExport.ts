@@ -51,7 +51,8 @@ export function buildAssistantMessageExportHtml(title: string, bodyHtml: string)
     'h1, h2, h3, h4, h5, h6 { margin: 20px 0 10px; line-height: 1.3; color: #0d1321; }',
     'p { margin: 0 0 11px; }',
     'a { color: #007a66; text-decoration: none; }',
-    'a.msg-cite { display: inline-block; min-width: 16px; padding: 1px 5px; border: 1px solid #00aa88; border-radius: 999px; font-size: 11px; font-weight: 700; color: #007a66; }',
+    '.msg-cite-ref { display: inline; vertical-align: super; margin-left: 1px; line-height: 0; }',
+    '.msg-cite-ref a { display: inline; padding: 0; border: 0; background: transparent; font-size: 8px; font-weight: 800; color: #007a66; text-decoration: none; }',
     'pre, code { font-family: Consolas, "SFMono-Regular", monospace; }',
     'code { background: #f0f2f5; border-radius: 5px; padding: 1px 4px; }',
     'pre { overflow-wrap: anywhere; white-space: pre-wrap; background: #f5f6f8; border: 1px solid #dce1e8; border-radius: 8px; padding: 10px; }',
@@ -72,6 +73,7 @@ export function buildAssistantMessageExportHtml(title: string, bodyHtml: string)
 
 interface WordExportContext {
   relationships: Array<{ id: string; target: string }>;
+  citationHrefs: Map<string, string>;
 }
 
 function cleanInlineMarkdown(input: string): string {
@@ -140,25 +142,45 @@ function createHyperlinkRelationship(ctx: WordExportContext, href: string): stri
   return id;
 }
 
-function runXml(text: string, options: { bold?: boolean; size?: number; font?: string } = {}): string {
+function runXml(text: string, options: { bold?: boolean; size?: number; font?: string; superscript?: boolean } = {}): string {
   const props: string[] = [];
   if (options.bold) props.push('<w:b/>');
   if (options.size) props.push(`<w:sz w:val="${options.size}"/>`);
   if (options.font) props.push(`<w:rFonts w:ascii="${escapeXml(options.font)}" w:hAnsi="${escapeXml(options.font)}" w:eastAsia="${escapeXml(options.font)}"/>`);
+  if (options.superscript) props.push('<w:vertAlign w:val="superscript"/>');
+  const textXml = text
+    .split('\n')
+    .map((part, index) => `${index > 0 ? '<w:br/>' : ''}<w:t xml:space="preserve">${escapeXml(part)}</w:t>`)
+    .join('');
   return [
     '<w:r>',
     props.length > 0 ? `<w:rPr>${props.join('')}</w:rPr>` : '',
-    `<w:t xml:space="preserve">${escapeXml(text)}</w:t>`,
+    textXml,
     '</w:r>'
   ].join('');
 }
 
-function hyperlinkXml(label: string, href: string, ctx: WordExportContext): string {
+function normalizeHrefForExport(href: string): string {
+  const trimmed = href.trim().replace(/^<(.+)>$/, '$1');
+  try {
+    return encodeURI(trimmed);
+  } catch {
+    return trimmed.replace(/\s+/g, '%20');
+  }
+}
+
+function hyperlinkXml(label: string, href: string, ctx: WordExportContext, options: { superscript?: boolean; underline?: boolean } = {}): string {
   const id = createHyperlinkRelationship(ctx, href);
+  const props = [
+    '<w:rStyle w:val="Hyperlink"/>',
+    '<w:color w:val="0563C1"/>',
+    options.underline === false ? '<w:u w:val="none"/>' : '<w:u w:val="single"/>',
+    options.superscript ? '<w:vertAlign w:val="superscript"/><w:sz w:val="16"/>' : ''
+  ].join('');
   return [
     `<w:hyperlink r:id="${id}" w:history="1">`,
     '<w:r>',
-    '<w:rPr><w:rStyle w:val="Hyperlink"/><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr>',
+    `<w:rPr>${props}</w:rPr>`,
     `<w:t xml:space="preserve">${escapeXml(label)}</w:t>`,
     '</w:r>',
     '</w:hyperlink>'
@@ -167,36 +189,48 @@ function hyperlinkXml(label: string, href: string, ctx: WordExportContext): stri
 
 function inlineMarkdownXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string } = {}): string {
   const source = input.trim();
-  const linkRe = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g;
-  const bareUrlRe = /https?:\/\/[^\s<]+/g;
+  const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\n]+)\)/g;
   const parts: string[] = [];
   let cursor = 0;
 
   for (const match of source.matchAll(linkRe)) {
     const index = match.index ?? 0;
     const before = source.slice(cursor, index);
-    if (before) parts.push(inlineMarkdownBareUrlXml(before, ctx, options, bareUrlRe));
+    if (before) parts.push(inlinePlainTextXml(before, ctx, options));
     const rawLabel = cleanInlineMarkdown(match[1] ?? '').trim() || match[2] || '';
-    const label = /^\d+$/.test(rawLabel) ? `[${rawLabel}]` : rawLabel;
-    const href = match[2] ?? '';
-    parts.push(hyperlinkXml(label, href, ctx));
+    const href = normalizeHrefForExport(match[2] ?? '');
+    if (/^\d+$/.test(rawLabel)) {
+      ctx.citationHrefs.set(rawLabel, href);
+      parts.push(hyperlinkXml(rawLabel, href, ctx, { superscript: true, underline: false }));
+    } else {
+      parts.push(hyperlinkXml(rawLabel, href, ctx));
+    }
     cursor = index + match[0].length;
   }
 
   const tail = source.slice(cursor);
-  if (tail) parts.push(inlineMarkdownBareUrlXml(tail, ctx, options, bareUrlRe));
+  if (tail) parts.push(inlinePlainTextXml(tail, ctx, options));
   return parts.join('') || runXml('', options);
 }
 
-function inlineMarkdownBareUrlXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }, bareUrlRe: RegExp): string {
+function inlinePlainTextXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }): string {
+  const tokenRe = /\[(\d+)\]|https?:\/\/[^\s<]+/g;
   const parts: string[] = [];
   let cursor = 0;
-  for (const match of input.matchAll(bareUrlRe)) {
+  for (const match of input.matchAll(tokenRe)) {
     const index = match.index ?? 0;
     const before = input.slice(cursor, index);
     if (before) parts.push(runXml(cleanInlineMarkdown(before), options));
-    const href = (match[0] ?? '').replace(/[),.;:]+$/, '');
-    const trailing = (match[0] ?? '').slice(href.length);
+    if (match[1]) {
+      const label = match[1];
+      const href = ctx.citationHrefs.get(label);
+      if (href) parts.push(hyperlinkXml(`[${label}]`, href, ctx));
+      else parts.push(runXml(`[${label}]`, options));
+      cursor = index + match[0].length;
+      continue;
+    }
+    const href = normalizeHrefForExport((match[0] ?? '').replace(/[),.;:]+$/, ''));
+    const trailing = (match[0] ?? '').slice((match[0] ?? '').replace(/[),.;:]+$/, '').length);
     parts.push(hyperlinkXml(href, href, ctx));
     if (trailing) parts.push(runXml(trailing, options));
     cursor = index + match[0].length;
@@ -213,15 +247,18 @@ function htmlInlineXml(input: string, ctx: WordExportContext, options: { bold?: 
   for (const match of input.matchAll(anchorRe)) {
     const index = match.index ?? 0;
     const before = htmlToPlainText(input.slice(cursor, index));
-    if (before) parts.push(runXml(before, options));
-    const href = decodeHtmlEntities(match[1] ?? '').trim();
+    if (before) parts.push(inlinePlainTextXml(before, ctx, options));
+    const href = normalizeHrefForExport(decodeHtmlEntities(match[1] ?? '').trim());
     const label = htmlToPlainText(match[2] ?? '').trim() || href;
-    if (/^https?:\/\//i.test(href)) parts.push(hyperlinkXml(label, href, ctx));
+    if (/^https?:\/\//i.test(href) && /^\d+$/.test(label)) {
+      ctx.citationHrefs.set(label, href);
+      parts.push(hyperlinkXml(label, href, ctx, { superscript: true, underline: false }));
+    } else if (/^https?:\/\//i.test(href)) parts.push(hyperlinkXml(label, href, ctx));
     else if (label) parts.push(runXml(label, options));
     cursor = index + match[0].length;
   }
   const tail = htmlToPlainText(input.slice(cursor));
-  if (tail) parts.push(runXml(tail, options));
+  if (tail) parts.push(inlinePlainTextXml(tail, ctx, options));
   return parts.join('') || runXml('', options);
 }
 
@@ -433,16 +470,50 @@ function markdownToWordBlocks(markdown: string, ctx: WordExportContext): string[
   return blocks.length > 0 ? blocks : [paragraphXml('(empty reply)')];
 }
 
+function collectMarkdownCitationHrefs(markdown: string, ctx: WordExportContext): void {
+  const linkRe = /\[(\d+)\]\((https?:\/\/[^)\n]+)\)/g;
+  for (const match of markdown.matchAll(linkRe)) {
+    const label = match[1] ?? '';
+    const href = normalizeHrefForExport(match[2] ?? '');
+    if (label && href && !ctx.citationHrefs.has(label)) ctx.citationHrefs.set(label, href);
+  }
+}
+
+function normalizeTitleForCompare(input: string): string {
+  return input
+    .replace(/\s+/g, ' ')
+    .replace(/[“”]/g, '"')
+    .trim()
+    .toLowerCase();
+}
+
+function firstMarkdownHeading(markdown: string): string {
+  const line = markdown
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .find((item) => /^#{1,6}\s+\S/.test(item.trim()));
+  return line?.trim().replace(/^#{1,6}\s+/, '').trim() ?? '';
+}
+
+function firstHtmlHeading(html: string): string {
+  const match = html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i) ?? html.match(/<h[1-6]\b[^>]*>([\s\S]*?)<\/h[1-6]>/i);
+  return match ? htmlToPlainText(match[1] ?? '') : '';
+}
+
 export async function buildAssistantMessageDocx(title: string, markdown: string, html?: string): Promise<Buffer> {
   const zip = new JSZip();
-  const ctx: WordExportContext = { relationships: [] };
+  const ctx: WordExportContext = { relationships: [], citationHrefs: new Map() };
+  collectMarkdownCitationHrefs(markdown, ctx);
   const htmlBlocks = html?.trim() ? htmlToWordBlocks(html, ctx) : [];
   const contentBlocks = htmlBlocks.length > 0 ? htmlBlocks : markdownToWordBlocks(markdown, ctx);
+  const firstContentHeading = html?.trim() ? firstHtmlHeading(html) : firstMarkdownHeading(markdown);
+  const shouldPrependTitle = normalizeTitleForCompare(title) !== normalizeTitleForCompare(firstContentHeading);
   const documentXml = [
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
     '<w:body>',
-    paragraphXml(title, { heading: 1 }),
+    ...(shouldPrependTitle ? [paragraphXml(title, { heading: 1 })] : []),
     ...contentBlocks,
     '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr>',
     '</w:body>',

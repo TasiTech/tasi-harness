@@ -19,9 +19,58 @@ describe('message export helpers', () => {
     expect(zip.file('[Content_Types].xml')).toBeTruthy();
     expect(documentXml).toContain('Heading');
     expect(documentXml).toContain('<w:hyperlink');
-    expect(documentXml).toContain('[1]');
+    expect(documentXml).toContain('<w:vertAlign w:val="superscript"/>');
+    expect(documentXml).toContain('<w:u w:val="none"/>');
+    expect(documentXml).toContain('>1</w:t>');
     expect(relsXml).toContain('https://example.com/source');
     expect(documentXml).toContain('- Item');
+  });
+
+  it('does not duplicate the title when the message already starts with the same heading', async () => {
+    const docx = await buildAssistantMessageDocx('Same Title', '# Same Title\n\nBody');
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+
+    expect((documentXml.match(/Same Title/g) ?? []).length).toBe(1);
+  });
+
+  it('links plain source references back to collected citation URLs in docx export', async () => {
+    const docx = await buildAssistantMessageDocx(
+      'Answer',
+      [
+        '# Answer',
+        '',
+        'Claim[1](https://example.com/source path).',
+        '',
+        '**来源：**',
+        '[1] Example source title.'
+      ].join('\n')
+    );
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+    const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string') ?? '';
+
+    expect(documentXml).toContain('来源：');
+    expect(documentXml).toContain('[1]');
+    expect(relsXml).toContain('https://example.com/source%20path');
+  });
+
+  it('preserves html line breaks in docx source paragraphs', async () => {
+    const html = '<p><strong>来源：</strong><br />[1] Example source title.<br />[2] Second source.</p>';
+    const docx = await buildAssistantMessageDocx(
+      'Answer',
+      'Claim[1](https://example.com/one)\n\nOther[2](https://example.com/two)',
+      html
+    );
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+    const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string') ?? '';
+
+    expect(documentXml).toContain('<w:br/>');
+    expect(documentXml).toContain('[1]');
+    expect(documentXml).toContain('[2]');
+    expect(relsXml).toContain('https://example.com/one');
+    expect(relsXml).toContain('https://example.com/two');
   });
 
   it('exports markdown tables as real Word tables', async () => {

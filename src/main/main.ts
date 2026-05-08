@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -981,6 +981,33 @@ async function renderHtmlToPdfBuffer(html: string): Promise<Buffer> {
   }
 }
 
+function isLockedExportWriteError(error: unknown): boolean {
+  const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES';
+}
+
+function nextExportFallbackPath(filePath: string, index: number): string {
+  const ext = extname(filePath);
+  const base = basename(filePath, ext);
+  return join(dirname(filePath), `${base} (${index})${ext}`);
+}
+
+function writeExportFileWithFallback(filePath: string, data: Buffer): { filePath: string; fallback: boolean } {
+  try {
+    writeFileSync(filePath, data);
+    return { filePath, fallback: false };
+  } catch (error) {
+    if (!isLockedExportWriteError(error)) throw error;
+    for (let index = 1; index <= 99; index += 1) {
+      const candidate = nextExportFallbackPath(filePath, index);
+      if (existsSync(candidate)) continue;
+      writeFileSync(candidate, data);
+      return { filePath: candidate, fallback: true };
+    }
+    throw error;
+  }
+}
+
 async function exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult> {
   const format = req.format;
   if (format !== 'pdf' && format !== 'docx') {
@@ -1006,13 +1033,19 @@ async function exportAssistantMessage(req: AssistantMessageExportRequest): Promi
     return { ok: true, content: 'Export canceled.' };
   }
 
+  let saved: { filePath: string; fallback: boolean };
   if (format === 'pdf') {
     const html = buildAssistantMessageExportHtml(title, req.html?.trim() || `<pre>${escapeHtmlText(content)}</pre>`);
-    writeFileSync(picked.filePath, await renderHtmlToPdfBuffer(html));
+    saved = writeExportFileWithFallback(picked.filePath, await renderHtmlToPdfBuffer(html));
   } else {
-    writeFileSync(picked.filePath, await buildAssistantMessageDocx(title, content, req.html));
+    saved = writeExportFileWithFallback(picked.filePath, await buildAssistantMessageDocx(title, content, req.html));
   }
-  return { ok: true, content: `Exported ${picked.filePath}` };
+  return {
+    ok: true,
+    content: saved.fallback
+      ? `Exported ${saved.filePath} (original file was busy or locked)`
+      : `Exported ${saved.filePath}`
+  };
 }
 
 async function createWindow(): Promise<void> {

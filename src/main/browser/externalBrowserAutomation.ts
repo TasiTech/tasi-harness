@@ -17,8 +17,8 @@ import { pageHelpers } from './embeddedBrowserAutomation.js';
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
-const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 80;
-const DEFAULT_SNAPSHOT_MAX_CHARS = 20000;
+const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
+const DEFAULT_SNAPSHOT_MAX_CHARS = 100000;
 
 interface CdpTargetInfo {
   id: string;
@@ -210,22 +210,32 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         const found = TasiBrowser.resolve(${JSON.stringify(sel)}, 0);
         if (!found.ok) return found;
         const el = found.el;
-        if (!TasiBrowser.setText(el, ${JSON.stringify(text ?? '')}, ${options?.clear === false ? 'false' : 'true'})) {
+        const editable = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || (el instanceof HTMLElement && el.isContentEditable);
+        if (!editable) {
           return { ok: false, error: "Target is not an input, textarea, or contenteditable element." };
         }
-        if (${options?.submit === true ? 'true' : 'false'}) {
-          const enterInit = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true };
-          el.dispatchEvent(new KeyboardEvent("keydown", enterInit));
-          el.dispatchEvent(new KeyboardEvent("keyup", enterInit));
-          if (el.form) {
-            if (typeof el.form.requestSubmit === "function") el.form.requestSubmit();
-            else el.form.submit();
-          }
+        if (typeof el.focus === "function") el.focus();
+        if (${options?.clear === false ? 'false' : 'true'} && typeof el.select === "function") {
+          el.select();
+        } else if ("setSelectionRange" in el && typeof el.value === "string") {
+          const end = el.value.length;
+          try { el.setSelectionRange(end, end); } catch {}
         }
         return { ok: true };
       })();`
     );
     if (!result.ok) throw new Error(result.error || `Failed to type into selector: ${sel}`);
+    if (options?.clear !== false) {
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', modifiers: 2 });
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', modifiers: 2 });
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Backspace', code: 'Backspace', modifiers: 0 });
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', modifiers: 0 });
+    }
+    if (text) await this.cdpCommand('Input.insertText', { text });
+    if (options?.submit === true) {
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', modifiers: 0 });
+      await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', modifiers: 0 });
+    }
     return this.state();
   }
 
@@ -371,8 +381,10 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
 
   async snapshot(options?: { selector?: string; maxElements?: number; maxChars?: number }): Promise<BrowserSnapshotResult> {
     const selector = options?.selector?.trim() || '';
-    const maxElements = clampInt(Number(options?.maxElements), DEFAULT_SNAPSHOT_MAX_ELEMENTS, 5, 500);
-    const maxChars = clampInt(Number(options?.maxChars), DEFAULT_SNAPSHOT_MAX_CHARS, 1000, 100000);
+    const maxElements = Number.isFinite(Number(options?.maxElements)) && Number(options?.maxElements) > 0
+      ? clampInt(Number(options?.maxElements), DEFAULT_SNAPSHOT_MAX_ELEMENTS, 1, 50000)
+      : 0;
+    const maxChars = clampInt(Number(options?.maxChars), DEFAULT_SNAPSHOT_MAX_CHARS, 1000, 1000000);
     const domRaw = await this.evalInPage<Omit<BrowserSnapshotResult, 'url' | 'title' | 'content'>>(
       `(function () {
         ${pageHelpers()}
@@ -383,28 +395,41 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         const scope = selector ? TasiBrowser.resolve(selector, 0).el : document.body;
         if (!scope) throw new Error("Selector not found: " + selector);
         const elementSelector = [
-          "a[href]", "button", "input", "textarea", "select", "option", "summary",
+          "a", "button", "input", "textarea", "select", "option", "summary",
           "[role]", "[tabindex]", "[contenteditable=true]", "label", "h1", "h2", "h3", "h4", "h5", "h6",
-          "img[alt]", "[data-testid]", "[data-test]", "[data-cy]", "main", "nav", "header", "footer", "section", "article", "aside", "form", "dialog", "ul", "ol", "li", "table", "tr", "th", "td"
+          "img[alt]", "[data-testid]", "[data-test]", "[data-cy]", "[onclick]", "[data-href]", "[data-url]", "[data-link]", "[data-route]",
+          "[class*='guide-main-item']", "[class*='gsl-common-card']",
+          "main", "nav", "header", "footer", "section", "article", "aside", "form", "dialog", "ul", "ol", "li", "table", "tr", "th", "td"
         ].join(",");
         const candidates = Array.from(scope.querySelectorAll(elementSelector))
-          .filter((el) => TasiBrowser.isVisible(el) || ["input", "textarea", "select", "option"].includes(el.tagName.toLowerCase()));
+          .filter((el) => TasiBrowser.isVisible(el) || TasiBrowser.looksClickable(el) || ["input", "textarea", "select", "option"].includes(el.tagName.toLowerCase()));
+        const snapshotRank = (el) => {
+          const rect = el.getBoundingClientRect();
+          const tag = el.tagName.toLowerCase();
+          const chrome = el.closest("nav,header,footer,[role=navigation],[role=banner],[role=contentinfo]") ? 1000000 : 0;
+          const hidden = rect.width <= 0 || rect.height <= 0 ? 500000 : 0;
+          const inViewport = rect.bottom >= 0 && rect.top <= window.innerHeight && rect.right >= 0 && rect.left <= window.innerWidth ? 0 : 200000;
+          const fieldBonus = ["input", "textarea", "select"].includes(tag) ? -2000 : 0;
+          const resultish = /result|search|list|card|item|poi|sight|景点|搜索|结果/i.test((el.className || "") + " " + (el.id || "") + " " + (el.getAttribute("aria-label") || "")) ? -1000 : 0;
+          return chrome + hidden + inViewport + fieldBonus + resultish + Math.max(0, rect.top) + Math.max(0, rect.left) / 1000;
+        };
+        candidates.sort((left, right) => snapshotRank(left) - snapshotRank(right));
         const elements = [];
         const elementToRef = new Map();
         let nextRef = 1;
         for (const el of candidates) {
-          if (elements.length >= maxElements) break;
+          if (maxElements > 0 && elements.length >= maxElements) break;
           const ref = "@e" + nextRef++;
           refs[ref] = el;
           elementToRef.set(el, ref);
           elements.push(TasiBrowser.describe(el, ref));
         }
-        const headings = Array.from(scope.querySelectorAll("h1,h2,h3,h4,h5,h6")).slice(0, 40).map((el) => ({
+        const headings = Array.from(scope.querySelectorAll("h1,h2,h3,h4,h5,h6")).map((el) => ({
           level: Number(el.tagName.slice(1)),
           text: TasiBrowser.normalizeText(el.innerText || el.textContent || ""),
           ref: elementToRef.get(el)
         })).filter((item) => item.text);
-        const links = Array.from(scope.querySelectorAll("a[href]")).slice(0, 80).map((el) => {
+        const links = Array.from(scope.querySelectorAll("a[href]")).sort((left, right) => snapshotRank(left) - snapshotRank(right)).map((el) => {
           let href = el.getAttribute("href") || "";
           try { href = new URL(href, location.href).toString(); } catch {}
           const item = { text: TasiBrowser.normalizeText(el.innerText || el.textContent || ""), href };
@@ -412,7 +437,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
           if (ref) item.ref = ref;
           return item;
         }).filter((item) => item.href);
-        const images = Array.from(scope.querySelectorAll("img")).slice(0, 40).map((el) => ({
+        const images = Array.from(scope.querySelectorAll("img")).map((el) => ({
           alt: el.getAttribute("alt") || "",
           src: el.currentSrc || el.src || "",
           ref: elementToRef.get(el)
@@ -423,7 +448,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
           links,
           images,
           viewport: { width: window.innerWidth, height: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
-          truncated: candidates.length > elements.length
+          truncated: maxElements > 0 && candidates.length > elements.length
         };
       })();`
     );
@@ -774,7 +799,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       return match.ref;
     };
     const visit = (node: CdpAxNode, depth: number): void => {
-      if (out.length >= maxElements * 3) return;
+      if (maxElements > 0 && out.length >= maxElements * 3) return;
       if (!node || node.ignored) return;
       const role = String(node.role?.value || 'generic');
       const name = String(node.name?.value || '');
@@ -800,7 +825,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       }
     };
     for (const root of roots.length > 0 ? roots : nodes.slice(0, 1)) visit(root, 0);
-    return { tree: out, truncated: out.length >= maxElements * 3 };
+    return { tree: out, truncated: maxElements > 0 && out.length >= maxElements * 3 };
   }
 
   private semanticTreeFromElements(elements: Array<{ ref: string; role: string; name: string; text: string; href?: string; value?: string; checked?: boolean; enabled: boolean }>): unknown[] {

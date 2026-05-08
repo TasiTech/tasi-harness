@@ -17,8 +17,8 @@ import { resolveAppWindowIconPath } from '../appIcon.js';
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
-const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 80;
-const DEFAULT_SNAPSHOT_MAX_CHARS = 20000;
+const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
+const DEFAULT_SNAPSHOT_MAX_CHARS = 100000;
 
 interface BrowserExtractJsonLink {
   text: string;
@@ -199,7 +199,7 @@ export function pageHelpers(): string {
         if (explicit) return explicit;
         const tag = el.tagName.toLowerCase();
         const type = (el.getAttribute("type") || "").toLowerCase();
-        if (tag === "a" && el.hasAttribute("href")) return "link";
+        if (tag === "a") return "link";
         if (tag === "button" || type === "button" || type === "submit" || type === "reset") return "button";
         if (tag === "input" && type === "checkbox") return "checkbox";
         if (tag === "input" && type === "radio") return "radio";
@@ -209,6 +209,23 @@ export function pageHelpers(): string {
         if (tag === "img") return "img";
         if (tag === "form") return "form";
         return tag;
+      };
+      const looksClickable = (el) => {
+        if (!(el instanceof Element)) return false;
+        const tag = el.tagName.toLowerCase();
+        if (["a", "button", "summary"].includes(tag)) return true;
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (["button", "link", "menuitem", "tab", "option", "checkbox", "radio", "switch"].includes(role)) return true;
+        if (el.hasAttribute("onclick")) return true;
+        if (el.hasAttribute("data-href") || el.hasAttribute("data-url") || el.hasAttribute("data-link") || el.hasAttribute("data-route")) return true;
+        const tabindex = el.getAttribute("tabindex");
+        if (tabindex !== null && Number(tabindex) >= 0) return true;
+        const classAndId = String(el.className || "") + " " + String(el.id || "");
+        if (/(^|[-_\\s])(btn|button|link|click|clickable|card|item|tile|result|guide|poi|sight|gsl)([-_\\s]|$)/i.test(classAndId)) return true;
+        try {
+          if (window.getComputedStyle(el).cursor === "pointer") return true;
+        } catch {}
+        return false;
       };
       const labelFor = (el) => {
         if (!(el instanceof Element)) return "";
@@ -348,7 +365,7 @@ export function pageHelpers(): string {
         }
         return nodes;
       };
-      return { normalizeText, isVisible, selectorFor, roleFor, labelFor, nameFor, describe, ensureRefs, resolve, setText, activate, fireMouse, candidates };
+      return { normalizeText, isVisible, selectorFor, roleFor, looksClickable, labelFor, nameFor, describe, ensureRefs, resolve, setText, activate, fireMouse, candidates };
     })();
   `;
 }
@@ -440,22 +457,33 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
         const found = TasiBrowser.resolve(${JSON.stringify(sel)}, 0);
         if (!found.ok) return found;
         const el = found.el;
-        if (!TasiBrowser.setText(el, ${JSON.stringify(value)}, ${clear ? 'true' : 'false'})) {
+        const editable = el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || (el instanceof HTMLElement && el.isContentEditable);
+        if (!editable) {
           return { ok: false, error: "Target is not an input, textarea, or contenteditable element." };
         }
-        if (${submit ? 'true' : 'false'}) {
-          const enterInit = { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true };
-          el.dispatchEvent(new KeyboardEvent("keydown", enterInit));
-          el.dispatchEvent(new KeyboardEvent("keyup", enterInit));
-          if (el.form) {
-            if (typeof el.form.requestSubmit === "function") el.form.requestSubmit();
-            else el.form.submit();
-          }
+        if (typeof el.focus === "function") el.focus();
+        if (${clear ? 'true' : 'false'} && typeof el.select === "function") {
+          el.select();
+        } else if ("setSelectionRange" in el && typeof el.value === "string") {
+          const end = el.value.length;
+          try { el.setSelectionRange(end, end); } catch {}
         }
         return { ok: true };
       })();`
     );
     if (!result.ok) throw new Error(result.error || `Failed to type into selector: ${sel}`);
+    const wc = this.getTargetWebContents();
+    if (clear) {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'A', modifiers: ['control'] });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'A', modifiers: ['control'] });
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+    }
+    if (value) wc.insertText(value);
+    if (submit) {
+      wc.sendInputEvent({ type: 'keyDown', keyCode: 'Enter' });
+      wc.sendInputEvent({ type: 'keyUp', keyCode: 'Enter' });
+    }
     return this.state();
   }
 
@@ -646,8 +674,10 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
 
   async snapshot(options?: { selector?: string; maxElements?: number; maxChars?: number }): Promise<BrowserSnapshotResult> {
     const selector = options?.selector?.trim() || '';
-    const maxElements = clampInt(Number(options?.maxElements), DEFAULT_SNAPSHOT_MAX_ELEMENTS, 5, 500);
-    const maxChars = clampInt(Number(options?.maxChars), DEFAULT_SNAPSHOT_MAX_CHARS, 1000, 100000);
+    const maxElements = Number.isFinite(Number(options?.maxElements)) && Number(options?.maxElements) > 0
+      ? clampInt(Number(options?.maxElements), DEFAULT_SNAPSHOT_MAX_ELEMENTS, 1, 50000)
+      : 0;
+    const maxChars = clampInt(Number(options?.maxChars), DEFAULT_SNAPSHOT_MAX_CHARS, 1000, 1000000);
     const raw = await this.evalInPage<Omit<BrowserSnapshotResult, 'url' | 'title' | 'content'>>(
       `(function () {
         ${pageHelpers()}
@@ -658,18 +688,31 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
         const scope = selector ? TasiBrowser.resolve(selector, 0).el : document.body;
         if (!scope) throw new Error("Selector not found: " + selector);
         const elementSelector = [
-          "a[href]", "button", "input", "textarea", "select", "option", "summary",
+          "a", "button", "input", "textarea", "select", "option", "summary",
           "[role]", "[tabindex]", "[contenteditable=true]", "label", "h1", "h2", "h3", "h4", "h5", "h6",
-          "img[alt]", "[data-testid]", "[data-test]", "[data-cy]", "main", "nav", "header", "footer", "section", "article", "aside", "form", "dialog", "ul", "ol", "li", "table", "tr", "th", "td"
+          "img[alt]", "[data-testid]", "[data-test]", "[data-cy]", "[onclick]", "[data-href]", "[data-url]", "[data-link]", "[data-route]",
+          "[class*='guide-main-item']", "[class*='gsl-common-card']",
+          "main", "nav", "header", "footer", "section", "article", "aside", "form", "dialog", "ul", "ol", "li", "table", "tr", "th", "td"
         ].join(",");
         const allCandidates = Array.from(scope.querySelectorAll(elementSelector));
         const candidates = allCandidates
-          .filter((el) => TasiBrowser.isVisible(el) || ["input", "textarea", "select", "option"].includes(el.tagName.toLowerCase()));
+          .filter((el) => TasiBrowser.isVisible(el) || TasiBrowser.looksClickable(el) || ["input", "textarea", "select", "option"].includes(el.tagName.toLowerCase()));
+        const snapshotRank = (el) => {
+          const rect = el.getBoundingClientRect();
+          const tag = el.tagName.toLowerCase();
+          const chrome = el.closest("nav,header,footer,[role=navigation],[role=banner],[role=contentinfo]") ? 1000000 : 0;
+          const hidden = rect.width <= 0 || rect.height <= 0 ? 500000 : 0;
+          const inViewport = rect.bottom >= 0 && rect.top <= window.innerHeight && rect.right >= 0 && rect.left <= window.innerWidth ? 0 : 200000;
+          const fieldBonus = ["input", "textarea", "select"].includes(tag) ? -2000 : 0;
+          const resultish = /result|search|list|card|item|poi|sight|景点|搜索|结果/i.test((el.className || "") + " " + (el.id || "") + " " + (el.getAttribute("aria-label") || "")) ? -1000 : 0;
+          return chrome + hidden + inViewport + fieldBonus + resultish + Math.max(0, rect.top) + Math.max(0, rect.left) / 1000;
+        };
+        candidates.sort((left, right) => snapshotRank(left) - snapshotRank(right));
         const elements = [];
         const elementToRef = new Map();
         let nextRef = 1;
         for (const el of candidates) {
-          if (elements.length >= maxElements) {
+          if (maxElements > 0 && elements.length >= maxElements) {
             const ref = "@e" + nextRef++;
             refs[ref] = el;
             elementToRef.set(el, ref);
@@ -703,17 +746,17 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
             }
             tree.push(item);
           }
-          if (tree.length >= maxElements * 3) return;
+          if (maxElements > 0 && tree.length >= maxElements * 3) return;
           for (const child of Array.from(node.children)) walk(child, meaningful ? depth + 1 : depth);
         };
         walk(scope, 0);
-        const headings = Array.from(scope.querySelectorAll("h1,h2,h3,h4,h5,h6")).slice(0, 40).map((el) => {
+        const headings = Array.from(scope.querySelectorAll("h1,h2,h3,h4,h5,h6")).map((el) => {
           const item = { level: Number(el.tagName.slice(1)), text: TasiBrowser.normalizeText(el.innerText || el.textContent || "") };
           const ref = elementToRef.get(el);
           if (ref) item.ref = ref;
           return item;
         }).filter((item) => item.text);
-        const links = Array.from(scope.querySelectorAll("a[href]")).slice(0, 80).map((el) => {
+        const links = Array.from(scope.querySelectorAll("a[href]")).sort((left, right) => snapshotRank(left) - snapshotRank(right)).map((el) => {
           let href = el.getAttribute("href") || "";
           try { href = new URL(href, location.href).toString(); } catch {}
           const item = { text: TasiBrowser.normalizeText(el.innerText || el.textContent || ""), href };
@@ -721,7 +764,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
           if (ref) item.ref = ref;
           return item;
         }).filter((item) => item.href);
-        const images = Array.from(scope.querySelectorAll("img")).slice(0, 40).map((el) => {
+        const images = Array.from(scope.querySelectorAll("img")).map((el) => {
           const item = { alt: el.getAttribute("alt") || "", src: el.currentSrc || el.src || "" };
           const ref = elementToRef.get(el);
           if (ref) item.ref = ref;
@@ -735,7 +778,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
           links,
           images,
           viewport: { width: window.innerWidth, height: window.innerHeight, scrollX: window.scrollX, scrollY: window.scrollY },
-          truncated: candidates.length > elements.length || tree.length >= maxElements * 3
+          truncated: (maxElements > 0 && candidates.length > elements.length) || (maxElements > 0 && tree.length >= maxElements * 3)
         };
       })();`
     );
