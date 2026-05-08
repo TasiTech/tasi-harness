@@ -70,6 +70,9 @@ This skill uses an entry-plus-modules structure:
 - Tasi browser automation skill: ../../browser/tasi-browser-automation/SKILL.md
 - Built-in browser operator: ../../browser/embedded-browser-operator/SKILL.md
 
+### Helper Scripts
+- Ctrip destination links: ./scripts/extract_ctrip_destinations.py
+
 ## Provider Routing Policy
 
 ### Selection Logic

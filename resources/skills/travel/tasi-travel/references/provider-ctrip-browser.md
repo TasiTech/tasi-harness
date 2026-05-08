@@ -174,139 +174,81 @@ Recovery rule:
 
 
 ### POI and Travel Guides
-Use Ctrip `you.ctrip.com` pages when the user wants:
-- attractions / scenic spots
-- museums
-- landmarks
-- destination guide context
-- ticket ideas or opening-hour / address / rating context from visible Ctrip pages
-- itinerary inspiration from real travel notes
 
-Required inputs:
+Use Ctrip `you.ctrip.com` pages when the user asks for attractions, scenic spots, museums, landmarks, destination guide context, ticket ideas, opening hours, addresses, ratings, or travel-note itinerary inspiration.
+
+Required input:
 - `city` or `keyword`
 
-Normalize these POI fields whenever available:
-- `name`
-- `category`
-- `rating`
-- `commentCount`
-- `price`
-- `address`
-- `openingHours`
-- `rankOrBadge`
-- `detailUrl`
-- `sourceUrl`
-- `sourceTitle`
-- `publisherOrSite`
-- `observedAt`
-- `evidenceFields`
+Normalize POI rows with these fields when visible:
+- `name`, `category`, `rating`, `commentCount`, `price`, `address`, `openingHours`, `rankOrBadge`
+- `detailUrl`, `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
 
-Normalize these guide/article fields whenever available:
-- `title`
-- `publishDate`
-- `readCountText`
-- `startMonthText`
-- `tripDaysText`
-- `perCapitaCostText`
-- `travelWithText`
-- `keyItinerary`
-- `relatedPoiLinks`
-- `sourceUrl`
-- `sourceTitle`
-- `publisherOrSite`
-- `observedAt`
-- `evidenceFields`
+Normalize guide/article rows with these fields when visible:
+- `title`, `publishDate`, `readCountText`, `startMonthText`, `tripDaysText`, `perCapitaCostText`, `travelWithText`, `keyItinerary`, `relatedPoiLinks`
+- `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
+
+Mandatory city / destination resolution:
+1. For a named city or destination, first run `../scripts/extract_ctrip_destinations.py` with exact matching:
+   - `python ../scripts/extract_ctrip_destinations.py --name 三亚 --require-match`
+2. Use only the returned `url` as the Ctrip guide route. Example: 三亚 must resolve to `https://you.ctrip.com/place/sanya61.html`, not `https://you.ctrip.com/place/sanya3.html`.
+3. `routeSegment` means the exact path segment between `/place/` and `.html` in the resolved Ctrip guide URL.
+   - `https://you.ctrip.com/place/sanya61.html` -> `routeSegment=sanya61`
+   - It is not the Chinese city name, not the numeric id alone, and not a hotel-channel `cityId`.
+4. The helper reads `https://you.ctrip.com/` and prefers `script#__NEXT_DATA__`:
+   - `props.pageProps.initialState.CitySelectorData.domesticTab.tabList[*].districtList[*]`
+   - `props.pageProps.initialState.CitySelectorData.internationalTab.tabList[*].districtList[*]`
+5. If `__NEXT_DATA__` is unavailable, the helper may fall back to rendered anchors matching `(?:(?:https?:)?//you\.ctrip\.com)?/place/[^"]+\.html` and normalize relative links against `https://you.ctrip.com/`.
+6. Treat results as destination links, not strictly administrative city links; they can include cities, scenic areas, islands, regions, and landmarks.
 
 Primary POI workflow:
-1. Open the direct global-search URL for the city or scenic-spot keyword:
-   - example keyword: `广州`
-   - `https://you.ctrip.com/globalsearch/?keyword=%E5%B9%BF%E5%B7%9E`
-2. On `globalsearch`, run `browser_snapshot`, then use `browser_click` to click the matching city name, destination card, scenic-spot name, or attraction card.
-   - Prefer visible result links over generated URLs.
-   - Do not require a visible `href` on the result card. Ctrip global-search often renders city/POI cards as clickable anchors such as `<a class="guide-main-item" target="_blank">` with no `href` in the visible DOM snapshot; these must still be treated as clickable result candidates when their text matches the keyword.
-   - In `browser_snapshot`, search `elements` and `tree`, not only `links`. A valid city or POI result may appear as `tag=a`, `role=link`, `name/text` containing the requested city, POI, or matching English/alternate name, with a selector or class path like `guide-main-item` / `gsl-common-card`, but without `href`.
-   - If snapshot exposes a matching `@e` ref for a no-`href` card, click that ref directly. If no ref is exposed but the card is visible, use `browser_find` by exact/near text with `action=click` only as a bounded fallback.
-   - If both city and attraction results are visible, click the one that matches the user's intent: city-wide attraction discovery uses the city/destination result; a named attraction uses the attraction/scenic-spot result.
-   - The click is mandatory route evidence. Record the clicked ref/name and the resulting browser URL before treating any POI page as valid.
-3. Capture the final opened `you.ctrip.com` URL as route evidence.
-   - example city scenic route:
-     - `https://you.ctrip.com/sight/guangzhou152.html`
-   - Global-search city cards may first open `place/*`, such as `https://you.ctrip.com/place/guangzhou152.html`; keep that `place/*` URL as the city guide route evidence, then use visible page navigation or links to reach `sight/*` if scenic-list data is needed.
-   - parse route segments such as `guangzhou152` or `guangzhou152` only from the clicked/opened `you.ctrip.com` URL; do not import hotel-channel ids.
-4. Extract scenic-spot details from the final `place/*`, `sight/*`, or scenic detail page.
-   - If the final page is a city guide page such as `/place/guangzhou152.html`, extract guide context from that page and click the visible `景点` / scenic navigation or visible `sight/*` link before extracting scenic-card lists.
-   - If the final page is a city-level scenic list such as `/sight/guangzhou152.html`, extract visible scenic cards first.
-   - If a specific card has a concrete detail link, click it when full detail is needed, then extract the detail page.
+1. Open the exact resolved `place/*` guide URL.
+2. Run `browser_snapshot` and verify the title, heading, breadcrumb, or visible guide link names the requested city/destination.
+3. If the opened page is generic or exposes a different exact link for the requested destination, switch to that exact link before extracting POIs.
+4. From a city guide page, use visible `景点` navigation or visible `sight/*` links to reach the city scenic list when POI cards are needed.
+5. On `sight/*` list pages, extract visible scenic cards first; click concrete detail links only when full detail is needed.
+6. On scenic detail pages, extract visible title/name, rating, comment count, ticket/price blocks, opening hours, address, transport/location text, introduction/highlights, and related evidence links.
 
-Global-search click rule:
-- Always use the result page click as the source of the city/scenic route. Do not jump straight from a keyword to a fabricated `sight/*` URL.
-- After `browser_snapshot` on `globalsearch`, the next navigation to `place/*`, `sight/*`, or `travels/*` must come from `browser_click` on a visible snapshot ref. Do not use `browser_open` with a guessed slug/id route.
-- For Ctrip global search, absence from `links` is not enough to declare failure. Check `elements` / `tree` for clickable anchors and card containers whose text matches the keyword, especially `a.guide-main-item` and `.gsl-common-card`.
-- A no-`href` result card is valid click evidence only after it is actually clicked and the resulting URL is observed. Do not convert its text to a route yourself.
-- If a clicked card uses `target="_blank"` or JavaScript `window.open`, inspect the active/new page state after the click and preserve the actual opened URL. If the automation remains on the search URL and no new Ctrip page is reachable, mark the route unresolved instead of guessing.
-- If no click was performed, there is no valid POI route evidence. Mark POI retrieval degraded instead of citing or using a constructed `you.ctrip.com` route.
-- If `browser_snapshot` does not expose a clickable city or scenic-spot result, run one bounded `browser_wait` or `browser_scroll`, snapshot again, then click only if the target result is visible.
+Related city guide channels:
+- After an exact `place/*` guide URL is resolved, its route segment can be reused for related `you.ctrip.com` city channels when the user asks for that content.
+- Use these channel entries only when relevant to the request, then open and verify the page before extracting:
+  - attractions / scenic list: `https://you.ctrip.com/sight/{routeSegment}.html`
+  - food / restaurants: `https://you.ctrip.com/restaurant/{routeSegment}.html`
+  - travel notes / guides: `https://you.ctrip.com/travels/{routeSegment}.html`
+- Example from `https://you.ctrip.com/place/sanya61.html`:
+  - food: `https://you.ctrip.com/restaurant/sanya61.html`
+  - travel notes: `https://you.ctrip.com/travels/sanya61.html`
+- Treat constructed channel URLs as entry/action links until opened and verified. Cite or extract from them only after `browser_snapshot` confirms they match the requested city and content type.
 
-Global-search validity check:
-- After opening `globalsearch`, the snapshot must show the decoded keyword or a matching result name in the visible result area before any POI click.
-- Recommended snapshot call for Ctrip global search: omit `max_elements` and use a larger `max_chars` budget, for example `browser_snapshot {"max_chars": 200000}`. Do not pass small `max_elements` values that can hide result cards behind navigation noise.
-- If the snapshot shows only global navigation, footer links, an empty search box, or generic site index links, treat it as a search-shell snapshot, not a result snapshot.
-- For a search-shell snapshot, retry in this order:
-  - `browser_wait` for the results region or visible keyword text;
-  - `browser_scroll` once and run `browser_snapshot` again with a larger bound;
-  - if the search input is visible but empty, type the keyword into that search box on the `globalsearch` page, submit it, wait, and snapshot again.
-- If the decoded keyword still does not appear and no visible city/scenic result ref is available, mark POI retrieval degraded. Do not open a guessed route.
+Global-search fallback:
+- Use `https://you.ctrip.com/globalsearch/?keyword={encodedKeyword}` only when the helper cannot run, returns no exact match, or the user asks for a specific POI/keyword rather than a destination.
+- After `browser_snapshot`, click only a visible result/card/ref that matches the requested city, destination, or POI.
+- Check `elements` and `tree`, not only `links`; Ctrip may render clickable result anchors such as `a.guide-main-item` or `.gsl-common-card` without a visible `href`.
+- If a matching no-`href` card has a snapshot ref, click that ref and preserve the resulting URL as route evidence.
+- If no matching visible result/ref exists after one bounded wait or scroll, mark POI retrieval degraded instead of guessing a route.
 
-POI anti-patterns:
-- Do not open a guessed URL such as `https://you.ctrip.com/sight/{guessedSlug}{guessedId}.html` after search results.
+Valid route evidence:
+- Helper output, user-provided URLs, visible links from browser evidence, or URLs reached by `browser_click` from visible results.
+- `place/*`, `sight/*`, or `travels/*` URLs may be cited only when they come from valid route evidence.
+- Route examples:
+  - `https://you.ctrip.com/place/sanya61.html` -> 三亚 guide route
+  - `https://you.ctrip.com/sight/sanya61.html` -> 三亚 scenic list route
+  - `https://you.ctrip.com/sight/sanya61/3230.html?poiType=3` -> scenic detail route
+  - `https://you.ctrip.com/travels/{citySlug}{cityId}/{articleId}.html` -> travel-note route when visible
+
+Anti-patterns:
+- Do not open or cite guessed URLs such as `https://you.ctrip.com/place/{guessedSlug}{guessedId}.html` or `https://you.ctrip.com/sight/{guessedSlug}{guessedId}.html`.
 - Do not infer `{citySlug}{cityId}` from memory, hotel ids, offline tables, or prior examples.
-- Do not use a `place/*`, `sight/*`, or `travels/*` URL as evidence unless it was user-provided, visible in extraction output, or reached by `browser_click` from a visible result/link.
-- Do not continue with common-knowledge attractions when Ctrip POI click-through failed; label the Ctrip POI path as degraded and keep those attractions unverified or use another provider.
-
-URL patterns (from `you.ctrip.com`):
-- Global search:
-  - `https://you.ctrip.com/globalsearch/?keyword={encodedKeyword}`
-- City-level scenic route:
-  - `https://you.ctrip.com/sight/{citySlug}{cityId}.html`
-- Scenic detail route, when visible from result cards or list cards:
-  - `https://you.ctrip.com/sight/{citySlug}{cityId}/{poiId}.html`
-  - preserve `poiType` when present
-- Travel note / guide route, when visible:
-  - `https://you.ctrip.com/travels/{citySlug}{cityId}/{articleId}.html`
-  - numeric city-route variants may also appear; preserve the clicked URL as-is
-
-City / route-id rules:
-- On POI and guide pages, the route id is attached to the `you.ctrip.com` path, such as `guangzhou152`.
-- Use only visible links or the final opened URL as route evidence:
-  - `https://you.ctrip.com/sight/guangzhou152.html` -> city route segment `guangzhou152`
-  - `https://you.ctrip.com/place/guangzhou152.html` -> city route segment `guangzhou152`
-- Do not copy hotel-channel `cityId` values into `place/*`, `sight/*`, or `travels/*`.
-- If the visible city/scenic name conflicts with the path segment, trust the visible page title or breadcrumb and keep the conflict explicit.
-
-Extraction hints:
-- Run `browser_snapshot` before every click that chooses a city, scenic spot, tab, or result card.
-- Run `browser_extract format=json` after the final `sight/*` page is visibly stable.
-- For city-level scenic pages, prioritize:
-  - visible scenic card names
-  - ratings / comment counts
-  - price or ticket text
-  - address / area / distance text
-  - rank labels or badges
-  - concrete detail links
-- For scenic detail pages, prioritize:
-  - page title / scenic spot name
-  - rating, score, comment count
-  - ticket / price blocks
-  - opening hours
-  - address and transport/location text
-  - introduction / highlights
-  - nearby or related `sight/*`, `hotel/*`, or ticket links as evidence links only
-- For guide/travel-note pages, prioritize visible article metadata and body itinerary text; capture related `sight/*` and `travels/*` links as `relatedPoiLinks`.
+- Do not copy hotel-channel `cityId` values into `you.ctrip.com` guide, sight, or travel-note URLs.
+- Do not continue with common-knowledge attractions when Ctrip POI evidence failed; mark the Ctrip path degraded or use the next provider.
 
 Quality gate:
-- If extraction is mostly global navigation, footer, copyright, or search shell text, treat it as unusable.
-- Retry once with `browser_wait`, `browser_snapshot`, and one bounded click or scroll within the city/scenic result region.
-- If still unusable, mark degraded and ask whether to retry with a more specific city or scenic-spot keyword.
+- Before extraction, confirm the page is not just global navigation, footer, copyright, an empty search shell, or a generic guide page.
+- Run `browser_snapshot` before every click that chooses a city, scenic spot, tab, or result card.
+- Run `browser_extract format=json` only after the final guide/list/detail page is visibly stable.
+- Keep conflicts explicit if the visible city/scenic name disagrees with the path segment.
+- Never fabricate POI names, ratings, prices, opening hours, addresses, or links.
+
 
 
 ### Flights and Trains
