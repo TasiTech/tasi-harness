@@ -82,12 +82,33 @@ Use Ctrip hotel list pages when the user wants:
 - hotels in a city
 - hotels near an airport, station, landmark, school, hospital, district, or business area
 - hotel comparison
-- booking or detail links
+- booking links or hotel detail links
 
 Required inputs:
 - `city`
 - `check_in`
 - `check_out`
+
+Optional inputs:
+- `destName`
+- `searchWord`
+- `searchType`
+- `optionId`
+- `rooms`
+- `adults`
+- `childAges`
+- `currency`
+- `locale`
+
+Default input values:
+- `destName` defaults to `city`
+- `searchWord` defaults to empty string
+- `searchType` defaults to `CT`
+- `rooms` defaults to `1`
+- `adults` defaults to `2`
+- `childAges` defaults to empty array
+- `currency` defaults to `CNY`
+- `locale` defaults to `zh-CN`
 
 Normalize these fields whenever available:
 - `hotelName`
@@ -103,40 +124,68 @@ Normalize these fields whenever available:
 - `evidenceFields`
 
 Hotel URL pattern:
-- Preferred desktop list pattern:
+- Use the simplified desktop Ctrip hotel list pattern:
   - `https://hotels.ctrip.com/hotels/list?...`
-- Build hotel list URLs from city text, destination text, search text, dates, occupancy, filters, currency, locale, and Ctrip-returned scoped-search params.
-- For now, do not add, look up, or synthesize hotel-channel `cityId` values.
+- Build hotel list URLs from:
+  - city text
+  - destination text
+  - optional search text
+  - search type
+  - optional Ctrip-returned `optionId`
+  - dates
+  - room count
+  - adult count
+  - child ages
+  - currency
+  - locale
+  - page/version params
+- Do not add, look up, or synthesize hotel-channel `cityId`, `provinceId`, or `countryId` values.
 - Do not consult `city_id.txt` for Hotels unless this rule is explicitly changed later.
-- If a user-provided or Ctrip-returned hotel URL already contains `cityId`, keep the full URL as opaque route evidence, but do not extract or reuse that `cityId`.
-- Use concrete hotel detail URLs only when Ctrip UI or the user provides them; do not synthesize detail URLs from ids.
+- If a user-provided or Ctrip-returned hotel URL already contains `cityId`, `provinceId`, or `countryId`, keep the full URL as opaque route evidence when opening it, but do not extract, reuse, or synthesize those IDs when rebuilding simplified URLs.
+- Use concrete hotel detail URLs only when the Ctrip UI or the user provides them. Do not synthesize hotel detail URLs from hotel IDs.
 
-Hotel search strategy:
-- Prefer desktop `hotels/list` URLs over generic keyword-only hotel search pages.
-- When the user provides a working Ctrip hotel list URL, preserve that URL structure and only adjust user-requested constraints.
-- Treat hotel search on Ctrip as a scoped list search. Preserve the city/date/search scope instead of collapsing it into a plain keyword query.
-- If starting from `https://www.ctrip.com/`, the hotel home form may submit directly to `hotels/list`; after form submission, use the resulting URL as city/date/search evidence instead of reconstructing it from memory.
-- If the URL has repeated trace/version params such as repeated `v2_mod` or `v2_version`, preserve them when opening the exact user URL. When rebuilding a URL, do not intentionally duplicate those params.
+Simplified desktop hotel list URL template:
+- Base URL:
+  - `https://hotels.ctrip.com/hotels/list`
+- Query params:
+  - `flexType=1`
+  - `fixedDate=0`
+  - `cityName={encodedCityName}`
+  - `destName={encodedDestName}`
+  - `searchWord={encodedSearchWord}` when a keyword is available; otherwise omit it or keep it as an empty string if preserving an existing URL shape
+  - `searchType={searchType}`
+  - `optionId={optionId}` only when the user provides it or Ctrip returns it
+  - `checkin={YYYY-MM-DD}`
+  - `checkout={YYYY-MM-DD}`
+  - `crn={rooms}`
+  - `listFilters={encodedListFilters}`
+  - `curr={currency}`
+  - `locale={locale}`
+  - `old=1`
+  - `v2_mod=11`
+  - `v2_version=E`
 
-Parameter hit rules for desktop `hotels/list`:
+Canonical simplified URL shape:
+- `https://hotels.ctrip.com/hotels/list?flexType=1&fixedDate=0&cityName={cityName}&destName={destName}&searchWord={searchWord}&searchType={searchType}&optionId={optionId}&checkin={checkin}&checkout={checkout}&crn={rooms}&listFilters={listFilters}&curr=CNY&locale=zh-CN&old=1&v2_mod=11&v2_version=E`
+
+Parameter handling rules:
 - Preserve city and destination text:
   - `cityName`
   - `destName`
-- Preserve search scope:
+- Preserve search scope when available:
   - `searchWord`
   - `searchType`
-  - `optionId` when Ctrip returns it
-  - `searchValue` when Ctrip returns it
-  - `directSearch`
+  - `optionId` only when provided by the user or returned by Ctrip
+  - `searchValue` only when Ctrip returns it
+  - `directSearch` only when present in an existing working URL or returned by Ctrip
 - Preserve dates and occupancy:
   - `checkin`
   - `checkout`
   - `crn`
-  - `adult` / `children` when present
+  - `listFilters`
 - Preserve page-shaping and display params when already present:
   - `flexType`
   - `fixedDate`
-  - `listFilters`
   - `curr`
   - `locale`
   - `old`
@@ -144,34 +193,172 @@ Parameter hit rules for desktop `hotels/list`:
   - `sid`
   - `v2_mod`
   - `v2_version`
+- If a URL has repeated trace/version params such as repeated `v2_mod` or repeated `v2_version`, preserve them when opening the exact user URL. When rebuilding a URL, include each trace/version param only once.
+- If changing the destination city, do not carry over a stale `optionId` unless the new `optionId` is explicitly provided by the user or returned by Ctrip for the new destination.
+
+Occupancy rules:
+- `crn` means room count.
+- Example:
+  - `crn=1` means 1 room
+  - `crn=2` means 2 rooms
+  - `crn=4` means 4 rooms
+
+`listFilters` rules:
+- `listFilters` encodes adult count and child ages.
+- Adult count uses this format:
+  - `29~1*29*1~{adults}*2`
+- Examples:
+  - `29~1*29*1~1*2` means 1 adult
+  - `29~1*29*1~2*2` means 2 adults
+  - `29~1*29*1~4*2` means 4 adults
+- If there are no children, `listFilters` should contain only the adult segment.
+- Example:
+  - `crn=1&listFilters=29~1*29*1~2*2`
+  - Decode as: 1 room, 2 adults, 0 children
+
+Child age rules:
+- Children are represented by one age segment per child.
+- The first child starts at index `2`.
+- The second child uses index `3`.
+- The third child uses index `4`.
+- General child segment:
+  - `29~{childIndex}~{age}*29*{childIndex}~{age}`
+- Child index formula:
+  - `childIndex = childNumber + 1`
+- Examples:
+  - First child, age 8:
+    - `29~2~8*29*2~8`
+  - Second child, age 11:
+    - `29~3~11*29*3~11`
+  - Third child, age 13:
+    - `29~4~13*29*4~13`
+
+When children are present:
+- Append all child age segments after the adult segment.
+- Then append these fixed child-related filter segments:
+  - `80~2*80*2`
+  - `17~1*17*1`
+
+Full `listFilters` generation formula:
+- Input:
+  - `adults`
+  - `childAges`
+- Output:
+  - `29~1*29*1~{adults}*2`
+  - plus one child segment per child age
+  - plus `80~2*80*2,17~1*17*1` when `childAges.length > 0`
+
+Examples:
+- 1 room, 2 adults, 0 children:
+  - `crn=1`
+  - `listFilters=29~1*29*1~2*2`
+- 2 rooms, 2 adults, 1 child age 8:
+  - `crn=2`
+  - `listFilters=29~1*29*1~2*2,29~2~8*29*2~8,80~2*80*2,17~1*17*1`
+- 1 room, 1 adult, 2 children ages 8 and 10:
+  - `crn=1`
+  - `listFilters=29~1*29*1~1*2,29~2~8*29*2~8,29~3~10*29*3~10,80~2*80*2,17~1*17*1`
+- 4 rooms, 4 adults, 3 children ages 8, 11, and 13:
+  - `crn=4`
+  - `listFilters=29~1*29*1~4*2,29~2~8*29*2~8,29~3~11*29*3~11,29~4~13*29*4~13,80~2*80*2,17~1*17*1`
+
+Important occupancy limitation:
+- The simplified Ctrip list URL expresses total room count, total adult count, and child ages.
+- It does not reliably express per-room allocation.
+- Do not infer which adult or child belongs to which room unless the Ctrip UI explicitly shows that allocation.
+
+URL encoding rules:
+- Encode query params with a standard URL encoder.
+- Encode Chinese text in `cityName`, `destName`, and `searchWord`.
+- Encode `listFilters` as one query value.
+- Do not double-encode values.
+- Common encodings:
+  - `,` becomes `%2C`
+  - `*` may become `%2A`
+  - `桂林` becomes `%E6%A1%82%E6%9E%97`
+- Both raw `*` and encoded `%2A` may appear in observed Ctrip URLs. When building URLs, prefer standard query encoding.
 
 Common `searchType` meanings from observed links:
 - `searchType=CT`
-  - use for city-scoped text search within the destination
-  - example intent: `cityName=广州`, `destName=广州`, `searchWord=机场` means hotels in Guangzhou with an airport-related search scope
-- `searchType=LM`
-  - use for landmark / POI / school / station nearby hotels when Ctrip returns the scoped-search payload
-- `searchType=Z`
-  - use for zone / district / neighborhood / business-area hotels when Ctrip returns the scoped-search payload
+  - City-only hotel search.
+  - There should be no `searchWord`; omit it or keep it empty only when preserving an existing URL shape.
+- `searchType=T`
+  - `searchWord` is a location / place / area text.
+  - Use for user requests such as hotels near an airport, station, landmark, scenic area, school, hospital, district, or business area when Ctrip does not provide a more specific scoped payload.
+- `searchType=B`
+  - `searchWord` is a hotel brand.
+  - Use when the user asks for hotels by brand, such as Hilton, Atour, Marriott, or 全季.
+- `searchType=H`
+  - `searchWord` is a hotel name.
+  - Use when the user asks for one named hotel or hotels matching an explicit hotel-name text.
 
-Canonical no-`cityId` hotel list example:
-- `https://hotels.ctrip.com/hotels/list?flexType=1&fixedDate=0&cityName=%E5%B9%BF%E5%B7%9E&destName=%E5%B9%BF%E5%B7%9E&searchWord=%E6%9C%BA%E5%9C%BA&searchType=CT&checkin=2026-05-08&checkout=2026-05-09&crn=1&listFilters=29~1*29*1~2*2&curr=CNY&locale=zh-CN&directSearch=1&allianceid=4899&sid=963772&old=1&v2_mod=11&v2_version=E`
-- Decode this as: Guangzhou hotel search, airport keyword scope, 2026-05-08 to 2026-05-09, 1 room, CNY, zh-CN locale, preserving the visible filters and trace params.
+Canonical simplified no-child example:
+- `https://hotels.ctrip.com/hotels/list?flexType=1&fixedDate=0&cityName=%E6%A1%82%E6%9E%97&destName=%E6%A1%82%E6%9E%97&searchType=CT&optionId=33&checkin=2026-06-01&checkout=2026-06-05&crn=4&listFilters=29~1*29*1~4*2&curr=CNY&locale=zh-CN&old=1&v2_mod=11&v2_version=E`
+- Decode this as:
+  - Ctrip desktop hotel list page
+  - city text: 桂林
+  - destination text: 桂林
+  - search type: city search
+  - option ID: 33, only because it was present in the supplied URL
+  - check-in: 2026-06-01
+  - check-out: 2026-06-05
+  - 4 rooms
+  - 4 adults
+  - 0 children
+  - currency: CNY
+  - locale: zh-CN
+
+Canonical simplified child example:
+- `https://hotels.ctrip.com/hotels/list?flexType=1&fixedDate=0&cityName=%E6%A1%82%E6%9E%97&destName=%E6%A1%82%E6%9E%97&searchType=CT&optionId=33&checkin=2026-06-01&checkout=2026-06-05&crn=4&listFilters=29~1%2A29%2A1~4%2A2%2C29~2~8%2A29%2A2~8%2C29~3~11%2A29%2A3~11%2C29~4~13%2A29%2A4~13%2C80~2%2A80%2A2%2C17~1%2A17%2A1&curr=CNY&locale=zh-CN&old=1&v2_mod=11&v2_version=E`
+- Decode this as:
+  - Ctrip desktop hotel list page
+  - city text: 桂林
+  - destination text: 桂林
+  - search type: city search
+  - option ID: 33, only because it was present in the supplied URL
+  - check-in: 2026-06-01
+  - check-out: 2026-06-05
+  - 4 rooms
+  - 4 adults
+  - 3 children
+  - child ages: 8, 11, 13
+  - currency: CNY
+  - locale: zh-CN
+
+Hotel search strategy:
+- Prefer desktop `hotels/list` URLs over generic keyword-only hotel search pages.
+- When the user provides a working Ctrip hotel list URL, preserve that URL structure and only adjust user-requested constraints.
+- Treat hotel search on Ctrip as a scoped list search. Preserve the city/date/search scope instead of collapsing it into a plain keyword query.
+- If starting from `https://www.ctrip.com/`, the hotel home form may submit directly to `hotels/list`. After form submission, use the resulting URL as city/date/search evidence instead of reconstructing it from memory.
+- When rebuilding a URL, use the simplified no-`cityId` pattern unless the user explicitly asks to preserve the exact original URL.
+- When changing only dates, update only `checkin` and `checkout`.
+- When changing room/adult/child constraints, recompute `crn` and `listFilters`.
+- When changing city or destination, update `cityName` and `destName`; remove stale `optionId`, `searchValue`, or scoped POI params unless the new scoped values are explicitly provided or returned by Ctrip.
+- When changing only the keyword, update `searchWord` and choose `searchType` by intent: `T` for location/place, `B` for hotel brand, `H` for hotel name. Do not use `CT` with a non-empty `searchWord`.
 
 Extraction hints for hotel list pages:
-- Echo parsed city, keyword, check-in, check-out, room count, currency, and filter constraints before listing rows.
-- Run `browser_snapshot` before extraction to confirm the visible list region, city/search scope, date widgets, and whether the page is a login/captcha/empty shell.
-- Prioritize visible hotel cards tied to the current city/search/date scope.
-- When `searchType=CT` with a keyword such as `机场`, prioritize airport/location cues and distance text visible on hotel cards.
-- When `searchType=LM`, prioritize distance-to-landmark text and visible evidence that the page is scoped to that POI or landmark.
-- When `searchType=Z`, prioritize district / neighborhood / business-area labels and visible evidence that the page is scoped to that zone.
-- Do not infer hotel names, prices, scores, distances, or booking links when they are not clearly visible.
+- Echo parsed city, destination, keyword, check-in, check-out, room count, adult count, child ages, currency, locale, and visible filter constraints before listing rows.
+- Run `browser_snapshot` before extraction to confirm:
+  - the visible list region
+  - city/search scope
+  - date widgets
+  - occupancy widgets
+  - whether the page is a login page, captcha page, or empty shell
+- Prioritize visible hotel cards tied to the current city/search/date/occupancy scope.
+- When `searchType=CT`, confirm the page is scoped to the city and not to a stale `searchWord`.
+- When `searchType=T`, prioritize location/distance cues visible on hotel cards.
+- When `searchType=B`, prioritize visible brand/name matches.
+- When `searchType=H`, prioritize exact hotel-name matches and concrete hotel detail links.
+- Do not infer hotel names, prices, scores, distances, room availability, cancellation terms, or booking links when they are not clearly visible.
+- Do not infer a hotel detail URL unless it is present in a visible card, link, or Ctrip-provided route.
 
 Recovery rule:
-- If extraction from a hotel URL returns mostly global navigation, footer, or copyright text, treat that URL choice as weak.
-- Retry once with the same desktop `hotels/list` scope after `browser_wait`, `browser_snapshot`, and one bounded interaction or scroll.
-- If still unusable, mark degraded and ask whether to retry with adjusted city, date, or keyword constraints.
-
+- If extraction from a hotel URL returns mostly global navigation, footer, legal text, copyright text, or an empty app shell, treat that URL choice as weak.
+- Retry once with the same desktop `hotels/list` scope after:
+  - `browser_wait`
+  - `browser_snapshot`
+  - one bounded interaction or scroll
+- If still unusable, mark the extraction as degraded and ask whether to retry with adjusted city, date, keyword, or occupancy constraints.
 
 ### POI and Travel Guides
 
