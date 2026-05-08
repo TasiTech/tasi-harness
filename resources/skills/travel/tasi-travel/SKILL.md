@@ -137,49 +137,6 @@ Never fabricate hotel names, prices, scores, areas, or booking links.
 - Ask the user whether to retry with adjusted inputs such as city, date range, or keyword.
 - Keep uncertainty visible if only degraded or fallback data is available.
 
-## POI Search Integration (Ctrip/Browser Tools)
-
-### When to Trigger
-Use POI search when the user asks for city attractions, scenic spots, museums, landmarks, ticket ideas, or nearby places to visit.
-
-### Tool Binding
-- Preferred workflow: `browser_open` -> `browser_wait` -> `browser_snapshot` -> `browser_extract`
-- Preferred extract format: `format=json`
-- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
-- Required args: `city`
-- Optional args: `keyword`, `limit`
-- Preferred source: Ctrip sight or guide listing pages and clearly attributable POI detail pages.
-
-If required args are missing:
-1. Ask one concise follow-up question.
-2. Do not fabricate city or keyword silently.
-
-### Extraction Rules
-1. Open the relevant Ctrip city sight list or search page.
-2. Wait for the list container or detail content to stabilize before extraction.
-3. Run `browser_snapshot` to inspect result cards, city/POI/detail links, hover/click refs, and visible page sections before extraction.
-4. Scroll only when needed for lazy-loaded result cards, then run `browser_snapshot` again if new result cards or links appear.
-5. Extract bounded JSON card content with `browser_extract` using `format=json`, and capture visible detail or list URLs.
-6. Normalize result rows and keep the page URL as a fallback `sourceUrl`.
-
-### Output Contract for POI Rows
-When POI retrieval succeeds, render attraction rows directly from normalized browser output.
-Each displayed row should keep these fields whenever available:
-- `name`
-- `category`
-- `rating`
-- `price`
-- `address`
-- `detailUrl` (preferred detail/booking link)
-- `sourceUrl` (fallback list link)
-
-Never fabricate POI names, categories, prices, or links.
-
-### Degradation and Retry Policy
-- If browser extraction returns zero rows or explicit error, state this clearly.
-- Ask the user whether to retry with adjusted city or keyword constraints.
-- Keep uncertainty visible if only degraded or fallback data is available.
-
 ## Integrated Workflow
 
 ### Goal

@@ -175,79 +175,72 @@ Recovery rule:
 
 ### POI and Travel Guides
 
-Use Ctrip `you.ctrip.com` pages when the user asks for attractions, scenic spots, museums, landmarks, destination guide context, ticket ideas, opening hours, addresses, ratings, or travel-note itinerary inspiration.
+Use Ctrip `you.ctrip.com` pages when the user asks for attractions, scenic spots, museums, landmarks, destination guide context, food/restaurant ideas, travel notes, ticket ideas, opening hours, addresses, or ratings.
 
-Required input:
-- `city` or `keyword`
+No-guessing contract:
+- Never open, cite, or extract from a `you.ctrip.com` `place/*`, `sight/*`, `restaurant/*`, or `travels/*` URL that was made from memory, examples, hotel ids, or an inferred slug/id.
+- Valid route evidence is only: helper output, a user-provided URL, a visible browser link, a URL reached by clicking a visible browser result, or a channel URL built from a verified `routeSegment` and then opened and verified.
+- If no valid route evidence exists, use the global-search fallback with visible click evidence or mark the Ctrip POI path degraded.
 
-Normalize POI rows with these fields when visible:
-- `name`, `category`, `rating`, `commentCount`, `price`, `address`, `openingHours`, `rankOrBadge`
-- `detailUrl`, `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
+Tool binding:
+- Preferred workflow: `browser_open` -> `browser_wait` -> `browser_snapshot` -> `browser_extract`
+- Preferred extract format: `format=json`
+- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
+- Required args: `city` for city-wide POI discovery, or `keyword` for named POI / search fallback.
+- Optional args: `limit`
+- Preferred source: verified Ctrip guide, sight, restaurant, travels, or POI detail pages.
 
-Normalize guide/article rows with these fields when visible:
-- `title`, `publishDate`, `readCountText`, `startMonthText`, `tripDaysText`, `perCapitaCostText`, `travelWithText`, `keyItinerary`, `relatedPoiLinks`
-- `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
+If required args are missing:
+1. Ask one concise follow-up question.
+2. Do not fabricate city or keyword silently.
 
 Mandatory city / destination resolution:
 1. For a named city or destination, first run `../scripts/extract_ctrip_destinations.py` with exact matching:
    - `python ../scripts/extract_ctrip_destinations.py --name 三亚 --require-match`
-2. Use only the returned `url` as the Ctrip guide route. Example: 三亚 must resolve to `https://you.ctrip.com/place/sanya61.html`, not `https://you.ctrip.com/place/sanya3.html`.
+2. Use only the returned `url` as the guide route. Examples:
+   - 三亚 must resolve to `https://you.ctrip.com/place/sanya61.html`, not `https://you.ctrip.com/place/sanya3.html`.
 3. `routeSegment` means the exact path segment between `/place/` and `.html` in the resolved Ctrip guide URL.
    - `https://you.ctrip.com/place/sanya61.html` -> `routeSegment=sanya61`
    - It is not the Chinese city name, not the numeric id alone, and not a hotel-channel `cityId`.
-4. The helper reads `https://you.ctrip.com/` and prefers `script#__NEXT_DATA__`:
-   - `props.pageProps.initialState.CitySelectorData.domesticTab.tabList[*].districtList[*]`
-   - `props.pageProps.initialState.CitySelectorData.internationalTab.tabList[*].districtList[*]`
-5. If `__NEXT_DATA__` is unavailable, the helper may fall back to rendered anchors matching `(?:(?:https?:)?//you\.ctrip\.com)?/place/[^"]+\.html` and normalize relative links against `https://you.ctrip.com/`.
-6. Treat results as destination links, not strictly administrative city links; they can include cities, scenic areas, islands, regions, and landmarks.
+4. The helper reads `https://you.ctrip.com/`, prefers `script#__NEXT_DATA__`, and may fall back to rendered `/place/*.html` anchors.
+5. Treat helper results as destination links, not strictly administrative city links; they can include cities, scenic areas, islands, regions, and landmarks.
 
-Primary POI workflow:
+Primary workflow:
 1. Open the exact resolved `place/*` guide URL.
 2. Run `browser_snapshot` and verify the title, heading, breadcrumb, or visible guide link names the requested city/destination.
-3. If the opened page is generic or exposes a different exact link for the requested destination, switch to that exact link before extracting POIs.
-4. From a city guide page, use visible `景点` navigation or visible `sight/*` links to reach the city scenic list when POI cards are needed.
-5. On `sight/*` list pages, extract visible scenic cards first; click concrete detail links only when full detail is needed.
-6. On scenic detail pages, extract visible title/name, rating, comment count, ticket/price blocks, opening hours, address, transport/location text, introduction/highlights, and related evidence links.
-
-Related city guide channels:
-- After an exact `place/*` guide URL is resolved, its route segment can be reused for related `you.ctrip.com` city channels when the user asks for that content.
-- Use these channel entries only when relevant to the request, then open and verify the page before extracting:
-  - attractions / scenic list: `https://you.ctrip.com/sight/{routeSegment}.html`
-  - food / restaurants: `https://you.ctrip.com/restaurant/{routeSegment}.html`
-  - travel notes / guides: `https://you.ctrip.com/travels/{routeSegment}.html`
-- Example from `https://you.ctrip.com/place/sanya61.html`:
-  - food: `https://you.ctrip.com/restaurant/sanya61.html`
-  - travel notes: `https://you.ctrip.com/travels/sanya61.html`
-- Treat constructed channel URLs as entry/action links until opened and verified. Cite or extract from them only after `browser_snapshot` confirms they match the requested city and content type.
+3. If the opened page is generic or exposes a different exact link for the requested destination, switch to that exact link before extracting.
+4. For attractions, use visible `景点` navigation or construct `https://you.ctrip.com/sight/{routeSegment}.html` only from the verified `routeSegment`; open and verify it before extracting POI cards.
+5. For related content, construct these entries only from the verified `routeSegment`, and only when the user asks for that content:
+   - food / restaurants: `https://you.ctrip.com/restaurant/{routeSegment}.html`
+   - travel notes / guides: `https://you.ctrip.com/travels/{routeSegment}.html`
+6. On list pages, extract visible cards first; click concrete detail links only when full detail is needed.
 
 Global-search fallback:
-- Use `https://you.ctrip.com/globalsearch/?keyword={encodedKeyword}` only when the helper cannot run, returns no exact match, or the user asks for a specific POI/keyword rather than a destination.
+- Use `https://you.ctrip.com/globalsearch/?keyword={encodedKeyword}` only when the helper cannot run, returns no exact match, or the request is for a specific POI/keyword rather than a destination.
 - After `browser_snapshot`, click only a visible result/card/ref that matches the requested city, destination, or POI.
-- Check `elements` and `tree`, not only `links`; Ctrip may render clickable result anchors such as `a.guide-main-item` or `.gsl-common-card` without a visible `href`.
-- If a matching no-`href` card has a snapshot ref, click that ref and preserve the resulting URL as route evidence.
+- Check `elements` and `tree`, not only `links`; Ctrip may render clickable result cards without visible `href`.
 - If no matching visible result/ref exists after one bounded wait or scroll, mark POI retrieval degraded instead of guessing a route.
 
-Valid route evidence:
-- Helper output, user-provided URLs, visible links from browser evidence, or URLs reached by `browser_click` from visible results.
-- `place/*`, `sight/*`, or `travels/*` URLs may be cited only when they come from valid route evidence.
-- Route examples:
-  - `https://you.ctrip.com/place/sanya61.html` -> 三亚 guide route
-  - `https://you.ctrip.com/sight/sanya61.html` -> 三亚 scenic list route
-  - `https://you.ctrip.com/sight/sanya61/3230.html?poiType=3` -> scenic detail route
-  - `https://you.ctrip.com/travels/{citySlug}{cityId}/{articleId}.html` -> travel-note route when visible
-
-Anti-patterns:
-- Do not open or cite guessed URLs such as `https://you.ctrip.com/place/{guessedSlug}{guessedId}.html` or `https://you.ctrip.com/sight/{guessedSlug}{guessedId}.html`.
-- Do not infer `{citySlug}{cityId}` from memory, hotel ids, offline tables, or prior examples.
-- Do not copy hotel-channel `cityId` values into `you.ctrip.com` guide, sight, or travel-note URLs.
-- Do not continue with common-knowledge attractions when Ctrip POI evidence failed; mark the Ctrip path degraded or use the next provider.
+Extraction fields:
+- POI rows: `name`, `category`, `rating`, `commentCount`, `price`, `address`, `openingHours`, `rankOrBadge`, `detailUrl`, `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
+- Guide/article rows: `title`, `publishDate`, `readCountText`, `startMonthText`, `tripDaysText`, `perCapitaCostText`, `travelWithText`, `keyItinerary`, `relatedPoiLinks`, `sourceUrl`, `sourceTitle`, `publisherOrSite`, `observedAt`, `evidenceFields`
 
 Quality gate:
 - Before extraction, confirm the page is not just global navigation, footer, copyright, an empty search shell, or a generic guide page.
-- Run `browser_snapshot` before every click that chooses a city, scenic spot, tab, or result card.
+- Run `browser_snapshot` before each click that chooses a city, scenic spot, tab, or result card.
 - Run `browser_extract format=json` only after the final guide/list/detail page is visibly stable.
 - Keep conflicts explicit if the visible city/scenic name disagrees with the path segment.
 - Never fabricate POI names, ratings, prices, opening hours, addresses, or links.
+
+Degradation and retry:
+- If browser extraction returns zero rows or explicit error, state this clearly.
+- Ask whether to retry with adjusted city, destination, or keyword constraints.
+- Keep uncertainty visible if only degraded or fallback data is available.
+
+Implementation note for the helper:
+- It parses:
+   - `props.pageProps.initialState.CitySelectorData.domesticTab.tabList[*].districtList[*]`
+   - `props.pageProps.initialState.CitySelectorData.internationalTab.tabList[*].districtList[*]`
 
 
 
