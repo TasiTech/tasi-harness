@@ -16,6 +16,6 @@
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src/renderer", "src/preload", "src/shared", "tests"],
+  "include": ["src/renderer", "src/preload", "src/shared", "src/main/**/*.d.ts", "tests"],
   "references": []
 }

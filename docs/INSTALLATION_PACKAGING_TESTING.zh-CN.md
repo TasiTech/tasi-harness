@@ -64,6 +64,39 @@ bash scripts/package-macos-installer.sh
 - `scripts/package-win-installer.ps1` 为 Windows 打包脚本
 - `scripts/package-macos-installer.sh` 为 macOS 打包脚本
 - macOS 打包通常应在 macOS 主机执行
+- 安装包会包含命令行启动器：Windows 为安装目录下的 `tasi.cmd` / `tasi-harness.cmd`，macOS 为应用包内的 `Contents/Resources/bin/tasi` / `tasi-harness`
+
+## 命令行使用
+
+Windows 安装后，新开 PowerShell：
+
+```powershell
+tasi chat "写一个今天的工作计划"
+tasi chat --session xxx "继续上次的方案"
+tasi chat -s xxx -e sandbox "继续上次的方案"
+tasi chat --execution sandbox --knowledge "基于个人知识库回答"
+tasi sessions
+```
+
+macOS 安装到 `/Applications` 后：
+
+```bash
+/Applications/Tasi\ Harness.app/Contents/Resources/bin/tasi chat "写一个今天的工作计划"
+mkdir -p "$HOME/.local/bin"
+ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.local/bin/tasi"
+```
+
+常用选项：
+
+- `--session <id>` / `-s <id>`：复用已有会话；`<id>` 就是完整 session id，不需要固定前缀；不传则新建会话
+- `--execution workspace|sandbox` / `-e workspace|sandbox`：选择执行模式
+- `--knowledge` / `-k`：启用个人知识库上下文
+- `--plain` / `-p`：输出 Markdown 原文；默认普通输出会用 `marked-terminal` 渲染成终端格式
+- `--json` / `-j`：输出完整 JSON 结果，包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage`、`execution` 等字段，便于脚本解析
+- `--verbose` / `-V`：输出工具事件
+- `--home <path>` / `-H <path>`：覆盖默认数据目录
+
+无消息运行 `tasi` 会进入交互式对话，支持 `:new`、`:session <id>`、`:exit`。每次回复后都会显示当前 session id。命令行复用桌面端配置与本地数据；浏览器自动化工具通过外部 Chrome / Edge 的 CDP 模式运行。
 
 ## 测试
 
@@ -79,4 +112,3 @@ Vitest 覆盖包括：
 - 技能解析与更新
 - 个人知识库流程
 - 会话文档上下文流程
-

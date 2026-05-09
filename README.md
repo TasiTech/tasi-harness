@@ -103,6 +103,29 @@ Tasi Harness stores:
 
 Memory updates are queued during a run and committed after the run completes, which reduces partial-memory writes from failed executions.
 
+### Command-Line Chat
+
+After installing the Windows NSIS package, the install directory is added to the current user's `PATH`. Open a new PowerShell window and run:
+
+```powershell
+tasi chat "summarize the current workspace"
+tasi chat --session xxx "continue this session"
+tasi chat -s xxx -e sandbox "continue this session"
+tasi chat --execution sandbox --knowledge "answer with my personal knowledge base"
+tasi sessions
+```
+
+On macOS, after installing the app in `/Applications`, the bundled bash launcher is available inside the app bundle:
+
+```bash
+/Applications/Tasi\ Harness.app/Contents/Resources/bin/tasi chat "summarize the current workspace"
+ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.local/bin/tasi"
+```
+
+Running `tasi` with no message starts an interactive chat. `chat` creates a new session when `--session/-s` is omitted, and appends to an existing session when `--session xxx` or `-s xxx` is provided; `xxx` is the full session id and does not need a fixed prefix. Each reply prints the current session id. The CLI shares the desktop app's `~/.tasi-harness/config.json`, sessions, memory, skills, and personal knowledge base. Browser automation runs through external Chrome / Edge CDP mode.
+
+Normal output renders Markdown with `marked-terminal`, so headings, lists, tables, and code blocks are formatted for the terminal. Add `--plain` or `-p` when you want raw Markdown for copying, or `--json` / `-j` to print the full result object, including `sessionId`, `finalResponse`, `messages`, `toolEvents`, `usage`, and `execution`.
+
 ### Scheduled tasks and notifications
 
 The **Tasks** page supports:

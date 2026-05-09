@@ -23,6 +23,7 @@ interface WebDriverSessionCreated {
 
 interface ExternalBrowserBridgeOptions {
   runtimeDir?: string;
+  strictCdpEndpoint?: boolean;
 }
 
 interface CdpLaunchProfile {
@@ -55,6 +56,7 @@ export class ExternalBrowserBridge {
   private readonly logPrefix = '[browser][external]';
   private readonly logVersion = 'v2-auto-launch';
   private readonly runtimeDir: string;
+  private readonly strictCdpEndpoint: boolean;
   private cdpOpenedTargetIds = new Set<string>();
   private cdpEndpoint = '';
   private cdpBrowserName = '';
@@ -74,6 +76,7 @@ export class ExternalBrowserBridge {
 
   constructor(options: ExternalBrowserBridgeOptions = {}) {
     this.runtimeDir = options.runtimeDir?.trim() || join(tmpdir(), 'tasi-harness', 'external-browser');
+    this.strictCdpEndpoint = options.strictCdpEndpoint === true;
   }
 
   activeCdpTargetId(): string | null {
@@ -174,6 +177,10 @@ export class ExternalBrowserBridge {
   private resolveCdpEndpointCandidates(rawEndpoint: string, autoDetect: boolean): string[] {
     const primary = withScheme(rawEndpoint, 'http');
     if (!autoDetect) return [primary];
+    if (this.strictCdpEndpoint) {
+      const list = [primary, this.cdpManagedEndpoint].filter((item): item is string => Boolean(item));
+      return [...new Set(list.map((item) => withScheme(item, 'http')))];
+    }
     const defaults = ['http://127.0.0.1:9222', 'http://127.0.0.1:9223', 'http://127.0.0.1:9333', 'http://localhost:9222'];
     if (this.cdpManagedEndpoint) defaults.unshift(this.cdpManagedEndpoint);
     const list = [primary, ...defaults];

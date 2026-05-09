@@ -42,6 +42,8 @@ RELEASE_DIR="$REPO_ROOT/release"
 
 cd "$REPO_ROOT"
 
+chmod +x "$REPO_ROOT/build/cli/mac/tasi" "$REPO_ROOT/build/cli/mac/tasi-harness"
+
 if [[ "$SKIP_BUILD" -ne 1 ]]; then
   echo
   echo "==> Building app"

@@ -27,6 +27,8 @@
     "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-react": "latest",
     "jszip": "^3.10.1",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
     "nodemailer": "^8.0.7",
     "pdfjs-dist": "^5.7.284",
     "qrcode": "^1.5.4",
@@ -65,6 +67,14 @@
       {
         "from": "resources/skills",
         "to": "skills"
+      },
+      {
+        "from": "build/cli/mac",
+        "to": "bin",
+        "filter": [
+          "tasi",
+          "tasi-harness"
+        ]
       }
     ],
     "mac": {
@@ -72,13 +82,23 @@
     },
     "win": {
       "target": "nsis",
-      "icon": "build/icon.ico"
+      "icon": "build/icon.ico",
+      "extraFiles": [
+        {
+          "from": "build/cli/win",
+          "to": ".",
+          "filter": [
+            "*.cmd"
+          ]
+        }
+      ]
     },
     "nsis": {
       "createDesktopShortcut": "always",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
-      "installerHeaderIcon": "build/icon.ico"
+      "installerHeaderIcon": "build/icon.ico",
+      "include": "build/nsis/cli-path.nsh"
     },
     "linux": {
       "target": "AppImage",

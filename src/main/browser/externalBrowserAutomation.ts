@@ -13,7 +13,6 @@ import type {
 } from '../tools/browserAutomation.js';
 import type { AppConfig } from '../../shared/types.js';
 import { ExternalBrowserBridge } from './externalBrowserBridge.js';
-import { pageHelpers } from './embeddedBrowserAutomation.js';
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
@@ -163,6 +162,228 @@ function formatSnapshotTree(nodes: unknown[]): string {
     lines.push(parts.join(' '));
   }
   return lines.join('\n');
+}
+
+function pageHelpers(): string {
+  return `
+    const TasiBrowser = (() => {
+      const normalizeText = (value) => String(value || "")
+        .replace(/\\u00a0/g, " ")
+        .replace(/[ \\t]+/g, " ")
+        .replace(/\\n{3,}/g, "\\n\\n")
+        .trim();
+      const isVisible = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+      const cssEscape = (value) => {
+        if (window.CSS && typeof window.CSS.escape === "function") return window.CSS.escape(String(value));
+        return String(value).replace(/["\\\\]/g, "\\\\$&");
+      };
+      const nthOfType = (el) => {
+        let index = 1;
+        let sibling = el;
+        while ((sibling = sibling.previousElementSibling)) {
+          if (sibling.tagName === el.tagName) index += 1;
+        }
+        return index;
+      };
+      const selectorFor = (el) => {
+        if (!(el instanceof Element)) return "";
+        const attrPrefs = ["data-testid", "data-test", "data-cy", "aria-label", "name", "placeholder", "title", "alt"];
+        if (el.id) return "#" + cssEscape(el.id);
+        for (const attr of attrPrefs) {
+          const raw = el.getAttribute(attr);
+          if (!raw) continue;
+          const selector = el.tagName.toLowerCase() + "[" + attr + "=\\"" + cssEscape(raw) + "\\"]";
+          try {
+            if (document.querySelectorAll(selector).length === 1) return selector;
+          } catch {}
+        }
+        const parts = [];
+        let node = el;
+        while (node && node.nodeType === 1 && node !== document.body && parts.length < 5) {
+          const tag = node.tagName.toLowerCase();
+          parts.unshift(tag + ":nth-of-type(" + nthOfType(node) + ")");
+          node = node.parentElement;
+        }
+        return parts.length ? "body > " + parts.join(" > ") : el.tagName.toLowerCase();
+      };
+      const roleFor = (el) => {
+        const explicit = el.getAttribute("role");
+        if (explicit) return explicit;
+        const tag = el.tagName.toLowerCase();
+        const type = (el.getAttribute("type") || "").toLowerCase();
+        if (tag === "a") return "link";
+        if (tag === "button" || type === "button" || type === "submit" || type === "reset") return "button";
+        if (tag === "input" && type === "checkbox") return "checkbox";
+        if (tag === "input" && type === "radio") return "radio";
+        if (tag === "select") return "combobox";
+        if (tag === "textarea" || tag === "input") return "textbox";
+        if (/^h[1-6]$/.test(tag)) return "heading";
+        if (tag === "img") return "img";
+        if (tag === "form") return "form";
+        return tag;
+      };
+      const looksClickable = (el) => {
+        if (!(el instanceof Element)) return false;
+        const tag = el.tagName.toLowerCase();
+        if (["a", "button", "summary"].includes(tag)) return true;
+        const role = (el.getAttribute("role") || "").toLowerCase();
+        if (["button", "link", "menuitem", "tab", "option", "checkbox", "radio", "switch"].includes(role)) return true;
+        if (el.hasAttribute("onclick")) return true;
+        if (el.hasAttribute("data-href") || el.hasAttribute("data-url") || el.hasAttribute("data-link") || el.hasAttribute("data-route")) return true;
+        const tabindex = el.getAttribute("tabindex");
+        if (tabindex !== null && Number(tabindex) >= 0) return true;
+        const classAndId = String(el.className || "") + " " + String(el.id || "");
+        if (/(^|[-_\\s])(btn|button|link|click|clickable|card|item|tile|result|guide|poi|sight|gsl)([-_\\s]|$)/i.test(classAndId)) return true;
+        try {
+          if (window.getComputedStyle(el).cursor === "pointer") return true;
+        } catch {}
+        return false;
+      };
+      const labelFor = (el) => {
+        if (!(el instanceof Element)) return "";
+        if (el.id) {
+          const label = document.querySelector("label[for=\\"" + cssEscape(el.id) + "\\"]");
+          if (label) return normalizeText(label.innerText || label.textContent || "");
+        }
+        const parentLabel = el.closest("label");
+        if (parentLabel) return normalizeText(parentLabel.innerText || parentLabel.textContent || "");
+        return "";
+      };
+      const nameFor = (el) => {
+        const labelledBy = el.getAttribute("aria-labelledby");
+        if (labelledBy) {
+          const text = labelledBy.split(/\\s+/g).map((id) => document.getElementById(id)).filter(Boolean)
+            .map((node) => normalizeText(node.innerText || node.textContent || "")).filter(Boolean).join(" ");
+          if (text) return text;
+        }
+        return normalizeText(
+          el.getAttribute("aria-label") ||
+          labelFor(el) ||
+          el.getAttribute("alt") ||
+          el.getAttribute("title") ||
+          el.getAttribute("placeholder") ||
+          el.innerText ||
+          el.textContent ||
+          el.getAttribute("value") ||
+          ""
+        );
+      };
+      const clip = (value, max) => {
+        const text = normalizeText(value);
+        return text.length > max ? text.slice(0, Math.max(0, max - 15)) + "... [truncated]" : text;
+      };
+      const describe = (el, ref = "") => {
+        const rect = el.getBoundingClientRect();
+        const item = {
+          ref,
+          tag: el.tagName.toLowerCase(),
+          role: roleFor(el),
+          name: clip(nameFor(el), 220),
+          text: clip(normalizeText(el.innerText || el.textContent || ""), 360),
+          selector: selectorFor(el),
+          visible: isVisible(el),
+          enabled: !el.disabled && el.getAttribute("aria-disabled") !== "true",
+          box: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
+        };
+        const href = el.getAttribute("href");
+        if (href) {
+          try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
+        }
+        if ("value" in el && typeof el.value !== "undefined") item.value = clip(String(el.value || ""), 240);
+        const placeholder = el.getAttribute("placeholder");
+        if (placeholder) item.placeholder = placeholder;
+        const label = labelFor(el);
+        if (label) item.label = label;
+        if ("checked" in el) item.checked = Boolean(el.checked);
+        return item;
+      };
+      const ensureRefs = () => {
+        window.__tasiBrowserRefs = window.__tasiBrowserRefs || {};
+        return window.__tasiBrowserRefs;
+      };
+      const resolve = (selector, index = 0) => {
+        const value = String(selector || "").trim();
+        if (!value) return { ok: false, error: "selector is required." };
+        if (/^@e\\d+$/i.test(value)) {
+          const el = ensureRefs()[value];
+          return el ? { ok: true, el } : { ok: false, error: "Element ref not found or stale: " + value };
+        }
+        const nodes = Array.from(document.querySelectorAll(value));
+        if (nodes.length === 0) return { ok: false, error: "Selector not found: " + value };
+        return { ok: true, el: nodes[Math.min(Math.max(index, 0), nodes.length - 1)] };
+      };
+      const emitInput = (el) => {
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+      };
+      const setText = (el, text, clear = true) => {
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          el.focus();
+          if (clear) el.value = "";
+          el.value = clear ? text : String(el.value || "") + text;
+          emitInput(el);
+          return true;
+        }
+        if (el instanceof HTMLElement && el.isContentEditable) {
+          el.focus();
+          if (clear) el.textContent = "";
+          el.textContent = clear ? text : String(el.textContent || "") + text;
+          emitInput(el);
+          return true;
+        }
+        return false;
+      };
+      const fireMouse = (el, type) => el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      const activate = (el) => {
+        if (el && typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        fireMouse(el, "mouseover");
+        fireMouse(el, "mousedown");
+        fireMouse(el, "mouseup");
+        if (typeof el.click === "function") el.click();
+      };
+      const matchText = (candidate, query, exact) => {
+        const left = normalizeText(candidate).toLowerCase();
+        const right = normalizeText(query).toLowerCase();
+        return exact ? left === right : left.includes(right);
+      };
+      const candidates = (options) => {
+        const by = options.by;
+        const value = String(options.value || "");
+        let nodes = [];
+        if (by === "css") nodes = Array.from(document.querySelectorAll(value));
+        else if (by === "role") {
+          nodes = Array.from(document.querySelectorAll("a[href],button,input,textarea,select,[role],h1,h2,h3,h4,h5,h6,img,form,[contenteditable=true]"))
+            .filter((el) => roleFor(el).toLowerCase() === value.toLowerCase());
+          if (options.name) nodes = nodes.filter((el) => matchText(nameFor(el), options.name, Boolean(options.exact)));
+        } else if (by === "text") {
+          nodes = Array.from(document.querySelectorAll("a,button,label,input,textarea,select,[role],h1,h2,h3,h4,h5,h6,p,li,td,th,summary,[contenteditable=true]"))
+            .filter((el) => matchText(el.innerText || el.textContent || el.getAttribute("value") || "", value, Boolean(options.exact)));
+        } else if (by === "label") {
+          nodes = Array.from(document.querySelectorAll("input,textarea,select,button,[contenteditable=true]"))
+            .filter((el) => matchText(labelFor(el), value, Boolean(options.exact)));
+        } else if (by === "placeholder") {
+          nodes = Array.from(document.querySelectorAll("[placeholder]"))
+            .filter((el) => matchText(el.getAttribute("placeholder") || "", value, Boolean(options.exact)));
+        } else if (by === "alt") {
+          nodes = Array.from(document.querySelectorAll("[alt]"))
+            .filter((el) => matchText(el.getAttribute("alt") || "", value, Boolean(options.exact)));
+        } else if (by === "title") {
+          nodes = Array.from(document.querySelectorAll("[title]"))
+            .filter((el) => matchText(el.getAttribute("title") || "", value, Boolean(options.exact)));
+        } else if (by === "testid") {
+          nodes = Array.from(document.querySelectorAll("[data-testid],[data-test],[data-cy]"))
+            .filter((el) => [el.getAttribute("data-testid"), el.getAttribute("data-test"), el.getAttribute("data-cy")].some((item) => matchText(item || "", value, true)));
+        }
+        return nodes;
+      };
+      return { normalizeText, isVisible, selectorFor, roleFor, looksClickable, labelFor, nameFor, describe, ensureRefs, resolve, setText, activate, fireMouse, candidates };
+    })();
+  `;
 }
 
 export class ExternalBrowserAutomation implements BrowserAutomation {

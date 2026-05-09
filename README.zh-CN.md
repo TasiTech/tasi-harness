@@ -90,6 +90,29 @@ Tasi Harness 是一个本地优先的桌面 AI Agent，基于 Electron、TypeScr
 - 会话历史保存在本地 JSON。
 - 记忆条目保存在本地文件中，运行中写入采用延迟提交策略，降低失败时的半成品落盘风险。
 
+### 命令行对话
+
+安装 Windows NSIS 包后，安装目录会加入当前用户 `PATH`，新开 PowerShell 后可直接使用：
+
+```powershell
+tasi chat "帮我总结当前工作区"
+tasi chat --session xxx "继续这个会话"
+tasi chat -s xxx -e sandbox "继续这个会话"
+tasi chat --execution sandbox --knowledge "根据个人知识库回答"
+tasi sessions
+```
+
+macOS 安装到 `/Applications` 后，可在 bash 中使用应用内置命令：
+
+```bash
+/Applications/Tasi\ Harness.app/Contents/Resources/bin/tasi chat "帮我总结当前工作区"
+ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.local/bin/tasi"
+```
+
+无参数运行 `tasi` 会进入交互式对话。`chat` 不传 `--session/-s` 会新建会话，传入 `--session xxx` 或 `-s xxx` 会追加到该会话，`xxx` 就是完整 session id，不需要固定前缀；每次回复后都会显示当前 session id。命令行复用桌面应用的 `~/.tasi-harness/config.json`、会话、记忆、技能与个人知识库；浏览器自动化会通过外部 Chrome / Edge 的 CDP 模式运行。
+
+普通输出会使用 `marked-terminal` 渲染 Markdown，标题、列表、表格和代码块会按终端格式显示。需要复制 Markdown 原文时可加 `--plain` 或 `-p`；需要脚本处理结果时可加 `--json` 或 `-j`，输出会包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage` 与 `execution` 等完整字段。
+
 ### 定时任务与通知
 
 - 支持单次/周期任务。
