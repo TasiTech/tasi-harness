@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -8,10 +8,15 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AssistantMessageExportRequest,
   AppConfig,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   ToolEvent,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   ToolExecutionResult,
   MemoryQueryOptions,
   PersonalKnowledgeUploadRequest,
@@ -30,16 +35,18 @@ import type {
 import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
-import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
+import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
+import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
+import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let devToolsWindow: BrowserWindow | null = null;
 const context = new AppContext();
+const browserCoachRecorder = new BrowserCoachRecorder(join(__dirname, '..', 'preload', 'browserCoachPreload.js'));
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
-const externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(context.harnessHome, 'runtime', 'external-browser') });
 const externalFallbackUrls = new Set<string>();
 const activeChatControllers = new Map<number, AbortController>();
 const activeWechatRuns = new Map<string, AbortController>();
@@ -48,7 +55,13 @@ let wechatPollerFingerprint = '';
 const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
-const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf']);
+const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf', '.ofd']);
+const pendingToolApprovals = new Map<string, {
+  senderId: number;
+  request: ToolApprovalRequest;
+  resolve: (decision: ToolApprovalDecision) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}>();
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -64,6 +77,48 @@ function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
   }
 }
 
+function rememberToolApproval(key: string): void {
+  const cfg = context.getConfig();
+  if (cfg.safetyApproval.neverAskAgainKeys.includes(key)) return;
+  context.configStore.update({
+    safetyApproval: {
+      ...cfg.safetyApproval,
+      neverAskAgainKeys: [...cfg.safetyApproval.neverAskAgainKeys, key]
+    }
+  });
+}
+
+function requestInteractiveToolApproval(sender: WebContents, request: ToolApprovalRequest): Promise<ToolApprovalDecision> {
+  if (sender.isDestroyed()) return Promise.resolve({ id: request.id, approved: false });
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      pendingToolApprovals.delete(request.id);
+      resolve({ id: request.id, approved: false });
+    }, request.timeoutMs);
+    pendingToolApprovals.set(request.id, { senderId: sender.id, request, resolve, timeout });
+    sender.send('tool-approval:request', request);
+  });
+}
+
+function resolveToolApproval(senderId: number, decision: ToolApprovalDecision): ToolApprovalDecision {
+  const pending = pendingToolApprovals.get(decision.id);
+  if (!pending || pending.senderId !== senderId) return { id: decision.id, approved: false };
+  clearTimeout(pending.timeout);
+  pendingToolApprovals.delete(decision.id);
+  const normalized = { id: decision.id, approved: decision.approved === true, neverAskAgain: decision.neverAskAgain === true };
+  if (normalized.approved && normalized.neverAskAgain) rememberToolApproval(pending.request.key);
+  pending.resolve(normalized);
+  return normalized;
+}
+
+function denyPendingToolApprovals(): void {
+  for (const [id, pending] of pendingToolApprovals) {
+    clearTimeout(pending.timeout);
+    pending.resolve({ id, approved: false });
+  }
+  pendingToolApprovals.clear();
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
@@ -76,6 +131,13 @@ function isAbortLikeError(error: unknown): boolean {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
+}
+
+function escapeHtmlText(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 function getStringField(record: Record<string, unknown>, keys: string[]): string | undefined {
@@ -172,6 +234,34 @@ async function importKnowledgeBuffer(
       failed: [{ filePath: filename, error: error instanceof Error ? error.message : String(error) }]
     };
   }
+}
+
+function readOptionalUtf8(filePath: string): string {
+  try {
+    return readFileSync(filePath, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+function buildBuiltinSkillCreatorGuide(): string {
+  const skill = context.skillManager.readBundled('skill-creator') ?? context.skillManager.read('skill-creator');
+  if (!skill?.content.trim()) return '';
+  const root = dirname(skill.path);
+  const references = [
+    ['references/workflows.md', join(root, 'references', 'workflows.md')],
+    ['references/output-patterns.md', join(root, 'references', 'output-patterns.md')]
+  ]
+    .map(([label, filePath]) => {
+      const content = readOptionalUtf8(filePath);
+      return content.trim() ? `# ${label}\n${content.trim()}` : '';
+    })
+    .filter(Boolean);
+  return [
+    '# skill-creator/SKILL.md',
+    skill.content.trim(),
+    ...references
+  ].join('\n\n');
 }
 
 function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
@@ -783,7 +873,7 @@ function previewSourceText(toolName: string, args: unknown, content: string): st
 
 function shouldFallbackOpenExternal(toolName: string, args: unknown, content: string): boolean {
   const combined = previewSourceText(toolName, args, content);
-  if (toolName.startsWith('browser_')) return true;
+  if (toolName.startsWith('browser_')) return false;
   if (combined.includes('browser_preview_url')) return true;
   return false;
 }
@@ -824,7 +914,7 @@ async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResu
   if (lastExternalBrowserOpen && lastExternalBrowserOpen.url === url && now - lastExternalBrowserOpen.at < 1500) {
     return { ok: true, content: `External browser already opened recently for ${url}.` };
   }
-  const managed = await externalBrowserBridge.open(url, config);
+  const managed = await context.externalBrowserBridge.open(url, config);
   if (managed.ok) {
     lastExternalBrowserOpen = { url, at: now };
     return managed;
@@ -849,7 +939,7 @@ async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResu
 }
 
 async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
-  const managedResult = await externalBrowserBridge.close();
+  const managedResult = await context.externalBrowserBridge.close();
   const fallbackCount = externalFallbackUrls.size;
   externalFallbackUrls.clear();
   lastExternalBrowserOpen = null;
@@ -857,6 +947,104 @@ async function closeExternalBrowserPreview(): Promise<ToolExecutionResult> {
   return {
     ok: managedResult.ok,
     content: `${managedResult.content} ${fallbackCount} fallback URL(s) were opened via shell.openExternal and cannot be auto-closed.`
+  };
+}
+
+async function renderHtmlToPdfBuffer(html: string): Promise<Buffer> {
+  const win = new BrowserWindow({
+    show: false,
+    width: 900,
+    height: 1200,
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+  try {
+    await win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+    const data = await win.webContents.printToPDF({
+      printBackground: true,
+      pageSize: 'A4',
+      margins: {
+        marginType: 'custom',
+        top: 0.35,
+        bottom: 0.35,
+        left: 0.35,
+        right: 0.35
+      }
+    });
+    return Buffer.from(data);
+  } finally {
+    if (!win.isDestroyed()) win.destroy();
+  }
+}
+
+function isLockedExportWriteError(error: unknown): boolean {
+  const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
+  return code === 'EBUSY' || code === 'EPERM' || code === 'EACCES';
+}
+
+function nextExportFallbackPath(filePath: string, index: number): string {
+  const ext = extname(filePath);
+  const base = basename(filePath, ext);
+  return join(dirname(filePath), `${base} (${index})${ext}`);
+}
+
+function writeExportFileWithFallback(filePath: string, data: Buffer): { filePath: string; fallback: boolean } {
+  try {
+    writeFileSync(filePath, data);
+    return { filePath, fallback: false };
+  } catch (error) {
+    if (!isLockedExportWriteError(error)) throw error;
+    for (let index = 1; index <= 99; index += 1) {
+      const candidate = nextExportFallbackPath(filePath, index);
+      if (existsSync(candidate)) continue;
+      writeFileSync(candidate, data);
+      return { filePath: candidate, fallback: true };
+    }
+    throw error;
+  }
+}
+
+async function exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult> {
+  const format = req.format;
+  if (format !== 'pdf' && format !== 'docx') {
+    return { ok: false, content: `Unsupported export format: ${String(format)}` };
+  }
+  const content = req.content?.trim() ?? '';
+  if (!content) return { ok: false, content: 'Nothing to export.' };
+
+  const title = req.title?.trim() || 'Assistant Reply';
+  const ext = format === 'pdf' ? 'pdf' : 'docx';
+  const filters = format === 'pdf'
+    ? [{ name: 'PDF Document', extensions: ['pdf'] }]
+    : [{ name: 'Word Document', extensions: ['docx'] }];
+  const saveOptions = {
+    title: `Export assistant reply as ${ext.toUpperCase()}`,
+    defaultPath: `${safeExportBasename(title)}.${ext}`,
+    filters
+  };
+  const picked = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showSaveDialog(mainWindow, saveOptions)
+    : await dialog.showSaveDialog(saveOptions);
+  if (picked.canceled || !picked.filePath) {
+    return { ok: true, content: 'Export canceled.' };
+  }
+
+  let saved: { filePath: string; fallback: boolean };
+  if (format === 'pdf') {
+    const html = buildAssistantMessageExportHtml(title, req.html?.trim() || `<pre>${escapeHtmlText(content)}</pre>`);
+    saved = writeExportFileWithFallback(picked.filePath, await renderHtmlToPdfBuffer(html));
+  } else {
+    saved = writeExportFileWithFallback(picked.filePath, await buildAssistantMessageDocx(title, content, req.html));
+  }
+  return {
+    ok: true,
+    content: saved.fallback
+      ? `Exported ${saved.filePath} (original file was busy or locked)`
+      : `Exported ${saved.filePath}`
   };
 }
 
@@ -890,6 +1078,7 @@ async function createWindow(): Promise<void> {
 }
 
 function registerIpc(): void {
+  ipcMain.on('browser-coach:event', (event, payload) => browserCoachRecorder.acceptEvent(event, payload));
   ipcMain.handle('config:get', () => context.configStore.publicConfig(false));
   ipcMain.handle('config:set', async (_event, partial: Partial<AppConfig>) => {
     const sanitized = { ...partial };
@@ -950,6 +1139,10 @@ function registerIpc(): void {
     }
   });
 
+  ipcMain.handle('tool-approval:decision', (_event, decision: ToolApprovalDecision) => {
+    return resolveToolApproval(_event.sender.id, decision);
+  });
+
   ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
     if (!input || !input.trim()) throw new Error('Message cannot be empty.');
     const senderId = _event.sender.id;
@@ -964,6 +1157,7 @@ function registerIpc(): void {
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
         origin: 'chat',
         signal: controller.signal,
+        requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
           _event.sender.send('agent:tool-event', payload);
@@ -1119,6 +1313,20 @@ function registerIpc(): void {
   ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));
   ipcMain.handle('skills:market:uninstall', (_event, name: string) => context.marketplaceManager.uninstall(name));
+  ipcMain.handle('browser-coach:start', (_event, req?: BrowserCoachStartRequest) => browserCoachRecorder.start(req));
+  ipcMain.handle('browser-coach:stop', () => browserCoachRecorder.stop());
+  ipcMain.handle('browser-coach:status', () => browserCoachRecorder.status());
+  ipcMain.handle('browser-coach:clear', () => browserCoachRecorder.clear());
+  ipcMain.handle('browser-coach:generateSkill', async (_event, req: BrowserCoachGenerateSkillRequest) => browserCoachRecorder.generateSkill(
+    req,
+    context.skillManager,
+    (request, recording) => buildBrowserCoachSkillContentWithModel(
+      request,
+      recording,
+      createLlmClient(context.getConfig()),
+      buildBuiltinSkillCreatorGuide()
+    )
+  ));
 
   ipcMain.handle('tasks:list', () => context.scheduledTaskStore.list());
   ipcMain.handle('tasks:create', (_event, req: ScheduledTaskCreateRequest) => context.scheduledTaskStore.create(req));
@@ -1195,7 +1403,9 @@ function registerIpc(): void {
     const result = await context.toolRegistry.execute(req.name, req.args, {
       sessionId: req.sessionId || 'manual',
       workspaceDir: req.executionMode === 'sandbox' ? context.sandboxManager.prepare('sandbox', cfg.workspaceDir, createId('manual-run')).workspaceDir : cfg.workspaceDir,
-      requestId: createId('manual')
+      requestId: createId('manual'),
+      safetyApproval: context.getConfig().safetyApproval,
+      requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request)
     });
     await maybeOpenExternalBrowser(latestWebPreviewUrlFromSource(req.name, req.args, result.content, true));
     return result;
@@ -1208,11 +1418,23 @@ function registerIpc(): void {
     node: process.versions.node,
     harnessHome: context.harnessHome
   }));
+  ipcMain.handle('app:exportAssistantMessage', async (_event, req: AssistantMessageExportRequest) => exportAssistantMessage(req));
   ipcMain.handle('app:openPath', async (_event, path: string) => {
     const err = await shell.openPath(path);
     return { ok: !err, content: err || 'Opened.' };
   });
-  ipcMain.handle('app:openExternalUrl', async (_event, url: string) => maybeOpenExternalBrowser(url));
+  ipcMain.handle('app:openExternalUrl', async (_event, url: string, options?: { system?: boolean }) => {
+    if (options?.system) {
+      try {
+        await shell.openExternal(url);
+        return { ok: true, content: `Opened ${url} in the system browser.` };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, content: `Failed to open ${url}: ${message}` };
+      }
+    }
+    return maybeOpenExternalBrowser(url);
+  });
   ipcMain.handle('app:closeExternalPreview', async () => closeExternalBrowserPreview());
   ipcMain.handle('app:setEmbeddedPreviewWebContentsId', (_event, id: number | null) => {
     if (id == null) {
@@ -1239,6 +1461,8 @@ function registerIpc(): void {
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  denyPendingToolApprovals();
+  browserCoachRecorder.close();
   for (const controller of activeChatControllers.values()) controller.abort();
   activeChatControllers.clear();
   stopWechatPoller();

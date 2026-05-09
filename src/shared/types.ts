@@ -61,12 +61,15 @@ export interface ToolExecutionContext {
   sessionId: string;
   workspaceDir: string;
   requestId: string;
+  safetyApproval?: SafetyApprovalSettings;
+  requestToolApproval?: ToolApprovalRequester;
 }
 
 export interface ToolExecutionResult {
   ok: boolean;
   content: string;
   data?: unknown;
+  approval?: ToolApprovalRecord;
 }
 
 export type ToolExecutor = (args: unknown, context: ToolExecutionContext) => Promise<ToolExecutionResult>;
@@ -76,6 +79,49 @@ export interface RegisteredTool {
   execute: ToolExecutor;
   safety: 'read-only' | 'writes-workspace' | 'executes-command' | 'network' | 'stateful';
 }
+
+export type ToolSafety = RegisteredTool['safety'];
+export type ToolApprovalRisk = 'workspace-delete' | 'outside-read' | 'outside-write' | 'outside-delete' | 'terminal-risk';
+export type ToolApprovalStatus = 'not_required' | 'approved' | 'denied' | 'unavailable' | 'remembered' | 'blocked';
+
+export interface SafetyApprovalSettings {
+  enabled: boolean;
+  approveRiskyTerminalCommands: boolean;
+  timeoutMs: number;
+  neverAskAgainKeys: string[];
+}
+
+export interface ToolApprovalRequest {
+  id: string;
+  key: string;
+  toolName: string;
+  safety: ToolSafety;
+  risk: ToolApprovalRisk;
+  summary: string;
+  args: unknown;
+  workspaceDir: string;
+  sessionId: string;
+  requestId: string;
+  createdAt: string;
+  timeoutMs: number;
+  allowNeverAskAgain: boolean;
+}
+
+export interface ToolApprovalDecision {
+  id: string;
+  approved: boolean;
+  neverAskAgain?: boolean;
+}
+
+export interface ToolApprovalRecord {
+  status: ToolApprovalStatus;
+  key?: string;
+  risk?: ToolApprovalRisk;
+  summary?: string;
+  requestId?: string;
+}
+
+export type ToolApprovalRequester = (request: ToolApprovalRequest) => Promise<ToolApprovalDecision>;
 
 export interface LlmUsage {
   promptTokens?: number;
@@ -108,10 +154,12 @@ export interface AppConfig {
   workspaceDir: string;
   allowShellTools: boolean;
   enableNetworkTools: boolean;
+  safetyApproval: SafetyApprovalSettings;
   browserMode: BrowserMode;
   externalBrowserEngine: ExternalBrowserEngine;
   externalBrowserCdpEndpoint: string;
   externalBrowserProfileMode: ExternalBrowserProfileMode;
+  browserHeadless: boolean;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];
@@ -170,7 +218,7 @@ export interface MemoryEntry {
   target: MemoryTarget;
   scope: MemoryScope;
   sessionId?: string;
-  domain: MemoryDomain | string;
+  domain?: MemoryDomain | string;
   content: string;
   createdAt: string;
   updatedAt: string;
@@ -215,6 +263,7 @@ export interface SessionSummary {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
+  domain?: MemoryDomain | string;
 }
 
 export interface SessionSystemPromptRecord {
@@ -273,6 +322,7 @@ export interface ToolEvent {
   args: unknown;
   ok: boolean;
   content: string;
+  approval?: ToolApprovalRecord;
   createdAt: string;
 }
 
@@ -297,6 +347,12 @@ export interface SkillMarketplaceSource {
   enabled: boolean;
 }
 
+export interface SkillSupportingFile {
+  path: string;
+  content?: string;
+  contentBase64?: string;
+}
+
 export interface MarketplaceSkill {
   id: string;
   sourceId: string;
@@ -307,6 +363,7 @@ export interface MarketplaceSkill {
   version: string;
   readme: string;
   skillContent: string;
+  supportingFiles?: SkillSupportingFile[];
   homepage?: string;
   remoteVersionId?: string;
   installCommand?: string;
@@ -319,9 +376,26 @@ export interface MarketplaceBrowseResult {
   skills: MarketplaceSkill[];
 }
 
+export interface MarketplaceSkillSnapshot {
+  id: string;
+  sourceId: string;
+  sourceName: string;
+  name: string;
+  description: string;
+  category: string;
+  version: string;
+  readme: string;
+  skillContent: string;
+  supportingFiles?: SkillSupportingFile[];
+  homepage?: string;
+  remoteVersionId?: string;
+  installCommand?: string;
+}
+
 export interface SkillInstallRequest {
   sourceId: string;
   skillId: string;
+  skill?: MarketplaceSkillSnapshot;
 }
 
 export interface EmailNotificationSettings {
@@ -425,6 +499,13 @@ export interface AppInfo {
   harnessHome: string;
 }
 
+export interface AssistantMessageExportRequest {
+  format: 'pdf' | 'docx';
+  title?: string;
+  content: string;
+  html?: string;
+}
+
 export interface SkillWriteRequest {
   name: string;
   content: string;
@@ -442,6 +523,49 @@ export interface SkillArchiveUploadRequest {
   contentBase64: string;
   name?: string;
   category?: string;
+}
+
+export type BrowserCoachEventType = 'navigation' | 'click' | 'input' | 'change' | 'submit' | 'keydown' | 'window_closed';
+
+export interface BrowserCoachRecordedEvent {
+  id: string;
+  index: number;
+  type: BrowserCoachEventType;
+  url: string;
+  title?: string;
+  selector?: string;
+  tag?: string;
+  role?: string;
+  name?: string;
+  text?: string;
+  value?: string;
+  key?: string;
+  createdAt: string;
+}
+
+export interface BrowserCoachRecording {
+  id: string;
+  startUrl: string;
+  startedAt: string;
+  endedAt?: string;
+  active: boolean;
+  events: BrowserCoachRecordedEvent[];
+}
+
+export interface BrowserCoachStartRequest {
+  url?: string;
+}
+
+export interface BrowserCoachGenerateSkillRequest {
+  name: string;
+  category: string;
+  description?: string;
+}
+
+export interface BrowserCoachGenerateSkillResult {
+  skill: SkillDocument;
+  recording: BrowserCoachRecording;
+  recordingReferencePath: string;
 }
 
 export interface PersonalKnowledgeUploadRequest {

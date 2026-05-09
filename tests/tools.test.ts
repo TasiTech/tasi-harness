@@ -21,9 +21,10 @@ describe('builtin tools', () => {
     expect(cfg.externalBrowserEngine).toBe('auto');
     expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     expect(cfg.externalBrowserProfileMode).toBe('isolated');
+    expect(cfg.browserHeadless).toBe(false);
   });
 
-  it('writes only inside workspace and rejects escaped paths', async () => {
+  it('writes inside workspace without approval and outside workspace with approval', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
@@ -40,9 +41,213 @@ describe('builtin tools', () => {
     expect(ok.ok).toBe(true);
     expect(readFileSync(join(cfg.workspaceDir, 'notes/a.txt'), 'utf8')).toBe('hello');
 
-    const bad = await registry.execute('file_write', { path: '../outside.txt', content: 'nope' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' });
-    expect(bad.ok).toBe(false);
-    expect(existsSync(join(env.home, 'outside.txt'))).toBe(false);
+    const outside = await registry.execute(
+      'file_write',
+      { path: '../outside.txt', content: 'approved' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => ({ id: request.id, approved: true })
+      }
+    );
+    expect(outside.ok).toBe(true);
+    expect(readFileSync(join(env.home, 'outside.txt'), 'utf8')).toBe('approved');
+  });
+
+  it('requires approval for workspace deletes but not workspace writes', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home)
+    })) registry.register(tool);
+    let approvals = 0;
+    const write = await registry.execute(
+      'file_write',
+      { path: 'a.txt', content: 'hello' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      }
+    );
+    expect(write.ok).toBe(true);
+    expect(approvals).toBe(0);
+
+    const deniedDelete = await registry.execute(
+      'file_delete',
+      { path: 'a.txt' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r2',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      }
+    );
+    expect(deniedDelete.ok).toBe(false);
+    expect(deniedDelete.approval?.risk).toBe('workspace-delete');
+    expect(existsSync(join(cfg.workspaceDir, 'a.txt'))).toBe(true);
+    expect(approvals).toBe(1);
+  });
+
+  it('requires approval for outside-workspace reads and writes', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const outsidePath = join(env.home, 'outside.txt');
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home)
+    })) registry.register(tool);
+
+    const deniedWrite = await registry.execute(
+      'file_write',
+      { path: outsidePath, content: 'nope' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => ({ id: request.id, approved: false })
+      }
+    );
+    expect(deniedWrite.ok).toBe(false);
+    expect(deniedWrite.approval?.risk).toBe('outside-write');
+    expect(existsSync(outsidePath)).toBe(false);
+
+    const approvedWrite = await registry.execute(
+      'file_write',
+      { path: outsidePath, content: 'outside' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r2',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => ({ id: request.id, approved: true })
+      }
+    );
+    expect(approvedWrite.ok).toBe(true);
+
+    const deniedRead = await registry.execute(
+      'file_read',
+      { path: outsidePath },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r3',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => ({ id: request.id, approved: false })
+      }
+    );
+    expect(deniedRead.ok).toBe(false);
+    expect(deniedRead.approval?.risk).toBe('outside-read');
+  });
+
+  it('uses remembered approval keys', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const outsidePath = join(env.home, 'outside.txt');
+    const rememberedKey = `outside:write:${outsidePath}`;
+    const rememberedCfg = {
+      ...cfg,
+      safetyApproval: { ...cfg.safetyApproval, neverAskAgainKeys: [rememberedKey] }
+    };
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => rememberedCfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home)
+    })) registry.register(tool);
+    let approvals = 0;
+    const result = await registry.execute(
+      'file_write',
+      { path: outsidePath, content: 'remembered' },
+      {
+        sessionId: 's',
+        workspaceDir: rememberedCfg.workspaceDir,
+        requestId: 'r',
+        safetyApproval: rememberedCfg.safetyApproval,
+        requestToolApproval: async (request) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      }
+    );
+    expect(result.ok).toBe(true);
+    expect(result.approval?.status).toBe('remembered');
+    expect(approvals).toBe(0);
+  });
+
+  it('approves only risky terminal commands', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), allowShellTools: true };
+    ensureDir(cfg.workspaceDir);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home)
+    })) registry.register(tool);
+    let approvals = 0;
+    const safe = await registry.execute(
+      'terminal',
+      { command: 'echo hello' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      }
+    );
+    expect(safe.ok).toBe(true);
+    expect(approvals).toBe(0);
+
+    const risky = await registry.execute(
+      'terminal',
+      { command: 'del a.txt' },
+      {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: 'r2',
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      }
+    );
+    expect(risky.ok).toBe(false);
+    expect(risky.approval?.risk).toBe('terminal-risk');
+    expect(approvals).toBe(1);
   });
 
   it('blocks terminal tool by default', async () => {
@@ -194,6 +399,57 @@ describe('builtin tools', () => {
           ),
           format: 'json' as const
         };
+      },
+      async snapshot() {
+        return {
+          url: 'https://example.com',
+          title: 'Example',
+          content: JSON.stringify({ tool: 'browser_snapshot', browser_preview_url: 'https://example.com', elements: [] }),
+          elements: [],
+          headings: [],
+          links: [],
+          images: [],
+          viewport: { width: 1280, height: 720, scrollX: 0, scrollY: 0 }
+        };
+      },
+      async find() {
+        return { url: 'https://example.com', title: 'Example', ref: '@e1', selector: '#demo', text: 'Hello world' };
+      },
+      async hover() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async select() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async check() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async press() {
+        return { url: 'https://example.com', title: 'Example' };
+      },
+      async screenshot() {
+        return { url: 'https://example.com', title: 'Example', data: Buffer.from('png'), mimeType: 'image/png', extension: 'png' };
+      },
+      async pdf() {
+        return { url: 'https://example.com', title: 'Example', data: Buffer.from('pdf'), mimeType: 'application/pdf', extension: 'pdf' };
+      },
+      async storage() {
+        return { url: 'https://example.com', title: 'Example', area: 'local' as const, content: '{}' };
+      },
+      async cookies() {
+        return { url: 'https://example.com', title: 'Example', content: '[]' };
+      },
+      async console() {
+        return { url: 'https://example.com', title: 'Example', content: '{"console":[]}' };
+      },
+      async network() {
+        return { url: 'https://example.com', title: 'Example', content: '[]' };
+      },
+      async evaluate() {
+        return { url: 'https://example.com', title: 'Example', content: '"ok"' };
+      },
+      async setViewport() {
+        return { url: 'https://example.com', title: 'Example' };
       },
       async state() {
         return { url: 'https://example.com', title: 'Example' };

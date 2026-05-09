@@ -2,8 +2,11 @@
 import type {
   AgentMessage,
   AppInfo,
+  BrowserCoachRecordedEvent,
+  BrowserCoachRecording,
   LlmUsage,
   MarketplaceBrowseResult,
+  MarketplaceSkill,
   MemoryDomain,
   MemoryEntry,
   MemoryState,
@@ -15,6 +18,7 @@ import type {
   SessionSummary,
   SkillDocument,
   SkillMetadata,
+  ToolApprovalRequest,
   ToolEvent
 } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
@@ -26,6 +30,7 @@ import {
   providerPreset,
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
+import { extractCitationLinks, type CitationLink } from './citations.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
 
@@ -39,15 +44,22 @@ const defaultConfig: PublicAppConfig = {
   apiKeyConfigured: false,
   model: providerDefaultModel('openai'),
   temperature: 0.3,
-  maxIterations: 8,
+  maxIterations: 100,
   sessionDocumentMaxDocs: 10,
   workspaceDir: '',
   allowShellTools: false,
   enableNetworkTools: false,
+  safetyApproval: {
+    enabled: true,
+    approveRiskyTerminalCommands: true,
+    timeoutMs: 60000,
+    neverAskAgainKeys: []
+  },
   browserMode: 'embedded',
   externalBrowserEngine: 'auto',
   externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
   externalBrowserProfileMode: 'isolated',
+  browserHeadless: false,
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -158,7 +170,7 @@ function previewSourceText(toolName: string, args: unknown, content: string): st
 
 function shouldFallbackOpenExternal(event: ToolEvent): boolean {
   const combined = previewSourceText(event.toolName, event.args, event.content);
-  if (event.toolName.startsWith('browser_')) return true;
+  if (event.toolName.startsWith('browser_')) return false;
   if (combined.includes('browser_preview_url')) return true;
   return false;
 }
@@ -323,6 +335,7 @@ export function App(): ReactElement {
     const saved = globalThis.localStorage?.getItem('tasi_harness_ui_language');
     return saved === 'zh' ? 'zh' : 'en';
   });
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_sidebar_collapsed') === '1');
   const [config, setConfig] = useState<PublicAppConfig>(defaultConfig);
   const [sessions, refreshSessions] = useAsyncData<SessionSummary[]>(() => window.tasiHarness.sessions.list(), []);
   const [tasks, refreshTasks] = useAsyncData<ScheduledTask[]>(() => window.tasiHarness.tasks.list(), []);
@@ -340,6 +353,7 @@ export function App(): ReactElement {
   const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
   const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const [approvalRequest, setApprovalRequest] = useState<ToolApprovalRequest | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatStopping, setChatStopping] = useState(false);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
@@ -366,7 +380,7 @@ export function App(): ReactElement {
       { page: 'memory', icon: <SidebarIcon kind="memory" />, label: tr('Memory', '记忆') },
       { page: 'skills', icon: <SidebarIcon kind="skills" />, label: tr('Skills', '技能') },
       { page: 'tasks', icon: <SidebarIcon kind="tasks" />, label: tr('Tasks', '任务') },
-      { page: 'sessions', icon: <SidebarIcon kind="sessions" />, label: tr('Sessions', '会话') },
+      { page: 'sessions', icon: <SidebarIcon kind="sessions" />, label: tr('History', '历史') },
       { page: 'settings', icon: <SidebarIcon kind="settings" />, label: tr('Settings', '设置') },
       { page: 'about', icon: <SidebarIcon kind="about" />, label: tr('About', '关于') }
     ],
@@ -398,6 +412,9 @@ export function App(): ReactElement {
     globalThis.localStorage?.setItem('tasi_harness_ui_language', language);
     document.documentElement.setAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
   }, [language]);
+  useEffect(() => {
+    globalThis.localStorage?.setItem('tasi_harness_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -426,12 +443,28 @@ export function App(): ReactElement {
     return off;
   }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
 
+  useEffect(() => {
+    const off = window.tasiHarness.security.onToolApprovalRequest((request) => {
+      setApprovalRequest(request);
+    });
+    return off;
+  }, []);
+
+  async function resolveApproval(request: ToolApprovalRequest, approved: boolean, neverAskAgain = false): Promise<void> {
+    setApprovalRequest((current) => (current?.id === request.id ? null : current));
+    await window.tasiHarness.security.resolveToolApproval({ id: request.id, approved, neverAskAgain });
+    if (approved && neverAskAgain) {
+      const next = await window.tasiHarness.config.get();
+      setConfig(next);
+    }
+  }
+
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-logo">
           <div className="logo-icon">TH</div>
-          <div>
+          <div className="logo-copy">
             <div className="logo-head">
               <div className="logo-text">Tasi Harness</div>
               <button className="lang-toggle" onClick={() => setLanguage((current) => (current === 'zh' ? 'en' : 'zh'))}>
@@ -442,7 +475,16 @@ export function App(): ReactElement {
           </div>
         </div>
         <div className="nav-section">
-          <div className="nav-label">{tr('Workspace', '工作区')}</div>
+          <div className="nav-toolbar">
+            <button
+              className="sidebar-collapse-button"
+              onClick={() => setSidebarCollapsed((value) => !value)}
+              title={sidebarCollapsed ? tr('Expand workspace sidebar', '展开工作区侧栏') : tr('Collapse workspace sidebar', '收起工作区侧栏')}
+              aria-label={sidebarCollapsed ? tr('Expand workspace sidebar', '展开工作区侧栏') : tr('Collapse workspace sidebar', '收起工作区侧栏')}
+            >
+              {sidebarCollapsed ? '›' : '‹'}
+            </button>
+          </div>
           {sidebarNav.map((item) => (
             <button key={item.page} className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => setPage(item.page)}>
               <span className="nav-icon">{item.icon}</span>
@@ -516,6 +558,65 @@ export function App(): ReactElement {
         {page === 'settings' && <SettingsPage tr={tr} config={config} setConfig={setConfig} />}
         {page === 'about' && <AboutPage tr={tr} info={info} />}
       </main>
+      {approvalRequest && (
+        <ToolApprovalModal
+          tr={tr}
+          request={approvalRequest}
+          onApprove={() => void resolveApproval(approvalRequest, true)}
+          onApproveNever={() => void resolveApproval(approvalRequest, true, true)}
+          onDeny={() => void resolveApproval(approvalRequest, false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ToolApprovalModal(props: { tr: TranslateFn; request: ToolApprovalRequest; onApprove: () => void; onApproveNever: () => void; onDeny: () => void }): ReactElement {
+  const [remainingMs, setRemainingMs] = useState(props.request.timeoutMs);
+  useEffect(() => {
+    setRemainingMs(props.request.timeoutMs);
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      const next = Math.max(0, props.request.timeoutMs - (Date.now() - started));
+      setRemainingMs(next);
+      if (next <= 0) {
+        window.clearInterval(timer);
+        props.onDeny();
+      }
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [props.request]);
+  const riskLabel = props.request.risk === 'workspace-delete'
+    ? props.tr('Workspace delete', '工作区删除')
+    : props.request.risk === 'outside-read'
+      ? props.tr('Outside read', '工作区外读取')
+      : props.request.risk === 'outside-write'
+        ? props.tr('Outside write', '工作区外写入')
+        : props.request.risk === 'outside-delete'
+          ? props.tr('Outside delete', '工作区外删除')
+          : props.tr('Risky command', '风险命令');
+  return (
+    <div className="modal-backdrop approval-backdrop" onClick={props.onDeny}>
+      <div className="modal-card approval-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h2>{props.tr('Approval Required', '需要审批')}</h2>
+            <div className="card-subtle">{props.tr('Review this action before Tasi Harness continues.', '请在继续前确认此操作。')}</div>
+          </div>
+          <span className="soft-badge">{riskLabel}</span>
+        </div>
+        <div className="approval-summary">{props.request.summary}</div>
+        <div className="meta-row wrap">
+          <span className="soft-badge">{props.tr('Tool', '工具')} {props.request.toolName}</span>
+          <span className="soft-badge">{props.tr('Timeout', '超时')} {Math.ceil(remainingMs / 1000)}s</span>
+        </div>
+        <pre className="code-block small approval-args">{JSON.stringify(props.request.args, null, 2)}</pre>
+        <div className="button-row modal-actions">
+          <button className="ghost-button" onClick={props.onDeny}>{props.tr('Deny', '拒绝')}</button>
+          <button className="ghost-button" onClick={props.onApproveNever}>{props.tr('Allow and do not ask again', '允许且不再需要审批')}</button>
+          <button className="primary-button" onClick={props.onApprove}>{props.tr('Allow once', '允许一次')}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -627,6 +728,8 @@ function ChatPage(props: {
   const [sessionDocBusy, setSessionDocBusy] = useState(false);
   const [sessionDocError, setSessionDocError] = useState('');
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
+  const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
+  const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
   const [webPreviewExpanded, setWebPreviewExpanded] = useState(false);
   const [webPreviewRect, setWebPreviewRect] = useState<PreviewRect | null>(null);
   const [previewAddress, setPreviewAddress] = useState('');
@@ -660,6 +763,11 @@ function ChatPage(props: {
   );
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
+  const latestAssistantContent = useMemo(() => {
+    const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
+    return latest?.content ?? '';
+  }, [visibleMessages]);
+  const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
@@ -1312,6 +1420,21 @@ function ChatPage(props: {
     uploadSessionDocInputRef.current.click();
   }
 
+  async function openWorkspaceDirectory(): Promise<void> {
+    const workspaceDir = props.config.workspaceDir.trim();
+    if (!workspaceDir) {
+      setError(props.tr('Workspace directory is not configured.', '尚未配置工作区目录。'));
+      return;
+    }
+    setError('');
+    try {
+      const result = await window.tasiHarness.app.openPath(workspaceDir);
+      if (!result.ok) setError(result.content || props.tr('Failed to open workspace directory.', '打开工作区目录失败。'));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   async function uploadSessionDocuments(files: File[]): Promise<void> {
     if (files.length === 0) return;
     setSessionDocBusy(true);
@@ -1414,9 +1537,12 @@ function ChatPage(props: {
           >
             {props.tr('New session', '新会话')}
           </button>
+          <button className="ghost-button" onClick={() => void openWorkspaceDirectory()}>
+            {props.tr('Open workspace', '打开工作区')}
+          </button>
         </div>
       </div>
-      <div className="chat-content-grid" ref={chatContentGridRef}>
+      <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef}>
         <div className="chat-messages">
           {visibleMessages.length === 0 && (
             <div className="empty-state">
@@ -1441,13 +1567,77 @@ function ChatPage(props: {
           )}
           <div ref={endRef} />
         </div>
-        <div className="tool-panel">
+        <div className={`tool-panel ${toolPanelCollapsed ? 'collapsed' : ''}`}>
+          {toolPanelCollapsed ? (
+            <button
+              className="tool-panel-expand-button"
+              onClick={() => setToolPanelCollapsed(false)}
+              title={props.tr('Expand side panel', '展开侧边栏')}
+              aria-label={props.tr('Expand side panel', '展开侧边栏')}
+            >
+              <span>‹</span>
+              <strong>{props.tr('Trace', '轨迹')}</strong>
+            </button>
+          ) : (
+            <>
           <div className="tool-panel-header">
-            <strong>{props.tr('Tool Trace', '工具轨迹')}</strong>
-            <span>{props.tr(`${props.toolEvents.length} events`, `${props.toolEvents.length} 条事件`)}</span>
+            <button
+              className="tool-panel-collapse-button"
+              onClick={() => setToolPanelCollapsed(true)}
+              title={props.tr('Collapse side panel', '收起侧边栏')}
+              aria-label={props.tr('Collapse side panel', '收起侧边栏')}
+            >
+              ›
+            </button>
+            <div className="tool-panel-tabs" role="tablist" aria-label={props.tr('Side panel', '侧边栏')}>
+              <button
+                className={`tool-panel-tab ${toolPanelTab === 'tools' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'tools'}
+                onClick={() => setToolPanelTab('tools')}
+              >
+                {props.tr('Tool Trace', '工具轨迹')}
+                <span>{props.toolEvents.length}</span>
+              </button>
+              <button
+                className={`tool-panel-tab ${toolPanelTab === 'sources' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'sources'}
+                onClick={() => setToolPanelTab('sources')}
+              >
+                {props.tr('Referenced Pages', '引用网页')}
+                <span>{referencedPages.length}</span>
+              </button>
+            </div>
           </div>
           <div className="tool-panel-body">
-            {props.toolEvents.length === 0 ? (
+            {toolPanelTab === 'sources' ? (
+              referencedPages.length === 0 ? (
+                <div className="tool-empty">{props.tr('Referenced webpages from the latest answer will appear here.', '最新回复中的引用网页会显示在这里。')}</div>
+              ) : (
+                <div className="reference-panel">
+                  <div className="reference-summary">
+                    <strong>{props.tr(`Read ${referencedPages.length} webpages`, `已引用 ${referencedPages.length} 个网页`)}</strong>
+                    <div className="reference-favicons">
+                      {referencedPages.slice(0, 5).map((page) => (
+                        <ReferenceFavicon key={page.href} page={page} compact />
+                      ))}
+                    </div>
+                  </div>
+                  {referencedPages.map((page) => (
+                    <button key={`${page.label}-${page.href}`} className="reference-card" onClick={() => void window.tasiHarness.app.openExternalUrl(page.href, { system: true })}>
+                      <div className="reference-card-top">
+                        <span className="reference-index">{page.label}</span>
+                        <ReferenceFavicon page={page} />
+                        <strong>{page.host}</strong>
+                      </div>
+                      {page.excerpt && <p>{page.excerpt}</p>}
+                      <span>{page.href}</span>
+                    </button>
+                  ))}
+                </div>
+              )
+            ) : props.toolEvents.length === 0 ? (
               <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
             ) : (
               props.toolEvents.map((event) => (
@@ -1540,6 +1730,8 @@ function ChatPage(props: {
               </div>
             </div>
           )}
+            </>
+          )}
         </div>
       </div>
       {error && <div className="error-box">{error}</div>}
@@ -1551,7 +1743,7 @@ function ChatPage(props: {
             className="hidden-file-input"
             type="file"
             multiple
-            accept=".docx,.pptx,.xlsx,.pdf,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
+            accept=".docx,.pptx,.xlsx,.pdf,.ofd,.xml,.txt,.md,.markdown,.json,.csv,.log,.text"
             onChange={(event) => {
               const files = Array.from(event.target.files ?? []);
               if (files.length === 0) return;
@@ -1638,7 +1830,7 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
     event.stopPropagation();
     const href = anchor.getAttribute('href')?.trim() ?? '';
     if (!/^https?:\/\//i.test(href)) return;
-    void window.tasiHarness.app.openExternalUrl(href);
+    void window.tasiHarness.app.openExternalUrl(href, { system: true });
   };
   return (
     <div
@@ -1650,14 +1842,86 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
-function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
+function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactElement | null {
+  if (citations.length === 0) return null;
+  return (
+    <div className="msg-citation-strip" aria-label="Referenced webpages">
+      {citations.map((citation) => (
+        <button
+          key={`${citation.label}-${citation.href}`}
+          className="msg-citation-chip"
+          title={[`${citation.label}. ${citation.host}`, citation.excerpt].filter(Boolean).join(' - ')}
+          aria-label={[`${citation.label}. ${citation.host}`, citation.excerpt].filter(Boolean).join(' - ')}
+          onClick={() => void window.tasiHarness.app.openExternalUrl(citation.href, { system: true })}
+        >
+          <span className="msg-citation-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" />
+              <path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1" />
+            </svg>
+          </span>
+          <span>{citation.label}</span>
+          <span className="msg-citation-host">{citation.host}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function faviconCandidates(page: CitationLink): string[] {
+  const candidates: string[] = [];
+  try {
+    const url = new URL(page.href);
+    candidates.push(`${url.origin}/favicon.ico`);
+    candidates.push(`https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(page.href)}&sz=32`);
+  } catch {
+    // Fall back to host-based services below.
+  }
+  if (page.host) {
+    candidates.push(`https://www.google.com/s2/favicons?domain=${encodeURIComponent(page.host)}&sz=32`);
+    candidates.push(`https://icons.duckduckgo.com/ip3/${encodeURIComponent(page.host)}.ico`);
+  }
+  return [...new Set(candidates)];
+}
+
+function ReferenceFavicon({ page, compact = false }: { page: CitationLink; compact?: boolean }): ReactElement {
+  const candidates = useMemo(() => faviconCandidates(page), [page]);
+  const [index, setIndex] = useState(0);
+  const src = candidates[index];
+  const fallbackText = (page.host || page.label || '?').replace(/^www\./, '').slice(0, 1).toUpperCase();
+
+  useEffect(() => {
+    setIndex(0);
+  }, [page.href]);
+
+  if (!src) {
+    return <span className={`reference-favicon-fallback ${compact ? 'compact' : ''}`}>{fallbackText}</span>;
+  }
+
+  return (
+    <img
+      className="reference-favicon"
+      src={src}
+      alt=""
+      onError={() => setIndex((old) => old + 1)}
+    />
+  );
+}
+
+function assistantExportTitle(content: string): string {
+  const lines = normalizeMarkdownForRender(content).split('\n');
+  const heading = lines.find((line) => /^#{1,3}\s+\S/.test(line.trim()))?.replace(/^#{1,6}\s+/, '').trim();
+  if (heading) return heading.slice(0, 80);
+  const firstText = lines.find((line) => line.trim() && !/^```/.test(line.trim()))?.trim() ?? 'Assistant Reply';
+  return firstText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1').slice(0, 80);
+}
+
+function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
-  const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'U'}</div>
+      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
       <div className="msg-bubble-wrap">
-        <div className="msg-sender">{label}</div>
         <div className="msg-bubble">{renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}</div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
@@ -1667,9 +1931,10 @@ function LegacyMessageBubble({ message, tr }: { message: AgentMessage; tr: Trans
 
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
-  const label = message.role === 'assistant' ? 'Tasi Harness' : tr('You', '你');
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
+  const citations = message.role === 'assistant' ? extractCitationLinks(message.content) : [];
   const [copied, setCopied] = useState(false);
+  const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
 
   useEffect(() => {
     if (!copied) return;
@@ -1686,11 +1951,35 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
     }
   }
 
+  async function handleExport(format: 'pdf' | 'docx'): Promise<void> {
+    if (message.role !== 'assistant' || exportBusy) return;
+    const exportAssistantMessage = window.tasiHarness.app.exportAssistantMessage;
+    if (typeof exportAssistantMessage !== 'function') {
+      window.alert(tr('Export is not available in this window yet. Please restart Tasi Harness once so the updated preload API is loaded.', '当前窗口尚未加载导出接口。请重启一次 Tasi Harness，让新的 preload API 生效。'));
+      return;
+    }
+    setExportBusy(format);
+    try {
+      const normalized = normalizeMarkdownForRender(message.content);
+      const html = renderMarkdownToHtml(normalized);
+      const result = await exportAssistantMessage({
+        format,
+        title: assistantExportTitle(message.content),
+        content: normalized,
+        html
+      });
+      if (!result.ok) window.alert(result.content);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExportBusy(null);
+    }
+  }
+
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'U'}</div>
+      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
       <div className="msg-bubble-wrap">
-        <div className="msg-sender">{label}</div>
         <div className="msg-bubble">
           {isWechatPending ? (
             <div>
@@ -1699,8 +1988,31 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
             </div>
           ) : (
             <>
+              <CitationLinkStrip citations={citations} />
               {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
               <div className="msg-bubble-actions">
+                {message.role === 'assistant' && (
+                  <>
+                    <button
+                      className="msg-export-button"
+                      onClick={() => void handleExport('pdf')}
+                      disabled={exportBusy != null}
+                      title={tr('Export as PDF', '导出为 PDF')}
+                      aria-label={tr('Export as PDF', '导出为 PDF')}
+                    >
+                      {exportBusy === 'pdf' ? '...' : 'P'}
+                    </button>
+                    <button
+                      className="msg-export-button"
+                      onClick={() => void handleExport('docx')}
+                      disabled={exportBusy != null}
+                      title={tr('Export as Word', '导出为 Word')}
+                      aria-label={tr('Export as Word', '导出为 Word')}
+                    >
+                      {exportBusy === 'docx' ? '...' : 'W'}
+                    </button>
+                  </>
+                )}
                 <button
                   className={`msg-icon-button ${copied ? 'copied' : ''}`}
                   onClick={() => void handleCopy()}
@@ -1738,6 +2050,10 @@ const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: str
   { value: 'health', labelEn: 'Health', labelZh: '健康' },
   { value: 'other', labelEn: 'Other', labelZh: '其他' }
 ];
+
+function knownMemoryDomain(value?: string): MemoryDomain {
+  return MEMORY_DOMAINS.some((item) => item.value === value) ? (value as MemoryDomain) : 'other';
+}
 
 function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeState; refreshKnowledge: () => Promise<void> }): ReactElement {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
@@ -1852,11 +2168,11 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
       <div className="split-grid knowledge-layout">
         <div className="card">
           <h2>{props.tr('Add Document', '添加文档')}</h2>
-          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF。')}</p>
+          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF, OFD.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF、OFD。')}</p>
           <label>{props.tr('Source document', '源文档')}</label>
           <input
             type="file"
-            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf"
+            accept=".md,.markdown,.txt,.text,.log,.json,.csv,.docx,.xlsx,.pptx,.pdf,.ofd"
             disabled={uploadBusy || folderImportBusy}
             onChange={(event) => {
               setUploadFile(event.target.files?.[0] ?? null);
@@ -1988,7 +2304,7 @@ function MemoryPage(props: { tr: TranslateFn; memory: MemoryState; sessionId?: s
     for (const item of MEMORY_DOMAINS) byDomain.set(item.value, []);
     const allSorted = [...retrieved.entries].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     for (const entry of allSorted) {
-      const domain = MEMORY_DOMAINS.some((item) => item.value === entry.domain) ? (entry.domain as MemoryDomain) : 'other';
+      const domain = knownMemoryDomain(entry.domain);
       byDomain.get(domain)?.push(entry);
     }
     return { allSorted, byDomain };
@@ -2162,12 +2478,27 @@ function normalizeSkillContent(content: string, name: string, category: string):
   return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, '---', '', body, ''].join('\n');
 }
 
+const emptyCoachRecording: BrowserCoachRecording = {
+  id: '',
+  startUrl: '',
+  startedAt: '',
+  active: false,
+  events: []
+};
+
+function formatCoachEvent(event: BrowserCoachRecordedEvent): string {
+  const target = event.name || event.text || event.selector || event.tag || '';
+  const detail = event.value ? ` = ${event.value}` : event.key ? ` key=${event.key}` : '';
+  return `${event.index}. ${event.type}${target ? ` | ${target}` : ''}${detail}`;
+}
+
 function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
-  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload'>('installed');
+  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach'>('installed');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
   const [marketError, setMarketError] = useState('');
+  const [marketActionKey, setMarketActionKey] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const [uploadName, setUploadName] = useState('uploaded-skill');
@@ -2175,6 +2506,14 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadNotice, setUploadNotice] = useState('');
   const [uploadError, setUploadError] = useState('');
+  const [coachUrl, setCoachUrl] = useState('https://www.baidu.com');
+  const [coachRecording, setCoachRecording] = useState<BrowserCoachRecording>(emptyCoachRecording);
+  const [coachSkillName, setCoachSkillName] = useState('recorded-browser-workflow');
+  const [coachCategory, setCoachCategory] = useState('browser');
+  const [coachDescription, setCoachDescription] = useState('');
+  const [coachBusy, setCoachBusy] = useState(false);
+  const [coachNotice, setCoachNotice] = useState('');
+  const [coachError, setCoachError] = useState('');
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorMode, setEditorMode] = useState<'create' | 'edit'>('create');
   const [editorName, setEditorName] = useState('my-workflow');
@@ -2204,6 +2543,26 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
         setMarketError(error instanceof Error ? error.message : String(error));
       });
   }, [debouncedQuery, skills, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'coach') return;
+    let canceled = false;
+    const refresh = () => {
+      void window.tasiHarness.browserCoach.status()
+        .then((recording) => {
+          if (!canceled) setCoachRecording(recording);
+        })
+        .catch((error) => {
+          if (!canceled) setCoachError(error instanceof Error ? error.message : String(error));
+        });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 900);
+    return () => {
+      canceled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeTab]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -2321,21 +2680,58 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
-  async function install(sourceId: string, skillId: string): Promise<void> {
-    const installed = await window.tasiHarness.skills.installFromMarketplace({ sourceId, skillId });
-    setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
-    await refreshSkills();
-    await refreshMarketplaceSnapshot();
-    await openInstalledSkill(installed.installedSkillName ?? installed.name);
+  async function install(skill: MarketplaceSkill): Promise<void> {
+    const { sourceId, id: skillId } = skill;
+    const actionKey = `install:${sourceId}:${skillId}`;
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      const installed = await window.tasiHarness.skills.installFromMarketplace({
+        sourceId,
+        skillId,
+        skill: {
+          id: skill.id,
+          sourceId: skill.sourceId,
+          sourceName: skill.sourceName,
+          name: skill.name,
+          description: skill.description,
+          category: skill.category,
+          version: skill.version,
+          readme: skill.readme,
+          skillContent: skill.skillContent,
+          supportingFiles: skill.supportingFiles,
+          homepage: skill.homepage,
+          remoteVersionId: skill.remoteVersionId,
+          installCommand: skill.installCommand
+        }
+      });
+      setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
+      await refreshSkills();
+      await refreshMarketplaceSnapshot();
+      await openInstalledSkill(installed.installedSkillName ?? installed.name);
+    } catch (error) {
+      setMarketError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
   }
 
   async function uninstall(name: string): Promise<void> {
     if (!name) return;
-    await window.tasiHarness.skills.uninstallMarketplaceSkill(name);
-    setNotice(`Removed ${name}.`);
-    if (editorOpen && editorOriginalName === name) setEditorOpen(false);
-    await refreshSkills();
-    await refreshMarketplaceSnapshot();
+    const actionKey = `uninstall:${name}`;
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      await window.tasiHarness.skills.uninstallMarketplaceSkill(name);
+      setNotice(`Removed ${name}.`);
+      if (editorOpen && editorOriginalName === name) setEditorOpen(false);
+      await refreshSkills();
+      await refreshMarketplaceSnapshot();
+    } catch (error) {
+      setMarketError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
   }
 
   async function uploadArchive(): Promise<void> {
@@ -2372,6 +2768,79 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
+  async function startCoach(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      const recording = await window.tasiHarness.browserCoach.start({ url: coachUrl });
+      setCoachRecording(recording);
+      setCoachNotice(tr('Browser coach started. Operate in the opened browser window.', '教练已开始。请在弹出的浏览器窗口中操作。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function stopCoach(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    try {
+      setCoachRecording(await window.tasiHarness.browserCoach.stop());
+      setCoachNotice(tr('Browser coach stopped.', '教练已停止。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function clearCoachTrace(): Promise<void> {
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      setCoachRecording(await window.tasiHarness.browserCoach.clear());
+      setCoachNotice(tr('Browser trace cleared.', '浏览器操作轨迹已清除。'));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
+  async function generateCoachSkill(): Promise<void> {
+    const name = coachSkillName.trim();
+    const category = coachCategory.trim() || 'browser';
+    if (!name) {
+      setCoachError(tr('Skill name is required.', '请填写技能名称。'));
+      return;
+    }
+    if (coachRecording.events.length === 0) {
+      setCoachError(tr('Record at least one browser action before generating a skill.', '请至少记录一个浏览器操作后再生成技能。'));
+      return;
+    }
+    setCoachBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      const result = await window.tasiHarness.browserCoach.generateSkill({
+        name,
+        category,
+        description: coachDescription.trim() || undefined
+      });
+      setNotice(tr(`Generated skill ${result.skill.name}.`, `已生成技能 ${result.skill.name}。`));
+      setCoachNotice(tr(`Generated skill ${result.skill.name}; recording saved to ${result.recordingReferencePath}.`, `已生成技能 ${result.skill.name}；轨迹已保存到 ${result.recordingReferencePath}。`));
+      await refreshSkills();
+      await openInstalledSkill(result.skill.name);
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachBusy(false);
+    }
+  }
+
   return (
     <section className="page">
       <PageHeader
@@ -2389,6 +2858,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
           </button>
           <button className={`skill-tab ${activeTab === 'upload' ? 'active' : ''}`} onClick={() => setActiveTab('upload')}>
             {tr('Upload', '上传')}
+          </button>
+          <button className={`skill-tab ${activeTab === 'coach' ? 'active' : ''}`} onClick={() => setActiveTab('coach')}>
+            {tr('Coach', '教练')}
           </button>
         </div>
         {activeTab === 'installed' && (
@@ -2429,17 +2901,29 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             <div className="marketplace-list">
               {marketplace.skills.map((skill) => (
                 <div key={`${skill.sourceId}-${skill.id}`} className="marketplace-card">
+                  {(() => {
+                    const installActionKey = `install:${skill.sourceId}:${skill.id}`;
+                    const uninstallActionKey = `uninstall:${skill.installedSkillName ?? ''}`;
+                    const installBusy = marketActionKey === installActionKey;
+                    const uninstallBusy = marketActionKey === uninstallActionKey;
+                    return (
                   <div className="marketplace-card-top">
                     <div>
                       <strong>{skill.name}</strong>
                       <div className="card-subtle">{skill.sourceName} | {skill.category} | v{skill.version}</div>
                     </div>
                     {skill.installed && skill.installedSkillName ? (
-                      <button className="danger-button" onClick={() => void uninstall(skill.installedSkillName ?? '')}>{tr('Uninstall', '卸载')}</button>
+                      <button className="danger-button" disabled={uninstallBusy || marketActionKey !== null} onClick={() => void uninstall(skill.installedSkillName ?? '')}>
+                        {uninstallBusy ? tr('Uninstalling...', '卸载中...') : tr('Uninstall', '卸载')}
+                      </button>
                     ) : (
-                      <button className="primary-button" onClick={() => void install(skill.sourceId, skill.id)}>{tr('Install', '安装')}</button>
+                      <button className="primary-button" disabled={installBusy || marketActionKey !== null} onClick={() => void install(skill)}>
+                        {installBusy ? tr('Installing...', '安装中...') : tr('Install', '安装')}
+                      </button>
                     )}
                   </div>
+                    );
+                  })()}
                   <p>{skill.description}</p>
                   <pre className="code-block small">{skill.readme || skill.skillContent}</pre>
                 </div>
@@ -2481,6 +2965,72 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             </div>
             {uploadError && <div className="error-box market-error">{uploadError}</div>}
             {uploadNotice && <div className="notice-box">{uploadNotice}</div>}
+          </>
+        )}
+        {activeTab === 'coach' && (
+          <>
+            <h2>{tr('Browser Coach', '浏览器教练')}</h2>
+            <div className="coach-layout">
+              <div className="coach-controls">
+                <label>{tr('Start URL', '起始网址')}</label>
+                <input value={coachUrl} onChange={(event) => setCoachUrl(event.target.value)} placeholder="https://www.baidu.com" />
+                <div className="button-row">
+                  <button className="primary-button" disabled={coachBusy || coachRecording.active} onClick={() => void startCoach()}>
+                    {coachRecording.active ? tr('Recording...', '记录中...') : tr('Start', '开始')}
+                  </button>
+                  <button className="ghost-button" disabled={coachBusy || !coachRecording.active} onClick={() => void stopCoach()}>
+                    {tr('Stop', '停止')}
+                  </button>
+                  <span className={`soft-badge ${coachRecording.active ? 'badge-ok' : 'badge-muted'}`}>
+                    {coachRecording.active ? tr('Recording', '记录中') : tr('Idle', '空闲')}
+                  </span>
+                  <span className="soft-badge">{tr('Events', '事件')}: {coachRecording.events.length}</span>
+                </div>
+                <label>{tr('Skill name', '技能名')}</label>
+                <input value={coachSkillName} onChange={(event) => setCoachSkillName(event.target.value)} placeholder="recorded-browser-workflow" />
+                <label>{tr('Category', '分类')}</label>
+                <input value={coachCategory} onChange={(event) => setCoachCategory(event.target.value)} placeholder="browser" />
+                <label>{tr('Description', '描述')}</label>
+                <input value={coachDescription} onChange={(event) => setCoachDescription(event.target.value)} placeholder={tr('optional skill trigger description', '可选，用于触发技能的描述')} />
+                <div className="button-row">
+                  <button className="primary-button" disabled={coachBusy || coachRecording.events.length === 0} onClick={() => void generateCoachSkill()}>
+                    {coachBusy ? tr('Working...', '处理中...') : tr('Generate Skill', '生成技能')}
+                  </button>
+                </div>
+              </div>
+              <div className="coach-trace">
+                <div className="coach-trace-head">
+                  <strong>{tr('Recorded Browser Trace', '浏览器操作轨迹')}</strong>
+                  <div className="coach-trace-head-actions">
+                    {coachRecording.startedAt && <span>{prettyDate(coachRecording.startedAt)}</span>}
+                    <button
+                      className="mini-button"
+                      disabled={coachBusy || coachRecording.events.length === 0}
+                      onClick={() => void clearCoachTrace()}
+                    >
+                      {tr('Clear', '清除')}
+                    </button>
+                  </div>
+                </div>
+                {coachRecording.events.length === 0 ? (
+                  <div className="tool-empty">{tr('Click Start, operate in the browser window, and actions will appear here.', '点击开始，在弹出的浏览器中操作，轨迹会显示在这里。')}</div>
+                ) : (
+                  <div className="coach-trace-list">
+                    {coachRecording.events.slice(-120).map((event) => (
+                      <div key={event.id || `${event.index}-${event.createdAt}`} className="coach-event">
+                        <div>
+                          <strong>{formatCoachEvent(event)}</strong>
+                          <span>{event.url}</span>
+                        </div>
+                        <time>{prettyDate(event.createdAt)}</time>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            {coachError && <div className="error-box market-error">{coachError}</div>}
+            {coachNotice && <div className="notice-box">{coachNotice}</div>}
           </>
         )}
         {notice && <div className="notice-box">{notice}</div>}
@@ -2649,10 +3199,23 @@ function TasksPage(props: {
 
 function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: TranslateFn; sessions: SessionSummary[]; onOpen: (id: string) => Promise<void>; refreshSessions: () => Promise<void> }): ReactElement {
   const [query, setQuery] = useState('');
+  const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<MemoryDomain | 'all', number>([['all', sessions.length]]);
+    for (const session of sessions) {
+      const domain = knownMemoryDomain(session.domain);
+      counts.set(domain, (counts.get(domain) ?? 0) + 1);
+    }
+    return counts;
+  }, [sessions]);
   const filtered = useMemo(() => {
-    if (!query.trim()) return sessions;
-    return sessions.filter((s) => s.title.toLowerCase().includes(query.toLowerCase()));
-  }, [sessions, query]);
+    const needle = query.trim().toLowerCase();
+    return sessions.filter((s) => {
+      if (activeCategory !== 'all' && knownMemoryDomain(s.domain) !== activeCategory) return false;
+      if (!needle) return true;
+      return s.title.toLowerCase().includes(needle);
+    });
+  }, [sessions, query, activeCategory]);
 
   async function remove(id: string): Promise<void> {
     await window.tasiHarness.sessions.delete(id);
@@ -2661,22 +3224,49 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 
   return (
     <section className="page">
-      <PageHeader title={tr('Sessions', '会话')} subtitle={tr('Local JSON session history with simple full-text search.', '本地 JSON 会话历史，支持简单全文筛选。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by the same domains as memory.', '本地 JSON 会话历史，按记忆相同分类展示。')} />
       <div className="card">
-        <input className="wide-input" placeholder={tr('Filter sessions', '筛选会话')} value={query} onChange={(e) => setQuery(e.target.value)} />
-        <div className="session-list">
-          {filtered.map((s) => (
-            <div className="session-card" key={s.id}>
-              <div>
-                <strong>{s.title}</strong>
-                <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+        <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="memory-browser session-browser">
+          <div className="memory-category-list">
+            <button className={`memory-category-item ${activeCategory === 'all' ? 'active' : ''}`} onClick={() => setActiveCategory('all')}>
+              <span>{tr('All', '全部')}</span>
+              <span className="soft-badge">{categoryCounts.get('all') ?? 0}</span>
+            </button>
+            {MEMORY_DOMAINS.map((category) => (
+              <button
+                key={category.value}
+                className={`memory-category-item ${activeCategory === category.value ? 'active' : ''}`}
+                onClick={() => setActiveCategory(category.value)}
+              >
+                <span>{tr(category.labelEn, category.labelZh)}</span>
+                <span className="soft-badge">{categoryCounts.get(category.value) ?? 0}</span>
+              </button>
+            ))}
+          </div>
+          <div className="session-list">
+            {filtered.map((s) => {
+              const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
+              return (
+                <div className="session-card" key={s.id}>
+                  <div>
+                    <strong>{s.title}</strong>
+                    <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+                    {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
+                  </div>
+                  <div className="button-row compact">
+                    <button className="primary-button" onClick={() => void onOpen(s.id)}>{tr('Open', '打开')}</button>
+                    <button className="danger-button" onClick={() => void remove(s.id)}>{tr('Delete', '删除')}</button>
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && (
+              <div className="tool-empty">
+                {tr('No sessions matched this category or filter.', '没有匹配该分类或筛选条件的会话。')}
               </div>
-              <div className="button-row compact">
-                <button className="primary-button" onClick={() => void onOpen(s.id)}>{tr('Open', '打开')}</button>
-                <button className="danger-button" onClick={() => void remove(s.id)}>{tr('Delete', '删除')}</button>
-              </div>
-            </div>
-          ))}
+            )}
+          </div>
         </div>
       </div>
     </section>
@@ -2877,7 +3467,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label>{tr('Temperature', '温度')}</label>
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
-          <input type="number" min="1" max="50" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <input type="number" min="1" max="100" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
           <label>{tr('Session document max docs', '对话文档最大数量')}</label>
           <input
             type="number"
@@ -2921,8 +3511,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="isolated">{tr('Isolated (safe default)', '隔离模式（默认更安全）')}</option>
             <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
-          <div className="card-subtle">{tr('External auto mode tries CDP first, then Safari WebDriver on macOS, then shell.openExternal.', '外部自动模式会优先尝试 CDP，其次在 macOS 使用 Safari WebDriver，最后回退到 shell.openExternal。')}</div>
-          <div className="card-subtle">{tr('System profile mode reuses login state and may force-close browser processes during controlled takeover.', '系统配置会复用登录态，在受控接管时可能强制关闭浏览器进程。')}</div>
+          <label className="toggle-line"><input type="checkbox" checked={draft.browserHeadless} onChange={(e) => setDraft((old) => ({ ...old, browserHeadless: e.target.checked }))} /> {tr('Run external CDP browser headless', '以无头模式运行外部 CDP 浏览器')}</label>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>
@@ -2932,6 +3521,52 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <h2>{tr('Security', '安全')}</h2>
           <label className="toggle-line"><input type="checkbox" checked={draft.allowShellTools} onChange={(e) => setDraft((old) => ({ ...old, allowShellTools: e.target.checked }))} /> {tr('Enable terminal tool', '启用终端工具')}</label>
           <label className="toggle-line"><input type="checkbox" checked={draft.enableNetworkTools} onChange={(e) => setDraft((old) => ({ ...old, enableNetworkTools: e.target.checked }))} /> {tr('Enable network tools', '启用网络工具')}</label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.safetyApproval.enabled}
+              onChange={(e) => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, enabled: e.target.checked } }))}
+            />
+            {tr('Enable safety approval', '启用安全审批')}
+          </label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.safetyApproval.approveRiskyTerminalCommands}
+              onChange={(e) => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, approveRiskyTerminalCommands: e.target.checked } }))}
+            />
+            {tr('Approve risky terminal commands', '风险终端命令需要审批')}
+          </label>
+          <label>{tr('Approval timeout seconds', '审批超时秒数')}</label>
+          <input
+            type="number"
+            min="5"
+            max="300"
+            value={Math.round(draft.safetyApproval.timeoutMs / 1000)}
+            onChange={(e) => setDraft((old) => ({
+              ...old,
+              safetyApproval: {
+                ...old.safetyApproval,
+                timeoutMs: Math.max(5, Math.min(300, Number(e.target.value) || 60)) * 1000
+              }
+            }))}
+          />
+          <div className="card-subtle">
+            {tr(
+              'Rules: workspace deletes require approval; outside-workspace reads, writes, and deletes require approval; low-risk terminal commands do not.',
+              '规则：工作区内仅删除需要审批；工作区外读取、写入、删除需要审批；低风险终端命令不需要审批。'
+            )}
+          </div>
+          <div className="button-row">
+            <button
+              className="ghost-button"
+              onClick={() => setDraft((old) => ({ ...old, safetyApproval: { ...old.safetyApproval, neverAskAgainKeys: [] } }))}
+              disabled={draft.safetyApproval.neverAskAgainKeys.length === 0}
+            >
+              {tr('Clear remembered approvals', '清空不再审批记录')}
+            </button>
+            <span className="soft-badge">{tr('Remembered', '已记住')} {draft.safetyApproval.neverAskAgainKeys.length}</span>
+          </div>
         </div>
       )}
       {subPage === 'channels' && (

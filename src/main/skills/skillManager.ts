@@ -4,7 +4,8 @@ import JSZip from 'jszip';
 import type { SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
 import { ensureDir, safeJoin, slugifyName } from '../storage/pathUtils.js';
 
-type Frontmatter = Record<string, string | string[] | boolean | number>;
+type FrontmatterValue = string | string[] | boolean | number;
+type Frontmatter = Record<string, FrontmatterValue>;
 
 export function parseSkillMarkdown(content: string): { frontmatter: Frontmatter; body: string } {
   const match = content.match(/^---\n([\s\S]*?)\n---\n?/);
@@ -79,6 +80,16 @@ export class SkillManager {
     return this.documentFromFile(file, file.startsWith(this.localRoot), file.startsWith(this.localRoot) ? 'local' : 'bundled');
   }
 
+  readBundled(name: string): SkillDocument | null {
+    if (!this.bundledRoot || !existsSync(this.bundledRoot)) return null;
+    const slug = slugifyName(name);
+    const file = this.findSkillFiles(this.bundledRoot).find((candidate) => {
+      const metadata = this.metadataFromFile(candidate, true, 'bundled');
+      return slugifyName(metadata.name) === slug || basename(dirname(candidate)) === slug;
+    });
+    return file ? this.documentFromFile(file, true, 'bundled') : null;
+  }
+
   create(req: SkillWriteRequest): SkillDocument {
     const slug = slugifyName(req.name);
     const category = slugifyName(req.category || 'local');
@@ -105,6 +116,10 @@ export class SkillManager {
   }
 
   async uploadArchive(req: SkillArchiveUploadRequest): Promise<SkillDocument> {
+    return this.installArchive(req);
+  }
+
+  async installArchive(req: SkillArchiveUploadRequest, frontmatterOverrides: Record<string, FrontmatterValue | undefined> = {}): Promise<SkillDocument> {
     if (!req.contentBase64?.trim()) throw new Error('Archive content is empty.');
     const archive = Buffer.from(req.contentBase64, 'base64');
     if (archive.length === 0) throw new Error('Archive content is empty.');
@@ -125,25 +140,25 @@ export class SkillManager {
     if (!skillName) throw new Error('Skill name is required.');
     const frontmatter: Frontmatter = {
       ...parsed.frontmatter,
+      ...Object.fromEntries(Object.entries(frontmatterOverrides).filter((entry): entry is [string, FrontmatterValue] => entry[1] !== undefined)),
       name: skillName,
       category: skillCategory || 'local',
       description: parsed.frontmatter.description ?? `Skill: ${skillName}`
     };
-    const frontmatterText = Object.entries(frontmatter).map(([key, value]) => `${key}: ${String(value)}`).join('\n');
-    const content = ['---', frontmatterText, '---', '', parsed.body.trim()].join('\n');
+    const content = stringifySkill(frontmatter, parsed.body);
     const created = this.create({
       name: skillName,
       category: skillCategory || 'local',
       content
     });
-    const skillRoot = this.normalizeZipPath(skillEntry.name).replace(/(^|\/)SKILL\.md$/i, '');
+    const skillRoot = this.skillRootForEntry(skillEntry.name);
     for (const entry of entries) {
-      if (entry.name === skillEntry.name) continue;
+      if (entry === skillEntry) continue;
       const entryPath = this.normalizeZipPath(entry.name);
       if (!this.belongsToSkillRoot(entryPath, skillRoot)) continue;
       const relPath = skillRoot ? entryPath.slice(skillRoot.length + 1) : entryPath;
       if (!relPath || /(^|\/)\.\.(\/|$)/.test(relPath)) continue;
-      const fileContent = await entry.async('string');
+      const fileContent = await entry.async('nodebuffer');
       this.writeSupportingFile(created.name, relPath, fileContent);
     }
     return this.documentFromFile(this.localSkillFile(created.name), true, 'local');
@@ -156,12 +171,12 @@ export class SkillManager {
     return true;
   }
 
-  writeSupportingFile(name: string, filePath: string, fileContent: string): string {
+  writeSupportingFile(name: string, filePath: string, fileContent: string | Uint8Array): string {
     const skillFile = this.localSkillFile(name);
     const root = dirname(skillFile);
     const target = safeJoin(root, filePath);
     ensureDir(dirname(target));
-    writeFileSync(target, fileContent, 'utf8');
+    writeFileSync(target, fileContent);
     return relative(root, target);
   }
 
@@ -268,8 +283,12 @@ export class SkillManager {
     return path.replace(/\\/g, '/').replace(/^\/+/, '');
   }
 
+  private skillRootForEntry(path: string): string {
+    return this.normalizeZipPath(path).replace(/(^|\/)SKILL\.md$/i, '').replace(/\/+$/, '');
+  }
+
   private belongsToSkillRoot(entryPath: string, skillRoot: string): boolean {
-    if (!skillRoot) return !entryPath.includes('/');
+    if (!skillRoot) return true;
     return entryPath.startsWith(`${skillRoot}/`);
   }
 

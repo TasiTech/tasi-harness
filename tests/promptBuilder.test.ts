@@ -56,6 +56,18 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('A final answer that skips required skill steps is incorrect');
     expect(prompt).toContain('Before producing a final answer for a skill-driven request');
     expect(prompt).toContain('return a degraded answer rather than presenting an unverified answer as complete');
+    expect(prompt).toContain('2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。');
+    expect(prompt).toContain('inline citations near claims are required for web-backed answers');
+    expect(prompt).toContain('Preserve source traceability from tool use to final answer');
+    expect(prompt).toContain('For data-heavy answers, cite every important number or live-data item near the value');
+    expect(prompt).toContain('In tables, put the citation in the same row or source column');
+    expect(prompt).toContain('cite article-level or official-page URLs for timelines, quotes, official responses');
+    expect(prompt).toContain('Do not replace opened article/source URLs with a generic search page');
+    expect(prompt).toContain('add a compact Sources/来源 section');
+    expect(prompt).toContain('Do not write plain `[1] Source title`');
+    expect(prompt).toContain('Keep evidence links separate from action links');
+    expect(prompt).toContain('label it as [estimated], [inferred], or [unverified]');
+    expect(prompt).toContain('URL-encode spaces and unsafe characters');
   });
 
   it('injects uploaded session document XML into the system prompt', async () => {

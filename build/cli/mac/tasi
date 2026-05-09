@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+APP_CONTENTS="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+TASI_EXE="$APP_CONTENTS/MacOS/Tasi Harness"
+TASI_CLI=""
+
+if [[ -f "$APP_CONTENTS/Resources/app/dist/main/cli.js" ]]; then
+  TASI_CLI="$APP_CONTENTS/Resources/app/dist/main/cli.js"
+elif [[ -f "$APP_CONTENTS/Resources/app.asar" ]]; then
+  TASI_CLI="$APP_CONTENTS/Resources/app.asar/dist/main/cli.js"
+fi
+
+if [[ ! -x "$TASI_EXE" ]]; then
+  echo "Tasi Harness executable was not found in the app bundle." >&2
+  exit 1
+fi
+
+if [[ -z "$TASI_CLI" ]]; then
+  echo "Tasi Harness CLI script was not found in the app bundle resources." >&2
+  exit 1
+fi
+
+export ELECTRON_RUN_AS_NODE=1
+export TASI_CLI_FORCE_MAIN=1
+export NODE_NO_WARNINGS=1
+exec "$TASI_EXE" "$TASI_CLI" "$@"

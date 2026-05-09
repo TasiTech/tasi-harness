@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
+import JSZip from 'jszip';
 import { PersonalKnowledgeBase } from '../src/main/knowledge/personalKnowledgeBase.js';
 import { tempHome } from './helpers.js';
 
@@ -17,6 +18,19 @@ function createPdfWithText(text: string): Buffer {
     '%%EOF'
   ].join('\n');
   return Buffer.from(body, 'latin1');
+}
+
+async function createOfdWithText(text: string): Promise<Buffer> {
+  const zip = new JSZip();
+  zip.file(
+    'OFD.xml',
+    '<ofd:OFD xmlns:ofd="http://www.ofdspec.org/2016"><ofd:DocBody><ofd:DocRoot>Doc_0/Document.xml</ofd:DocRoot></ofd:DocBody></ofd:OFD>'
+  );
+  zip.file(
+    'Doc_0/Pages/Page_0/Content.xml',
+    `<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content><ofd:TextObject><ofd:TextCode>${text}</ofd:TextCode></ofd:TextObject></ofd:Content></ofd:Page>`
+  );
+  return zip.generateAsync({ type: 'nodebuffer' });
 }
 
 describe('PersonalKnowledgeBase', () => {
@@ -105,6 +119,27 @@ describe('PersonalKnowledgeBase', () => {
       expect(existsSync(doc.markdownPath)).toBe(true);
       expect(readFileSync(doc.markdownPath, 'utf8')).toContain('Hello PDF world');
       const hits = await knowledgeBase.search('PDF world', 3);
+      expect(hits.length).toBeGreaterThan(0);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('imports ofd documents into markdown for retrieval', async () => {
+    const env = tempHome();
+    try {
+      const knowledgeBase = new PersonalKnowledgeBase(env.home);
+      const ofd = await createOfdWithText('Hello OFD world');
+
+      const doc = await knowledgeBase.addDocument({
+        filename: 'notice.ofd',
+        contentBase64: ofd.toString('base64')
+      });
+
+      expect(doc.filename).toBe('notice.ofd');
+      expect(existsSync(doc.markdownPath)).toBe(true);
+      expect(readFileSync(doc.markdownPath, 'utf8')).toContain('Hello OFD world');
+      const hits = await knowledgeBase.search('OFD world', 3);
       expect(hits.length).toBeGreaterThan(0);
     } finally {
       env.cleanup();

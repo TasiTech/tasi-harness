@@ -2,6 +2,11 @@ import type {
   AgentToolEventStream,
   AgentRunResult,
   AppInfo,
+  AssistantMessageExportRequest,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachGenerateSkillResult,
+  BrowserCoachRecording,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -27,6 +32,8 @@ import type {
   SkillDocument,
   SkillMetadata,
   SkillPatchRequest,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   SkillWriteRequest,
@@ -49,6 +56,10 @@ declare global {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
+      };
+      security: {
+        onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;
+        resolveToolApproval(decision: ToolApprovalDecision): Promise<ToolApprovalDecision>;
       };
       sessions: {
         list(): Promise<SessionSummary[]>;
@@ -85,6 +96,13 @@ declare global {
         installFromMarketplace(req: SkillInstallRequest): Promise<MarketplaceSkill>;
         uninstallMarketplaceSkill(name: string): Promise<boolean>;
       };
+      browserCoach: {
+        start(req?: BrowserCoachStartRequest): Promise<BrowserCoachRecording>;
+        stop(): Promise<BrowserCoachRecording>;
+        status(): Promise<BrowserCoachRecording>;
+        clear(): Promise<BrowserCoachRecording>;
+        generateSkill(req: BrowserCoachGenerateSkillRequest): Promise<BrowserCoachGenerateSkillResult>;
+      };
       tasks: {
         list(): Promise<ScheduledTask[]>;
         create(req: ScheduledTaskCreateRequest): Promise<ScheduledTask>;
@@ -98,8 +116,9 @@ declare global {
       };
       app: {
         info(): Promise<AppInfo>;
+        exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult>;
         openPath(path: string): Promise<ToolExecutionResult>;
-        openExternalUrl(url: string): Promise<ToolExecutionResult>;
+        openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
       };

@@ -1,6 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
+  AssistantMessageExportRequest,
+  BrowserCoachGenerateSkillRequest,
+  BrowserCoachGenerateSkillResult,
+  BrowserCoachRecording,
+  BrowserCoachStartRequest,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -15,6 +20,8 @@ import type {
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   ToolRunRequest
@@ -38,6 +45,15 @@ const api = {
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }
+  },
+  security: {
+    onToolApprovalRequest: (listener: (payload: ToolApprovalRequest) => void) => {
+      const channel = 'tool-approval:request';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: ToolApprovalRequest) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    },
+    resolveToolApproval: (decision: ToolApprovalDecision) => ipcRenderer.invoke('tool-approval:decision', decision) as Promise<ToolApprovalDecision>
   },
   sessions: {
     list: () => ipcRenderer.invoke('sessions:list'),
@@ -79,6 +95,13 @@ const api = {
     installFromMarketplace: (req: SkillInstallRequest) => ipcRenderer.invoke('skills:market:install', req),
     uninstallMarketplaceSkill: (name: string) => ipcRenderer.invoke('skills:market:uninstall', name)
   },
+  browserCoach: {
+    start: (req?: BrowserCoachStartRequest) => ipcRenderer.invoke('browser-coach:start', req) as Promise<BrowserCoachRecording>,
+    stop: () => ipcRenderer.invoke('browser-coach:stop') as Promise<BrowserCoachRecording>,
+    status: () => ipcRenderer.invoke('browser-coach:status') as Promise<BrowserCoachRecording>,
+    clear: () => ipcRenderer.invoke('browser-coach:clear') as Promise<BrowserCoachRecording>,
+    generateSkill: (req: BrowserCoachGenerateSkillRequest) => ipcRenderer.invoke('browser-coach:generateSkill', req) as Promise<BrowserCoachGenerateSkillResult>
+  },
   tasks: {
     list: () => ipcRenderer.invoke('tasks:list'),
     create: (req: ScheduledTaskCreateRequest) => ipcRenderer.invoke('tasks:create', req),
@@ -92,8 +115,9 @@ const api = {
   },
   app: {
     info: () => ipcRenderer.invoke('app:info'),
+    exportAssistantMessage: (req: AssistantMessageExportRequest) => ipcRenderer.invoke('app:exportAssistantMessage', req),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
-    openExternalUrl: (url: string) => ipcRenderer.invoke('app:openExternalUrl', url),
+    openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),
     closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
     setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
   }

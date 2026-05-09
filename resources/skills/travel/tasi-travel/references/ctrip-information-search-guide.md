@@ -22,16 +22,22 @@ This guide is browser-only.
 1. Normalize city, date, and keyword constraints first.
 2. Open the relevant Ctrip list or detail page with `browser_open`.
 3. Wait for a stable list or detail region with `browser_wait`.
-4. Scroll only when the page is clearly lazy-loaded.
-5. Extract bounded JSON with `browser_extract` using `format=json`.
-6. Normalize visible rows only.
-7. Preserve the active page URL as `sourceUrl` when item-level links are missing.
+4. Run `browser_snapshot` to inspect visible structure, refs, result cards, and candidate detail links.
+5. Scroll only when the page is clearly lazy-loaded, then run `browser_snapshot` again if new visible rows or links appear.
+6. Extract bounded JSON with `browser_extract` using `format=json`.
+7. Normalize visible rows only.
+8. Preserve the active page URL as `sourceUrl` when item-level links are missing.
+9. Preserve source metadata for citation handoff: `sourceTitle`, `publisherOrSite`, `observedAt`, and `evidenceFields`.
 
 ## Evidence Rules
 - Do not fabricate hotel names, POI names, prices, scores, ratings, or links.
 - Treat partially rendered prices or rates as incomplete until they are clearly visible.
 - Keep route and date evidence visible when extracting flights or trains.
 - If extraction fails, mark the result as degraded and fall back to the next provider.
+- Each normalized row must be traceable to either an inspected `detailUrl` or `sourceUrl`.
+- Keep evidence URLs separate from booking, route, map, and generated search action links.
+- URL-encode source URLs before final citation output so `[1](https://...)` links remain renderer-detectable.
+- Use `browser_snapshot` to confirm the page is the intended city/date/keyword scope before trusting extracted data.
 
 ## Related Active Docs
 - Browser-first provider: `./provider-ctrip-browser.md`

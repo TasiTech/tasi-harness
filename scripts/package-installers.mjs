@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, readdirSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -11,6 +11,7 @@ const argv = new Set(process.argv.slice(2));
 const builderRetryCount = Math.max(1, Number(process.env.TASI_BUILDER_RETRIES ?? '3') || 3);
 const builderRetryDelayMs = Math.max(0, Number(process.env.TASI_BUILDER_RETRY_DELAY_MS ?? '2000') || 2000);
 const windowsExecutablePath = join(releaseDir, 'win-unpacked', 'Tasi Harness.exe');
+const macCliScripts = [join(rootDir, 'build', 'cli', 'mac', 'tasi'), join(rootDir, 'build', 'cli', 'mac', 'tasi-harness')];
 const expectedWindowsMetadata = {
   productName: 'Tasi Harness',
   fileDescription: 'Tasi Harness'
@@ -72,6 +73,16 @@ function clearReleaseDir(reason) {
   console.log(`Removed ${releaseDir}`);
 }
 
+function prepareCliAssets(targets) {
+  if (!targets.mac) return;
+  for (const scriptPath of macCliScripts) {
+    if (!existsSync(scriptPath)) {
+      throw new Error(`Expected macOS CLI launcher is missing: ${scriptPath}`);
+    }
+    chmodSync(scriptPath, 0o755);
+  }
+}
+
 function ensureSuccess(result, title) {
   if (result.status === 0) return;
   const detail = [result.stderr?.trim(), result.stdout?.trim()].filter(Boolean).join('\n');
@@ -123,6 +134,11 @@ function verifyWindowsExecutableIdentity() {
   console.log(`Verified Windows executable metadata: ProductName=${productName}, FileDescription=${fileDescription}.`);
 }
 
+function hadRecoveredRceditFailure(result) {
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  return output.includes('rcedit') && output.includes('Fatal error: Unable to commit changes');
+}
+
 function packageInstallers(command, args, targets) {
   let lastError;
   for (let attempt = 1; attempt <= builderRetryCount; attempt += 1) {
@@ -131,6 +147,11 @@ function packageInstallers(command, args, targets) {
     if (result.status === 0) {
       try {
         if (targets.win) verifyWindowsExecutableIdentity();
+        if (hadRecoveredRceditFailure(result)) {
+          console.warn(
+            'Note: electron-builder reported transient rcedit "Unable to commit changes" errors, then retried successfully. The final Windows executable metadata was verified.'
+          );
+        }
         return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
@@ -180,6 +201,7 @@ if (targets.mac && process.platform !== 'darwin' && !allowCrossMac) {
 }
 
 const npm = commandName('npm');
+prepareCliAssets(targets);
 if (!argv.has('--skip-build')) {
   ensureSuccess(run(npm, ['run', 'build'], 'Building app'), 'Building app');
 }

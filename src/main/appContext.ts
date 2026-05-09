@@ -19,10 +19,14 @@ import { McpConfigStore } from './mcp/mcpConfig.js';
 import { SandboxManager } from './sandbox/sandboxManager.js';
 import { EmailNotifier } from './notifications/emailNotifier.js';
 import { TaskScheduler } from './scheduler/taskScheduler.js';
+import { BrowserAutomationRouter } from './browser/browserAutomationRouter.js';
 import { EmbeddedBrowserAutomation } from './browser/embeddedBrowserAutomation.js';
+import { ExternalBrowserAutomation } from './browser/externalBrowserAutomation.js';
+import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
 import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
+import type { BrowserAutomation } from './tools/browserAutomation.js';
 
 function findBundledSkillsRoot(): string | undefined {
   const here = fileURLToPath(new URL('.', import.meta.url));
@@ -64,6 +68,9 @@ export class AppContext {
   readonly emailNotifier: EmailNotifier;
   readonly taskScheduler: TaskScheduler;
   readonly embeddedBrowserAutomation: EmbeddedBrowserAutomation;
+  readonly externalBrowserBridge: ExternalBrowserBridge;
+  readonly externalBrowserAutomation: ExternalBrowserAutomation;
+  readonly browserAutomation: BrowserAutomation;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
 
@@ -80,6 +87,9 @@ export class AppContext {
     this.sandboxManager = new SandboxManager(this.harnessHome);
     this.emailNotifier = new EmailNotifier();
     this.embeddedBrowserAutomation = new EmbeddedBrowserAutomation();
+    this.externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(this.harnessHome, 'runtime', 'external-browser') });
+    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig());
+    this.browserAutomation = new BrowserAutomationRouter(() => this.getConfig(), this.embeddedBrowserAutomation, this.externalBrowserAutomation);
     this.personalKnowledgeBase = new PersonalKnowledgeBase(this.harnessHome, {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
     });
@@ -142,12 +152,12 @@ export class AppContext {
     const strategy =
       config.externalBrowserEngine === 'auto'
         ? process.platform === 'darwin'
-          ? 'cdp (with local auto-launch) -> webdriver-safari -> shell.openExternal fallback'
-          : 'cdp (with local auto-launch) -> shell.openExternal fallback'
+          ? 'browser_* tools attach to CDP targets; preview fallback can use webdriver-safari or shell.openExternal'
+          : 'browser_* tools attach to CDP targets; preview fallback can use shell.openExternal'
         : config.externalBrowserEngine === 'cdp'
-          ? 'cdp (with local auto-launch) -> shell.openExternal fallback'
-          : 'webdriver-safari -> shell.openExternal fallback';
-    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; strategy=${strategy}.`;
+          ? 'browser_* tools attach to CDP targets; preview fallback can use shell.openExternal'
+          : 'webdriver-safari preview only; browser_* tools require CDP for external-page automation';
+    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}; strategy=${strategy}.`;
   }
 
   private createTools(): RegisteredTool[] {
@@ -156,7 +166,7 @@ export class AppContext {
       memoryStore: this.memoryStore,
       sessionStore: this.sessionStore,
       skillManager: this.skillManager,
-      browserAutomation: this.embeddedBrowserAutomation
+      browserAutomation: this.browserAutomation
     });
   }
 }

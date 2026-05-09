@@ -75,6 +75,19 @@ function createPdfWithAnnotation(): Buffer {
   return Buffer.from(pdf, 'latin1');
 }
 
+async function createOfdWithText(text: string): Promise<Buffer> {
+  const zip = new JSZip();
+  zip.file(
+    'OFD.xml',
+    '<ofd:OFD xmlns:ofd="http://www.ofdspec.org/2016"><ofd:DocBody><ofd:DocRoot>Doc_0/Document.xml</ofd:DocRoot></ofd:DocBody></ofd:OFD>'
+  );
+  zip.file(
+    'Doc_0/Pages/Page_0/Content.xml',
+    `<ofd:Page xmlns:ofd="http://www.ofdspec.org/2016"><ofd:Content><ofd:TextObject><ofd:TextCode>${text}</ofd:TextCode></ofd:TextObject></ofd:Content></ofd:Page>`
+  );
+  return zip.generateAsync({ type: 'nodebuffer' });
+}
+
 describe('SessionDocumentContextStore', () => {
   it('stores uploaded docx as XML and keeps comment parts for prompt injection', async () => {
     const env = tempHome();
@@ -90,6 +103,10 @@ describe('SessionDocumentContextStore', () => {
       workspaceDir
     });
     expect(added.commentCount).toBe(1);
+    expect(added.xmlPath).toContain(workspaceDir);
+    expect(added.xmlPath).toContain('session-documents');
+    expect(added.xmlPath).toContain('session_a');
+    expect(existsSync(added.xmlPath)).toBe(true);
     expect(typeof added.workspaceCopyPath).toBe('string');
     expect(added.workspaceCopyPath).toContain('session-documents');
     expect(added.workspaceCopyPath).toContain('session_a');
@@ -111,7 +128,7 @@ describe('SessionDocumentContextStore', () => {
     expect(store.list('session_a')).toHaveLength(0);
   });
 
-  it('supports xlsx/pptx/pdf uploads and renders them as XML context', async () => {
+  it('supports xlsx/pptx/pdf/ofd uploads and renders them as XML context', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const store = new SessionDocumentContextStore(env.home);
@@ -119,6 +136,7 @@ describe('SessionDocumentContextStore', () => {
     const xlsx = await createXlsxWithComment();
     const pptx = await createPptxWithComment();
     const pdf = createPdfWithAnnotation();
+    const ofd = await createOfdWithText('Hello OFD world');
 
     const xlsxDoc = await store.addDocument({
       sessionId: 'session_mix',
@@ -141,13 +159,22 @@ describe('SessionDocumentContextStore', () => {
     });
     expect(pdfDoc.commentCount).toBeGreaterThan(0);
 
-    const promptBlock = store.renderPromptBlock('session_mix', { maxDocs: 3, maxChars: 30_000 });
+    const ofdDoc = await store.addDocument({
+      sessionId: 'session_mix',
+      filename: 'notice.ofd',
+      contentBase64: ofd.toString('base64')
+    });
+    expect(ofdDoc.commentCount).toBe(0);
+
+    const promptBlock = store.renderPromptBlock('session_mix', { maxDocs: 4, maxChars: 30_000 });
     expect(promptBlock).toContain('table.xlsx');
     expect(promptBlock).toContain('xl/comments1.xml');
     expect(promptBlock).toContain('slides.pptx');
     expect(promptBlock).toContain('ppt/comments/comment1.xml');
     expect(promptBlock).toContain('report.pdf');
     expect(promptBlock).toContain('Hello PDF world');
+    expect(promptBlock).toContain('notice.ofd');
+    expect(promptBlock).toContain('Hello OFD world');
   });
 
   it('limits prompt injection to ten documents and adds an overflow notice', async () => {

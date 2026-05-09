@@ -36,8 +36,16 @@ function splitNameAndExt(filename: string): { name: string; ext: string } {
   return { name: filename.slice(0, -ext.length), ext };
 }
 
+function resolveWorkspaceSessionDir(workspaceDir: string, sessionId: string): string {
+  return ensureDir(join(workspaceDir, WORKSPACE_DOCS_DIR, sanitizeFilename(sessionId, 'session')));
+}
+
+function resolveWorkspaceDocumentDir(workspaceDir: string, sessionId: string, id: string): string {
+  return ensureDir(join(resolveWorkspaceSessionDir(workspaceDir, sessionId), DOCS_DIR, sanitizeFilename(id, 'document')));
+}
+
 function resolveWorkspaceCopyPath(workspaceDir: string, sessionId: string, filename: string): string {
-  const sessionDir = ensureDir(join(workspaceDir, WORKSPACE_DOCS_DIR, sanitizeFilename(sessionId, 'session')));
+  const sessionDir = resolveWorkspaceSessionDir(workspaceDir, sessionId);
   const cleanName = sanitizeFilename(filename, 'document');
   const { name, ext } = splitNameAndExt(cleanName);
   let attempt = 0;
@@ -81,11 +89,12 @@ export class SessionDocumentContextStore {
     const converted = await convertDocumentToSessionXml(filename, content);
     const id = createId('sessiondoc');
     const createdAt = nowIso();
-    const docDir = ensureDir(join(this.docsRoot, id));
+    const workspaceDir = req.workspaceDir?.trim();
+    const docDir = workspaceDir ? resolveWorkspaceDocumentDir(workspaceDir, sessionId, id) : ensureDir(join(this.docsRoot, id));
     const xmlPath = join(docDir, XML_FILE);
     writeFileSync(xmlPath, converted.xml, 'utf8');
-    const workspaceCopyPath = req.workspaceDir?.trim()
-      ? resolveWorkspaceCopyPath(req.workspaceDir.trim(), sessionId, filename)
+    const workspaceCopyPath = workspaceDir
+      ? resolveWorkspaceCopyPath(workspaceDir, sessionId, filename)
       : undefined;
     if (workspaceCopyPath) writeFileSync(workspaceCopyPath, content);
 

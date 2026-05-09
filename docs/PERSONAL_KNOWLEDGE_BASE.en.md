@@ -10,10 +10,12 @@ The Personal Knowledge Base (PKB) lets you upload documents and retrieve grounde
 - `txt`, `text`, `log`
 - `json`, `csv`
 - `docx`, `xlsx`, `pptx`
+- `pdf`
+- `ofd`
 
 ## How It Works
 
-1. Uploaded files are converted to Markdown.
+1. Uploaded files are converted to Markdown; PDF and OFD use best-effort text extraction.
 2. Content and assets are stored locally.
 3. Markdown is split into local chunks.
 4. Retrieval uses lexical scoring, optionally with query expansion.
@@ -32,4 +34,3 @@ When **Personal KB** is enabled in Chat:
 - the query is analyzed for search terms
 - candidate chunks are ranked locally
 - top evidence is added to the model prompt context
-

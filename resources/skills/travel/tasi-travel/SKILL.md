@@ -32,7 +32,7 @@ This skill uses an entry-plus-modules structure:
 - feedback_history (optional)
 - map_render_request (optional):
   - map_enabled (bool; default true)
-  - map_focus (city|day|full_trip, optional; default day)
+  - map_focus (day, optional; default day)
   - travel_mode (car|walk|bus|bike, optional; default car)
   - use_lnglat (bool, optional; default false)
 
@@ -70,6 +70,9 @@ This skill uses an entry-plus-modules structure:
 - Tasi browser automation skill: ../../browser/tasi-browser-automation/SKILL.md
 - Built-in browser operator: ../../browser/embedded-browser-operator/SKILL.md
 
+### Helper Scripts
+- Ctrip destination links: ./scripts/extract_ctrip_destinations.py
+
 ## Provider Routing Policy
 
 ### Selection Logic
@@ -97,7 +100,7 @@ This skill uses an entry-plus-modules structure:
 Use hotel search when the user asks for nearby hotels, accommodation options, hotel comparison, or booking links.
 
 ### Tool Binding
-- Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
+- Preferred workflow: `browser_open` -> `browser_wait` -> `browser_snapshot` -> `browser_extract`
 - Preferred extract format: `format=json`
 - External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
 - Required args: `city`, `check_in`, `check_out`
@@ -112,9 +115,10 @@ If required args are missing:
 ### Extraction Rules
 1. Open the hotel list or search page with the requested city and dates.
 2. Wait for a stable hotel list container before extracting content.
-3. Scroll only when needed to load visible hotel cards.
-4. Extract bounded JSON from visible cards with `browser_extract` using `format=json`, then normalize rows.
-5. Preserve the active listing page URL as `sourceUrl` whenever item-level detail links are missing.
+3. Run `browser_snapshot` to inspect the page structure, visible hotel-card regions, and available link/click refs before extraction.
+4. Scroll only when needed to load visible hotel cards, then run `browser_snapshot` again if the visible card set changed.
+5. Extract bounded JSON from visible cards with `browser_extract` using `format=json`, then normalize rows.
+6. Preserve the active listing page URL as `sourceUrl` whenever item-level detail links are missing.
 
 ### Output Contract for Hotel Rows
 When extraction succeeds, render hotel recommendations directly from normalized browser rows.
@@ -131,48 +135,6 @@ Never fabricate hotel names, prices, scores, areas, or booking links.
 ### Degradation and Retry Policy
 - If browser extraction returns zero accepted rows or explicit error, state this clearly.
 - Ask the user whether to retry with adjusted inputs such as city, date range, or keyword.
-- Keep uncertainty visible if only degraded or fallback data is available.
-
-## POI Search Integration (Ctrip/Browser Tools)
-
-### When to Trigger
-Use POI search when the user asks for city attractions, scenic spots, museums, landmarks, ticket ideas, or nearby places to visit.
-
-### Tool Binding
-- Preferred workflow: `browser_open` -> `browser_wait` -> `browser_extract`
-- Preferred extract format: `format=json`
-- External runtime policy: in external browser mode, continue using `browser_*`; the harness manages controlled system browser routing and auto-close when available.
-- Required args: `city`
-- Optional args: `keyword`, `limit`
-- Preferred source: Ctrip sight or guide listing pages and clearly attributable POI detail pages.
-
-If required args are missing:
-1. Ask one concise follow-up question.
-2. Do not fabricate city or keyword silently.
-
-### Extraction Rules
-1. Open the relevant Ctrip city sight list or search page.
-2. Wait for the list container or detail content to stabilize before extraction.
-3. Scroll only when needed for lazy-loaded result cards.
-4. Extract bounded JSON card content with `browser_extract` using `format=json`, and capture visible detail or list URLs.
-5. Normalize result rows and keep the page URL as a fallback `sourceUrl`.
-
-### Output Contract for POI Rows
-When POI retrieval succeeds, render attraction rows directly from normalized browser output.
-Each displayed row should keep these fields whenever available:
-- `name`
-- `category`
-- `rating`
-- `price`
-- `address`
-- `detailUrl` (preferred detail/booking link)
-- `sourceUrl` (fallback list link)
-
-Never fabricate POI names, categories, prices, or links.
-
-### Degradation and Retry Policy
-- If browser extraction returns zero rows or explicit error, state this clearly.
-- Ask the user whether to retry with adjusted city or keyword constraints.
 - Keep uncertainty visible if only degraded or fallback data is available.
 
 ## Integrated Workflow
@@ -195,10 +157,24 @@ Execute provider calls following the priority table:
 - Apply degradation rules from the Provider Routing Policy.
 - Record each call using canonical tool logs.
 - For hotel, POI, flight, and train information, start with `ctrip_browser` using browser tools. Only if Ctrip browser retrieval fails or returns insufficient usable rows should the workflow fall back to `flyai`.
+- Preserve a source ledger while collecting evidence. For each usable source, keep `sourceId`, `sourceTitle`, `publisherOrSite`, `sourceUrl`, `observedAt`, and the exact fields supported by that source.
+- Treat provider result links as evidence only when the page was opened/inspected or returned by a trusted provider response with enough context to support the displayed fields.
 
 Auth and capability probe rules:
 - Run capability probe first for providers that support it.
 - Ask for credentials only on explicit auth errors (401/403), not on generic network or quota failures.
+
+### Step 2A: Source Ledger and Citation Handoff
+Goal: preserve data traceability from provider collection to final itinerary output.
+
+Rules:
+1. Assign citation numbers in first-use order from the source ledger.
+2. Reuse the same number for the same `sourceUrl`.
+3. Keep citation links in renderer-detectable Markdown format: `[1](https://...)`.
+4. URL-encode spaces and unsafe characters in citation URLs; do not leave raw spaces inside link destinations.
+5. Use item detail URLs as evidence when they support the displayed item fields. Use the list/search page URL when detail links are missing or when the list page is the only inspected evidence.
+6. Keep action links separate from evidence links. Booking, route, map, and generated search URLs are useful actions, but they are not evidence unless opened/inspected as a source.
+7. If a data value is estimated, inferred, generated from URL parameters, or not directly visible in a source, label it as `[estimated]`, `[inferred]`, or `[unverified]`.
 
 ### Step 3: Degrade Strategy
 Apply the degradation rules consistently:
@@ -214,32 +190,29 @@ Apply the degradation rules consistently:
 - If multiple `must_visit` items cannot be reasonably covered within the given date range due to geographic dispersion, either distribute them across available days with clear labeling or flag this in "Risks and missing information" with a recommendation to prioritize or extend the trip.
 
 ### Step 4A: Build Amap Route Links (When Map Is Requested)
-Goal: output a local HTML viewer link that embeds the Amap route URLs to display consecutive day routes together on a single page using URL parameters.
+Goal: output one direct Amap route Markdown link per itinerary day. Do not wrap routes in a local HTML viewer.
 
 Entry-level rules:
-1. Generate the Amap routing URLs using name-only mode by default for simplicity and robustness.
+1. Generate direct Amap routing URLs using name-only mode by default for simplicity and robustness.
 2. If `use_lnglat=true`, include both `name` and `lnglat` for each point to avoid ambiguity.
 3. Enforce Amap limitations: only `car` supports via points, up to 6 via points, and the total number of points (including origin and destination) must not exceed 8.
-4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. To display the route more clearly and connect the locations on the combined map, generate a `car` link that includes all POIs as a demonstration, and use this `car` link for the multi-day viewer.
-5. Map focus behavior:
-  - `day` (default): generate one Amap link per day.
-  - `full_trip`: attempt a single link for the whole trip (may exceed Amap point limits).
-  - `city`: generate a single intra-city link when the trip stays within one city.
-6. Provide the user with a Markdown link pointing to the local static viewer containing the encoded parameters.
+4. For `walk`, `bus`, or `bike`, ignore via points and explain that Amap will ignore them. If a non-car day has multiple stops, generate a direct `car` route link as a route preview and label it clearly.
+5. Map focus behavior is always `day`: generate one direct Amap link per day that has routeable stops.
 
 Link Generation:
-- Use an absolute URL starting with `file:///` pointing to the viewer file, for example: `file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html`.
-- Encode each generated URL properly.
-- To prevent the multi-day map URL from becoming too long, use the compact pipe-separated points format `?day1=点1|点2|点3` instead of raw Amap URLs for the iframe viewer. The local HTML viewer will automatically expand it.
-Append the links as query parameters: `?day1=URL_ENCODED(Origin|Via1|Via2|Destination)&day2=URL_ENCODED(Origin|Destination)`. For `full_trip` or `city`, just use `?day1=...`.
+- Use direct Amap URLs starting with `https://ditu.amap.com/dir`.
+- Encode Chinese names and special characters in final Markdown links when needed.
+- For each day, use the first routeable stop as `from[name]`, the last routeable stop as `to[name]`, and intermediate stops as `via[i][name]` when `type=car`.
+- If a day has more than 8 total points, keep the most important 8 points and mention that extra stops are omitted from the map link.
 
 Fallback Strategy:
-- If a local `file:///` link cannot be opened or the local path is unknown, omit the viewer link.
-- Provide per-day Amap URLs (`https://ditu.amap.com/dir?...`) as plain Markdown links instead, one link per day, so the user can still open each day directly.
+- If a day has fewer than two routeable stops, omit that day's map link and state why.
+- If Amap URL generation is ambiguous, provide a direct Amap search URL or mark the map link as unavailable instead of fabricating coordinates.
 
 Example:
 ```markdown
-🗺️ [点击打开多日行程地图预览](file:///D:/DEV/test/tasi-travel/assets/map/multi_day_map.html?day1=%E5%A4%A9%E5%AE%89%E9%97%A8%E5%B9%BF%E5%9C%BA%7C%E6%95%85%E5%AE%AB%E5%8D%9A%E7%89%A9%E9%99%A2%7C%E5%A4%A9%E5%9D%9B%E5%85%AC%E5%9B%AD&day2=%E5%8C%97%E4%BA%AC%E5%8C%97%E7%AB%99%7C%E5%85%AB%E8%BE%BE%E5%B2%AD%E9%95%BF%E5%9F%8E)
+- Day 1 map: [机场 -> 解放碑 -> 洪崖洞](https://ditu.amap.com/dir?from[name]=重庆江北国际机场&to[name]=洪崖洞民俗风貌区&type=car&via[0][name]=解放碑步行街)
+- Day 2 map: [解放碑 -> 长江索道 -> 南山一棵树](https://ditu.amap.com/dir?from[name]=解放碑步行街&to[name]=南山一棵树观景台&type=car&via[0][name]=长江索道)
 ```
 
 ### Step 5: Budget and Risks
@@ -288,12 +261,47 @@ The final Markdown output must include:
 8. One-Click Booking Links
 9. Verification notes (what was checked and what was adjusted)
 10. Itinerary compactness label (Relaxed/Moderate/Compact)
+11. Data Sources / Sources
 
 When `map_render_request.map_enabled` is true, also include:
-11. Amap route link notes (mode, via limits, and link formatting)
+12. Per-day Amap route link notes (mode, via limits, and link formatting)
 
-### Amap Route Link Contract (When Map Is Requested)
-Generate an Amap route URL based on either name-only or lnglat-enhanced mode.
+### Evidence and Citation Contract
+The final itinerary must preserve citations for sourced travel data.
+
+Data that requires a nearby citation:
+- flight numbers, airline names, departure/arrival times, fare or fare range, airport names, and availability status
+- train numbers, departure/arrival times, duration, fare or seat class, station names, and availability status
+- hotel names, prices, scores/ratings, location or distance text, room/policy details, and booking/detail links
+- POI names, ratings, comment counts, ticket prices, opening hours, addresses, and attraction/detail links
+- weather, policy, closure, crowding, traffic, or other current/contextual claims
+
+Citation placement:
+- In paragraphs, place the citation immediately after the supported sentence or value.
+- In tables, place the citation in the same row, the same data cell, or a dedicated Source column.
+- Do not put all citations only in a final list when individual rows contain distinct sourced data.
+- Do not cite a generic homepage, search page, or encyclopedia page for item-level data when an opened list/detail/article page is available.
+
+`Data Sources / Sources` section:
+- Required when any web/provider data is used.
+- Preserve the same citation numbers used inline.
+- Write each source number as an actual Markdown link, for example `[1](https://example.com/source) Ctrip hotel list`. Do not write plain `[1] Ctrip hotel list`.
+- Include source title or publisher/site plus the actual Markdown link.
+- Keep it compact; do not repeat every booking/action link unless it was also the evidence source.
+- Never write vague entries such as "Ctrip data", "media reports", or "multiple sources" without actual links.
+
+Example:
+```markdown
+| Option | Key data | Source |
+| --- | --- | --- |
+| Flight JD5755 | 07:55-10:35, fare from CNY 520[1](https://flights.ctrip.com/online/list/oneway-bjs-ckg?depdate=2026-06-01) | Ctrip flight list |
+| Hotel A | Score 4.8, from CNY 120/night[2](https://hotels.ctrip.com/hotels/detail/?hotelId=123) | Ctrip hotel detail |
+
+Sources: [1](https://flights.ctrip.com/online/list/oneway-bjs-ckg?depdate=2026-06-01) Ctrip flight list; [2](https://hotels.ctrip.com/hotels/detail/?hotelId=123) Ctrip hotel detail
+```
+
+### Per-Day Amap Route Link Contract (When Map Is Requested)
+Generate one direct Amap route URL per itinerary day based on either name-only or lnglat-enhanced mode.
 
 **Base URL**: `https://ditu.amap.com/dir`
 
@@ -331,8 +339,9 @@ https://ditu.amap.com/dir?from[name]={origin}&from[lnglat]={lng},{lat}&to[name]=
 ```
 
 #### Rules
+- Output per-day Markdown links only, such as `Day 1 map: [A -> B -> C](https://ditu.amap.com/dir?...)`.
 - Via points are supported only when `type=car` and are ignored for `walk`, `bus`, `bike`.
-- If a walking (or other non-car) itinerary must show via points, include a separate `car` link that chains all POIs as a sample visualization.
+- If a walking (or other non-car) itinerary must show via points, include a direct `car` link that chains the day's POIs as a sample visualization and label it clearly.
 - Max via points: 6 (indices 0..5), total points <= 8.
 - `lnglat` order is `longitude,latitude`.
 - URL-encoding for Chinese names is recommended but not required.
@@ -350,6 +359,14 @@ https://ditu.amap.com/dir?from[name]={origin}&from[lnglat]={lng},{lat}&to[name]=
 | Flights | Provider-native | `jumpUrl` or equivalent verified provider link |
 | Hotels | Ctrip | `detailUrl` or `sourceUrl` from provider hotel |
 | Trains | 12306 | Constructed URL |
+
+### Evidence Links vs Action Links
+| Link Type | Purpose | Can support citations? |
+|---|---|---|
+| Evidence link | Source page inspected or returned with provider evidence fields | Yes |
+| Booking link | User action to book a flight, hotel, train, or ticket | Only if it is also the inspected evidence source |
+| Map/route link | User action to view route | No, unless the route/distance data was inspected from that page |
+| Generated search link | User action to continue searching | No, unless it was opened and extracted as evidence |
 
 ### 12306 URL Template
 
@@ -390,7 +407,17 @@ Canonical tool log object:
   "params": {},
   "status": "success|degraded|failed",
   "result_summary": "string",
-  "evidence_ref": "string"
+  "evidence_ref": "string",
+  "sources": [
+    {
+      "sourceId": "string",
+      "sourceTitle": "string",
+      "publisherOrSite": "string",
+      "sourceUrl": "https://example.com/source",
+      "observedAt": "YYYY-MM-DDTHH:mm:ss.sssZ",
+      "supports": ["field_or_claim"]
+    }
+  ]
 }
 ```
 

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import JSZip from 'jszip';
 import { SkillManager, parseSkillMarkdown } from '../src/main/skills/skillManager.js';
 import { tempHome } from './helpers.js';
 
@@ -56,5 +57,25 @@ describe('SkillManager', () => {
     expect(readFileSync(join(localSkillDir, 'scripts', 'document.py'), 'utf8')).toContain('print("ok")');
     expect(readFileSync(join(localSkillDir, 'scripts', 'templates', 'people.xml'), 'utf8')).toContain('<people />');
     expect(readFileSync(join(localSkillDir, 'ooxml', 'schemas', 'wml.xsd'), 'utf8')).toContain('<schema />');
+  });
+
+  it('uploads root skill archives with nested supporting files', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const manager = new SkillManager(env.home);
+    const zip = new JSZip();
+    zip.file('SKILL.md', '---\nname: root-pack\ndescription: root package\ncategory: local\n---\n\nUse support files.\n');
+    zip.file('references/provider.md', '# Provider\n\nUse provider.\n');
+    zip.file('scripts/run.py', 'print("ok")\n');
+
+    const archive = await zip.generateAsync({ type: 'nodebuffer' });
+    const doc = await manager.uploadArchive({
+      filename: 'root-pack.zip',
+      contentBase64: archive.toString('base64')
+    });
+    const root = dirname(doc.path);
+
+    expect(readFileSync(join(root, 'references', 'provider.md'), 'utf8')).toContain('Use provider.');
+    expect(readFileSync(join(root, 'scripts', 'run.py'), 'utf8')).toContain('print("ok")');
   });
 });
