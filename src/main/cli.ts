@@ -287,6 +287,7 @@ async function main(): Promise<number> {
 }
 
 function isMainModule(): boolean {
+  if (process.env.TASI_CLI_FORCE_MAIN === '1') return true;
   const entry = process.argv[1];
   if (!entry) return false;
   return resolve(entry) === fileURLToPath(import.meta.url);

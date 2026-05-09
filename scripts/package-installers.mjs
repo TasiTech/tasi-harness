@@ -134,6 +134,11 @@ function verifyWindowsExecutableIdentity() {
   console.log(`Verified Windows executable metadata: ProductName=${productName}, FileDescription=${fileDescription}.`);
 }
 
+function hadRecoveredRceditFailure(result) {
+  const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  return output.includes('rcedit') && output.includes('Fatal error: Unable to commit changes');
+}
+
 function packageInstallers(command, args, targets) {
   let lastError;
   for (let attempt = 1; attempt <= builderRetryCount; attempt += 1) {
@@ -142,6 +147,11 @@ function packageInstallers(command, args, targets) {
     if (result.status === 0) {
       try {
         if (targets.win) verifyWindowsExecutableIdentity();
+        if (hadRecoveredRceditFailure(result)) {
+          console.warn(
+            'Note: electron-builder reported transient rcedit "Unable to commit changes" errors, then retried successfully. The final Windows executable metadata was verified.'
+          );
+        }
         return;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));

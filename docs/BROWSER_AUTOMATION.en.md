@@ -4,6 +4,12 @@
 
 Tasi Harness provides built-in browser automation tools for web retrieval and page interaction.
 
+## Related Skills
+
+- `tasi-browser-automation`: browser tool guidance that emphasizes `browser_snapshot` as an accessibility tree with actionable `@e` refs.
+- `deep-search`: multi-engine deep search across Baidu, Google, Bing, DuckDuckGo, Sogou, 360, and other engines, with opened-page evidence extraction before answering.
+- `tasi-travel`: itinerary planning skill that prefers Ctrip browser retrieval and preserves source citations.
+
 ## Tool Set
 
 - `browser_open`
@@ -52,5 +58,6 @@ Tasi Harness provides built-in browser automation tools for web retrieval and pa
 - Prefer stable, bounded extraction instead of full-page dumps.
 - Use `browser_snapshot.snapshot` as the primary action map; use `browser_extract` when you need content/body data.
 - Preserve source URL evidence in results.
+- Web-backed user answers should use numbered Markdown citations such as `[1](https://example.com/source)` so the UI can display referenced pages.
 - Use screenshots/PDFs for visual evidence when text extraction is not enough.
 - Mark uncertain data clearly when the page is partially loaded or blocked.

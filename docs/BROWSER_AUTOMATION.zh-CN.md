@@ -4,6 +4,12 @@
 
 Tasi Harness 内置浏览器自动化工具，可用于网页检索与页面交互。
 
+## 相关技能
+
+- `tasi-browser-automation`：浏览器工具使用规范，强调先用 `browser_snapshot` 获取 accessibility tree 与 `@e` 引用。
+- `deep-search`：多搜索源深度检索流程，支持 Baidu、Google、Bing、DuckDuckGo、Sogou、360 等入口，要求打开网页并抽取证据后再回答。
+- `tasi-travel`：行程规划入口技能，优先使用携程浏览器检索链路，并保留来源引用。
+
 ## 工具集
 
 - `browser_open`
@@ -52,5 +58,6 @@ Tasi Harness 内置浏览器自动化工具，可用于网页检索与页面交�
 - 优先使用有边界、可重复的提取方式，避免全页 dump。
 - 将 `browser_snapshot.snapshot` 作为主要操作地图；需要正文/内容数据时再用 `browser_extract`。
 - 在结果中保留来源 URL 证据。
+- 面向用户的网页事实回答应使用编号 Markdown 链接引用，例如 `[1](https://example.com/source)`，以便 UI 展示引用网页。
 - 文本提取不足时，可用 `browser_screenshot` 或 `browser_pdf` 保存视觉证据。
 - 页面未完整加载或受限时，明确标注不确定性。

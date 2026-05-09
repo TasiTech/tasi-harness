@@ -2168,7 +2168,7 @@ function KnowledgePage(props: { tr: TranslateFn; knowledge: PersonalKnowledgeSta
       <div className="split-grid knowledge-layout">
         <div className="card">
           <h2>{props.tr('Add Document', '添加文档')}</h2>
-          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF。')}</p>
+          <p>{props.tr('Supported formats: Markdown, TXT, JSON, CSV, DOCX, XLSX, PPTX, PDF, OFD.', '支持格式：Markdown、TXT、JSON、CSV、DOCX、XLSX、PPTX、PDF、OFD。')}</p>
           <label>{props.tr('Source document', '源文档')}</label>
           <input
             type="file"

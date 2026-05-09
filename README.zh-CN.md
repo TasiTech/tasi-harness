@@ -13,9 +13,11 @@ Tasi Harness 是一个本地优先的桌面 AI Agent，基于 Electron、TypeScr
 - 桌面优先：会话、记忆、技能文件都可在本地管理。
 - 内置多模型提供方预设：OpenAI、Anthropic、DeepSeek、Qwen / Bailian、MiniMax、Kimi、OpenAI-compatible、Ollama。
 - 内置浏览器自动化工具，支持内嵌预览与外部浏览器桥接模式。
-- 个人知识库支持将 Office 与文本类文档转换为可检索内容。
-- 技能系统基于可编辑 `SKILL.md`，并支持市场来源浏览与安装。
+- 深度搜索技能支持 Baidu、Google、Bing 等多搜索源，并将网页证据转换为可引用回答。
+- 个人知识库支持将 Office、PDF、OFD 与文本类文档转换为可检索内容。
+- 技能系统基于可编辑 `SKILL.md`，支持市场来源浏览、安装，以及浏览器行为录制生成技能。
 - 支持定时任务、邮件通知、微信通知，以及按次沙箱执行。
+- 支持 PDF / Word 导出、引用网页展示、工作区打开，以及安装后的命令行对话。
 
 ## 功能概览
 
@@ -24,11 +26,13 @@ Tasi Harness 是一个本地优先的桌面 AI Agent，基于 Electron、TypeScr
 | Agent 运行时 | 支持工具感知的多轮执行循环、Prompt 组装与会话持久化。 |
 | 记忆系统 | 将长期事实写入本地 JSON 记忆，并在对话时注入相关上下文。 |
 | 浏览器自动化 | 支持导航、基于 CDP 的外部 Chromium 自动化与可选无头启动、带 `@e` 引用的快照、语义查找、键盘/鼠标/表单操作、提取、截图/PDF、存储/Cookie、控制台、网络、视口与关闭重置工具。 |
-| 个人知识库 | 将本地文档转换并切分后做本地检索，无需 embedding 或外部向量库。 |
-| 技能系统 | 支持读取、创建、修改、上传、安装 `SKILL.md` 技能。 |
-| 会话管理 | 本地保存并检索历史会话。 |
+| 深度搜索与引用 | 通过 `deep-search` 使用 Baidu、Google、Bing 等搜索源打开网页、抽取证据，并在回复中保留编号 Markdown 引用。 |
+| 个人知识库 | 将本地文档转换并切分后做本地检索，支持 Office、PDF、OFD 与文本类格式，无需 embedding 或外部向量库。 |
+| 技能系统 | 支持读取、创建、修改、上传、安装 `SKILL.md` 技能，并可通过浏览器教练录制用户操作生成技能。 |
+| 历史会话 | 本地保存并检索历史对话。 |
 | 定时任务 | 按时间/间隔执行任务，并可发送通知。 |
 | 工作区安全 | 文件工具限定在工作区，支持复制式沙箱执行。 |
+| 导出与命令行 | 助手回复可导出 PDF / Word，安装后可在 PowerShell 或 bash 中使用 `tasi chat`。 |
 
 ## 安装与打包测试
 
@@ -81,9 +85,15 @@ Tasi Harness 是一个本地优先的桌面 AI Agent，基于 Electron、TypeScr
 
 - [个人知识库](docs/PERSONAL_KNOWLEDGE_BASE.zh-CN.md)
 
+### 引用溯源与导出
+
+浏览器或搜索支撑的回答会优先输出编号 Markdown 引用，例如 `[1](https://example.com/source)`。聊天页会自动提取这些引用，在消息上方和引用网页区域展示来源，方便回看原网页。
+
+助手回复支持导出为 PDF 或 Word，适合保存报告、行程规划、网页调研结论和带引用的表格。
+
 ### 技能系统与市场
 
-技能文件采用 `SKILL.md` 规范，支持本地编辑、压缩包上传、市场浏览与安装。
+技能文件采用 `SKILL.md` 规范，支持本地编辑、压缩包上传、市场浏览与安装。内置 `deep-search` 可用于多搜索源网页调研，`tasi-travel` 可用于带携程数据和路线链接的行程规划。浏览器教练可以记录用户在浏览器中的操作，并生成可复用的浏览器技能。
 
 ### 会话与记忆
 
@@ -180,7 +190,8 @@ docs/         文档目录
 - [安装、打包与测试指南](docs/INSTALLATION_PACKAGING_TESTING.zh-CN.md)
 - [浏览器自动化](docs/BROWSER_AUTOMATION.zh-CN.md)
 - [个人知识库](docs/PERSONAL_KNOWLEDGE_BASE.zh-CN.md)
-- [版本发布说明（v1.2.0）](docs/release_v1.2.0.zh-CN.md)
+- [版本发布说明（v1.3.0）](docs/release_v1.3.0.zh-CN.md)
+- [版本发布归档（v1.2.0）](docs/release_v1.2.0.zh-CN.md)
 - [版本发布归档（v1.1.0）](docs/release_v1.1.0.zh-CN.md)
 
 ## 致谢
