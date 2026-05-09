@@ -9,7 +9,11 @@ import { markedTerminal } from 'marked-terminal';
 import type { ExecutionMode, ToolApprovalDecision, ToolApprovalRequest } from '../shared/types.js';
 import { CliContext } from './cliContext.js';
 
-marked.use(markedTerminal());
+marked.use(
+  markedTerminal({
+    showSectionPrefix: false
+  })
+);
 
 export interface CliOptions {
   command: 'chat' | 'sessions' | 'help' | 'version';
@@ -174,9 +178,36 @@ async function requestApproval(context: CliContext, rl: Interface, request: Tool
   return { id: request.id, approved, neverAskAgain };
 }
 
-function renderMarkdownForTerminal(markdown: string): string {
-  const rendered = marked.parse(markdown.trim(), { async: false });
-  return typeof rendered === 'string' ? rendered : markdown.trim();
+function normalizeMarkdownForTerminal(markdown: string): string {
+  const lines = markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let fenced = false;
+  return lines
+    .map((line) => {
+      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+      if (fenced) return line;
+      return line.replace(/^ {4,}([*+-]\s+)/, '$1').replace(/^ {4,}(\d+[.)]\s+)/, '$1');
+    })
+    .join('\n');
+}
+
+function applyTerminalStrongFallback(markdown: string): string {
+  const boldStart = process.stdout.isTTY ? '\u001b[1m' : '';
+  const boldEnd = process.stdout.isTTY ? '\u001b[22m' : '';
+  const lines = markdown.split('\n');
+  let fenced = false;
+  return lines
+    .map((line) => {
+      if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+      if (fenced) return line;
+      return line.replace(/\*\*([^*\n]+)\*\*/g, `${boldStart}$1${boldEnd}`);
+    })
+    .join('\n');
+}
+
+export function renderMarkdownForTerminal(markdown: string): string {
+  const normalized = applyTerminalStrongFallback(normalizeMarkdownForTerminal(markdown.trim()));
+  const rendered = marked.parse(normalized, { async: false });
+  return typeof rendered === 'string' ? rendered : normalized;
 }
 
 function printResult(result: Awaited<ReturnType<CliContext['runChat']>>, options: Pick<CliOptions, 'json' | 'plain'>): void {

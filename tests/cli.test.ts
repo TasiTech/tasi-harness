@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseArgs } from '../src/main/cli.js';
+import { parseArgs, renderMarkdownForTerminal } from '../src/main/cli.js';
 
 describe('CLI argument parsing', () => {
   it('continues a chat with --session', () => {
@@ -37,5 +37,14 @@ describe('CLI argument parsing', () => {
     const parsed = parseArgs(['chat', 'abc123', 'hello']);
     expect(parsed.sessionId).toBeUndefined();
     expect(parsed.message).toBe('abc123 hello');
+  });
+
+  it('renders headings without markdown prefixes and de-indents markdown list items', () => {
+    const rendered = renderMarkdownForTerminal(['## 北京当前天气', '', '    * **温度**：21°C'].join('\n'));
+
+    expect(rendered).toContain('北京当前天气');
+    expect(rendered).not.toContain('## 北京当前天气');
+    expect(rendered).toContain('温度');
+    expect(rendered).not.toContain('**温度**');
   });
 });
