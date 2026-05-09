@@ -103,6 +103,10 @@ describe('SessionDocumentContextStore', () => {
       workspaceDir
     });
     expect(added.commentCount).toBe(1);
+    expect(added.xmlPath).toContain(workspaceDir);
+    expect(added.xmlPath).toContain('session-documents');
+    expect(added.xmlPath).toContain('session_a');
+    expect(existsSync(added.xmlPath)).toBe(true);
     expect(typeof added.workspaceCopyPath).toBe('string');
     expect(added.workspaceCopyPath).toContain('session-documents');
     expect(added.workspaceCopyPath).toContain('session_a');
