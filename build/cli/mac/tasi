@@ -24,4 +24,5 @@ fi
 
 export ELECTRON_RUN_AS_NODE=1
 export TASI_CLI_FORCE_MAIN=1
+export NODE_NO_WARNINGS=1
 exec "$TASI_EXE" "$TASI_CLI" "$@"

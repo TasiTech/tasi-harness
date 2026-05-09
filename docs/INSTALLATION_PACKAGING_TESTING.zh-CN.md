@@ -78,6 +78,14 @@ tasi chat --execution sandbox --knowledge "基于个人知识库回答"
 tasi sessions
 ```
 
+如果刚安装完 PowerShell 仍提示找不到 `tasi`，先关闭所有 PowerShell / Windows Terminal 窗口后重新打开；也可以用下面命令检查命令来源：
+
+```powershell
+Get-Command tasi
+```
+
+安装器会同时把安装目录写入当前用户 `PATH`，并在 `%LOCALAPPDATA%\Microsoft\WindowsApps` 写入 `tasi.cmd` / `tasi-harness.cmd` shim。PowerShell 使用 `tasi.ps1`，`cmd.exe` 下的 `tasi.cmd` 会委托给同一个 PowerShell 启动器；启动器会把控制台输入/输出设为 UTF-8，不再打印 `chcp` 输出，也不会清空终端内容。
+
 macOS 安装到 `/Applications` 后：
 
 ```bash

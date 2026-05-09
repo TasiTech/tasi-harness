@@ -125,6 +125,8 @@ tasi chat --execution sandbox --knowledge "answer with my personal knowledge bas
 tasi sessions
 ```
 
+If PowerShell still cannot find `tasi`, close all PowerShell / Windows Terminal windows and open a fresh one, then run `Get-Command tasi` to inspect the resolved launcher. The installer also creates shims in `%LOCALAPPDATA%\Microsoft\WindowsApps`. PowerShell uses `tasi.ps1`, while `cmd.exe` delegates `tasi.cmd` to the same PowerShell launcher; the launcher sets console input/output to UTF-8 without printing `chcp` output or clearing the terminal.
+
 On macOS, after installing the app in `/Applications`, the bundled bash launcher is available inside the app bundle:
 
 ```bash

@@ -42,7 +42,8 @@ Omitting `--session/-s` creates a new session; passing it appends to that sessio
 ## Packaging
 
 - App version bumped to `1.3.0`.
-- Windows NSIS packages include `tasi.cmd` / `tasi-harness.cmd` and add the install directory to the current user's PATH.
+- Windows NSIS packages include `tasi.cmd` / `tasi-harness.cmd`, add the install directory to the current user's PATH, and create shims in `%LOCALAPPDATA%\Microsoft\WindowsApps` for better PowerShell command discovery.
+- PowerShell uses `tasi.ps1`, while `cmd.exe` delegates `tasi.cmd` to the same PowerShell launcher; the launcher sets console input/output to UTF-8 without printing `chcp` output or clearing the terminal.
 - macOS app bundles include `Contents/Resources/bin/tasi` / `tasi-harness`.
 - Packaging verifies Windows executable metadata and explains recovered transient electron-builder `rcedit` retries when final packaging succeeds.
 
@@ -55,4 +56,3 @@ Omitting `--session/-s` creates a new session; passing it appends to that sessio
 ## Archive
 
 - Previous release: `docs/release_v1.2.0.en.md` and `docs/release_v1.2.0.zh-CN.md`.
-

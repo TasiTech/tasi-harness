@@ -78,6 +78,14 @@ tasi chat --execution sandbox --knowledge "answer with my personal knowledge bas
 tasi sessions
 ```
 
+If PowerShell still cannot find `tasi` immediately after installation, close all PowerShell / Windows Terminal windows and open a fresh one. You can inspect the resolved command with:
+
+```powershell
+Get-Command tasi
+```
+
+The installer writes the install directory to the current user's `PATH` and also creates `tasi.cmd` / `tasi-harness.cmd` shims under `%LOCALAPPDATA%\Microsoft\WindowsApps`. PowerShell uses `tasi.ps1`, while `cmd.exe` delegates `tasi.cmd` to the same PowerShell launcher; the launcher sets console input/output to UTF-8 without printing `chcp` output or clearing the terminal.
+
 After installing the macOS app in `/Applications`:
 
 ```bash

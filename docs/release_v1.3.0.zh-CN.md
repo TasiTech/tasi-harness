@@ -7,7 +7,7 @@
 ## 主要更新
 
 1. 优化浏览器工具链：`browser_snapshot` 以 accessibility tree 为主要页面地图，并保留可操作的 `@e` 引用，方便后续点击、输入、选择与提取。
-2. 增加深度搜索技能：内置 `deep-search`，支持 Baidu、Google、Bing、DuckDuckGo、Sogou、360 等搜索入口，按“搜索结果 -> 打开网页 -> 抽取证据”的流程获取更深入网页内容。
+2. 增加深度搜索技能：内置 `deep-search`，支持 Baidu、Google、Bing、DuckDuckGo、Sogou、360 等搜索入口，按“搜索结果 -> 打开网页 -> 抓取证据”的流程获取更深入网页内容。
 3. 增加引用溯源：浏览器和搜索类回答要求使用编号 Markdown 链接引用，UI 会提取并展示引用网页，保留来源 URL、站点和支持的事实。
 4. 增加隐私与权限提醒：文件、删除、跨工作区访问和风险终端命令会触发安全审批弹窗，并支持“本次允许”和“以后不再询问”。
 5. 优化行程规划技能：`tasi-travel` 优先使用携程浏览器检索链路，强化酒店、交通、景点数据的来源记录、引用输出、降级策略和高德路线链接。
@@ -42,7 +42,8 @@ macOS 可使用应用包内启动器：
 ## 打包说明
 
 - 应用版本升级至 `1.3.0`。
-- Windows NSIS 包包含 `tasi.cmd` / `tasi-harness.cmd`，安装后加入当前用户 PATH。
+- Windows NSIS 包包含 `tasi.cmd` / `tasi-harness.cmd` 与 `tasi.ps1` / `tasi-harness.ps1`，安装后加入当前用户 PATH，并在 `%LOCALAPPDATA%\Microsoft\WindowsApps` 写入 shim 以改善 PowerShell 命令发现。
+- PowerShell 使用 `tasi.ps1`，`cmd.exe` 下的 `tasi.cmd` 会委托给同一个 PowerShell 启动器；启动器会把控制台输入/输出设为 UTF-8，不再打印 `chcp` 输出，也不会清空终端内容。
 - macOS 应用包包含 `Contents/Resources/bin/tasi` / `tasi-harness`。
 - 打包脚本会校验 Windows 可执行文件 metadata，并在 electron-builder 的瞬时 `rcedit` 重试最终恢复时给出提示。
 
@@ -55,4 +56,3 @@ macOS 可使用应用包内启动器：
 ## 归档
 
 - 上一版本发布说明：`docs/release_v1.2.0.en.md` 与 `docs/release_v1.2.0.zh-CN.md`。
-
