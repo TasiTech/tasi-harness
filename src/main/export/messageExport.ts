@@ -276,8 +276,14 @@ function paragraphXml(text: string, options: { heading?: number; code?: boolean;
   return `<w:p>${paragraphProps}${runContent}</w:p>`;
 }
 
+function isMarkdownTableRow(line: string): boolean {
+  const normalized = line.trim();
+  return normalized.startsWith('|') && normalized.endsWith('|') && (normalized.match(/\|/g) ?? []).length >= 2;
+}
+
 function looksLikeTableRow(line: string): boolean {
   const normalized = line.trim();
+  if (isMarkdownTableRow(normalized)) return true;
   if (!normalized.includes('|')) return false;
   return splitMarkdownTableCells(normalized).filter((cell) => cell.trim()).length >= 2;
 }

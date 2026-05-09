@@ -114,6 +114,7 @@ function isHorizontalRule(line: string): boolean {
 
 function looksLikeTableRow(line: string): boolean {
   const normalized = line.trim();
+  if (isMarkdownTableRow(normalized)) return true;
   if (!normalized.includes('|')) return false;
   return normalized.split('|').filter((cell) => cell.trim()).length >= 2;
 }

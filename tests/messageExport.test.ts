@@ -94,6 +94,30 @@ describe('message export helpers', () => {
     expect(documentXml).toContain('x | y');
   });
 
+  it('keeps markdown table section rows with empty cells in docx export', async () => {
+    const docx = await buildAssistantMessageDocx(
+      'Answer',
+      [
+        '| 项目 | 单价 | 数量 | 小计 | 备注 |',
+        '|------|------|------|------|------|',
+        '| **交通** | | | | |',
+        '| 高铁往返 | ¥784/人 | 2人×2程 | ¥3,136 | 北京西↔成都东 |',
+        '| **住宿** | | | | |',
+        '| 酒店 | ¥150/晚 | 4晚 | ¥600 | 经济型酒店 |',
+        '| **合计** | | | **¥3,736** | 人均约¥1,868 |'
+      ].join('\n')
+    );
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+
+    expect(documentXml).toContain('<w:tbl>');
+    expect(documentXml.match(/<w:tr>/g)).toHaveLength(6);
+    expect(documentXml).toContain('交通');
+    expect(documentXml).toContain('住宿');
+    expect(documentXml).toContain('高铁往返');
+    expect(documentXml).toContain('合计');
+  });
+
   it('exports rendered html tables as real Word tables', async () => {
     const html = [
       '<p>Before table</p>',
