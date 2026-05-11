@@ -35,4 +35,20 @@ describe('CliContext', () => {
       env.cleanup();
     }
   });
+
+  it('preserves system browser profile settings for login-state reuse', () => {
+    const env = tempHome();
+    try {
+      const context = new CliContext(env.home);
+      context.configStore.update({
+        externalBrowserProfileMode: 'system',
+        externalBrowserCdpEndpoint: 'http://127.0.0.1:9222'
+      });
+
+      expect(context.getConfig().externalBrowserProfileMode).toBe('system');
+      expect(context.getConfig().externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
+    } finally {
+      env.cleanup();
+    }
+  });
 });

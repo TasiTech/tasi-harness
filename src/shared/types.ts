@@ -173,6 +173,7 @@ export interface AppConfig {
   externalBrowserCdpEndpoint: string;
   externalBrowserProfileMode: ExternalBrowserProfileMode;
   browserHeadless: boolean;
+  browserExecutionLoggingEnabled: boolean;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];

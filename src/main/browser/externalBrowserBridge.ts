@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import type { AppConfig, ToolExecutionResult } from '../../shared/types.js';
+import type { BrowserExecutionLogger } from './browserExecutionLogger.js';
 
 type ExternalRuntimeEngine = 'cdp' | 'webdriver-safari';
 
@@ -24,6 +25,7 @@ interface WebDriverSessionCreated {
 interface ExternalBrowserBridgeOptions {
   runtimeDir?: string;
   strictCdpEndpoint?: boolean;
+  logger?: BrowserExecutionLogger;
 }
 
 interface CdpLaunchProfile {
@@ -57,6 +59,7 @@ export class ExternalBrowserBridge {
   private readonly logVersion = 'v2-auto-launch';
   private readonly runtimeDir: string;
   private readonly strictCdpEndpoint: boolean;
+  private readonly logger?: BrowserExecutionLogger;
   private cdpOpenedTargetIds = new Set<string>();
   private cdpEndpoint = '';
   private cdpBrowserName = '';
@@ -77,6 +80,8 @@ export class ExternalBrowserBridge {
   constructor(options: ExternalBrowserBridgeOptions = {}) {
     this.runtimeDir = options.runtimeDir?.trim() || join(tmpdir(), 'tasi-harness', 'external-browser');
     this.strictCdpEndpoint = options.strictCdpEndpoint === true;
+    this.logger = options.logger;
+    this.log('bridge.init', { runtimeDir: this.runtimeDir, strictCdpEndpoint: this.strictCdpEndpoint });
   }
 
   activeCdpTargetId(): string | null {
@@ -91,13 +96,24 @@ export class ExternalBrowserBridge {
   async open(url: string, config: AppConfig): Promise<ToolExecutionResult> {
     if (!url.trim()) return { ok: false, content: 'No external URL provided.' };
     const attempts = this.resolveEngineAttempts(config);
+    this.log('bridge.open.start', {
+      url,
+      engine: config.externalBrowserEngine,
+      requestedEndpoint: config.externalBrowserCdpEndpoint,
+      profileMode: config.externalBrowserProfileMode,
+      headless: config.browserHeadless,
+      attempts
+    });
     console.info(`${this.logPrefix} ${this.logVersion} open start url=${url} engine=${config.externalBrowserEngine} attempts=${attempts.join('->')}`);
     const errors: string[] = [];
     for (const engine of attempts) {
       try {
         console.info(`${this.logPrefix} trying engine=${engine} url=${url}`);
         const result = engine === 'cdp' ? await this.openViaCdp(url, config) : await this.openViaSafariWebDriver(url);
-        if (result.ok) return result;
+        if (result.ok) {
+          this.log('bridge.open.done', { url, engine, ok: true });
+          return result;
+        }
         console.warn(`${this.logPrefix} engine=${engine} reported failure: ${result.content}`);
         errors.push(`[${engine}] ${result.content}`);
       } catch (error) {
@@ -107,10 +123,17 @@ export class ExternalBrowserBridge {
       }
     }
     console.warn(`${this.logPrefix} no managed engine succeeded for ${url}: ${errors.join(' | ')}`);
+    this.log('bridge.open.done', { url, ok: false, errors });
     return { ok: false, content: `No external engine succeeded: ${errors.join(' | ')}` };
   }
 
   async close(): Promise<ToolExecutionResult> {
+    this.log('bridge.close.start', {
+      cdpTargets: this.cdpOpenedTargetIds.size,
+      managedEndpoint: this.cdpManagedEndpoint,
+      managedProfileDir: this.cdpManagedProfileDir,
+      safariSessionId: this.safariSessionId
+    });
     const parts: string[] = [];
     const cdpClosed = await this.closeCdpTargets();
     if (cdpClosed > 0) parts.push(`closed ${cdpClosed} CDP target(s)`);
@@ -124,6 +147,7 @@ export class ExternalBrowserBridge {
     }
     const content = parts.join(' and ') + '.';
     console.info(`${this.logPrefix} close completed: ${content}`);
+    this.log('bridge.close.done', { content });
     return { ok: true, content };
   }
 
@@ -137,6 +161,12 @@ export class ExternalBrowserBridge {
 
   private async openViaCdp(url: string, config: AppConfig): Promise<ToolExecutionResult> {
     const connection = await this.resolveCdpConnectionWithAutoDetect(config, config.externalBrowserCdpEndpoint, true);
+    this.log('cdp.open.resolved', {
+      url,
+      endpoint: connection.endpoint,
+      browserName: connection.browserName,
+      browserWsUrlPresent: Boolean(connection.browserWsUrl)
+    });
     const result = await this.sendCdpCommand(connection.browserWsUrl, 'Target.createTarget', {
       url,
       background: false
@@ -150,6 +180,7 @@ export class ExternalBrowserBridge {
     this.cdpEndpoint = connection.endpoint;
     this.cdpBrowserName = connection.browserName;
     console.info(`${this.logPrefix} engine=cdp browser=${connection.browserName} endpoint=${connection.endpoint} target=${targetId}`);
+    this.log('cdp.open.target', { url, endpoint: connection.endpoint, browserName: connection.browserName, targetId });
     return {
       ok: true,
       content: `Opened ${url} via CDP (${connection.browserName}) and tracked target ${targetId} for auto-close.`
@@ -158,8 +189,18 @@ export class ExternalBrowserBridge {
 
   private async resolveCdpConnectionWithAutoDetect(config: AppConfig, rawEndpoint: string, autoDetect: boolean): Promise<CdpConnectionInfo> {
     const probeWithAutoCandidates = autoDetect && config.externalBrowserProfileMode !== 'system';
+    this.log('cdp.resolve.start', {
+      rawEndpoint,
+      autoDetect,
+      probeWithAutoCandidates,
+      profileMode: config.externalBrowserProfileMode,
+      strictCdpEndpoint: this.strictCdpEndpoint
+    });
     const first = await this.tryResolveCdpConnection(rawEndpoint, probeWithAutoCandidates);
-    if (first.connection) return first.connection;
+    if (first.connection) {
+      this.log('cdp.resolve.done', { endpoint: first.connection.endpoint, browserName: first.connection.browserName, via: 'existing' });
+      return first.connection;
+    }
     if (!autoDetect) {
       throw new Error(`CDP endpoint probe failed: ${first.errors.join(' | ')}`);
     }
@@ -170,7 +211,10 @@ export class ExternalBrowserBridge {
     }
 
     const second = await this.tryResolveCdpConnection(rawEndpoint, probeWithAutoCandidates);
-    if (second.connection) return second.connection;
+    if (second.connection) {
+      this.log('cdp.resolve.done', { endpoint: second.connection.endpoint, browserName: second.connection.browserName, via: 'auto-launch' });
+      return second.connection;
+    }
     throw new Error(`CDP endpoint probe failed after auto-launch: ${[...first.errors, ...second.errors].join(' | ')}`);
   }
 
@@ -237,9 +281,11 @@ export class ExternalBrowserBridge {
       this.cdpLastLaunchFailureState = this.cdpAutoLaunchState;
       this.cdpLaunchCooldownUntil = Date.now() + 10000;
       console.warn(`${this.logPrefix} CDP auto-launch skipped: no local Chromium/Chrome/Edge executable found.`);
+      this.log('cdp.launch.skipped', { reason: 'no-chromium-executable', priorErrors });
       return false;
     }
     if (config.externalBrowserProfileMode === 'system' && this.isBrowserProcessLikelyRunning(executable)) {
+      this.log('cdp.launch.systemProfileInUse', { executable });
       const takeoverOk = this.forceTakeoverSystemProfile(executable);
       if (!takeoverOk) {
         this.cdpAutoLaunchState = `failed:system-profile-force-close@${executable}`;
@@ -268,6 +314,16 @@ export class ExternalBrowserBridge {
       console.info(
         `${this.logPrefix} launching managed CDP browser executable=${executable} port=${port} profile=${launchProfile.userDataDir} mode=${launchProfile.mode} after probe errors=${priorErrors.join(' | ')}`
       );
+      this.log('cdp.launch.start', {
+        executable,
+        port,
+        endpoint,
+        mode: launchProfile.mode,
+        userDataDir: launchProfile.userDataDir,
+        profileDir: launchProfile.profileDir,
+        headless: config.browserHeadless,
+        priorErrors
+      });
       const child = spawn(executable, args, { stdio: 'ignore' });
       let exited = false;
       child.once('exit', () => {
@@ -289,6 +345,14 @@ export class ExternalBrowserBridge {
         this.cdpLastLaunchFailureState = '';
         this.cdpLaunchCooldownUntil = 0;
         console.info(`${this.logPrefix} managed CDP browser ready executable=${executable} endpoint=${endpoint}`);
+        this.log('cdp.launch.ready', {
+          executable,
+          endpoint,
+          mode: launchProfile.mode,
+          userDataDir: launchProfile.userDataDir,
+          profileDir: launchProfile.profileDir,
+          pid: child.pid
+        });
         return true;
       }
       if (!exited) {
@@ -305,6 +369,7 @@ export class ExternalBrowserBridge {
     this.cdpLastLaunchFailureState = this.cdpAutoLaunchState;
     this.cdpLaunchCooldownUntil = Date.now() + (requestedMode === 'system' ? 20000 : 8000);
     console.warn(`${this.logPrefix} managed CDP browser launch failed for executable=${executable}.`);
+    this.log('cdp.launch.failed', { executable, requestedMode, state: this.cdpAutoLaunchState });
     return false;
   }
 
@@ -429,6 +494,7 @@ export class ExternalBrowserBridge {
     this.cdpManagedBrowser = '';
     this.cdpManagedProfileDir = '';
     console.info(`${this.logPrefix} stopping managed CDP browser executable=${browser} endpoint=${endpoint} profile=${profileDir}`);
+    this.log('cdp.launch.stop', { browser, endpoint, profileDir });
     try {
       child.kill('SIGTERM');
     } catch {
@@ -451,7 +517,10 @@ export class ExternalBrowserBridge {
             ]
           : ['/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/usr/bin/chromium', '/snap/bin/chromium'];
     for (const candidate of platformCandidates) {
-      if (candidate && existsSync(candidate)) return candidate;
+      if (candidate && existsSync(candidate)) {
+        this.log('cdp.executable.detected', { executable: candidate, source: 'well-known-path' });
+        return candidate;
+      }
     }
     if (process.platform === 'win32') {
       const fromRegistry = this.lookupWindowsExecutableFromRegistry(['msedge.exe', 'chrome.exe']);
@@ -460,7 +529,10 @@ export class ExternalBrowserBridge {
     const pathLookup = process.platform === 'win32'
       ? this.lookupExecutableFromPath(['msedge.exe', 'chrome.exe', 'chromium.exe'], 'where')
       : this.lookupExecutableFromPath(['google-chrome', 'chromium-browser', 'chromium'], 'which');
-    if (pathLookup) return pathLookup;
+    if (pathLookup) {
+      this.log('cdp.executable.detected', { executable: pathLookup, source: 'path' });
+      return pathLookup;
+    }
     return null;
   }
 
@@ -536,6 +608,7 @@ export class ExternalBrowserBridge {
     const image = basename(executable).trim();
     if (!image) return false;
     console.warn(`${this.logPrefix} system profile is in use by ${image}; forcing takeover by terminating existing browser processes.`);
+    this.log('cdp.systemProfile.takeover.start', { executable, image });
     try {
       if (process.platform === 'win32') {
         const stop = spawnSync('taskkill', ['/IM', image, '/F', '/T'], { encoding: 'utf8' });
@@ -555,9 +628,11 @@ export class ExternalBrowserBridge {
     const stillRunning = this.isBrowserProcessLikelyRunning(executable);
     if (stillRunning) {
       console.warn(`${this.logPrefix} takeover failed; ${image} is still running and locks system profile.`);
+      this.log('cdp.systemProfile.takeover.done', { executable, image, ok: false });
       return false;
     }
     console.info(`${this.logPrefix} takeover succeeded; ${image} processes were stopped.`);
+    this.log('cdp.systemProfile.takeover.done', { executable, image, ok: true });
     return true;
   }
 
@@ -605,6 +680,11 @@ export class ExternalBrowserBridge {
       throw new Error(`CDP endpoint ${versionUrl} did not return webSocketDebuggerUrl.`);
     }
     const browserName = (json.Browser || 'Chromium-family browser').trim();
+    this.log('cdp.version', {
+      endpoint,
+      browserName,
+      webSocketDebuggerUrlPresent: Boolean(ws)
+    });
     return {
       endpoint,
       browserName,
@@ -615,6 +695,8 @@ export class ExternalBrowserBridge {
   private async sendCdpCommand(wsUrl: string, method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const id = ++this.cdpMessageId;
+      const started = Date.now();
+      this.log('cdp.command.start', { id, method, params: this.sanitizeCdpParams(method, params) });
       let settled = false;
       const ws = new WebSocket(withScheme(wsUrl, 'ws'));
       const fail = (message: string) => {
@@ -625,6 +707,7 @@ export class ExternalBrowserBridge {
         } catch {
           // Ignore socket close errors during failure handling.
         }
+        this.log('cdp.command.done', { id, method, ok: false, durationMs: Date.now() - started, message });
         reject(new Error(message));
       };
       const done = (result: Record<string, unknown>) => {
@@ -635,6 +718,7 @@ export class ExternalBrowserBridge {
         } catch {
           // Ignore socket close errors during success handling.
         }
+        this.log('cdp.command.done', { id, method, ok: true, durationMs: Date.now() - started, result: this.sanitizeCdpResult(method, result) });
         resolve(result);
       };
 
@@ -675,6 +759,32 @@ export class ExternalBrowserBridge {
         if (!settled) fail(`CDP socket closed before response for ${method}.`);
       });
     });
+  }
+
+  private log(event: string, details: Record<string, unknown> = {}): void {
+    this.logger?.log(event, details);
+  }
+
+  private sanitizeCdpParams(method: string, params: Record<string, unknown>): Record<string, unknown> {
+    if (method === 'Network.setCookie') return { ...params, value: params.value ? '[redacted]' : params.value };
+    return params;
+  }
+
+  private sanitizeCdpResult(method: string, result: Record<string, unknown>): Record<string, unknown> {
+    if (method === 'Network.getCookies') {
+      const cookies = Array.isArray(result.cookies) ? result.cookies : [];
+      return {
+        cookieCount: cookies.length,
+        cookieNames: cookies.map((cookie: any) => ({
+          name: typeof cookie?.name === 'string' ? cookie.name : '',
+          domain: typeof cookie?.domain === 'string' ? cookie.domain : '',
+          session: Boolean(cookie?.session)
+        }))
+      };
+    }
+    if (method === 'Runtime.evaluate') return { resultType: (result.result as any)?.type, hasExceptionDetails: Boolean(result.exceptionDetails) };
+    if (method === 'Page.captureScreenshot' || method === 'Page.printToPDF') return { data: result.data ? '[base64]' : undefined };
+    return result;
   }
 
   private async openViaSafariWebDriver(url: string): Promise<ToolExecutionResult> {

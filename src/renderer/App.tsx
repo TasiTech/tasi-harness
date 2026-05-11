@@ -61,6 +61,7 @@ const defaultConfig: PublicAppConfig = {
   externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
   externalBrowserProfileMode: 'isolated',
   browserHeadless: false,
+  browserExecutionLoggingEnabled: false,
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -3724,6 +3725,15 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
           <label className="toggle-line"><input type="checkbox" checked={draft.browserHeadless} onChange={(e) => setDraft((old) => ({ ...old, browserHeadless: e.target.checked }))} /> {tr('Run external CDP browser headless', '以无头模式运行外部 CDP 浏览器')}</label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.browserExecutionLoggingEnabled}
+              onChange={(e) => setDraft((old) => ({ ...old, browserExecutionLoggingEnabled: e.target.checked }))}
+            />
+            {tr('Enable browser execution log', '启用浏览器执行日志')}
+          </label>
+          <div className="card-subtle">{tr('Log file:', '日志文件：')} ~/.tasi-harness/logs/browser-execution.log</div>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>

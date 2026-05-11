@@ -23,6 +23,7 @@ import { BrowserAutomationRouter } from './browser/browserAutomationRouter.js';
 import { EmbeddedBrowserAutomation } from './browser/embeddedBrowserAutomation.js';
 import { ExternalBrowserAutomation } from './browser/externalBrowserAutomation.js';
 import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
+import { BrowserExecutionLogger } from './browser/browserExecutionLogger.js';
 import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
@@ -71,6 +72,7 @@ export class AppContext {
   readonly externalBrowserBridge: ExternalBrowserBridge;
   readonly externalBrowserAutomation: ExternalBrowserAutomation;
   readonly browserAutomation: BrowserAutomation;
+  readonly browserExecutionLogger: BrowserExecutionLogger;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
 
@@ -87,8 +89,15 @@ export class AppContext {
     this.sandboxManager = new SandboxManager(this.harnessHome);
     this.emailNotifier = new EmailNotifier();
     this.embeddedBrowserAutomation = new EmbeddedBrowserAutomation();
-    this.externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(this.harnessHome, 'runtime', 'external-browser') });
-    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig());
+    this.browserExecutionLogger = new BrowserExecutionLogger(
+      join(this.harnessHome, 'logs', 'browser-execution.log'),
+      () => this.getConfig().browserExecutionLoggingEnabled
+    );
+    this.externalBrowserBridge = new ExternalBrowserBridge({
+      runtimeDir: join(this.harnessHome, 'runtime', 'external-browser'),
+      logger: this.browserExecutionLogger
+    });
+    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig(), this.browserExecutionLogger);
     this.browserAutomation = new BrowserAutomationRouter(() => this.getConfig(), this.embeddedBrowserAutomation, this.externalBrowserAutomation);
     this.personalKnowledgeBase = new PersonalKnowledgeBase(this.harnessHome, {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
@@ -157,7 +166,7 @@ export class AppContext {
         : config.externalBrowserEngine === 'cdp'
           ? 'browser_* tools attach to CDP targets; preview fallback can use shell.openExternal'
           : 'webdriver-safari preview only; browser_* tools require CDP for external-page automation';
-    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}; strategy=${strategy}.`;
+    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}; strategy=${strategy}; log=${join(this.harnessHome, 'logs', 'browser-execution.log')}.`;
   }
 
   private createTools(): RegisteredTool[] {

@@ -13,6 +13,7 @@ import type {
 } from '../tools/browserAutomation.js';
 import type { AppConfig } from '../../shared/types.js';
 import { ExternalBrowserBridge } from './externalBrowserBridge.js';
+import type { BrowserExecutionLogger } from './browserExecutionLogger.js';
 
 const DEFAULT_TIMEOUT_MS = 20000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
@@ -391,17 +392,28 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
 
   constructor(
     private readonly bridge: ExternalBrowserBridge,
-    private readonly getConfig: () => AppConfig
+    private readonly getConfig: () => AppConfig,
+    private readonly logger?: BrowserExecutionLogger
   ) {}
 
   async open(url: string, options?: { timeoutMs?: number }): Promise<BrowserPageState> {
     const target = normalizeUrl(url);
     const config = { ...this.getConfig(), externalBrowserEngine: 'cdp' as const };
+    this.log('automation.open.start', {
+      url: target,
+      timeoutMs: options?.timeoutMs,
+      endpoint: config.externalBrowserCdpEndpoint,
+      profileMode: config.externalBrowserProfileMode,
+      headless: config.browserHeadless
+    });
     const result = await this.bridge.open(target, config);
     if (!result.ok) throw new Error(result.content);
     await this.waitForIdle(clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000));
     await this.installPageErrorCapture().catch(() => {});
-    return this.state();
+    const state = await this.state();
+    await this.logStorageDiagnostics(state.url);
+    this.log('automation.open.done', { url: state.url, title: state.title });
+    return state;
   }
 
   async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number }): Promise<BrowserPageState> {
@@ -871,6 +883,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       });
     }
     const cookies = await this.cdpCommand('Network.getCookies', { urls: [url] });
+    this.logCookieDiagnostics(url, cookies.cookies);
     return { ...(await this.state()), content: JSON.stringify(cookies.cookies ?? [], null, 2) };
   }
 
@@ -1095,11 +1108,18 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
   private async cdpCommand(method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
     const session = await this.resolveSession();
     if (!session.target.webSocketDebuggerUrl) throw new Error(`External browser target has no CDP websocket URL: ${session.target.id}`);
+    this.log('automation.cdp.command', {
+      method,
+      targetId: session.target.id,
+      targetUrl: session.target.url,
+      targetTitle: session.target.title
+    });
     return this.sendCdpCommand(session.target.webSocketDebuggerUrl, method, params);
   }
 
   private async resolveSession(): Promise<CdpSession> {
     const endpoint = endpointRoot(this.bridge.cdpEndpointHint(this.getConfig()));
+    this.log('automation.resolveSession.start', { endpoint });
     const response = await fetch(`${endpoint}/json/list`, { method: 'GET' });
     if (!response.ok) throw new Error(`CDP target list unavailable (${response.status}) at ${endpoint}/json/list`);
     const targets = (await response.json()) as CdpTargetInfo[];
@@ -1109,12 +1129,22 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     const target = (activeId ? pages.find((item) => item.id === activeId) : undefined)
       ?? pages.find((item) => item.url && item.url !== 'about:blank')
       ?? pages[0];
+    this.log('automation.resolveSession.done', {
+      endpoint,
+      activeId,
+      targetId: target.id,
+      targetUrl: target.url,
+      targetTitle: target.title,
+      pageCount: pages.length
+    });
     return { target };
   }
 
   private async sendCdpCommand(wsUrl: string, method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
     return new Promise<Record<string, any>>((resolve, reject) => {
       const id = ++this.messageId;
+      const started = Date.now();
+      this.log('automation.cdp.send.start', { id, method });
       let settled = false;
       const ws = new WebSocket(withScheme(wsUrl, 'ws'));
       const fail = (message: string) => {
@@ -1125,6 +1155,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         } catch {
           // Ignore socket close errors.
         }
+        this.log('automation.cdp.send.done', { id, method, ok: false, durationMs: Date.now() - started, message });
         reject(new Error(message));
       };
       const done = (result: Record<string, any>) => {
@@ -1135,6 +1166,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         } catch {
           // Ignore socket close errors.
         }
+        this.log('automation.cdp.send.done', { id, method, ok: true, durationMs: Date.now() - started });
         resolve(result);
       };
       const timeout = setTimeout(() => fail(`CDP timeout for ${method} on ${wsUrl}`), 8000);
@@ -1173,6 +1205,44 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         clearTimeout(timeout);
         if (!settled) fail(`CDP socket closed before response for ${method}.`);
       });
+    });
+  }
+
+  private log(event: string, details: Record<string, unknown> = {}): void {
+    this.logger?.log(event, details);
+  }
+
+  private async logStorageDiagnostics(url: string): Promise<void> {
+    try {
+      const cookies = await this.cdpCommand('Network.getCookies', { urls: [url] });
+      this.logCookieDiagnostics(url, cookies.cookies);
+    } catch (error) {
+      this.log('diagnostic.cookies.failed', { url, error: error instanceof Error ? error.message : String(error) });
+    }
+    try {
+      const storage = await this.evalInPage<{ localStorageKeys: number; sessionStorageKeys: number }>(
+        `(function () {
+          return { localStorageKeys: localStorage.length, sessionStorageKeys: sessionStorage.length };
+        })();`
+      );
+      this.log('diagnostic.storage', { url, ...storage });
+    } catch (error) {
+      this.log('diagnostic.storage.failed', { url, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private logCookieDiagnostics(url: string, rawCookies: unknown): void {
+    const cookies = Array.isArray(rawCookies) ? rawCookies : [];
+    this.log('diagnostic.cookies', {
+      url,
+      cookieCount: cookies.length,
+      cookies: cookies.map((cookie: any) => ({
+        name: typeof cookie?.name === 'string' ? cookie.name : '',
+        domain: typeof cookie?.domain === 'string' ? cookie.domain : '',
+        path: typeof cookie?.path === 'string' ? cookie.path : '',
+        session: Boolean(cookie?.session),
+        expires: typeof cookie?.expires === 'number' ? cookie.expires : undefined
+      }))
     });
   }
 }

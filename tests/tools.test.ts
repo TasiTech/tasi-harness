@@ -22,6 +22,7 @@ describe('builtin tools', () => {
     expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     expect(cfg.externalBrowserProfileMode).toBe('isolated');
     expect(cfg.browserHeadless).toBe(false);
+    expect(cfg.browserExecutionLoggingEnabled).toBe(false);
   });
 
   it('writes inside workspace without approval and outside workspace with approval', async () => {
