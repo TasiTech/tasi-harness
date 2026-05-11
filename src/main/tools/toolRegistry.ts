@@ -20,6 +20,7 @@ const DEFAULT_APPROVAL_SETTINGS: SafetyApprovalSettings = {
 };
 
 type ApprovalCandidate = { key: string; risk: ToolApprovalRisk; summary: string; blocked?: boolean };
+const APPROVAL_FREE_TASI_DIRS = new Set(['memories', 'personal-knowledge', 'session-documents', 'sessions', 'skills', 'workspace']);
 
 function normalizePathSlashes(input: string): string {
   return input.replace(/\\/g, '/');
@@ -37,6 +38,14 @@ export function isPathInside(root: string, target: string): boolean {
   return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`);
 }
 
+function isPathInsideApprovalFreeTasiDir(target: string): boolean {
+  const segments = normalizePathSlashes(resolve(target)).split('/').map((segment) => segment.toLowerCase());
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    if (segments[index] === '.tasi-harness' && APPROVAL_FREE_TASI_DIRS.has(segments[index + 1])) return true;
+  }
+  return false;
+}
+
 function shortPath(workspaceDir: string, target: string): string {
   return isPathInside(workspaceDir, target) ? relative(workspaceDir, target) || '.' : target;
 }
@@ -48,6 +57,7 @@ function approvalFromFileTool(toolName: string, args: unknown, context: ToolExec
   const target = resolveToolPath(context.workspaceDir, pathArg || '.');
   const inside = isPathInside(context.workspaceDir, target);
   const label = shortPath(context.workspaceDir, target);
+  if (toolName !== 'file_delete' && isPathInsideApprovalFreeTasiDir(target)) return null;
   if (toolName === 'file_delete') {
     return {
       key: `${inside ? 'workspace' : 'outside'}:delete:${target}`,

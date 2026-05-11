@@ -163,6 +163,46 @@ describe('builtin tools', () => {
     expect(deniedRead.approval?.risk).toBe('outside-read');
   });
 
+  it('does not require approval for reads and writes under app data directories', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const appHome = join(env.home, '.tasi-harness');
+    const cfg = { ...defaultConfig(), workspaceDir: join(appHome, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(appHome),
+      sessionStore: new SessionStore(appHome),
+      skillManager: new SkillManager(appHome)
+    })) registry.register(tool);
+
+    let approvals = 0;
+    for (const dir of ['memories', 'personal-knowledge', 'session-documents', 'sessions', 'skills', 'workspace']) {
+      const targetDir = join(appHome, dir, 'agent-test');
+      const targetFile = join(targetDir, 'note.txt');
+      const context = {
+        sessionId: 's',
+        workspaceDir: cfg.workspaceDir,
+        requestId: `r-${dir}`,
+        safetyApproval: cfg.safetyApproval,
+        requestToolApproval: async (request: any) => {
+          approvals += 1;
+          return { id: request.id, approved: false };
+        }
+      };
+
+      const write = await registry.execute('file_write', { path: targetFile, content: dir }, context);
+      expect(write.ok).toBe(true);
+      const read = await registry.execute('file_read', { path: targetFile }, context);
+      expect(read.ok).toBe(true);
+      expect(read.content).toBe(dir);
+      const list = await registry.execute('file_list', { path: targetDir }, context);
+      expect(list.ok).toBe(true);
+    }
+    expect(approvals).toBe(0);
+  });
+
   it('uses remembered approval keys', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
