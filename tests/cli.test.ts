@@ -52,11 +52,12 @@ describe('CLI argument parsing', () => {
   });
 
   it('renders headings without markdown prefixes and de-indents markdown list items', () => {
-    const rendered = renderMarkdownForTerminal(['## 北京当前天气', '', '    * **温度**：21°C'].join('\n'));
+    const rendered = renderMarkdownForTerminal(['## Current weather', '', '    * **Temperature**: 21 C'].join('\n'));
 
-    expect(rendered).toContain('北京当前天气');
-    expect(rendered).not.toContain('## 北京当前天气');
-    expect(rendered).toContain('温度');
-    expect(rendered).not.toContain('**温度**');
+    expect(rendered).toContain('Current weather');
+    expect(rendered).not.toContain('## Current weather');
+    expect(rendered).toContain('Temperature');
+    expect(rendered).not.toContain('**Temperature**');
   });
+
 });

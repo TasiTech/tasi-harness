@@ -99,7 +99,7 @@ ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.loca
 - `--session <id>` / `-s <id>`：复用已有会话；`<id>` 就是完整 session id，不需要固定前缀；不传则新建会话
 - `--execution workspace|sandbox` / `-e workspace|sandbox`：选择执行模式
 - `--knowledge` / `-k`：启用个人知识库上下文
-- `--plain` / `-p`：输出 Markdown 原文；默认普通输出会用 `marked-terminal` 渲染成终端格式
+- `--plain` / `-p`：只输出 Markdown 原文流；默认流式输出会先实时打印原文，完成后清掉原文并替换成 `marked-terminal` 渲染版
 - `--json` / `-j`：输出完整 JSON 结果，包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage`、`execution` 等字段，便于脚本解析
 - `--verbose` / `-V`：输出工具事件
 - `--home <path>` / `-H <path>`：覆盖默认数据目录

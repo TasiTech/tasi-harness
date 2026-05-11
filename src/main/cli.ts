@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { clearScreenDown, moveCursor } from 'node:readline';
 import { createInterface, type Interface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -45,7 +46,7 @@ function printUsage(): void {
       '  -k, --knowledge          Use the personal knowledge base.',
       '  -j, --json               Print the run result as JSON.',
       '  -p, --plain              Print raw Markdown instead of terminal-rendered output.',
-      '      --stream             Stream assistant output as it arrives (default).',
+      '      --stream             Stream raw output first, then render Markdown when complete (default).',
       '      --no-stream          Wait for the full response, then render it.',
       '  -V, --verbose            Print tool events to stderr.',
       '  -H, --home <path>        Override TASI_HARNESS_HOME.',
@@ -222,6 +223,62 @@ export function renderMarkdownForTerminal(markdown: string): string {
   return typeof rendered === 'string' ? rendered : normalized;
 }
 
+function visibleCharWidth(char: string): number {
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(char)) return 0;
+  if (/[\u1100-\u115f\u2329\u232a\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/.test(char)) return 2;
+  return 1;
+}
+
+class StreamedTerminalRegion {
+  private rowsBelowStart = 0;
+  private column = 0;
+  private wrote = false;
+  private readonly columns = Math.max(1, output.columns || 80);
+
+  write(delta: string): void {
+    if (!output.isTTY) return;
+    this.wrote = true;
+    for (const char of delta) {
+      if (char === '\r') {
+        this.column = 0;
+        continue;
+      }
+      if (char === '\n') {
+        this.rowsBelowStart += 1;
+        this.column = 0;
+        continue;
+      }
+      if (char === '\t') {
+        this.advance(8 - (this.column % 8));
+        continue;
+      }
+      this.advance(visibleCharWidth(char));
+    }
+  }
+
+  clear(): boolean {
+    if (!output.isTTY || !this.wrote) return false;
+    output.write('\r');
+    if (this.rowsBelowStart > 0) moveCursor(output, 0, -this.rowsBelowStart);
+    clearScreenDown(output);
+    return true;
+  }
+
+  private advance(width: number): void {
+    if (width <= 0) return;
+    if (this.column + width > this.columns) {
+      this.rowsBelowStart += 1;
+      this.column = width;
+      return;
+    }
+    this.column += width;
+    if (this.column > this.columns) {
+      this.rowsBelowStart += 1;
+      this.column %= this.columns;
+    }
+  }
+}
+
 function printResult(result: Awaited<ReturnType<CliContext['runChat']>>, options: Pick<CliOptions, 'json' | 'plain'>, alreadyStreamed = false): void {
   const json = options.json;
   if (json) {
@@ -242,7 +299,7 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
   const onSigint = () => controller.abort();
   process.once('SIGINT', onSigint);
   let streamedContent = '';
-  let wroteReasoningHeader = false;
+  const streamedRegion = new StreamedTerminalRegion();
   try {
     const result = await context.runChat(
       {
@@ -263,23 +320,19 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
           : undefined,
         onMessageDelta: options.stream && !options.json
           ? (_sessionId, event) => {
-              if (event.type === 'reasoning_content' && event.delta && options.verbose) {
-                if (!wroteReasoningHeader) {
-                  process.stderr.write('[reasoning]\n');
-                  wroteReasoningHeader = true;
-                }
-                process.stderr.write(event.delta);
-              }
               if (event.type === 'content' && event.delta) {
                 streamedContent += event.delta;
+                streamedRegion.write(event.delta);
                 output.write(event.delta);
               }
             }
           : undefined
       }
     );
-    if (wroteReasoningHeader) process.stderr.write('\n');
-    printResult(result, options, options.stream && !options.json && streamedContent.length > 0);
+    const shouldReplaceStream = options.stream && !options.json && !options.plain && streamedContent.length > 0;
+    const replacedStream = shouldReplaceStream ? streamedRegion.clear() : false;
+    const alreadyStreamed = options.stream && !options.json && streamedContent.length > 0 && (options.plain || !replacedStream);
+    printResult(result, options, alreadyStreamed);
     return result.sessionId;
   } finally {
     process.removeListener('SIGINT', onSigint);

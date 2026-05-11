@@ -123,7 +123,7 @@ ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.loca
 
 无参数运行 `tasi` 会进入交互式对话。`chat` 不传 `--session/-s` 会新建会话，传入 `--session xxx` 或 `-s xxx` 会追加到该会话，`xxx` 就是完整 session id，不需要固定前缀；每次回复后都会显示当前 session id。命令行复用桌面应用的 `~/.tasi-harness/config.json`、会话、记忆、技能与个人知识库；浏览器自动化会通过外部 Chrome / Edge 的 CDP 模式运行。
 
-普通输出会使用 `marked-terminal` 渲染 Markdown，标题、列表、表格和代码块会按终端格式显示。需要复制 Markdown 原文时可加 `--plain` 或 `-p`；需要脚本处理结果时可加 `--json` 或 `-j`，输出会包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage` 与 `execution` 等完整字段。
+默认启用 `--stream` 时，CLI 会先按原文实时输出模型回复；回复完成后，会清掉这段原文并用 `marked-terminal` 替换成终端渲染版 Markdown。需要只保留 Markdown 原文流时可加 `--plain` 或 `-p`；需要脚本处理结果时可加 `--json` 或 `-j`，输出会包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage` 与 `execution` 等完整字段。
 
 ### 定时任务与通知
 

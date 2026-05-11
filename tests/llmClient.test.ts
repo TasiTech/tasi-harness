@@ -365,6 +365,75 @@ describe('llmClient', () => {
     expect(JSON.parse(String(init.body)).stream).toBe(true);
   });
 
+  it('streams anthropic content deltas', async () => {
+    const events = [
+      { type: 'message_start', message: { id: 'msg_stream', usage: { input_tokens: 3, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Claude' } },
+      { type: 'message_delta', usage: { output_tokens: 4 } },
+      { type: 'message_stop' }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}`).join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+      apiKey: 'anthropic-test-key',
+      model: 'claude-3-7-sonnet-latest'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.content) deltas.push(delta.content);
+    });
+
+    expect(result?.message.content).toBe('Hello Claude');
+    expect(result?.usage?.totalTokens).toBe(7);
+    expect(deltas).toEqual(['Hello ', 'Claude']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
+  it('streams ollama content deltas', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          JSON.stringify({ message: { role: 'assistant', content: 'Hello ' }, done: false }),
+          JSON.stringify({ message: { role: 'assistant', content: 'Ollama' }, done: false }),
+          JSON.stringify({ done: true })
+        ].join('\n'),
+        { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'ollama',
+      baseUrl: 'http://127.0.0.1:11434',
+      apiKey: '',
+      model: 'qwen3:8b'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.content) deltas.push(delta.content);
+    });
+
+    expect(result?.message.content).toBe('Hello Ollama');
+    expect(deltas).toEqual(['Hello ', 'Ollama']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
   it('drops malformed deepseek historical tool traces that miss reasoning_content', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

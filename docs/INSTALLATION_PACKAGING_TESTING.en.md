@@ -99,7 +99,7 @@ Common options:
 - `--session <id>` / `-s <id>`: continue an existing session; `<id>` is the full session id and does not need a fixed prefix; omit it to create a new session
 - `--execution workspace|sandbox` / `-e workspace|sandbox`: choose the execution mode
 - `--knowledge` / `-k`: include personal knowledge base context
-- `--plain` / `-p`: print raw Markdown; normal output renders Markdown for the terminal with `marked-terminal`
+- `--plain` / `-p`: only print the raw Markdown stream; normal streamed output prints raw text first and then replaces it with a `marked-terminal` rendered version when complete
 - `--json` / `-j`: print the full JSON result, including `sessionId`, `finalResponse`, `messages`, `toolEvents`, `usage`, and `execution`, for scripts to parse
 - `--verbose` / `-V`: print tool events
 - `--home <path>` / `-H <path>`: override the default data directory

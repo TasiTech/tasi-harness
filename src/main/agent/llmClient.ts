@@ -614,8 +614,83 @@ class ModelClient implements LlmClient {
     }
   }
 
+  private async postJsonLineStream(
+    endpoint: string,
+    headers: Record<string, string>,
+    body: unknown,
+    request: LlmRequest,
+    onJsonEvent: (json: any) => void
+  ): Promise<void> {
+    let attempt = 0;
+    while (true) {
+      let response: Response;
+      try {
+        response = await runtimeFetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: request.signal
+        });
+      } catch (error) {
+        if (!isAbortError(error) && attempt < MAX_LLM_REQUEST_RETRIES) {
+          await sleepWithSignal(retryDelayMs(attempt), request.signal);
+          attempt += 1;
+          continue;
+        }
+        throw new Error(appendAttemptSuffix(formatFetchFailure(this.config, endpoint, error), attempt));
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        const json = parseJsonBody(text) as any;
+        const detail = responseErrorDetail(response, text, json);
+        if (isRetriableStatus(response.status) && attempt < MAX_LLM_REQUEST_RETRIES) {
+          await sleepWithSignal(retryDelayMs(attempt, response), request.signal);
+          attempt += 1;
+          continue;
+        }
+        throw new Error(appendAttemptSuffix(`LLM request failed (${response.status}): ${detail}`, attempt));
+      }
+
+      if (!response.body) throw new Error('LLM stream response did not include a readable body.');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            onJsonEvent(JSON.parse(trimmed));
+          } catch {
+            throw new Error(`Invalid LLM JSON stream event: ${trimmed.slice(0, 200)}`);
+          }
+        }
+      }
+
+      buffer += decoder.decode();
+      const trimmed = buffer.trim();
+      if (trimmed) {
+        try {
+          onJsonEvent(JSON.parse(trimmed));
+        } catch {
+          throw new Error(`Invalid LLM JSON stream event: ${trimmed.slice(0, 200)}`);
+        }
+      }
+      return;
+    }
+  }
+
   async streamComplete(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
     const style = providerApiStyle(this.config.provider);
+    if (style === 'ollama') return this.completeWithOllamaStream(request, onDelta);
+    if (style === 'anthropic') return this.completeWithAnthropicStream(request, onDelta);
     if (style !== 'openai') return this.complete(request);
     return this.completeWithOpenAiCompatibleStream(request, onDelta);
   }
@@ -713,6 +788,96 @@ class ModelClient implements LlmClient {
     return parseAnthropicCompletion(json);
   }
 
+  private async completeWithAnthropicStream(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
+    const endpoint = `${normalizeBase(this.config.baseUrl)}/messages`;
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': this.config.apiKey,
+      'anthropic-version': '2023-06-01'
+    };
+    const body = {
+      model: this.config.model,
+      max_tokens: request.maxTokens ?? 2048,
+      messages: toAnthropicMessages(request.messages),
+      system: toAnthropicSystem(request.messages),
+      tools: toAnthropicTools(request.tools),
+      temperature: request.temperature ?? this.config.temperature,
+      stream: true
+    };
+
+    let rawId = '';
+    let content = '';
+    let usage: LlmCompletion['usage'];
+    const toolBlocks = new Map<number, { id: string; name: string; inputJson: string }>();
+    let rawEventCount = 0;
+
+    await this.postEventStream(endpoint, headers, body, request, (json) => {
+      rawEventCount += 1;
+      if (json.type === 'message_start' && json.message) {
+        if (typeof json.message.id === 'string') rawId = json.message.id;
+        if (json.message.usage) {
+          usage = {
+            promptTokens: json.message.usage.input_tokens,
+            completionTokens: json.message.usage.output_tokens,
+            totalTokens:
+              typeof json.message.usage.input_tokens === 'number' && typeof json.message.usage.output_tokens === 'number'
+                ? json.message.usage.input_tokens + json.message.usage.output_tokens
+                : undefined
+          };
+        }
+      }
+      if (json.type === 'content_block_start' && json.content_block?.type === 'tool_use') {
+        toolBlocks.set(Number(json.index ?? toolBlocks.size), {
+          id: String(json.content_block.id ?? createId('toolcall')),
+          name: String(json.content_block.name ?? ''),
+          inputJson: json.content_block.input ? JSON.stringify(json.content_block.input) : ''
+        });
+      }
+      if (json.type === 'content_block_delta') {
+        if (json.delta?.type === 'text_delta' && typeof json.delta.text === 'string') {
+          content += json.delta.text;
+          onDelta({ content: json.delta.text });
+        }
+        if (json.delta?.type === 'input_json_delta') {
+          const tool = toolBlocks.get(Number(json.index));
+          if (tool && typeof json.delta.partial_json === 'string') tool.inputJson += json.delta.partial_json;
+        }
+      }
+      if (json.type === 'message_delta' && json.usage) {
+        usage = {
+          promptTokens: usage?.promptTokens,
+          completionTokens: json.usage.output_tokens ?? usage?.completionTokens,
+          totalTokens:
+            typeof usage?.promptTokens === 'number' && typeof json.usage.output_tokens === 'number'
+              ? usage.promptTokens + json.usage.output_tokens
+              : usage?.totalTokens
+        };
+      }
+    });
+
+    const toolCalls = [...toolBlocks.values()]
+      .filter((tool) => tool.name)
+      .map((tool) => ({
+        id: tool.id,
+        type: 'function' as const,
+        function: {
+          name: tool.name,
+          arguments: tool.inputJson || '{}'
+        }
+      }));
+
+    return {
+      message: {
+        id: rawId || createId('msg'),
+        role: 'assistant',
+        content,
+        tool_calls: toolCalls.length > 0 ? toolCalls : undefined
+      },
+      usage,
+      raw: { stream: true, eventCount: rawEventCount }
+    };
+  }
+
   private async completeWithOllama(request: LlmRequest): Promise<LlmCompletion> {
     const endpoint = `${normalizeBase(this.config.baseUrl)}/api/chat`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -734,6 +899,41 @@ class ModelClient implements LlmClient {
         content: String(json.message?.content ?? '')
       },
       raw: json
+    };
+  }
+
+  private async completeWithOllamaStream(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
+    const endpoint = `${normalizeBase(this.config.baseUrl)}/api/chat`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const body = {
+      model: this.config.model,
+      messages: request.messages.map((message) => ({
+        role: message.role === 'tool' ? 'user' : message.role,
+        content: message.content,
+        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
+      })),
+      stream: true,
+      options: { temperature: request.temperature ?? this.config.temperature }
+    };
+
+    let content = '';
+    let rawEventCount = 0;
+    await this.postJsonLineStream(endpoint, headers, body, request, (json) => {
+      rawEventCount += 1;
+      const delta = typeof json.message?.content === 'string' ? json.message.content : '';
+      if (delta) {
+        content += delta;
+        onDelta({ content: delta });
+      }
+    });
+
+    return {
+      message: {
+        id: createId('msg'),
+        role: 'assistant',
+        content
+      },
+      raw: { stream: true, eventCount: rawEventCount }
     };
   }
 }
