@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
   AgentMessageDeltaStream,
+  AgentMessageAttachment,
   AssistantMessageExportRequest,
   BrowserCoachGenerateSkillRequest,
   BrowserCoachGenerateSkillResult,
@@ -37,8 +38,8 @@ const api = {
     wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
   },
   agent: {
-    chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) =>
-      ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase),
+    chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]) =>
+      ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase, attachments),
     stop: () => ipcRenderer.invoke('agent:stop'),
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';

@@ -66,7 +66,13 @@ export class AgentLoop {
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
     const session = options.sessionId ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create() : this.deps.sessions.create();
     this.deps.beginDeferredMemory(session.id);
-    const userMessage: AgentMessage = { id: createId('msg'), role: 'user', content: options.userInput, createdAt: nowIso() };
+    const userMessage: AgentMessage = {
+      id: createId('msg'),
+      role: 'user',
+      content: options.userInput,
+      attachments: options.attachments?.length ? options.attachments : undefined,
+      createdAt: nowIso()
+    };
     try {
       const history = [...session.messages, userMessage];
       const prompt = await this.deps.promptBuilder.build(cfg, {

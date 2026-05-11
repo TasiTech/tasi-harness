@@ -1,4 +1,4 @@
-import type { AgentMessage, AppConfig, LlmCompletion, LlmRequest, ToolCall, ToolDefinition } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageAttachment, AppConfig, LlmCompletion, LlmRequest, ToolCall, ToolDefinition } from '../../shared/types.js';
 import { createId } from '../../shared/types.js';
 import { providerApiStyle, providerRequiresApiKey } from '../../shared/providerCatalog.js';
 
@@ -14,6 +14,7 @@ export interface LlmStreamDelta {
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   | { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean };
 
@@ -196,6 +197,59 @@ function anthropicTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text: text.trim() || ' ' };
 }
 
+function attachmentDataUrl(attachment: AgentMessageAttachment): string {
+  return `data:${attachment.mimeType};base64,${attachment.contentBase64}`;
+}
+
+function audioFormat(attachment: AgentMessageAttachment): string {
+  const fromMime = attachment.mimeType.split('/')[1]?.toLowerCase().replace(/^x-/, '') ?? '';
+  const fromName = attachment.filename.split('.').pop()?.toLowerCase() ?? '';
+  const value = fromMime || fromName || 'mp3';
+  if (value === 'mpeg') return 'mp3';
+  if (value === 'x-wav') return 'wav';
+  return value;
+}
+
+function openAiContentParts(message: AgentMessage, provider: AppConfig['provider']): string | Array<Record<string, unknown>> {
+  const attachments = message.attachments ?? [];
+  if (attachments.length === 0) return String(message.content ?? '');
+  const parts: Array<Record<string, unknown>> = [];
+  if (message.content.trim()) parts.push({ type: 'text', text: message.content });
+  for (const attachment of attachments) {
+    if (attachment.kind === 'image') {
+      parts.push({ type: 'image_url', image_url: { url: attachmentDataUrl(attachment) } });
+      continue;
+    }
+    if (attachment.kind === 'audio') {
+      parts.push({
+        type: 'input_audio',
+        input_audio: {
+          data: provider === 'openai' ? attachment.contentBase64 : attachmentDataUrl(attachment),
+          format: audioFormat(attachment)
+        }
+      });
+      continue;
+    }
+    if (attachment.kind === 'video') {
+      parts.push({ type: 'video_url', video_url: { url: attachmentDataUrl(attachment) } });
+    }
+  }
+  return parts.length > 0 ? parts : String(message.content ?? '');
+}
+
+function anthropicImageBlocks(attachments: AgentMessageAttachment[]): AnthropicContentBlock[] {
+  return attachments
+    .filter((attachment) => attachment.kind === 'image' && attachment.mimeType.startsWith('image/'))
+    .map((attachment) => ({
+      type: 'image' as const,
+      source: {
+        type: 'base64' as const,
+        media_type: attachment.mimeType,
+        data: attachment.contentBase64
+      }
+    }));
+}
+
 function toAnthropicSystem(messages: AgentMessage[]): string | undefined {
   const parts = messages
     .filter((message) => message.role === 'system' && message.content.trim())
@@ -238,7 +292,7 @@ function toAnthropicMessages(messages: AgentMessage[]): AnthropicMessage[] {
       result.push({ role: 'assistant', content: blocks });
       continue;
     }
-    result.push({ role: 'user', content: [anthropicTextBlock(message.content)] });
+    result.push({ role: 'user', content: [anthropicTextBlock(message.content), ...anthropicImageBlocks(message.attachments ?? [])] });
   }
   return result;
 }
@@ -330,7 +384,7 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
     if (message.role === 'system' || message.role === 'user') {
       const next: Record<string, unknown> = {
         role: message.role,
-        content: String(message.content ?? '')
+        content: message.role === 'user' ? openAiContentParts(message, provider) : String(message.content ?? '')
       };
       if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
       normalized.push(next);
@@ -664,7 +718,11 @@ class ModelClient implements LlmClient {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     const body = {
       model: this.config.model,
-      messages: request.messages.map((message) => ({ role: message.role === 'tool' ? 'user' : message.role, content: message.content })),
+      messages: request.messages.map((message) => ({
+        role: message.role === 'tool' ? 'user' : message.role,
+        content: message.content,
+        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
+      })),
       stream: false,
       options: { temperature: request.temperature ?? this.config.temperature }
     };

@@ -8,6 +8,7 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AgentMessageAttachment,
   AssistantMessageExportRequest,
   AppConfig,
   BrowserCoachGenerateSkillRequest,
@@ -1143,8 +1144,15 @@ function registerIpc(): void {
     return resolveToolApproval(_event.sender.id, decision);
   });
 
-  ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
-    if (!input || !input.trim()) throw new Error('Message cannot be empty.');
+  ipcMain.handle('agent:chat', async (
+    _event,
+    input: string,
+    sessionId?: string,
+    executionMode?: 'workspace' | 'sandbox',
+    usePersonalKnowledgeBase?: boolean,
+    attachments?: AgentMessageAttachment[]
+  ) => {
+    if ((!input || !input.trim()) && (!Array.isArray(attachments) || attachments.length === 0)) throw new Error('Message cannot be empty.');
     const senderId = _event.sender.id;
     if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
     const controller = new AbortController();
@@ -1152,6 +1160,7 @@ function registerIpc(): void {
     try {
       const result = await context.agentLoop.run({
         userInput: input,
+        attachments: Array.isArray(attachments) ? attachments : undefined,
         sessionId,
         executionMode,
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,

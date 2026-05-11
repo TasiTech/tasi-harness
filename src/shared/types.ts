@@ -30,12 +30,24 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  attachments?: AgentMessageAttachment[];
   reasoning_content?: string;
   reasoning_parts?: string[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
   createdAt?: string;
+}
+
+export type AgentMessageAttachmentKind = 'image' | 'video' | 'audio';
+
+export interface AgentMessageAttachment {
+  id?: string;
+  kind: AgentMessageAttachmentKind;
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+  sizeBytes?: number;
 }
 
 export interface JsonSchema {
@@ -299,6 +311,7 @@ export interface ExternalSessionMessageRequest {
 export interface AgentRunOptions {
   sessionId?: string;
   userInput: string;
+  attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
   usePersonalKnowledgeBase?: boolean;
   origin?: 'chat' | 'scheduled';

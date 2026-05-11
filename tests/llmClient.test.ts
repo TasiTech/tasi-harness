@@ -242,6 +242,54 @@ describe('llmClient', () => {
     expect(secondBody.messages[1].reasoning_content).toBe('internal chain');
   });
 
+  it('sends multimodal attachments as openai-compatible content parts', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.5-plus'
+    });
+
+    await client.complete({
+      messages: [
+        {
+          role: 'user',
+          content: 'Describe these files.',
+          attachments: [
+            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'aW1hZ2U=' },
+            { kind: 'video', filename: 'clip.mp4', mimeType: 'video/mp4', contentBase64: 'dmlkZW8=' },
+            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'YXVkaW8=' }
+          ]
+        }
+      ]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    const content = body.messages[0].content;
+    expect(content).toEqual([
+      { type: 'text', text: 'Describe these files.' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,aW1hZ2U=' } },
+      { type: 'video_url', video_url: { url: 'data:video/mp4;base64,dmlkZW8=' } },
+      { type: 'input_audio', input_audio: { data: 'data:audio/mpeg;base64,YXVkaW8=', format: 'mp3' } }
+    ]);
+  });
+
   it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {
     const events = [
       {

@@ -1,6 +1,7 @@
 import type {
   AgentToolEventStream,
   AgentMessageDeltaStream,
+  AgentMessageAttachment,
   AgentRunResult,
   AppInfo,
   AssistantMessageExportRequest,
@@ -54,7 +55,7 @@ declare global {
         wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
       };
       agent: {
-        chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
+        chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
         onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;

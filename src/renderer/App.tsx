@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
 import type {
   AgentMessage,
+  AgentMessageAttachment,
   AppInfo,
   BrowserCoachRecordedEvent,
   BrowserCoachRecording,
@@ -83,6 +84,7 @@ const defaultConfig: PublicAppConfig = {
   }
 };
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -119,6 +121,24 @@ function safeJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function createLocalId(prefix = 'ui'): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function multimediaKind(mimeType: string): AgentMessageAttachment['kind'] | null {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  return null;
+}
+
+function formatBytes(bytes?: number): string {
+  const value = Number(bytes ?? 0);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function findFirstHttpUrl(text: string): string | undefined {
@@ -734,6 +754,8 @@ function ChatPage(props: {
   const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
   const [sessionDocBusy, setSessionDocBusy] = useState(false);
   const [sessionDocError, setSessionDocError] = useState('');
+  const [multimediaAttachments, setMultimediaAttachments] = useState<AgentMessageAttachment[]>([]);
+  const [multimediaError, setMultimediaError] = useState('');
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
@@ -748,6 +770,7 @@ function ChatPage(props: {
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
   const uploadSessionDocInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadMultimediaInputRef = useRef<HTMLInputElement | null>(null);
   const previewZoomFactorRef = useRef(1);
   const previewZoomSyncIdRef = useRef(0);
   const previewContentMetricsRef = useRef<{ contentWidth: number; contentHeight: number } | null>(null);
@@ -1271,16 +1294,19 @@ function ChatPage(props: {
 
   async function submitMessage(rawText: string): Promise<void> {
     const text = rawText.trim();
-    if (!text || props.busy) return;
+    const outgoingAttachments = multimediaAttachments;
+    if ((!text && outgoingAttachments.length === 0) || props.busy) return;
     setInput('');
     setError('');
+    setMultimediaError('');
+    setMultimediaAttachments([]);
     props.setBusy(true);
     props.setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
-    props.setMessages([...props.messages, { role: 'user', content: text, createdAt: new Date().toISOString() }]);
+    props.setMessages([...props.messages, { role: 'user', content: text, attachments: outgoingAttachments.length > 0 ? outgoingAttachments : undefined, createdAt: new Date().toISOString() }]);
     try {
-      const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled);
+      const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled, outgoingAttachments);
       props.setSessionId(result.sessionId);
       props.setMessages(result.messages.filter((m) => m.role !== 'system'));
       props.setLastUsage(result.usage);
@@ -1461,6 +1487,13 @@ function ChatPage(props: {
     uploadSessionDocInputRef.current.click();
   }
 
+  function openMultimediaPicker(): void {
+    if (runBusy) return;
+    if (!uploadMultimediaInputRef.current) return;
+    uploadMultimediaInputRef.current.value = '';
+    uploadMultimediaInputRef.current.click();
+  }
+
   async function openWorkspaceDirectory(): Promise<void> {
     const workspaceDir = props.config.workspaceDir.trim();
     if (!workspaceDir) {
@@ -1515,6 +1548,43 @@ function ChatPage(props: {
     } finally {
       setSessionDocBusy(false);
     }
+  }
+
+  async function addMultimediaAttachments(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    setMultimediaError('');
+    const next: AgentMessageAttachment[] = [];
+    const failures: string[] = [];
+    for (const file of files) {
+      const kind = multimediaKind(file.type);
+      if (!kind) {
+        failures.push(`${file.name}: ${props.tr('unsupported media type', '不支持的媒体类型')}`);
+        continue;
+      }
+      if (file.size > MAX_MULTIMEDIA_ATTACHMENT_BYTES) {
+        failures.push(`${file.name}: ${props.tr('file is larger than 8 MB', '文件超过 8 MB')}`);
+        continue;
+      }
+      try {
+        next.push({
+          id: createLocalId('media'),
+          kind,
+          filename: file.name,
+          mimeType: file.type,
+          contentBase64: await fileToBase64(file),
+          sizeBytes: file.size
+        });
+      } catch (error) {
+        failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (next.length > 0) setMultimediaAttachments((old) => [...old, ...next]);
+    if (failures.length > 0) setMultimediaError(failures.join('\n'));
+  }
+
+  function removeMultimediaAttachment(id: string | undefined): void {
+    if (!id) return;
+    setMultimediaAttachments((old) => old.filter((item) => item.id !== id));
   }
 
   async function removeSessionDocument(id: string): Promise<void> {
@@ -1574,6 +1644,8 @@ function ChatPage(props: {
               setFollowUpQuestions([]);
               setSessionDocs([]);
               setSessionDocError('');
+              setMultimediaAttachments([]);
+              setMultimediaError('');
             }}
           >
             {props.tr('New session', '新会话')}
@@ -1777,6 +1849,7 @@ function ChatPage(props: {
       </div>
       {error && <div className="error-box">{error}</div>}
       {sessionDocError && <div className="error-box">{sessionDocError}</div>}
+      {multimediaError && <div className="error-box">{multimediaError}</div>}
       <div className="chat-input-area">
         <div className="chat-input-main">
           <input
@@ -1789,6 +1862,18 @@ function ChatPage(props: {
               const files = Array.from(event.target.files ?? []);
               if (files.length === 0) return;
               void uploadSessionDocuments(files);
+            }}
+          />
+          <input
+            ref={uploadMultimediaInputRef}
+            className="hidden-file-input"
+            type="file"
+            multiple
+            accept="image/*,video/*,audio/*"
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              if (files.length === 0) return;
+              void addMultimediaAttachments(files);
             }}
           />
           <div className="chat-session-doc-row">
@@ -1808,6 +1893,26 @@ function ChatPage(props: {
               </span>
             ))}
           </div>
+          {multimediaAttachments.length > 0 && (
+            <div className="chat-media-row">
+              {multimediaAttachments.map((attachment) => (
+                <span key={attachment.id} className={`chat-media-chip ${attachment.kind}`} title={attachment.filename}>
+                  <span className="chat-media-kind">{attachment.kind}</span>
+                  <span className="chat-media-name">{attachment.filename}</span>
+                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  <button
+                    className="chat-session-doc-remove"
+                    onClick={() => removeMultimediaAttachment(attachment.id)}
+                    disabled={runBusy}
+                    title={props.tr('Remove media', '移除多媒体')}
+                    aria-label={props.tr('Remove media', '移除多媒体')}
+                  >
+                    x
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="chat-textarea-wrap">
           <textarea
             className="chat-textarea"
@@ -1840,11 +1945,24 @@ function ChatPage(props: {
                 />
               </svg>
             </button>
+            <button
+              className="chat-attach-button chat-media-button"
+              onClick={openMultimediaPicker}
+              disabled={runBusy || !connected}
+              title={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+              aria-label={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                <path d="m7 15 3-3 2.4 2.4L14.5 12 18 15.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
+              </svg>
+            </button>
           </div>
         </div>
         <button
           className={`send-btn${runBusy ? ' stop' : ''}`}
-          disabled={runBusy ? props.stopping : !input.trim() || !connected}
+          disabled={runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected}
           title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
           onClick={() => {
             if (runBusy) {
@@ -2004,6 +2122,21 @@ function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactEleme
   );
 }
 
+function MessageAttachments({ attachments }: { attachments?: AgentMessageAttachment[] }): ReactElement | null {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div className="msg-attachment-list">
+      {attachments.map((attachment, index) => (
+        <div key={attachment.id ?? `${attachment.filename}-${index}`} className={`msg-attachment ${attachment.kind}`}>
+          <span className="msg-attachment-kind">{attachment.kind}</span>
+          <span className="msg-attachment-name">{attachment.filename}</span>
+          <span className="msg-attachment-size">{formatBytes(attachment.sizeBytes)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
@@ -2064,6 +2197,7 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
           ) : (
             <>
               <CitationLinkStrip citations={citations} />
+              <MessageAttachments attachments={message.attachments} />
               {message.role === 'assistant' && message.reasoning_content?.trim()
                 ? <ReasoningList content={message.reasoning_content} parts={message.reasoning_parts} tr={tr} />
                 : null}
