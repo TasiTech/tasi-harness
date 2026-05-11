@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
+  AgentMessageDeltaStream,
   AssistantMessageExportRequest,
   BrowserCoachGenerateSkillRequest,
   BrowserCoachGenerateSkillResult,
@@ -42,6 +43,12 @@ const api = {
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';
       const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentToolEventStream) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    },
+    onMessageDelta: (listener: (payload: AgentMessageDeltaStream) => void) => {
+      const channel = 'agent:message-delta';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentMessageDeltaStream) => listener(payload);
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }

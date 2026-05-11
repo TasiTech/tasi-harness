@@ -242,6 +242,81 @@ describe('llmClient', () => {
     expect(secondBody.messages[1].reasoning_content).toBe('internal chain');
   });
 
+  it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {
+    const events = [
+      {
+        id: 'chatcmpl_stream',
+        choices: [
+          {
+            delta: {
+              reasoning_content: 'think ',
+              content: 'Hello ',
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'browser_open', arguments: '{"url"' }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        choices: [
+          {
+            delta: {
+              reasoning_content: 'now',
+              content: 'world',
+              tool_calls: [
+                {
+                  index: 0,
+                  function: { arguments: ':"https://example.com"}' }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [...events.map((event) => `data: ${JSON.stringify(event)}`), 'data: [DONE]'].join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-reasoner'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.(
+      {
+        messages: [{ role: 'user', content: 'open example.com' }],
+        tools: [browserOpenTool]
+      },
+      (delta) => {
+        if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+        if (delta.content) deltas.push(`c:${delta.content}`);
+      }
+    );
+
+    expect(result?.message.content).toBe('Hello world');
+    expect(result?.message.reasoning_content).toBe('think now');
+    expect(result?.message.tool_calls?.[0].function.name).toBe('browser_open');
+    expect(result?.message.tool_calls?.[0].function.arguments).toBe('{"url":"https://example.com"}');
+    expect(deltas).toEqual(['r:think ', 'c:Hello ', 'r:now', 'c:world']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
   it('drops malformed deepseek historical tool traces that miss reasoning_content', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

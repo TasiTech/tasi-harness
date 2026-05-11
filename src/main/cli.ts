@@ -24,6 +24,7 @@ export interface CliOptions {
   json: boolean;
   plain: boolean;
   verbose: boolean;
+  stream: boolean;
   home?: string;
 }
 
@@ -44,6 +45,8 @@ function printUsage(): void {
       '  -k, --knowledge          Use the personal knowledge base.',
       '  -j, --json               Print the run result as JSON.',
       '  -p, --plain              Print raw Markdown instead of terminal-rendered output.',
+      '      --stream             Stream assistant output as it arrives (default).',
+      '      --no-stream          Wait for the full response, then render it.',
       '  -V, --verbose            Print tool events to stderr.',
       '  -H, --home <path>        Override TASI_HARNESS_HOME.',
       '  -h, --help               Show this help.',
@@ -80,7 +83,8 @@ export function parseArgs(argv: string[]): CliOptions {
     usePersonalKnowledgeBase: false,
     json: false,
     plain: false,
-    verbose: false
+    verbose: false,
+    stream: true
   };
   const rest: string[] = [];
   const args = [...argv];
@@ -123,6 +127,14 @@ export function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === '--plain' || arg === '-p') {
       options.plain = true;
+      continue;
+    }
+    if (arg === '--stream') {
+      options.stream = true;
+      continue;
+    }
+    if (arg === '--no-stream') {
+      options.stream = false;
       continue;
     }
     if (arg === '--verbose' || arg === '-V') {
@@ -210,10 +222,14 @@ export function renderMarkdownForTerminal(markdown: string): string {
   return typeof rendered === 'string' ? rendered : normalized;
 }
 
-function printResult(result: Awaited<ReturnType<CliContext['runChat']>>, options: Pick<CliOptions, 'json' | 'plain'>): void {
+function printResult(result: Awaited<ReturnType<CliContext['runChat']>>, options: Pick<CliOptions, 'json' | 'plain'>, alreadyStreamed = false): void {
   const json = options.json;
   if (json) {
     output.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (alreadyStreamed) {
+    output.write(`\n[session: ${result.sessionId}]\n`);
     return;
   }
   const response = result.finalResponse.trim();
@@ -225,13 +241,16 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
   const controller = new AbortController();
   const onSigint = () => controller.abort();
   process.once('SIGINT', onSigint);
+  let streamedContent = '';
+  let wroteReasoningHeader = false;
   try {
     const result = await context.runChat(
       {
         userInput: message,
         sessionId: options.sessionId,
         executionMode: options.executionMode,
-        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase
+        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase,
+        stream: options.stream
       },
       {
         signal: controller.signal,
@@ -241,10 +260,26 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
           ? (_sessionId, event) => {
               process.stderr.write(`[tool:${event.toolName}] ${event.ok ? 'ok' : 'fail'} ${event.content.slice(0, 160).replace(/\s+/g, ' ')}\n`);
             }
+          : undefined,
+        onMessageDelta: options.stream && !options.json
+          ? (_sessionId, event) => {
+              if (event.type === 'reasoning_content' && event.delta && options.verbose) {
+                if (!wroteReasoningHeader) {
+                  process.stderr.write('[reasoning]\n');
+                  wroteReasoningHeader = true;
+                }
+                process.stderr.write(event.delta);
+              }
+              if (event.type === 'content' && event.delta) {
+                streamedContent += event.delta;
+                output.write(event.delta);
+              }
+            }
           : undefined
       }
     );
-    printResult(result, options);
+    if (wroteReasoningHeader) process.stderr.write('\n');
+    printResult(result, options, options.stream && !options.json && streamedContent.length > 0);
     return result.sessionId;
   } finally {
     process.removeListener('SIGINT', onSigint);

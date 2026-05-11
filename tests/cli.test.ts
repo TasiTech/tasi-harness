@@ -14,7 +14,8 @@ describe('CLI argument parsing', () => {
     const parsed = parseArgs(['chat', 'write a plan']);
     expect(parsed).toMatchObject({
       command: 'chat',
-      message: 'write a plan'
+      message: 'write a plan',
+      stream: true
     });
     expect(parsed.sessionId).toBeUndefined();
   });
@@ -37,6 +38,17 @@ describe('CLI argument parsing', () => {
     const parsed = parseArgs(['chat', 'abc123', 'hello']);
     expect(parsed.sessionId).toBeUndefined();
     expect(parsed.message).toBe('abc123 hello');
+  });
+
+  it('supports explicit stream and no-stream flags', () => {
+    expect(parseArgs(['chat', '--no-stream', 'hello'])).toMatchObject({
+      message: 'hello',
+      stream: false
+    });
+    expect(parseArgs(['chat', '--no-stream', '--stream', 'hello'])).toMatchObject({
+      message: 'hello',
+      stream: true
+    });
   });
 
   it('renders headings without markdown prefixes and de-indents markdown list items', () => {

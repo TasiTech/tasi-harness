@@ -1,5 +1,6 @@
 import type {
   AgentToolEventStream,
+  AgentMessageDeltaStream,
   AgentRunResult,
   AppInfo,
   AssistantMessageExportRequest,
@@ -56,6 +57,7 @@ declare global {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
+        onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;
       };
       security: {
         onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;

@@ -31,6 +31,7 @@ export interface AgentMessage {
   role: AgentRole;
   content: string;
   reasoning_content?: string;
+  reasoning_parts?: string[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -302,6 +303,7 @@ export interface AgentRunOptions {
   usePersonalKnowledgeBase?: boolean;
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
+  stream?: boolean;
 }
 
 export interface AgentRunResult {
@@ -329,6 +331,18 @@ export interface ToolEvent {
 export interface AgentToolEventStream {
   sessionId: string;
   event: ToolEvent;
+}
+
+export interface AgentMessageDeltaStream {
+  sessionId: string;
+  messageId: string;
+  role: 'assistant';
+  type: 'content' | 'reasoning_content' | 'done';
+  delta?: string;
+  content?: string;
+  reasoning_content?: string;
+  reasoning_parts?: string[];
+  createdAt?: string;
 }
 
 export type ExecutionMode = 'workspace' | 'sandbox';

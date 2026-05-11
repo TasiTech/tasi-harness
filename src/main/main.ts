@@ -1161,6 +1161,9 @@ function registerIpc(): void {
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
           _event.sender.send('agent:tool-event', payload);
+        },
+        onMessageDelta: (_eventSessionId, messageDelta) => {
+          _event.sender.send('agent:message-delta', messageDelta);
         }
       });
       const followUpQuestions = await generateFollowUpQuestions(

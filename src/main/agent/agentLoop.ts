@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
@@ -16,6 +16,7 @@ function parseToolArgs(raw: string): unknown {
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
+  onMessageDelta?: (sessionId: string, event: AgentMessageDeltaStream) => void;
   requestToolApproval?: ToolApprovalRequester;
   signal?: AbortSignal;
 }
@@ -28,6 +29,18 @@ function createAbortError(): Error {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw createAbortError();
+}
+
+function splitReasoningParts(content: string): string[] {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized) return [];
+  const lineItems = normalized
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, ''))
+    .filter(Boolean);
+  if (lineItems.length > 1) return lineItems;
+  const sentenceItems = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) ?? [];
+  return sentenceItems.length > 0 ? sentenceItems : [normalized];
 }
 
 export class AgentLoop {
@@ -70,18 +83,85 @@ export class AgentLoop {
       let finalResponse = '';
       let iterations = 0;
       const appended: AgentMessage[] = [userMessage];
+      const visibleAssistantId = createId('msg');
+      const visibleAssistantCreatedAt = nowIso();
+      let accumulatedReasoning = '';
+      const accumulatedReasoningParts: string[] = [];
+
+      const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
+      const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
 
       for (; iterations < cfg.maxIterations; iterations++) {
         throwIfAborted(options.signal);
-        const completion = await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
-        const assistant = { ...completion.message, id: completion.message.id ?? createId('msg'), createdAt: nowIso() };
+        const assistantId = createId('msg');
+        const assistantCreatedAt = nowIso();
+        let streamedContent = '';
+        let streamedReasoning = '';
+        const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
+        const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
+        const completion = canStream
+          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, signal: options.signal }, (delta) => {
+              if (delta.reasoning_content) {
+                streamedReasoning += delta.reasoning_content;
+                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                options.onMessageDelta?.(session.id, {
+                  sessionId: session.id,
+                  messageId: visibleAssistantId,
+                  role: 'assistant',
+                  type: 'reasoning_content',
+                  delta: delta.reasoning_content,
+                  reasoning_content: joinReasoning(visibleReasoningParts),
+                  reasoning_parts: visibleReasoningParts,
+                  content: streamedContent,
+                  createdAt: visibleAssistantCreatedAt
+                });
+              }
+              if (delta.content) {
+                streamedContent += delta.content;
+                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                options.onMessageDelta?.(session.id, {
+                  sessionId: session.id,
+                  messageId: visibleAssistantId,
+                  role: 'assistant',
+                  type: 'content',
+                  delta: delta.content,
+                  content: streamedContent,
+                  reasoning_content: joinReasoning(visibleReasoningParts) || undefined,
+                  reasoning_parts: visibleReasoningParts.length > 0 ? visibleReasoningParts : undefined,
+                  createdAt: visibleAssistantCreatedAt
+                });
+              }
+            })
+          : await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
+        const assistant = { ...completion.message, id: assistantId, createdAt: assistantCreatedAt };
+        const currentReasoning = assistant.reasoning_content || streamedReasoning;
+        if (currentReasoning.trim()) {
+          const currentParts = splitReasoningParts(currentReasoning);
+          accumulatedReasoningParts.push(...currentParts);
+          accumulatedReasoning = joinReasoning(accumulatedReasoningParts);
+          assistant.reasoning_parts = currentParts.length > 0 ? currentParts : undefined;
+        }
         usage = completion.usage ?? usage;
         messages.push(assistant);
         appended.push(assistant);
 
         const toolCalls = assistant.tool_calls ?? [];
         if (toolCalls.length === 0) {
+          if (accumulatedReasoning) assistant.reasoning_content = accumulatedReasoning;
+          if (accumulatedReasoningParts.length > 0) assistant.reasoning_parts = [...accumulatedReasoningParts];
           finalResponse = assistant.content || '';
+          if (canStream) {
+            options.onMessageDelta?.(session.id, {
+              sessionId: session.id,
+              messageId: visibleAssistantId,
+              role: 'assistant',
+              type: 'done',
+              content: assistant.content,
+              reasoning_content: assistant.reasoning_content,
+              reasoning_parts: assistant.reasoning_parts,
+              createdAt: visibleAssistantCreatedAt
+            });
+          }
           break;
         }
 

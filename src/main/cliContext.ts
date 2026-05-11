@@ -162,6 +162,7 @@ export class CliContext {
     runtime?: {
       requestToolApproval?: ToolApprovalRequester;
       onToolEvent?: Parameters<AgentLoop['run']>[0]['onToolEvent'];
+      onMessageDelta?: Parameters<AgentLoop['run']>[0]['onMessageDelta'];
       signal?: AbortSignal;
       browserLogEnabled?: boolean;
     }
@@ -172,6 +173,7 @@ export class CliContext {
         origin: 'chat',
         requestToolApproval: runtime?.requestToolApproval,
         onToolEvent: runtime?.onToolEvent,
+        onMessageDelta: runtime?.onMessageDelta,
         signal: runtime?.signal
       });
       const usageRecord = this.sessionStore.recordUsage(result.sessionId, result.usage);

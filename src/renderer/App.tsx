@@ -486,7 +486,14 @@ export function App(): ReactElement {
             </button>
           </div>
           {sidebarNav.map((item) => (
-            <button key={item.page} className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => setPage(item.page)}>
+            <button
+              key={item.page}
+              className={`nav-item ${page === item.page ? 'active' : ''}`}
+              onClick={() => setPage(item.page)}
+              title={item.label}
+              aria-label={item.label}
+              data-label={item.label}
+            >
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
             </button>
@@ -703,7 +710,7 @@ function ChatPage(props: {
   config: PublicAppConfig;
   setConfig: (cfg: PublicAppConfig) => void;
   messages: AgentMessage[];
-  setMessages: (messages: AgentMessage[]) => void;
+  setMessages: Dispatch<SetStateAction<AgentMessage[]>>;
   sessionId?: string;
   setSessionId: (id?: string) => void;
   lastUsage?: LlmUsage;
@@ -757,7 +764,9 @@ function ChatPage(props: {
   const visibleMessages = useMemo(
     () => props.messages.filter((m) => {
       if (m.role === 'assistant' && m.content === WECHAT_PENDING_MARKER) return false;
-      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()));
+      const isIntermediateToolAssistant = m.role === 'assistant' && !m.content?.trim() && (m.tool_calls?.length ?? 0) > 0;
+      if (isIntermediateToolAssistant) return false;
+      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim() || m.reasoning_content?.trim()));
     }),
     [props.messages]
   );
@@ -879,6 +888,38 @@ function ChatPage(props: {
     });
     return off;
   }, [props.sessionId, props.setToolEvents]);
+  useEffect(() => {
+    const off = window.tasiHarness.agent.onMessageDelta((payload) => {
+      if (props.sessionId && payload.sessionId !== props.sessionId) return;
+      props.setMessages((old) => {
+        const existing = old.find((message) => message.id === payload.messageId);
+        if (!existing) {
+          return [
+            ...old,
+            {
+              id: payload.messageId,
+              role: 'assistant',
+              content: payload.content ?? '',
+              reasoning_content: payload.reasoning_content,
+              reasoning_parts: payload.reasoning_parts,
+              createdAt: payload.createdAt
+            }
+          ];
+        }
+        return old.map((message) => {
+          if (message.id !== payload.messageId) return message;
+          return {
+            ...message,
+            content: payload.content ?? message.content,
+            reasoning_content: payload.reasoning_content ?? message.reasoning_content,
+            reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
+            createdAt: message.createdAt ?? payload.createdAt
+          };
+        });
+      });
+    });
+    return off;
+  }, [props.sessionId, props.setMessages]);
   useEffect(() => {
     if (!showEmbeddedWebPreview) {
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
@@ -1842,6 +1883,40 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
+function reasoningItems(content: string, parts?: string[]): string[] {
+  const explicitParts = parts?.map((part) => part.trim()).filter(Boolean) ?? [];
+  if (explicitParts.length > 0) return explicitParts;
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized) return [];
+
+  const lineItems = normalized
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, ''))
+    .filter(Boolean);
+  if (lineItems.length > 1) return lineItems;
+
+  const sentenceItems = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) ?? [];
+  return sentenceItems.length > 0 ? sentenceItems : [normalized];
+}
+
+function ReasoningList({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
+  const items = reasoningItems(content, parts);
+  if (items.length === 0) return null;
+  return (
+    <div className="msg-reasoning">
+      <div className="msg-reasoning-title">{tr('Reasoning', '推理过程')}</div>
+      <div className="msg-reasoning-list">
+        {items.map((item, index) => (
+          <details key={`${index}-${item.slice(0, 24)}`} className="msg-reasoning-item" open>
+            <summary>{tr(`Step ${index + 1}`, `第 ${index + 1} 条`)}</summary>
+            <div className="msg-reasoning-item-body">{item}</div>
+          </details>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactElement | null {
   if (citations.length === 0) return null;
   return (
@@ -1989,7 +2064,10 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
           ) : (
             <>
               <CitationLinkStrip citations={citations} />
-              {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
+              {message.role === 'assistant' && message.reasoning_content?.trim()
+                ? <ReasoningList content={message.reasoning_content} parts={message.reasoning_parts} tr={tr} />
+                : null}
+              {message.content.trim() ? renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`) : null}
               <div className="msg-bubble-actions">
                 {message.role === 'assistant' && (
                   <>

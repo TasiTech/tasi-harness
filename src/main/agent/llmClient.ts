@@ -4,6 +4,12 @@ import { providerApiStyle, providerRequiresApiKey } from '../../shared/providerC
 
 export interface LlmClient {
   complete(request: LlmRequest): Promise<LlmCompletion>;
+  streamComplete?(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion>;
+}
+
+export interface LlmStreamDelta {
+  content?: string;
+  reasoning_content?: string;
 }
 
 type AnthropicContentBlock =
@@ -277,6 +283,45 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
   };
 }
 
+interface OpenAiStreamingToolCall {
+  id?: string;
+  type?: 'function';
+  function: {
+    name?: string;
+    arguments: string;
+  };
+}
+
+function applyOpenAiToolCallDeltas(acc: OpenAiStreamingToolCall[], rawToolCalls: unknown): void {
+  if (!Array.isArray(rawToolCalls)) return;
+  for (const raw of rawToolCalls) {
+    if (!raw || typeof raw !== 'object') continue;
+    const item = raw as Record<string, any>;
+    const index = typeof item.index === 'number' && Number.isInteger(item.index) && item.index >= 0 ? item.index : acc.length;
+    const current = acc[index] ?? { function: { arguments: '' } };
+    if (typeof item.id === 'string' && item.id) current.id = item.id;
+    if (item.type === 'function') current.type = 'function';
+    const fn = item.function && typeof item.function === 'object' ? item.function as Record<string, unknown> : null;
+    if (typeof fn?.name === 'string' && fn.name) current.function.name = `${current.function.name ?? ''}${fn.name}`;
+    if (typeof fn?.arguments === 'string') current.function.arguments += fn.arguments;
+    acc[index] = current;
+  }
+}
+
+function finalizeStreamingToolCalls(acc: OpenAiStreamingToolCall[]): ToolCall[] | undefined {
+  const calls = acc
+    .map((call) => ({
+      id: String(call.id ?? createId('toolcall')),
+      type: 'function' as const,
+      function: {
+        name: String(call.function.name ?? ''),
+        arguments: call.function.arguments || '{}'
+      }
+    }))
+    .filter((call) => call.function.name);
+  return calls.length > 0 ? calls : undefined;
+}
+
 function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: AppConfig['provider']): Array<Record<string, unknown>> {
   const normalized: Array<Record<string, unknown>> = [];
   const droppedToolCallIds = new Set<string>();
@@ -432,6 +477,95 @@ class ModelClient implements LlmClient {
     }
   }
 
+  private async postEventStream(
+    endpoint: string,
+    headers: Record<string, string>,
+    body: unknown,
+    request: LlmRequest,
+    onJsonEvent: (json: any) => void
+  ): Promise<void> {
+    let attempt = 0;
+    while (true) {
+      let response: Response;
+      try {
+        response = await runtimeFetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: request.signal
+        });
+      } catch (error) {
+        if (!isAbortError(error) && attempt < MAX_LLM_REQUEST_RETRIES) {
+          await sleepWithSignal(retryDelayMs(attempt), request.signal);
+          attempt += 1;
+          continue;
+        }
+        throw new Error(appendAttemptSuffix(formatFetchFailure(this.config, endpoint, error), attempt));
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        const json = parseJsonBody(text) as any;
+        const detail = responseErrorDetail(response, text, json);
+        if (isRetriableStatus(response.status) && attempt < MAX_LLM_REQUEST_RETRIES) {
+          await sleepWithSignal(retryDelayMs(attempt, response), request.signal);
+          attempt += 1;
+          continue;
+        }
+        throw new Error(appendAttemptSuffix(`LLM request failed (${response.status}): ${detail}`, attempt));
+      }
+
+      if (!response.body) throw new Error('LLM stream response did not include a readable body.');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let doneEventSeen = false;
+
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+        const lines = buffer.split(/\r?\n/);
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice('data:'.length).trim();
+          if (!data) continue;
+          if (data === '[DONE]') {
+            doneEventSeen = true;
+            break;
+          }
+          try {
+            onJsonEvent(JSON.parse(data));
+          } catch {
+            throw new Error(`Invalid LLM stream event: ${data.slice(0, 200)}`);
+          }
+        }
+        if (doneEventSeen) break;
+      }
+      buffer += decoder.decode();
+
+      if (!doneEventSeen && buffer.trim().startsWith('data:')) {
+        const data = buffer.trim().slice('data:'.length).trim();
+        if (data && data !== '[DONE]') {
+          try {
+            onJsonEvent(JSON.parse(data));
+          } catch {
+            throw new Error(`Invalid LLM stream event: ${data.slice(0, 200)}`);
+          }
+        }
+      }
+      return;
+    }
+  }
+
+  async streamComplete(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
+    const style = providerApiStyle(this.config.provider);
+    if (style !== 'openai') return this.complete(request);
+    return this.completeWithOpenAiCompatibleStream(request, onDelta);
+  }
+
   private async completeWithOpenAiCompatible(request: LlmRequest): Promise<LlmCompletion> {
     const endpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -446,6 +580,64 @@ class ModelClient implements LlmClient {
     };
     const json = await this.postJson(endpoint, headers, body, request);
     return parseOpenAiCompletion(json);
+  }
+
+  private async completeWithOpenAiCompatibleStream(request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
+    const endpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+    const body = {
+      model: this.config.model,
+      messages: normalizeOpenAiCompatibleMessages(request.messages, this.config.provider),
+      tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
+      temperature: request.temperature ?? this.config.temperature,
+      max_tokens: request.maxTokens,
+      stream: true
+    };
+
+    let content = '';
+    let reasoningContent = '';
+    let usage: LlmCompletion['usage'];
+    let rawId = '';
+    const toolCallAcc: OpenAiStreamingToolCall[] = [];
+    let rawEventCount = 0;
+
+    await this.postEventStream(endpoint, headers, body, request, (json) => {
+      rawEventCount += 1;
+      if (typeof json.id === 'string' && json.id) rawId = json.id;
+      if (json.usage) {
+        usage = {
+          promptTokens: json.usage.prompt_tokens,
+          completionTokens: json.usage.completion_tokens,
+          totalTokens: json.usage.total_tokens
+        };
+      }
+      const choice = json.choices?.[0];
+      const delta = choice?.delta ?? {};
+      const reasoningDelta = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
+      const contentDelta = typeof delta.content === 'string' ? delta.content : '';
+      if (reasoningDelta) {
+        reasoningContent += reasoningDelta;
+        onDelta({ reasoning_content: reasoningDelta });
+      }
+      if (contentDelta) {
+        content += contentDelta;
+        onDelta({ content: contentDelta });
+      }
+      applyOpenAiToolCallDeltas(toolCallAcc, delta.tool_calls);
+    });
+
+    return {
+      message: {
+        id: rawId || createId('msg'),
+        role: 'assistant',
+        content,
+        reasoning_content: reasoningContent || undefined,
+        tool_calls: finalizeStreamingToolCalls(toolCallAcc)
+      },
+      usage,
+      raw: { stream: true, eventCount: rawEventCount }
+    };
   }
 
   private async completeWithAnthropic(request: LlmRequest): Promise<LlmCompletion> {
@@ -494,6 +686,13 @@ export class MockLlmClient implements LlmClient {
   async complete(): Promise<LlmCompletion> {
     const next = this.completions.shift();
     if (!next) return { message: { role: 'assistant', content: 'No mock response.' } };
+    return next;
+  }
+
+  async streamComplete(_request: LlmRequest, onDelta: (delta: LlmStreamDelta) => void): Promise<LlmCompletion> {
+    const next = await this.complete();
+    if (next.message.reasoning_content) onDelta({ reasoning_content: next.message.reasoning_content });
+    if (next.message.content) onDelta({ content: next.message.content });
     return next;
   }
 }

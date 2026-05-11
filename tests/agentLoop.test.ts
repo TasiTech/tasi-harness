@@ -79,4 +79,120 @@ describe('AgentLoop', () => {
     const rawMessages = Array.isArray(rawSession.messages) ? rawSession.messages : [];
     expect(rawMessages.some((message) => message && typeof message === 'object' && (message as { role?: string }).role === 'tool')).toBe(true);
   });
+
+  it('emits streamed assistant deltas when the client supports streaming', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: 'Streamed answer.',
+          reasoning_content: 'Brief reasoning.'
+        }
+      }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'hello',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.delta}`);
+        if (event.type === 'content') deltas.push(`c:${event.delta}`);
+        if (event.type === 'done') deltas.push(`done:${event.content}`);
+      }
+    });
+
+    expect(result.finalResponse).toBe('Streamed answer.');
+    expect(deltas).toEqual(['r:Brief reasoning.', 'c:Streamed answer.', 'done:Streamed answer.']);
+  });
+
+  it('keeps tool-call reasoning on the same streamed assistant bubble as the final answer', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'Need to inspect the workspace.\nNeed to write the file.',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'answer.txt', content: '42' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Done.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const messageIds: string[] = [];
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'write a file',
+      onMessageDelta: (_sessionId, event) => {
+        messageIds.push(event.messageId);
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_parts?.join('|')}`);
+        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_parts?.join('|')}`);
+        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_parts?.join('|')}`);
+      }
+    });
+
+    expect(new Set(messageIds).size).toBe(1);
+    expect(deltas).toEqual([
+      'r:Need to inspect the workspace.|Need to write the file.',
+      'c:Done.:Need to inspect the workspace.|Need to write the file.',
+      'done:Done.:Need to inspect the workspace.|Need to write the file.'
+    ]);
+    const finalAssistant = [...result.messages].reverse().find((message) => message.role === 'assistant' && message.content === 'Done.');
+    expect(finalAssistant?.reasoning_content).toBe('Need to inspect the workspace.\nNeed to write the file.');
+    expect(finalAssistant?.reasoning_parts).toEqual(['Need to inspect the workspace.', 'Need to write the file.']);
+  });
 });
