@@ -183,6 +183,8 @@ After generating each Draw.io source:
   - Source: `diagrams/drawio/<name>.drawio`
   - Embedded asset: `diagrams/exports/<name>.png` or `.svg`
 - Use a real Draw.io/diagrams.net export path whenever possible, for example a desktop/CLI export (`drawio -x -f png -s 2 -o diagrams/exports/name.png diagrams/drawio/name.drawio`) or an equivalent app export. Do not substitute a browser viewport screenshot.
+- SVG exports must come from Draw.io/diagrams.net or a faithful renderer of the Draw.io source. Do not hand-recreate Draw.io diagrams as standalone SVG; manual SVG redraws often miss connectors, arrowheads, waypoints, grouped shapes, or labels.
+- If the `.drawio` source contains `edge="1"` cells, the exported SVG must include connector primitives such as `<path>`, `<line>`, or `<polyline>`. A matching SVG with only rectangles/text is incomplete and must be regenerated from Draw.io.
 - When a PNG must be derived from an exported Draw.io SVG, render the SVG file with a real SVG renderer instead of taking a browser screenshot. Use the SVG `viewBox`/canvas as the export bounds, preserve aspect ratio, and add padding if visible content touches an edge.
   - Preferred tools: `drawio -x -f png ...` directly from `.drawio`; otherwise `inkscape input.svg --export-type=png --export-filename=output.png`, `rsvg-convert input.svg -o output.png`, or an equivalent SVG renderer such as Sharp/resvg.
   - Do not use Playwright/browser viewport screenshots, whole-page screenshots, scroll-position screenshots, or temporary HTML render pages as PNG exports.
@@ -200,6 +202,7 @@ Use this only when the downstream workflow requires PNG. Keep SVG as the source 
 1. Export SVG from the Draw.io source using Draw.io/diagrams.net export, not by redrawing in HTML.
 2. Inspect the SVG root:
    - It should have a `viewBox`.
+   - If the source `.drawio` has `edge="1"` cells, the SVG should contain connector primitives (`<path>`, `<line>`, or `<polyline>`). If not, the SVG is missing connectors.
    - The viewBox should include the full diagram plus safe padding for strokes, arrows, labels, and shadows.
    - Do not crop to a browser viewport or a visible editor canvas.
 3. Render the SVG with a file renderer:
@@ -522,10 +525,12 @@ Before claiming a方案/设计文档 with diagrams is complete:
   node resources/skills/work/diagram-generator-1.1.1/scripts/validate_diagram_exports.mjs --asset-dir diagrams/exports --drawio-dir diagrams/drawio
   ```
 - If multiple PNG files have the same browser-like dimensions (for example `1910x915`, `1920x1080`, `1366x768`), the image is blank/near-blank, or visible content touches any export edge, treat the exported images as incomplete until regenerated from Draw.io/SVG with proper bounds.
+- If a Draw.io source has `edge="1"` connectors but the matching SVG has no `<path>`, `<line>`, or `<polyline>` connector primitives, treat the SVG as incomplete. Regenerate it with Draw.io/diagrams.net export; do not patch by hand unless every source edge is intentionally and visibly represented.
 
 ## Prohibited Export Fallbacks
 
 - Do not create HTML/CSS redraws of Draw.io diagrams and screenshot those pages as final document figures.
+- Do not manually redraw a Draw.io diagram into plain SVG for formal export; this commonly drops connectors and arrow geometry.
 - Do not use `browser_screenshot` of the whole page or current viewport as a formal diagram export.
 - Do not export PNG from SVG by screenshotting a browser tab. Use a real SVG renderer with the SVG viewBox as the export bounds.
 - Do not embed PNGs generated from a partially visible browser window, a zoomed editor canvas, or a local render page unless the screenshot is an element-level capture with verified full bounds and passes `validate_diagram_exports.mjs`.

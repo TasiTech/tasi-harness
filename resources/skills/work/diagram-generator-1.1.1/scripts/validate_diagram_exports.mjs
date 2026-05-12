@@ -183,6 +183,26 @@ function basenameNoExt(file) {
   return path.basename(file, path.extname(file)).toLowerCase();
 }
 
+function readTextFile(file) {
+  return fs.readFileSync(file, "utf8");
+}
+
+function countDrawioEdges(file) {
+  const xml = readTextFile(file);
+  return (xml.match(/\bedge="1"/g) || []).length;
+}
+
+function inspectSvg(file) {
+  const svg = readTextFile(file);
+  return {
+    file,
+    hasSvgRoot: /<svg[\s>]/i.test(svg.slice(0, 2048)),
+    hasViewBox: /\bviewBox="/i.test(svg.slice(0, 4096)),
+    connectorPrimitiveCount: (svg.match(/<(?:path|line|polyline)\b/gi) || []).length,
+    markerCount: (svg.match(/<marker\b/gi) || []).length,
+  };
+}
+
 const args = parseArgs(process.argv.slice(2));
 if (!args.assetDir) usage();
 
@@ -190,6 +210,8 @@ const pngFiles = listFiles(args.assetDir, [".png"]);
 const svgFiles = listFiles(args.assetDir, [".svg"]);
 const drawioFiles = listFiles(args.drawioDir, [".drawio"]);
 const issues = [];
+
+const svgByBase = new Map(svgFiles.map((file) => [basenameNoExt(file), file]));
 
 const pngs = [];
 for (const file of pngFiles) {
@@ -270,6 +292,28 @@ if (drawioFiles.length) {
       missing,
     ));
   }
+
+  for (const drawioFile of drawioFiles) {
+    const svgFile = svgByBase.get(basenameNoExt(drawioFile));
+    if (!svgFile) continue;
+
+    const edgeCount = countDrawioEdges(drawioFile);
+    const svg = inspectSvg(svgFile);
+    if (!svg.hasSvgRoot) {
+      issues.push(issue("invalid_svg", "Exported SVG does not contain an <svg> root.", [svgFile]));
+      continue;
+    }
+    if (!svg.hasViewBox) {
+      issues.push(issue("svg_missing_viewbox", "Exported SVG is missing viewBox; export bounds may be viewport-derived or unstable.", [svgFile]));
+    }
+    if (edgeCount > 0 && svg.connectorPrimitiveCount === 0) {
+      issues.push(issue(
+        "svg_missing_connectors",
+        `Draw.io source contains ${edgeCount} edge(s), but the matching SVG contains no path/line/polyline connector primitives. Regenerate with Draw.io/diagrams.net export instead of a hand-redraw or screenshot-derived SVG.`,
+        [drawioFile, svgFile],
+      ));
+    }
+  }
 }
 
 const report = {
@@ -282,6 +326,13 @@ const report = {
     drawio: drawioFiles.length,
   },
   pngs: pngs.map((png) => ({ file: png.file, width: png.width, height: png.height, inkBounds: inkBounds(png) })),
+  svgs: svgFiles.map((file) => {
+    const drawioFile = drawioFiles.find((item) => basenameNoExt(item) === basenameNoExt(file));
+    return {
+      ...inspectSvg(file),
+      matchingDrawioEdges: drawioFile ? countDrawioEdges(drawioFile) : null,
+    };
+  }),
   issues,
 };
 

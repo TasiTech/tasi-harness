@@ -480,6 +480,50 @@ export function App(): ReactElement {
     }
   }
 
+  async function startSkillOptimization(target: SessionSummary): Promise<void> {
+    if (chatBusy) return;
+    const prompt = tr(
+      `Use skill-creator to inspect session ${target.id} for failed work, identify all related skills, and optimize each affected skill separately. Start by reading the session failure signals, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.`,
+      `使用 skill-creator，检查 session ${target.id} 中的失败问题，识别所有相关技能，并分别优化每个受影响的技能。先读取该 session 的失败信号，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。`
+    );
+    const userMessage: AgentMessage = {
+      role: 'user',
+      content: prompt,
+      createdAt: new Date().toISOString()
+    };
+    setPage('chat');
+    setChatBusy(true);
+    setChatStopping(false);
+    setSessionId(undefined);
+    setToolEvents([]);
+    setMessages([userMessage]);
+    setLastUsage(undefined);
+    try {
+      const result = await window.tasiHarness.agent.chat(prompt, undefined, executionMode, false);
+      setSessionId(result.sessionId);
+      setMessages(result.messages.filter((m) => m.role !== 'system'));
+      setLastUsage(result.usage);
+      setTotalUsage(result.totalUsage);
+      setToolEvents(result.toolEvents);
+      setExecutionMode(result.execution.mode);
+      await refreshSessions();
+      await refreshSkills();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMessages([
+        userMessage,
+        {
+          role: 'assistant',
+          content: tr(`Skill optimization failed: ${message}`, `技能优化失败：${message}`),
+          createdAt: new Date().toISOString()
+        }
+      ]);
+    } finally {
+      setChatStopping(false);
+      setChatBusy(false);
+    }
+  }
+
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
@@ -560,7 +604,17 @@ export function App(): ReactElement {
         )}
         {page === 'knowledge' && <KnowledgePage tr={tr} knowledge={knowledge} refreshKnowledge={refreshKnowledge} />}
         {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} />}
-        {page === 'skills' && <SkillsPage tr={tr} skills={skills} refreshSkills={refreshSkills} />}
+        {page === 'skills' && (
+          <SkillsPage
+            tr={tr}
+            skills={skills}
+            sessions={sessions}
+            refreshSkills={refreshSkills}
+            refreshSessions={refreshSessions}
+            optimizeBusy={chatBusy}
+            onOptimizeSession={startSkillOptimization}
+          />
+        )}
         {page === 'tasks' && <TasksPage tr={tr} tasks={tasks} refreshTasks={refreshTasks} refreshSessions={refreshSessions} />}
         {page === 'sessions' && (
           <SessionsPage
@@ -2705,8 +2759,24 @@ function formatCoachEvent(event: BrowserCoachRecordedEvent): string {
   return `${event.index}. ${event.type}${target ? ` | ${target}` : ''}${detail}`;
 }
 
-function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
-  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach'>('installed');
+function SkillsPage({
+  tr,
+  skills,
+  sessions,
+  refreshSkills,
+  refreshSessions,
+  optimizeBusy,
+  onOptimizeSession
+}: {
+  tr: TranslateFn;
+  skills: SkillMetadata[];
+  sessions: SessionSummary[];
+  refreshSkills: () => Promise<void>;
+  refreshSessions: () => Promise<void>;
+  optimizeBusy: boolean;
+  onOptimizeSession: (session: SessionSummary) => Promise<void>;
+}): ReactElement {
+  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach' | 'optimize'>('installed');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
@@ -2727,6 +2797,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [coachBusy, setCoachBusy] = useState(false);
   const [coachNotice, setCoachNotice] = useState('');
   const [coachError, setCoachError] = useState('');
+  const [optimizeSessionId, setOptimizeSessionId] = useState('');
+  const [optimizeError, setOptimizeError] = useState('');
+  const [optimizeRefreshing, setOptimizeRefreshing] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorMode, setEditorMode] = useState<'create' | 'edit'>('create');
   const [editorName, setEditorName] = useState('my-workflow');
@@ -2776,6 +2849,11 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
       window.clearInterval(timer);
     };
   }, [activeTab]);
+
+  useEffect(() => {
+    if (optimizeSessionId || sessions.length === 0) return;
+    setOptimizeSessionId(sessions[0]?.id ?? '');
+  }, [optimizeSessionId, sessions]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -3054,6 +3132,32 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
+  async function refreshOptimizationSessions(): Promise<void> {
+    setOptimizeRefreshing(true);
+    setOptimizeError('');
+    try {
+      await refreshSessions();
+    } catch (error) {
+      setOptimizeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOptimizeRefreshing(false);
+    }
+  }
+
+  async function optimizeSelectedSession(): Promise<void> {
+    const selected = sessions.find((item) => item.id === optimizeSessionId);
+    if (!selected) {
+      setOptimizeError(tr('Choose a session first.', '请先选择一个 session。'));
+      return;
+    }
+    setOptimizeError('');
+    try {
+      await onOptimizeSession(selected);
+    } catch (error) {
+      setOptimizeError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   return (
     <section className="page">
       <PageHeader
@@ -3074,6 +3178,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
           </button>
           <button className={`skill-tab ${activeTab === 'coach' ? 'active' : ''}`} onClick={() => setActiveTab('coach')}>
             {tr('Coach', '教练')}
+          </button>
+          <button className={`skill-tab ${activeTab === 'optimize' ? 'active' : ''}`} onClick={() => setActiveTab('optimize')}>
+            {tr('Optimize', '技能优化')}
           </button>
         </div>
         {activeTab === 'installed' && (
@@ -3246,6 +3353,43 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             {coachNotice && <div className="notice-box">{coachNotice}</div>}
           </>
         )}
+        {activeTab === 'optimize' && (
+          <>
+            <h2>{tr('Skill Optimization', '技能优化')}</h2>
+            <p className="card-subtle">
+              {tr(
+                'Choose a previous session. Tasi will start a new agent run that inspects its failures, maps them to one or more skills, and patches the affected skill instructions or scripts.',
+                '选择一个历史 session。系统会启动新的智能体任务，检查其中的失败问题，映射到一个或多个技能，并修改受影响的技能说明或脚本。'
+              )}
+            </p>
+            <label>{tr('Session', 'Session')}</label>
+            <select value={optimizeSessionId} onChange={(event) => setOptimizeSessionId(event.target.value)} disabled={optimizeBusy || optimizeRefreshing}>
+              {sessions.map((session) => (
+                <option key={session.id} value={session.id}>
+                  {`${prettyDate(session.updatedAt)} · ${session.title || session.id}`}
+                </option>
+              ))}
+            </select>
+            {optimizeSessionId && (
+              <div className="meta-row wrap upload-file-row">
+                <span className="soft-badge">{optimizeSessionId}</span>
+                <span className="soft-badge">
+                  {tr('Messages', '消息')}: {sessions.find((session) => session.id === optimizeSessionId)?.messageCount ?? 0}
+                </span>
+              </div>
+            )}
+            <div className="button-row">
+              <button className="primary-button" disabled={optimizeBusy || optimizeRefreshing || sessions.length === 0} onClick={() => void optimizeSelectedSession()}>
+                {optimizeBusy ? tr('Optimizing...', '优化中...') : tr('Optimize Skills From Session', '从 Session 优化技能')}
+              </button>
+              <button className="ghost-button" disabled={optimizeBusy || optimizeRefreshing} onClick={() => void refreshOptimizationSessions()}>
+                {optimizeRefreshing ? tr('Refreshing...', '刷新中...') : tr('Refresh Sessions', '刷新 Session')}
+              </button>
+            </div>
+            {sessions.length === 0 && <div className="tool-empty">{tr('No sessions found.', '暂无 session。')}</div>}
+            {optimizeError && <div className="error-box market-error">{optimizeError}</div>}
+          </>
+        )}
         {notice && <div className="notice-box">{notice}</div>}
       </div>
       {editorOpen && (
@@ -3413,6 +3557,7 @@ function TasksPage(props: {
 function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: TranslateFn; sessions: SessionSummary[]; onOpen: (id: string) => Promise<void>; refreshSessions: () => Promise<void> }): ReactElement {
   const [query, setQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
+  const [deletingCategory, setDeletingCategory] = useState(false);
   const categoryCounts = useMemo(() => {
     const counts = new Map<MemoryDomain | 'all', number>([['all', sessions.length]]);
     for (const session of sessions) {
@@ -3429,10 +3574,42 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
       return s.title.toLowerCase().includes(needle);
     });
   }, [sessions, query, activeCategory]);
+  const activeCategoryLabel = useMemo(() => {
+    if (activeCategory === 'all') return tr('All', '全部');
+    const domain = MEMORY_DOMAINS.find((item) => item.value === activeCategory);
+    return domain ? tr(domain.labelEn, domain.labelZh) : activeCategory;
+  }, [activeCategory, tr]);
+  const activeCategoryDeleteCount = categoryCounts.get(activeCategory) ?? 0;
 
   async function remove(id: string): Promise<void> {
     await window.tasiHarness.sessions.delete(id);
     await refreshSessions();
+  }
+
+  async function removeActiveCategory(): Promise<void> {
+    const targets = activeCategory === 'all'
+      ? sessions
+      : sessions.filter((session) => knownMemoryDomain(session.domain) === activeCategory);
+    if (targets.length === 0 || deletingCategory) return;
+    const confirmed = window.confirm(
+      activeCategory === 'all'
+        ? tr(
+          `Delete all ${targets.length} sessions? This cannot be undone.`,
+          `删除全部 ${targets.length} 个会话？此操作无法撤销。`
+        )
+        : tr(
+          `Delete ${targets.length} sessions in category "${activeCategoryLabel}"? This cannot be undone.`,
+          `删除“${activeCategoryLabel}”分类下的 ${targets.length} 个会话？此操作无法撤销。`
+        )
+    );
+    if (!confirmed) return;
+    setDeletingCategory(true);
+    try {
+      await Promise.all(targets.map((session) => window.tasiHarness.sessions.delete(session.id)));
+      await refreshSessions();
+    } finally {
+      setDeletingCategory(false);
+    }
   }
 
   return (
@@ -3440,6 +3617,18 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
       <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by the same domains as memory.', '本地 JSON 会话历史，按记忆相同分类展示。')} />
       <div className="card">
         <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="history-actions">
+          <div className="card-subtle">
+            {tr('Current category', '当前分类')}: {activeCategoryLabel} · {activeCategoryDeleteCount} {tr('sessions', '个会话')}
+          </div>
+          <button className="danger-button" disabled={deletingCategory || activeCategoryDeleteCount === 0} onClick={() => void removeActiveCategory()}>
+            {deletingCategory
+              ? tr('Deleting...', '删除中...')
+              : activeCategory === 'all'
+                ? tr('Delete All Sessions', '删除全部会话')
+                : tr('Delete This Category', '删除当前分类')}
+          </button>
+        </div>
         <div className="memory-browser session-browser">
           <div className="memory-category-list">
             <button className={`memory-category-item ${activeCategory === 'all' ? 'active' : ''}`} onClick={() => setActiveCategory('all')}>

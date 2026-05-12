@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Guide for creating effective skills. This skill should be used when users want to create a new skill (or update an existing skill) that extends Claude's capabilities with specialized knowledge, workflows, or tool integrations.
+description: Guide for creating effective skills. Use when users want to create a new skill, update an existing skill, inspect a prior session for failures, or improve one or more related skills from session evidence.
 license: Complete terms in LICENSE.txt
 ---
 
@@ -354,3 +354,40 @@ After testing the skill, users may request improvements. Often this happens righ
 2. Notice struggles or inefficiencies
 3. Identify how SKILL.md or bundled resources should be updated
 4. Implement changes and test again
+
+### Session Failure-Driven Iteration
+
+Use this workflow when the user asks to select a session, inspect a session's failed work, or optimize related skills from a previous conversation.
+
+1. Select the session:
+   - If the user provides a session id or JSON path, use it directly.
+   - If no session is provided, list recent sessions and ask the user which one to inspect:
+     ```bash
+     node scripts/inspect_session_failures.mjs --list --limit 20
+     ```
+   - Accept either a session id such as `session_...` or a full `*.json` session path.
+
+2. Inspect the session:
+   ```bash
+   node scripts/inspect_session_failures.mjs --session <session-id-or-json-path>
+   ```
+   Read the reported failure signals, then open the session JSON around those messages. Treat user correction messages (for example, "still opens with problems", "missing connectors", "cropped screenshot", "validator failed") as the strongest evidence.
+
+3. Map failures to skills:
+   - A single session can involve multiple skills. Split the findings by actual failure type, not by the first skill mentioned.
+   - Map Office package/openability failures to the relevant `docx`, `pptx`, or `xlsx` skill.
+   - Map diagram, SVG, PNG, connector, screenshot, crop, or export completeness failures to the diagram-generation skill.
+   - Map chart data/visualization failures to the chart-generation skill.
+   - Map weak source text, missing sections, or document-quality failures to the document-writing skill.
+   - Map skill authoring, trigger, packaging, or validation workflow failures back to this skill.
+
+4. Optimize each affected skill separately:
+   - Update the smallest relevant `SKILL.md`, reference, or script.
+   - If the failure is structural or repeatable, prefer adding or extending a validator/converter script instead of only adding prose.
+   - Preserve unrelated local edits. Review existing diffs before patching files that are already modified.
+   - Do not let a fix for one skill hide another failure from the same session.
+
+5. Verify the optimization:
+   - Re-run the new or updated script against the failing artifact when available.
+   - For instruction-only fixes, run the skill package validator or a focused syntax check for changed scripts.
+   - Report which session was inspected, which failures were found, which skills were changed, and what validation was run.
