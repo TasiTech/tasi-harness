@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentRunOptions, AgentRunResult, AppConfig, RegisteredTool, ToolApprovalRequester } from '../shared/types.js';
@@ -51,6 +51,29 @@ function findResourcesRoot(): string {
   const withMarkets = candidates.find((candidate) => candidate && existsSync(join(candidate, 'markets')));
   if (withMarkets) return withMarkets;
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? resolve(process.cwd(), 'resources');
+}
+
+function consumeInstallerSkillOverwriteChoice(harnessHome: string): { overwriteExisting?: boolean; overwriteSkillNames?: string[] } {
+  const marker = join(harnessHome, 'runtime', 'installer-skill-overwrite.json');
+  if (!existsSync(marker)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8')) as { overwriteBundledSkills?: unknown; overwriteSkillNames?: unknown };
+    const overwriteSkillNames = Array.isArray(parsed.overwriteSkillNames)
+      ? parsed.overwriteSkillNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    return {
+      overwriteExisting: parsed.overwriteBundledSkills === true,
+      overwriteSkillNames
+    };
+  } catch {
+    return {};
+  } finally {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // Best-effort cleanup. A stale marker should not block CLI startup.
+    }
+  }
 }
 
 function isCliAvailableTool(tool: RegisteredTool): boolean {
@@ -113,7 +136,7 @@ export class CliContext {
     this.syncMemoryFromExistingSessions();
     this.scheduledTaskStore = new ScheduledTaskStore(this.harnessHome);
     this.skillManager = new SkillManager(this.harnessHome, findBundledSkillsRoot());
-    this.skillManager.seedBundledSkills();
+    this.skillManager.seedBundledSkills(consumeInstallerSkillOverwriteChoice(this.harnessHome));
     this.mcpConfigStore = new McpConfigStore(this.harnessHome);
     this.sandboxManager = new SandboxManager(this.harnessHome);
     this.browserExecutionLogger = new BrowserExecutionLogger(

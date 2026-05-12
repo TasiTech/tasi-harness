@@ -94,6 +94,7 @@ declare global {
         create(req: SkillWriteRequest): Promise<SkillDocument>;
         patch(req: SkillPatchRequest): Promise<SkillDocument>;
         delete(name: string): Promise<boolean>;
+        installBundled(name: string, overwrite?: boolean): Promise<SkillDocument>;
         uploadArchive(req: SkillArchiveUploadRequest): Promise<SkillDocument>;
         browseMarketplace(query?: string): Promise<MarketplaceBrowseResult>;
         installFromMarketplace(req: SkillInstallRequest): Promise<MarketplaceSkill>;

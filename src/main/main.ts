@@ -1321,6 +1321,7 @@ function registerIpc(): void {
   ipcMain.handle('skills:create', (_event, req: SkillWriteRequest) => context.skillManager.create(req));
   ipcMain.handle('skills:patch', (_event, req: SkillPatchRequest) => context.skillManager.patch(req));
   ipcMain.handle('skills:delete', (_event, name: string) => context.skillManager.delete(name));
+  ipcMain.handle('skills:installBundled', (_event, name: string, overwrite?: boolean) => context.skillManager.installBundled(name, Boolean(overwrite)));
   ipcMain.handle('skills:uploadArchive', (_event, req: SkillArchiveUploadRequest) => context.skillManager.uploadArchive(req));
   ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));

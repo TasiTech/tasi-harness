@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -81,6 +81,51 @@ function prepareCliAssets(targets) {
     }
     chmodSync(scriptPath, 0o755);
   }
+}
+
+function parseSkillFrontmatter(content) {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return {};
+  const data = {};
+  for (const raw of match[1].split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    data[line.slice(0, idx).trim()] = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+  }
+  return data;
+}
+
+function findSkillFiles(root) {
+  if (!existsSync(root)) return [];
+  const out = [];
+  const visit = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const file = join(dir, name);
+      const stat = statSync(file);
+      if (stat.isDirectory()) visit(file);
+      else if (name === 'SKILL.md') out.push(file);
+    }
+  };
+  visit(root);
+  return out;
+}
+
+function generateBundledSkillManifest(targets) {
+  if (!targets.win) return;
+  const skillsRoot = join(rootDir, 'resources', 'skills');
+  const manifestPath = join(rootDir, 'build', 'nsis', 'bundled-skills.json');
+  const skills = findSkillFiles(skillsRoot).map((file) => {
+    const frontmatter = parseSkillFrontmatter(readFileSync(file, 'utf8'));
+    return {
+      name: String(frontmatter.name || file.split(/[\\/]/).at(-2) || '').trim(),
+      category: String(frontmatter.category || file.split(/[\\/]/).at(-3) || '').trim()
+    };
+  }).filter((skill) => skill.name).sort((a, b) => a.name.localeCompare(b.name));
+  mkdirSync(join(rootDir, 'build', 'nsis'), { recursive: true });
+  writeFileSync(manifestPath, `${JSON.stringify({ generatedAt: new Date().toISOString(), skills }, null, 2)}\n`, 'utf8');
+  console.log(`Generated bundled skill manifest: ${manifestPath} (${skills.length} skills)`);
 }
 
 function ensureSuccess(result, title) {
@@ -202,6 +247,7 @@ if (targets.mac && process.platform !== 'darwin' && !allowCrossMac) {
 
 const npm = commandName('npm');
 prepareCliAssets(targets);
+generateBundledSkillManifest(targets);
 if (!argv.has('--skip-build')) {
   ensureSuccess(run(npm, ['run', 'build'], 'Building app'), 'Building app');
 }

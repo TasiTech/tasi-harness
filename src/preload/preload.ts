@@ -98,6 +98,7 @@ const api = {
     create: (req: SkillWriteRequest) => ipcRenderer.invoke('skills:create', req),
     patch: (req: SkillPatchRequest) => ipcRenderer.invoke('skills:patch', req),
     delete: (name: string) => ipcRenderer.invoke('skills:delete', name),
+    installBundled: (name: string, overwrite?: boolean) => ipcRenderer.invoke('skills:installBundled', name, overwrite),
     uploadArchive: (req: SkillArchiveUploadRequest) => ipcRenderer.invoke('skills:uploadArchive', req),
     browseMarketplace: (query?: string) => ipcRenderer.invoke('skills:market:browse', query),
     installFromMarketplace: (req: SkillInstallRequest) => ipcRenderer.invoke('skills:market:install', req),

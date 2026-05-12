@@ -32,7 +32,7 @@ describe('SkillManager', () => {
     expect(manager.list().map((s) => s.name)).toContain('repo-review');
   });
 
-  it('updates bundled skill local copies without changing unrelated local skills', () => {
+  it('seeds bundled skills without overwriting existing local edits', () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const bundledRoot = join(env.home, 'bundled-skills');
@@ -56,13 +56,59 @@ describe('SkillManager', () => {
     const manager = new SkillManager(env.home, bundledRoot);
     manager.seedBundledSkills();
 
+    expect(readFileSync(join(localSkillDir, 'SKILL.md'), 'utf8')).toContain('Keep local edits.');
+    expect(readFileSync(join(localSkillDir, 'stale.txt'), 'utf8')).toContain('old bundled file');
+    expect(readFileSync(join(userSkillDir, 'SKILL.md'), 'utf8')).toContain('Keep user skill.');
+    expect(manager.list().find((skill) => skill.name === 'docx')?.bundledPath).toContain(join('bundled-skills', 'work', 'docx', 'SKILL.md'));
+  });
+
+  it('installs a bundled skill only when overwrite is chosen', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const bundledRoot = join(env.home, 'bundled-skills');
+    const bundledSkillDir = join(bundledRoot, 'work', 'docx');
+    mkdirSync(join(bundledSkillDir, 'scripts'), { recursive: true });
+    writeFileSync(join(bundledSkillDir, 'SKILL.md'), '---\nname: docx\ndescription: bundled\ncategory: work\n---\n\nUse bundled skill.\n', 'utf8');
+    writeFileSync(join(bundledSkillDir, 'scripts', 'document.py'), 'print("ok")\n', 'utf8');
+
+    const localSkillDir = join(env.home, 'skills', 'work', 'docx');
+    mkdirSync(localSkillDir, { recursive: true });
+    writeFileSync(join(localSkillDir, 'SKILL.md'), '---\nname: docx\ndescription: local\ncategory: work\n---\n\nKeep local edits.\n', 'utf8');
+    writeFileSync(join(localSkillDir, 'stale.txt'), 'old bundled file\n', 'utf8');
+
+    const manager = new SkillManager(env.home, bundledRoot);
+    expect(() => manager.installBundled('docx')).toThrow(/already exists/i);
+
+    const installed = manager.installBundled('docx', true);
+    expect(installed.readonly).toBe(false);
     expect(readFileSync(join(localSkillDir, 'SKILL.md'), 'utf8')).toContain('Use bundled skill.');
     expect(existsSync(join(localSkillDir, 'stale.txt'))).toBe(false);
-    expect(readFileSync(join(localSkillDir, 'docx-js.md'), 'utf8')).toContain('reference doc');
     expect(readFileSync(join(localSkillDir, 'scripts', 'document.py'), 'utf8')).toContain('print("ok")');
-    expect(readFileSync(join(localSkillDir, 'scripts', 'templates', 'people.xml'), 'utf8')).toContain('<people />');
-    expect(readFileSync(join(localSkillDir, 'ooxml', 'schemas', 'wml.xsd'), 'utf8')).toContain('<schema />');
-    expect(readFileSync(join(userSkillDir, 'SKILL.md'), 'utf8')).toContain('Keep user skill.');
+  });
+
+  it('seeds only selected bundled skills when names are provided', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const bundledRoot = join(env.home, 'bundled-skills');
+    const bundledDocxDir = join(bundledRoot, 'work', 'docx');
+    const bundledPptxDir = join(bundledRoot, 'work', 'pptx');
+    mkdirSync(bundledDocxDir, { recursive: true });
+    mkdirSync(bundledPptxDir, { recursive: true });
+    writeFileSync(join(bundledDocxDir, 'SKILL.md'), '---\nname: docx\ndescription: bundled\ncategory: work\n---\n\nBundled docx.\n', 'utf8');
+    writeFileSync(join(bundledPptxDir, 'SKILL.md'), '---\nname: pptx\ndescription: bundled\ncategory: work\n---\n\nBundled pptx.\n', 'utf8');
+
+    const localDocxDir = join(env.home, 'skills', 'work', 'docx');
+    const localPptxDir = join(env.home, 'skills', 'work', 'pptx');
+    mkdirSync(localDocxDir, { recursive: true });
+    mkdirSync(localPptxDir, { recursive: true });
+    writeFileSync(join(localDocxDir, 'SKILL.md'), '---\nname: docx\ndescription: local\ncategory: work\n---\n\nLocal docx.\n', 'utf8');
+    writeFileSync(join(localPptxDir, 'SKILL.md'), '---\nname: pptx\ndescription: local\ncategory: work\n---\n\nLocal pptx.\n', 'utf8');
+
+    const manager = new SkillManager(env.home, bundledRoot);
+    manager.seedBundledSkills({ overwriteSkillNames: ['pptx'] });
+
+    expect(readFileSync(join(localDocxDir, 'SKILL.md'), 'utf8')).toContain('Local docx.');
+    expect(readFileSync(join(localPptxDir, 'SKILL.md'), 'utf8')).toContain('Bundled pptx.');
   });
 
   it('uploads root skill archives with nested supporting files', async () => {

@@ -34,6 +34,7 @@ import {
 import { extractCitationLinks, type CitationLink } from './citations.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
+import JSZip from 'jszip';
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -2745,6 +2746,34 @@ function normalizeSkillContent(content: string, name: string, category: string):
   return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, '---', '', body, ''].join('\n');
 }
 
+function parseSkillFrontmatter(content: string): Record<string, string> {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return {};
+  const out: Record<string, string> = {};
+  for (const raw of match[1].split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (key) out[key] = value;
+  }
+  return out;
+}
+
+async function inspectSkillArchive(file: File): Promise<{ name?: string; category?: string }> {
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+  const skillEntry = entries.find((entry) => /(^|\/)SKILL\.md$/i.test(entry.name.replace(/\\/g, '/')));
+  if (!skillEntry) throw new Error('Archive must include SKILL.md.');
+  const frontmatter = parseSkillFrontmatter(await skillEntry.async('string'));
+  return {
+    name: frontmatter.name,
+    category: frontmatter.category
+  };
+}
+
 const emptyCoachRecording: BrowserCoachRecording = {
   id: '',
   startUrl: '',
@@ -2789,6 +2818,9 @@ function SkillsPage({
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadNotice, setUploadNotice] = useState('');
   const [uploadError, setUploadError] = useState('');
+  const [uploadOverwrite, setUploadOverwrite] = useState(false);
+  const [uploadPackageSkillName, setUploadPackageSkillName] = useState('');
+  const [overwriteSelections, setOverwriteSelections] = useState<Record<string, boolean>>({});
   const [coachUrl, setCoachUrl] = useState('https://www.baidu.com');
   const [coachRecording, setCoachRecording] = useState<BrowserCoachRecording>(emptyCoachRecording);
   const [coachSkillName, setCoachSkillName] = useState('recorded-browser-workflow');
@@ -2912,6 +2944,31 @@ function SkillsPage({
     return normalized || 'uploaded-skill';
   }
 
+  function normalizeSkillNameForCompare(name: string): string {
+    return name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  }
+
+  function existingSkillForName(name: string): SkillMetadata | undefined {
+    const target = normalizeSkillNameForCompare(name);
+    if (!target) return undefined;
+    return skills.find((skill) => normalizeSkillNameForCompare(skill.name) === target);
+  }
+
+  function marketplaceExistingSkill(skill: MarketplaceSkill): SkillMetadata | undefined {
+    return [skill.installedSkillName, skill.name, skill.id]
+      .filter((name): name is string => Boolean(name?.trim()))
+      .map((name) => existingSkillForName(name))
+      .find((item): item is SkillMetadata => Boolean(item));
+  }
+
+  function overwriteSelected(key: string): boolean {
+    return Boolean(overwriteSelections[key]);
+  }
+
+  function setOverwriteSelection(key: string, checked: boolean): void {
+    setOverwriteSelections((old) => ({ ...old, [key]: checked }));
+  }
+
   async function fileToBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -2924,6 +2981,21 @@ function SkillsPage({
       reader.onerror = () => reject(reader.error ?? new Error('Failed to read file.'));
       reader.readAsDataURL(file);
     });
+  }
+
+  async function inspectUploadPackage(file: File): Promise<void> {
+    setUploadPackageSkillName('');
+    try {
+      const metadata = await inspectSkillArchive(file);
+      if (metadata.name?.trim()) {
+        setUploadName(metadata.name.trim());
+        setUploadPackageSkillName(metadata.name.trim());
+      }
+      if (metadata.category?.trim()) setUploadCategory(metadata.category.trim());
+      setUploadOverwrite(false);
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function saveEditor(): Promise<void> {
@@ -2974,6 +3046,15 @@ function SkillsPage({
   async function install(skill: MarketplaceSkill): Promise<void> {
     const { sourceId, id: skillId } = skill;
     const actionKey = `install:${sourceId}:${skillId}`;
+    const existing = marketplaceExistingSkill(skill);
+    const overwrite = existing ? overwriteSelected(actionKey) : false;
+    if (existing && !overwrite) {
+      setMarketError(tr(
+        `Skill ${existing.name} already exists. Check "Overwrite existing skill" to replace it.`,
+        `技能 ${existing.name} 已存在。勾选“覆盖现有技能”后才会替换。`
+      ));
+      return;
+    }
     setMarketActionKey(actionKey);
     setMarketError('');
     try {
@@ -2994,7 +3075,8 @@ function SkillsPage({
           homepage: skill.homepage,
           remoteVersionId: skill.remoteVersionId,
           installCommand: skill.installCommand
-        }
+        },
+        overwrite
       });
       setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
       await refreshSkills();
@@ -3037,6 +3119,15 @@ function SkillsPage({
       setUploadError('Please fill in a skill name.');
       return;
     }
+    const existing = existingSkillForName(skillName);
+    const overwrite = existing ? uploadOverwrite : false;
+    if (existing && !overwrite) {
+      setUploadError(tr(
+        `Skill ${existing.name} already exists. Check "Overwrite existing skill" to replace it.`,
+        `技能 ${existing.name} 已存在。勾选“覆盖现有技能”后才会替换。`
+      ));
+      return;
+    }
     setUploadBusy(true);
     try {
       const contentBase64 = await fileToBase64(uploadFile);
@@ -3044,7 +3135,8 @@ function SkillsPage({
         filename: uploadFile.name,
         contentBase64,
         name: skillName,
-        category: uploadCategory.trim() || 'local'
+        category: uploadCategory.trim() || 'local',
+        overwrite
       });
       setUploadNotice(`Uploaded and installed ${created.name}.`);
       setNotice(`Uploaded and installed ${created.name}.`);
@@ -3132,6 +3224,30 @@ function SkillsPage({
     }
   }
 
+  async function installBundledVersion(skill: SkillMetadata): Promise<void> {
+    const actionKey = `bundled:${skill.name}`;
+    const overwrite = overwriteSelected(actionKey);
+    if (!overwrite) {
+      setNotice(tr(
+        `Skill ${skill.name} was kept. Check "Overwrite existing skill" to replace it with the bundled version.`,
+        `已保留技能 ${skill.name}。勾选“覆盖现有技能”后才会用内置版本替换。`
+      ));
+      return;
+    }
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      const installed = await window.tasiHarness.skills.installBundled(skill.name, true);
+      setNotice(tr(`Replaced ${skill.name} with bundled skill.`, `已用内置版本覆盖 ${skill.name}。`));
+      await refreshSkills();
+      await openInstalledSkill(installed.name);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
+  }
+
   async function refreshOptimizationSessions(): Promise<void> {
     setOptimizeRefreshing(true);
     setOptimizeError('');
@@ -3195,8 +3311,30 @@ function SkillsPage({
                     <span>{skill.category}</span>
                     <span>{skill.marketplaceSourceId ?? skill.source}</span>
                   </div>
+                  {skill.bundledPath && (
+                    <div className="meta-row wrap upload-file-row">
+                      <span className="soft-badge">{tr('Bundled version available', '有内置版本')}</span>
+                      <label className="toggle-line overwrite-toggle">
+                        <input
+                          type="checkbox"
+                          checked={overwriteSelected(`bundled:${skill.name}`)}
+                          onChange={(event) => setOverwriteSelection(`bundled:${skill.name}`, event.target.checked)}
+                        />
+                        {tr('Overwrite existing skill', '覆盖现有技能')}
+                      </label>
+                    </div>
+                  )}
                   <div className="button-row compact skill-actions">
                     <button className="ghost-button" onClick={() => void openInstalledSkill(skill.name)}>{tr('Open', '打开')}</button>
+                    {skill.bundledPath && (
+                      <button
+                        className="ghost-button"
+                        disabled={marketActionKey === `bundled:${skill.name}` || !overwriteSelected(`bundled:${skill.name}`)}
+                        onClick={() => void installBundledVersion(skill)}
+                      >
+                        {marketActionKey === `bundled:${skill.name}` ? tr('Replacing...', '覆盖中...') : tr('Use Bundled', '用内置版本覆盖')}
+                      </button>
+                    )}
                     {!skill.readonly && <button className="danger-button" onClick={() => void uninstall(skill.name)}>{tr('Uninstall', '卸载')}</button>}
                   </div>
                 </div>
@@ -3226,18 +3364,30 @@ function SkillsPage({
                     const uninstallActionKey = `uninstall:${skill.installedSkillName ?? ''}`;
                     const installBusy = marketActionKey === installActionKey;
                     const uninstallBusy = marketActionKey === uninstallActionKey;
+                    const existing = marketplaceExistingSkill(skill);
+                    const needsOverwrite = Boolean(existing && !skill.installed);
                     return (
                   <div className="marketplace-card-top">
                     <div>
                       <strong>{skill.name}</strong>
                       <div className="card-subtle">{skill.sourceName} | {skill.category} | v{skill.version}</div>
+                      {needsOverwrite && (
+                        <label className="toggle-line overwrite-toggle">
+                          <input
+                            type="checkbox"
+                            checked={overwriteSelected(installActionKey)}
+                            onChange={(event) => setOverwriteSelection(installActionKey, event.target.checked)}
+                          />
+                          {tr(`Overwrite existing skill ${existing?.name}`, `覆盖现有技能 ${existing?.name}`)}
+                        </label>
+                      )}
                     </div>
                     {skill.installed && skill.installedSkillName ? (
                       <button className="danger-button" disabled={uninstallBusy || marketActionKey !== null} onClick={() => void uninstall(skill.installedSkillName ?? '')}>
                         {uninstallBusy ? tr('Uninstalling...', '卸载中...') : tr('Uninstall', '卸载')}
                       </button>
                     ) : (
-                      <button className="primary-button" disabled={installBusy || marketActionKey !== null} onClick={() => void install(skill)}>
+                      <button className="primary-button" disabled={installBusy || marketActionKey !== null || (needsOverwrite && !overwriteSelected(installActionKey))} onClick={() => void install(skill)}>
                         {installBusy ? tr('Installing...', '安装中...') : tr('Install', '安装')}
                       </button>
                     )}
@@ -3258,28 +3408,45 @@ function SkillsPage({
             <label>{tr('ZIP package', 'ZIP 文件')}</label>
             <input
               type="file"
-              accept=".zip,application/zip"
+              accept=".zip,.skill,application/zip"
               onChange={(e) => {
                 const file = e.target.files?.[0] ?? null;
                 setUploadFile(file);
+                setUploadPackageSkillName('');
+                setUploadOverwrite(false);
                 if (file) {
                   setUploadName(suggestSkillNameFromFilename(file.name));
                   setUploadError('');
+                  void inspectUploadPackage(file);
                 }
               }}
             />
             <label>{tr('Skill name', '技能名')}</label>
-            <input value={uploadName} onChange={(e) => setUploadName(e.target.value)} placeholder={tr('required, e.g. my-automation-skill', '必填，例如：my-automation-skill')} />
+            <input
+              value={uploadName}
+              onChange={(e) => {
+                setUploadName(e.target.value);
+                setUploadOverwrite(false);
+              }}
+              placeholder={tr('required, e.g. my-automation-skill', '必填，例如：my-automation-skill')}
+            />
             <label>{tr('Category', '分类')}</label>
             <input value={uploadCategory} onChange={(e) => setUploadCategory(e.target.value)} placeholder="local" />
+            {existingSkillForName(uploadName) && (
+              <label className="toggle-line overwrite-toggle">
+                <input type="checkbox" checked={uploadOverwrite} onChange={(event) => setUploadOverwrite(event.target.checked)} />
+                {tr(`Overwrite existing skill ${existingSkillForName(uploadName)?.name}`, `覆盖现有技能 ${existingSkillForName(uploadName)?.name}`)}
+              </label>
+            )}
             {uploadFile && (
               <div className="meta-row wrap upload-file-row">
                 <span className="soft-badge">{tr('File', '文件')}: {uploadFile.name}</span>
                 <span className="soft-badge">{tr('Size', '大小')}: {(uploadFile.size / 1024).toFixed(1)} KB</span>
+                {uploadPackageSkillName && <span className="soft-badge">{tr('Package skill', '包内技能')}: {uploadPackageSkillName}</span>}
               </div>
             )}
             <div className="button-row">
-              <button className="primary-button" disabled={uploadBusy} onClick={() => void uploadArchive()}>
+              <button className="primary-button" disabled={uploadBusy || Boolean(existingSkillForName(uploadName) && !uploadOverwrite)} onClick={() => void uploadArchive()}>
                 {uploadBusy ? tr('Uploading...', '上传中...') : tr('Upload and Install', '上传并安装')}
               </button>
             </div>

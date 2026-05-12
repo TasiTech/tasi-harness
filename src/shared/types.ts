@@ -261,6 +261,8 @@ export interface SkillMetadata {
   readonly: boolean;
   source: 'bundled' | 'local';
   updatedAt?: string;
+  bundledPath?: string;
+  bundledUpdatedAt?: string;
   marketplaceSourceId?: string;
   marketplaceSkillId?: string;
   version?: string;
@@ -424,6 +426,7 @@ export interface SkillInstallRequest {
   sourceId: string;
   skillId: string;
   skill?: MarketplaceSkillSnapshot;
+  overwrite?: boolean;
 }
 
 export interface EmailNotificationSettings {
@@ -538,6 +541,7 @@ export interface SkillWriteRequest {
   name: string;
   content: string;
   category?: string;
+  overwrite?: boolean;
 }
 
 export interface SkillPatchRequest {
@@ -551,6 +555,7 @@ export interface SkillArchiveUploadRequest {
   contentBase64: string;
   name?: string;
   category?: string;
+  overwrite?: boolean;
 }
 
 export type BrowserCoachEventType = 'navigation' | 'click' | 'input' | 'change' | 'submit' | 'keydown' | 'window_closed';

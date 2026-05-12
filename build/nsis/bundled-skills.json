@@ -1,0 +1,69 @@
+{
+  "generatedAt": "2026-05-12T10:20:08.986Z",
+  "skills": [
+    {
+      "name": "chart-generator",
+      "category": "work"
+    },
+    {
+      "name": "code-review",
+      "category": "developer"
+    },
+    {
+      "name": "deep-search",
+      "category": "browser"
+    },
+    {
+      "name": "diagram-generator-1.1.1",
+      "category": "local"
+    },
+    {
+      "name": "document",
+      "category": "work"
+    },
+    {
+      "name": "docx",
+      "category": "document-processing"
+    },
+    {
+      "name": "embedded-browser-operator",
+      "category": "browser"
+    },
+    {
+      "name": "pdf",
+      "category": "work"
+    },
+    {
+      "name": "persistent-memory",
+      "category": "productivity"
+    },
+    {
+      "name": "pptx",
+      "category": "work"
+    },
+    {
+      "name": "skill-creator",
+      "category": "skill"
+    },
+    {
+      "name": "tasi-browser-automation",
+      "category": "browser"
+    },
+    {
+      "name": "tasi-travel",
+      "category": "travel"
+    },
+    {
+      "name": "typescript-project",
+      "category": "developer"
+    },
+    {
+      "name": "ui-ux-pro-max",
+      "category": "work"
+    },
+    {
+      "name": "xlsx",
+      "category": "work"
+    }
+  ]
+}

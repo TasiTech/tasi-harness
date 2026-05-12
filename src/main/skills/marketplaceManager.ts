@@ -195,7 +195,8 @@ export class MarketplaceManager {
     const doc = this.skillManager.create({
       name: String(frontmatter.name),
       category: String(frontmatter.category),
-      content
+      content,
+      overwrite: req.overwrite
     });
     this.writeSupportingFiles(doc.name, catalogSkill.supportingFiles);
     return {
@@ -442,7 +443,8 @@ export class MarketplaceManager {
         {
           filename: `${catalogSkill.id}.zip`,
           contentBase64: archive.toString('base64'),
-          category: catalogSkill.category
+          category: catalogSkill.category,
+          overwrite: req.overwrite
         },
         {
           marketplace_source_id: req.sourceId,

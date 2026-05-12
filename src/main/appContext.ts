@@ -1,5 +1,5 @@
 import { app } from 'electron';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig, RegisteredTool } from '../shared/types.js';
@@ -53,6 +53,29 @@ function findResourcesRoot(): string {
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? resolve(process.cwd(), 'resources');
 }
 
+function consumeInstallerSkillOverwriteChoice(harnessHome: string): { overwriteExisting?: boolean; overwriteSkillNames?: string[] } {
+  const marker = join(harnessHome, 'runtime', 'installer-skill-overwrite.json');
+  if (!existsSync(marker)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8')) as { overwriteBundledSkills?: unknown; overwriteSkillNames?: unknown };
+    const overwriteSkillNames = Array.isArray(parsed.overwriteSkillNames)
+      ? parsed.overwriteSkillNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    return {
+      overwriteExisting: parsed.overwriteBundledSkills === true,
+      overwriteSkillNames
+    };
+  } catch {
+    return {};
+  } finally {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // Best-effort cleanup. A stale marker should not block startup.
+    }
+  }
+}
+
 export class AppContext {
   readonly harnessHome: string;
   readonly configStore: ConfigStore;
@@ -84,7 +107,7 @@ export class AppContext {
     this.syncMemoryFromExistingSessions();
     this.scheduledTaskStore = new ScheduledTaskStore(this.harnessHome);
     this.skillManager = new SkillManager(this.harnessHome, findBundledSkillsRoot());
-    this.skillManager.seedBundledSkills();
+    this.skillManager.seedBundledSkills(consumeInstallerSkillOverwriteChoice(this.harnessHome));
     this.mcpConfigStore = new McpConfigStore(this.harnessHome);
     this.sandboxManager = new SandboxManager(this.harnessHome);
     this.emailNotifier = new EmailNotifier();

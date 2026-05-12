@@ -56,11 +56,15 @@ export class SkillManager {
     ensureDir(this.localRoot);
   }
 
-  seedBundledSkills(): void {
+  seedBundledSkills(options: { overwriteExisting?: boolean; overwriteSkillNames?: string[] } = {}): void {
     if (!this.bundledRoot || !existsSync(this.bundledRoot)) return;
+    const overwriteNames = new Set((options.overwriteSkillNames ?? []).map((name) => slugifyName(name)));
     for (const file of this.findSkillFiles(this.bundledRoot)) {
       const rel = relative(this.bundledRoot, dirname(file));
       const targetDir = safeJoin(this.localRoot, rel);
+      const skillName = this.metadataFromFile(file, true, 'bundled').name;
+      const shouldOverwrite = options.overwriteExisting || overwriteNames.has(slugifyName(skillName));
+      if (existsSync(targetDir) && !shouldOverwrite) continue;
       this.replaceBundledSkillFiles(dirname(file), targetDir);
     }
   }
@@ -70,7 +74,17 @@ export class SkillManager {
     const local = this.findSkillFiles(this.localRoot).map((f) => this.metadataFromFile(f, false, 'local'));
     const byName = new Map<string, SkillMetadata>();
     for (const skill of bundled) byName.set(skill.name, skill);
-    for (const skill of local) byName.set(skill.name, skill);
+    const bundledBySlug = new Map(bundled.map((skill) => [slugifyName(skill.name), skill]));
+    for (const skill of local) {
+      const shadowedBundled = bundledBySlug.get(slugifyName(skill.name));
+      byName.set(skill.name, shadowedBundled
+        ? {
+          ...skill,
+          bundledPath: shadowedBundled.path,
+          bundledUpdatedAt: shadowedBundled.updatedAt
+        }
+        : skill);
+    }
     return [...byName.values()].sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
   }
 
@@ -94,6 +108,10 @@ export class SkillManager {
     const slug = slugifyName(req.name);
     const category = slugifyName(req.category || 'local');
     const dir = safeJoin(this.localRoot, join(category, slug));
+    if (existsSync(dir)) {
+      if (!req.overwrite) throw new Error(`Skill already exists: ${req.name}. Choose overwrite to replace it.`);
+      rmSync(dir, { recursive: true, force: true });
+    }
     ensureDir(dir);
     const { frontmatter, body } = parseSkillMarkdown(req.content);
     const finalFrontmatter: Frontmatter = {
@@ -149,7 +167,8 @@ export class SkillManager {
     const created = this.create({
       name: skillName,
       category: skillCategory || 'local',
-      content
+      content,
+      overwrite: req.overwrite
     });
     const skillRoot = this.skillRootForEntry(skillEntry.name);
     for (const entry of entries) {
@@ -162,6 +181,19 @@ export class SkillManager {
       this.writeSupportingFile(created.name, relPath, fileContent);
     }
     return this.documentFromFile(this.localSkillFile(created.name), true, 'local');
+  }
+
+  installBundled(name: string, overwrite = false): SkillDocument {
+    if (!this.bundledRoot || !existsSync(this.bundledRoot)) throw new Error('Bundled skills root is not available.');
+    const bundled = this.readBundled(name);
+    if (!bundled) throw new Error(`Bundled skill not found: ${name}`);
+    const rel = relative(this.bundledRoot, dirname(bundled.path));
+    const targetDir = safeJoin(this.localRoot, rel);
+    if (existsSync(targetDir) && !overwrite) {
+      throw new Error(`Local skill already exists: ${bundled.name}. Choose overwrite to replace it.`);
+    }
+    this.replaceBundledSkillFiles(dirname(bundled.path), targetDir);
+    return this.documentFromFile(join(targetDir, 'SKILL.md'), false, 'local');
   }
 
   delete(name: string): boolean {

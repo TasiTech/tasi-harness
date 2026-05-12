@@ -1134,6 +1134,7 @@ progress::-webkit-progress-value { background: var(--accent); }
   text-decoration: none;
 }
 .upload-file-row { margin-top: 10px; }
+.overwrite-toggle { margin: 8px 0 0; color: var(--text-secondary); font-size: 12px; }
 .coach-layout {
   display: grid;
   grid-template-columns: minmax(280px, 0.8fr) minmax(360px, 1.2fr);
