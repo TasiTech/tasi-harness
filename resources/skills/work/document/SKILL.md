@@ -1,7 +1,7 @@
 ---
-name: solution-generator
-description: "Generate and rewrite high-quality document text (not layout) for solutions, reports, proposals, plans, or analysis before Word/PDF formatting. Enforce Request → Plan → Draft → Audit → Refine → Deliver for complex tasks; allow streamlined handling for simple requests."
-category: document
+name: document
+description: "Generate, rewrite, expand, or polish high-quality document text for solutions, reports, proposals, plans, presentations, or analysis before Word/PDF/PPT formatting. Use for text-first deliverables that may need planned figure insertions, including flowcharts, architecture diagrams, topology diagrams, process diagrams, design sketches, data charts, and analytical visualizations. Enforce Request → Plan → Draft → Audit → Refine → Deliver for complex writing tasks; allow streamlined handling for simple text-only requests."
+category: work
 license: Proprietary
 ---
 
@@ -9,9 +9,9 @@ license: Proprietary
 
 ## Scope
 
-This skill controls **text content only**: topic understanding, section writing, detail depth, and final narrative quality.
+This skill controls **document content and figure planning**: topic understanding, section writing, detail depth, final narrative quality, and where diagrams should appear in the document.
 
-Use this skill when users ask to write, rewrite, expand, or polish document text.
+Use this skill when users ask to write, rewrite, expand, or polish document text. When diagrams would improve comprehension, include clear figure placeholders and diagram specifications in the document content. This skill does not directly edit binary Word/PDF/PPT files; use file-format skills for final document packaging.
 
 ## Workflow
 
@@ -39,6 +39,8 @@ Execution rules:
 - If the user asks for only one stage (for example, outline only), comply while preserving quality standards for that stage.
 - Match the user's language by default unless they request another language.
 - Do not fabricate specific facts, metrics, citations, or policy details; mark uncertain items clearly.
+- When the document would benefit from a visual, plan the figure location during **Plan**, draft the surrounding explanation during **Draft**, and verify every figure has a purpose, title, and source/specification during **Audit**. See [diagram-inserts.md](references/diagram-inserts.md) for diagram placement rules and [data-chart-inserts.md](references/data-chart-inserts.md) for data chart planning rules.
+- For formal方案/设计文档, require Draw.io diagram sources and exported PNG/SVG assets for all required design figures. Do not use Mermaid. The final document package is incomplete until exported images are embedded in the Word/PDF/PPTX body near their relevant sections.
 
 ## Content Quality Defaults (Critical)
 
@@ -72,6 +74,8 @@ Length guidance (default baseline unless user specifies otherwise):
 - For recommendations/proposals, include: current situation, problem analysis, proposed solution, implementation steps, risk control, expected outcomes.
 - For plans, include: timeline, owner roles, milestones, and measurable acceptance criteria.
 - For analytical content, include: claim, supporting facts, interpretation, and conclusion.
+- For visual-heavy documents, insert diagrams or data charts immediately after the paragraph that introduces the process, architecture, topology, design decision, metric trend, comparison, or analytical claim. Include a caption, source format, target export format (SVG/PNG), and, when useful, a compact specification block that downstream diagram/chart/file skills can render.
+- For formal方案/设计文档 with diagrams, include an embedded asset path for each figure and require the downstream docx/pdf/pptx workflow to insert the exported image itself. A file list in the appendix is supplementary and never a substitute for embedded figures.
 - Close longer documents with a concise summary and explicit next-step checklist.
 
 ## Writing Quality Checklist
@@ -82,4 +86,5 @@ Before finishing content generation, verify:
 - The document includes concrete details (examples, constraints, assumptions, or metrics).
 - Tone and wording match the target audience (e.g., management, technical team, client, regulator).
 - The conclusion includes clear decisions or next actions.
+- Visual deliverables include exported and embedded figure assets; no required diagram remains only as a source file, path, appendix inventory row, or Mermaid block.
 - Any uncertain or unverified factual detail is clearly labeled, not presented as confirmed fact.

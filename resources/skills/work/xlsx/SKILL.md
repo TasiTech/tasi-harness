@@ -131,19 +131,34 @@ This applies to ALL calculations - totals, percentages, ratios, differences, etc
 2. **Create/Load**: Create new workbook or load existing file
 3. **Modify**: Add/edit data, formulas, and formatting
 4. **Save**: Write to file
-5. **Recalculate formulas (MANDATORY IF USING FORMULAS)**: Use the recalc.py script
+5. **Validate package structure**: Run the XLSX openability validator:
+   ```bash
+   node scripts/validate_xlsx.mjs --input output.xlsx
+   ```
+   Treat any `ok: false` result as a failed workbook. The validator checks ZIP readability, required XLSX parts, XML well-formedness, sheet references, relationship targets, shared string indexes, style indexes, merge ranges, and embedded media signatures.
+   Fix/regenerate the workbook and rerun validation before delivery.
+6. **Recalculate formulas (MANDATORY IF USING FORMULAS)**: Use the recalc.py script
    ```bash
    python recalc.py output.xlsx
    ```
-6. **Verify and fix any errors**: 
+7. **Verify and fix any errors**: 
    - The script returns JSON with error details
    - If `status` is `errors_found`, check `error_summary` for specific error types and locations
    - Fix the identified errors and recalculate again
+   - If recalculation rewrites the file, rerun `node scripts/validate_xlsx.mjs --input output.xlsx` after formula errors are fixed
    - Common errors to fix:
      - `#REF!`: Invalid cell references
      - `#DIV/0!`: Division by zero
      - `#VALUE!`: Wrong data type in formula
      - `#NAME?`: Unrecognized formula name
+
+### XLSX openability gate
+
+Before delivering any generated or edited workbook:
+- Run `node scripts/validate_xlsx.mjs --input output.xlsx`.
+- If formulas are present, run `python recalc.py output.xlsx` and require zero formula errors.
+- Do not deliver a workbook with missing parts, malformed XML, broken `.rels` targets, missing worksheet parts, out-of-range shared string indexes, out-of-range style indexes, invalid merge ranges, or invalid embedded media signatures.
+- If a workbook includes exported charts/images, validate the source assets first and avoid browser viewport screenshots for formal figures.
 
 ### Creating new Excel files
 

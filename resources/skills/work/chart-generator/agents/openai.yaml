@@ -1,0 +1,7 @@
+interface:
+  display_name: "Chart Generator"
+  short_description: "Generate SVG charts from CSV data and chart specs."
+  default_prompt: "Use $chart-generator to create a chart asset from a CSV file and a clear chart specification."
+
+policy:
+  allow_implicit_invocation: true

@@ -226,22 +226,6 @@ new Table({
 - **2 columns:** `columnWidths: [4680, 4680]` (equal width)
 - **3 columns:** `columnWidths: [3120, 3120, 3120]` (equal width)
 
-**Table Generation Reliability Protocol (Use when tables are required):**
-- Build a `Table` object in a standalone constant first, then inject it into `sections[0].children`.
-- Keep the first pass minimal: header row + one data row only. Add advanced styles after successful generation.
-- Every `TableCell` must include `children: [new Paragraph(...)]` (never leave cell children empty).
-- Use BOTH table-level `columnWidths` and per-cell `width` for compatibility.
-- Keep borders on each `TableCell`; avoid relying on table-level borders.
-- If output misses tables, remove optional styling first (`shading`, custom alignment, extra runs), regenerate, then re-add styles incrementally.
-
-```javascript
-// Quick structural guard before creating Document
-const hasTable = Array.isArray(sectionChildren) && sectionChildren.some((node) => node instanceof Table);
-if (!hasTable) {
-  sectionChildren.push(table);
-}
-```
-
 ## Links & Navigation
 ```javascript
 // TOC (requires headings) - CRITICAL: Use HeadingLevel only, NOT custom styles
@@ -285,6 +269,55 @@ new Paragraph({
 })
 ```
 
+```javascript
+// SVG can be embedded directly. Do not convert vector diagrams to PNG just to insert them.
+new Paragraph({
+  alignment: AlignmentType.CENTER,
+  children: [new ImageRun({
+    type: "svg",
+    data: fs.readFileSync("diagram.svg"),
+    transformation: { width: 560, height: 315 },
+    altText: { title: "Diagram", description: "Architecture diagram", name: "Diagram" },
+  })]
+})
+```
+
+If the installed docx-js version requires a raster `fallback` for `type: "svg"`, do not replace the figure with PNG. Either embed SVG through direct OOXML package relationships, or add a PNG fallback only as compatibility support while keeping SVG as the primary image.
+
+**Figure completeness protocol for formal documents:**
+- Build a figure inventory before creating the `Document`: `{ title, caption, imagePath, type, width, height }`.
+- For every required diagram/chart referenced in the source content, verify `fs.existsSync(imagePath)` before calling `Packer.toBuffer`.
+- For Draw.io diagrams and other vector illustrations, embed SVG assets exported from the source directly. Do not convert SVG to PNG solely for Word insertion.
+- Embed PNG/JPG only when the original figure is raster, the user requested raster output, or a viewer/library compatibility fallback is required.
+- If diagram assets come from `diagrams/exports` or `diagrams/png`, run `validate_diagram_exports.mjs` before document generation and stop on failure.
+- Insert each figure in the body near the section that references it with `new ImageRun(...)`, followed by a centered caption paragraph.
+- Do not replace figures with source paths, `.drawio` paths, appendix rows, or plain text placeholders.
+- If any required image file is missing, throw an error or report degraded output; do not claim the DOCX is complete.
+
+```javascript
+function createFigure({ title, caption, imagePath, type = "svg", width = 560, height = 315 }) {
+  if (!fs.existsSync(imagePath)) {
+    throw new Error(`Missing required figure asset: ${imagePath}`);
+  }
+  // Diagram exports must already have passed validate_diagram_exports.mjs.
+  return [
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new ImageRun({
+        type,
+        data: fs.readFileSync(imagePath),
+        transformation: { width, height },
+        altText: { title, description: caption, name: title },
+      })],
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new TextRun({ text: caption, italics: true, size: 20 })],
+    }),
+  ];
+}
+```
+
 ## Page Breaks
 ```javascript
 // Manual page break
@@ -300,6 +333,26 @@ new Paragraph({
 // ❌ WRONG: new PageBreak() 
 // ✅ CORRECT: new Paragraph({ children: [new PageBreak()] })
 ```
+
+Section `children` must contain block elements such as `Paragraph` and `Table`. Never push a `PageBreak`, `TextRun`, or any run-level object directly into section children. A bare run under `w:body` makes Word report an open/repair error.
+
+## Post-generation DOCX validation
+After writing the buffer from `Packer.toBuffer`, validate the package before delivering it:
+
+```bash
+node resources/skills/work/docx/scripts/validate_docx.mjs --input output.docx
+```
+
+The validator must return `ok: true`. It checks package readability, required parts, XML well-formedness, direct body runs, bare page breaks, duplicate drawing ids, unqualified tags inside `word/*.xml`, broken relationship targets, missing image parts, and invalid embedded PNG/JPEG/SVG signatures.
+
+If the validator reports bare page-break runs, direct body runs, duplicate drawing ids, or bare page-number tags, write a repaired copy and validate that copy:
+
+```bash
+node resources/skills/work/docx/scripts/validate_docx.mjs --input output.docx --repair-output output.repaired.docx
+node resources/skills/work/docx/scripts/validate_docx.mjs --input output.repaired.docx
+```
+
+If validation still fails, do not deliver the DOCX as complete. Report the issue codes and either regenerate or fix the OOXML.
 
 ## Headers/Footers & Page Setup
 ```javascript
@@ -329,6 +382,8 @@ const doc = new Document({
 });
 ```
 
+**Critical page-number rule:** Use `PageNumber.CURRENT`, `PageNumber.TOTAL_PAGES`, or proper field elements for page numbers. Never use `new TextRun({ children: [{ text: "PAGE" }, { text: "NUMPAGES" }] })`; it produces bare `<text>` tags that make Word report a repair/open error.
+
 ## Tabs
 ```javascript
 new Paragraph({
@@ -350,6 +405,8 @@ new Paragraph({
 
 ## Critical Issues & Common Mistakes
 - **CRITICAL: PageBreak must ALWAYS be inside a Paragraph** - standalone PageBreak creates invalid XML that Word cannot open
+- **CRITICAL: Validate every generated DOCX before delivery** - run `scripts/validate_docx.mjs` to catch direct body runs, bare page breaks, broken relationships, bare page-number tags, invalid media, and duplicate drawing ids
+- **CRITICAL: Page numbers must use PageNumber constants** - never hand-write `{ text: "PAGE" }` / `{ text: "NUMPAGES" }` in TextRun children.
 - **ALWAYS use ShadingType.CLEAR for table cell shading** - Never use ShadingType.SOLID (causes black background).
 - Measurements in DXA (1440 = 1 inch) | Each table cell needs ≥1 Paragraph | TOC requires HeadingLevel styles only
 - **ALWAYS use custom styles** with Arial font for professional appearance and proper visual hierarchy
@@ -359,6 +416,7 @@ new Paragraph({
 - **NEVER use \n for line breaks anywhere** - always use separate Paragraph elements for each line
 - **ALWAYS use TextRun objects within Paragraph children** - never use text property directly on Paragraph
 - **CRITICAL for images**: ImageRun REQUIRES `type` parameter - always specify "png", "jpg", "jpeg", "gif", "bmp", or "svg"
+- **CRITICAL for vector figures**: Embed SVG directly when available. Do not rasterize SVG to PNG unless compatibility fallback is explicitly needed.
 - **CRITICAL for bullets**: Must use `LevelFormat.BULLET` constant, not string "bullet", and include `text: "•"` for the bullet character
 - **CRITICAL for numbering**: Each numbering reference creates an INDEPENDENT list. Same reference = continues numbering (1,2,3 then 4,5,6). Different reference = restarts at 1 (1,2,3 then 1,2,3). Use unique reference names for each separate numbered section!
 - **CRITICAL for TOC**: When using TableOfContents, headings must use HeadingLevel ONLY - do NOT add custom styles to heading paragraphs or TOC will break
