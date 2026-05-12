@@ -32,7 +32,7 @@ describe('SkillManager', () => {
     expect(manager.list().map((s) => s.name)).toContain('repo-review');
   });
 
-  it('seeds bundled skill supporting files without overwriting existing local files', () => {
+  it('updates bundled skill local copies without changing unrelated local skills', () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const bundledRoot = join(env.home, 'bundled-skills');
@@ -48,15 +48,21 @@ describe('SkillManager', () => {
     const localSkillDir = join(env.home, 'skills', 'work', 'docx');
     mkdirSync(localSkillDir, { recursive: true });
     writeFileSync(join(localSkillDir, 'SKILL.md'), '---\nname: docx\ndescription: local\ncategory: work\n---\n\nKeep local edits.\n', 'utf8');
+    writeFileSync(join(localSkillDir, 'stale.txt'), 'old bundled file\n', 'utf8');
+    const userSkillDir = join(env.home, 'skills', 'local', 'my-skill');
+    mkdirSync(userSkillDir, { recursive: true });
+    writeFileSync(join(userSkillDir, 'SKILL.md'), '---\nname: my-skill\ndescription: user skill\ncategory: local\n---\n\nKeep user skill.\n', 'utf8');
 
     const manager = new SkillManager(env.home, bundledRoot);
     manager.seedBundledSkills();
 
-    expect(readFileSync(join(localSkillDir, 'SKILL.md'), 'utf8')).toContain('Keep local edits.');
+    expect(readFileSync(join(localSkillDir, 'SKILL.md'), 'utf8')).toContain('Use bundled skill.');
+    expect(existsSync(join(localSkillDir, 'stale.txt'))).toBe(false);
     expect(readFileSync(join(localSkillDir, 'docx-js.md'), 'utf8')).toContain('reference doc');
     expect(readFileSync(join(localSkillDir, 'scripts', 'document.py'), 'utf8')).toContain('print("ok")');
     expect(readFileSync(join(localSkillDir, 'scripts', 'templates', 'people.xml'), 'utf8')).toContain('<people />');
     expect(readFileSync(join(localSkillDir, 'ooxml', 'schemas', 'wml.xsd'), 'utf8')).toContain('<schema />');
+    expect(readFileSync(join(userSkillDir, 'SKILL.md'), 'utf8')).toContain('Keep user skill.');
   });
 
   it('uploads root skill archives with nested supporting files', async () => {

@@ -31,9 +31,8 @@ npm run pack
 
 Create a directory under `resources/skills/<category>/<skill-name>/SKILL.md`.
 
-On startup, missing bundled skills are copied into `~/.tasi-harness/skills` so the app can scan them like normal local skills.
+On startup, bundled skills are synced into their matching directories under `~/.tasi-harness/skills`: files from the installer replace the corresponding bundled-skill copy and stale files in that directory are removed. Other user-installed skill directories are left unchanged.
 
 ## Testing notes
 
 The tests use temporary directories and do not write into the real user home. The agent-loop test uses `MockLlmClient`, so no network or API key is required.
-

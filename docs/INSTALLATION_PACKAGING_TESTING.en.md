@@ -65,6 +65,7 @@ Notes:
 - `scripts/package-macos-installer.sh` is macOS-focused.
 - macOS packaging should normally run on a macOS host.
 - Installers include command-line launchers: `tasi.cmd` / `tasi-harness.cmd` in the Windows install directory, and `Contents/Resources/bin/tasi` / `tasi-harness` inside the macOS app bundle.
+- The Windows installer cleans the old application install directory before writing new files; the user data directory `~/.tasi-harness` is left intact. On startup, bundled skills from the installer are synced into the matching bundled-skill copies under `~/.tasi-harness/skills`, while other user-installed skills are left unchanged.
 
 ## Command-Line Usage
 

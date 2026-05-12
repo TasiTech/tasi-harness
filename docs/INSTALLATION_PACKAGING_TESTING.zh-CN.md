@@ -65,6 +65,7 @@ bash scripts/package-macos-installer.sh
 - `scripts/package-macos-installer.sh` 为 macOS 打包脚本
 - macOS 打包通常应在 macOS 主机执行
 - 安装包会包含命令行启动器：Windows 为安装目录下的 `tasi.cmd` / `tasi-harness.cmd`，macOS 为应用包内的 `Contents/Resources/bin/tasi` / `tasi-harness`
+- Windows 安装器会在写入新文件前清理旧的程序安装目录；用户数据目录 `~/.tasi-harness` 不会被清理。启动时，安装包内置技能会同步到 `~/.tasi-harness/skills` 的对应内置副本，其他用户安装的技能保持不变。
 
 ## 命令行使用
 

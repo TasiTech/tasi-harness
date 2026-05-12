@@ -1,7 +1,7 @@
 ---
 name: solution-generator
 description: "Generate and rewrite high-quality document text (not layout) for solutions, reports, proposals, plans, or analysis before Word/PDF formatting. Enforce Request → Plan → Draft → Audit → Refine → Deliver for complex tasks; allow streamlined handling for simple requests."
-category: document-processing
+category: document
 license: Proprietary
 ---
 
@@ -12,8 +12,6 @@ license: Proprietary
 This skill controls **text content only**: topic understanding, section writing, detail depth, and final narrative quality.
 
 Use this skill when users ask to write, rewrite, expand, or polish document text.
-
-Do **not** use this skill for OOXML structure editing, Word styling, table rendering, PDF conversion, or page layout operations.
 
 ## Workflow
 

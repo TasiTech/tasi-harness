@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 import JSZip from 'jszip';
 import type { SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
 import { ensureDir, safeJoin, slugifyName } from '../storage/pathUtils.js';
@@ -52,7 +52,7 @@ export class SkillManager {
     private readonly harnessHome: string,
     private readonly bundledRoot?: string
   ) {
-    this.localRoot = join(harnessHome, 'skills');
+    this.localRoot = resolve(harnessHome, 'skills');
     ensureDir(this.localRoot);
   }
 
@@ -61,7 +61,7 @@ export class SkillManager {
     for (const file of this.findSkillFiles(this.bundledRoot)) {
       const rel = relative(this.bundledRoot, dirname(file));
       const targetDir = safeJoin(this.localRoot, rel);
-      this.copyMissingSkillFiles(dirname(file), targetDir);
+      this.replaceBundledSkillFiles(dirname(file), targetDir);
     }
   }
 
@@ -216,7 +216,14 @@ export class SkillManager {
     return out;
   }
 
-  private copyMissingSkillFiles(sourceDir: string, targetDir: string): void {
+  private replaceBundledSkillFiles(sourceDir: string, targetDir: string): void {
+    if (resolve(targetDir) !== this.localRoot && existsSync(targetDir)) {
+      rmSync(targetDir, { recursive: true, force: true });
+    }
+    this.copySkillFiles(sourceDir, targetDir);
+  }
+
+  private copySkillFiles(sourceDir: string, targetDir: string): void {
     mkdirSync(targetDir, { recursive: true });
     for (const name of readdirSync(sourceDir)) {
       if (name === '.DS_Store') continue;
@@ -224,10 +231,10 @@ export class SkillManager {
       const target = join(targetDir, name);
       const stat = statSync(source);
       if (stat.isDirectory()) {
-        this.copyMissingSkillFiles(source, target);
+        this.copySkillFiles(source, target);
         continue;
       }
-      if (!existsSync(target)) copyFileSync(source, target);
+      copyFileSync(source, target);
     }
   }
 
