@@ -731,6 +731,7 @@ export function App(): ReactElement {
           <SessionsPage
             tr={tr}
             sessions={sessions}
+            wechatSessionId={activeWechatSessionId}
             onOpen={async (id) => {
               const record = await window.tasiHarness.sessions.read(id);
               if (record) {
@@ -3884,28 +3885,59 @@ function TasksPage(props: {
   );
 }
 
-function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: TranslateFn; sessions: SessionSummary[]; onOpen: (id: string) => Promise<void>; refreshSessions: () => Promise<void> }): ReactElement {
+type SessionHistoryCategory = MemoryDomain | 'all' | 'wechat-clawbot';
+
+function isWechatClawBotSession(session: SessionSummary, wechatSessionId?: string): boolean {
+  const configuredId = wechatSessionId?.trim();
+  if (configuredId && session.id === configuredId) return true;
+  const title = session.title.trim().toLowerCase();
+  return title === 'wechat session' || title.startsWith('wechat clawbot');
+}
+
+function SessionsPage({
+  tr,
+  sessions,
+  wechatSessionId,
+  onOpen,
+  refreshSessions
+}: {
+  tr: TranslateFn;
+  sessions: SessionSummary[];
+  wechatSessionId?: string;
+  onOpen: (id: string) => Promise<void>;
+  refreshSessions: () => Promise<void>;
+}): ReactElement {
   const [query, setQuery] = useState('');
-  const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
+  const [activeCategory, setActiveCategory] = useState<SessionHistoryCategory>('all');
   const [deletingCategory, setDeletingCategory] = useState(false);
   const categoryCounts = useMemo(() => {
-    const counts = new Map<MemoryDomain | 'all', number>([['all', sessions.length]]);
+    const counts = new Map<SessionHistoryCategory, number>([
+      ['all', sessions.length],
+      ['wechat-clawbot', 0]
+    ]);
     for (const session of sessions) {
+      if (isWechatClawBotSession(session, wechatSessionId)) {
+        counts.set('wechat-clawbot', (counts.get('wechat-clawbot') ?? 0) + 1);
+        continue;
+      }
       const domain = knownMemoryDomain(session.domain);
       counts.set(domain, (counts.get(domain) ?? 0) + 1);
     }
     return counts;
-  }, [sessions]);
+  }, [sessions, wechatSessionId]);
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return sessions.filter((s) => {
-      if (activeCategory !== 'all' && knownMemoryDomain(s.domain) !== activeCategory) return false;
+      const isWechat = isWechatClawBotSession(s, wechatSessionId);
+      if (activeCategory === 'wechat-clawbot' && !isWechat) return false;
+      if (activeCategory !== 'all' && activeCategory !== 'wechat-clawbot' && (isWechat || knownMemoryDomain(s.domain) !== activeCategory)) return false;
       if (!needle) return true;
       return s.title.toLowerCase().includes(needle);
     });
-  }, [sessions, query, activeCategory]);
+  }, [sessions, query, activeCategory, wechatSessionId]);
   const activeCategoryLabel = useMemo(() => {
     if (activeCategory === 'all') return tr('All', '全部');
+    if (activeCategory === 'wechat-clawbot') return tr('WeChat', '微信');
     const domain = MEMORY_DOMAINS.find((item) => item.value === activeCategory);
     return domain ? tr(domain.labelEn, domain.labelZh) : activeCategory;
   }, [activeCategory, tr]);
@@ -3919,7 +3951,9 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
   async function removeActiveCategory(): Promise<void> {
     const targets = activeCategory === 'all'
       ? sessions
-      : sessions.filter((session) => knownMemoryDomain(session.domain) === activeCategory);
+      : activeCategory === 'wechat-clawbot'
+        ? sessions.filter((session) => isWechatClawBotSession(session, wechatSessionId))
+        : sessions.filter((session) => !isWechatClawBotSession(session, wechatSessionId) && knownMemoryDomain(session.domain) === activeCategory);
     if (targets.length === 0 || deletingCategory) return;
     const confirmed = window.confirm(
       activeCategory === 'all'
@@ -3944,7 +3978,7 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
 
   return (
     <section className="page">
-      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by the same domains as memory.', '本地 JSON 会话历史，按记忆相同分类展示。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by memory domain, with WeChat separated for quick access.', '本地 JSON 会话历史，按记忆分类展示，并单独列出微信，方便快速查找。')} />
       <div className="card">
         <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
         <div className="history-actions">
@@ -3965,6 +3999,10 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
               <span>{tr('All', '全部')}</span>
               <span className="soft-badge">{categoryCounts.get('all') ?? 0}</span>
             </button>
+            <button className={`memory-category-item ${activeCategory === 'wechat-clawbot' ? 'active' : ''}`} onClick={() => setActiveCategory('wechat-clawbot')}>
+              <span>{tr('WeChat', '微信')}</span>
+              <span className="soft-badge">{categoryCounts.get('wechat-clawbot') ?? 0}</span>
+            </button>
             {MEMORY_DOMAINS.map((category) => (
               <button
                 key={category.value}
@@ -3978,12 +4016,14 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
           </div>
           <div className="session-list">
             {filtered.map((s) => {
+              const isWechat = isWechatClawBotSession(s, wechatSessionId);
               const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
               return (
                 <div className="session-card" key={s.id}>
                   <div>
                     <strong>{s.title}</strong>
                     <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+                    {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
                     {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
                   </div>
                   <div className="button-row compact">
