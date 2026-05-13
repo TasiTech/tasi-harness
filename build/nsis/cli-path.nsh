@@ -4,8 +4,10 @@
 !macro customHeader
   LangString TasiSkillOverwritePageTitle 1033 "Skill overwrite policy"
   LangString TasiSkillOverwritePageTitle 2052 "技能覆盖策略"
-  LangString TasiSkillOverwritePageDescription 1033 "Select the local skills that may be overwritten by bundled installer versions. Nothing is selected by default."
-  LangString TasiSkillOverwritePageDescription 2052 "请选择允许安装包版本覆盖的本地技能。默认不选择任何技能。"
+  LangString TasiSkillOverwritePageDescription 1033 "Select the local skills that may be overwritten by bundled installer versions. All conflicting skills are selected by default."
+  LangString TasiSkillOverwritePageDescription 2052 "请选择允许安装包版本覆盖的本地技能。默认选中所有冲突技能。"
+  LangString TasiSkillOverwriteSelectAll 1033 "Select all"
+  LangString TasiSkillOverwriteSelectAll 2052 "全选"
   LangString TasiSkillOverwriteNoConflicts 1033 "No installed local skills conflict with this installer."
   LangString TasiSkillOverwriteNoConflicts 2052 "没有与此安装包冲突的本地技能。"
   LangString TasiCleanInstallFailed 1033 "Tasi Harness could not clean the existing installation directory. Close any running Tasi Harness windows and try the installer again."
@@ -15,6 +17,7 @@
 !ifndef BUILD_UNINSTALLER
 Var SkillConflictFile
 Var SkillSelectionFile
+Var SkillSelectAllCheck
 Var SkillName0
 Var SkillName1
 Var SkillName2
@@ -62,11 +65,17 @@ Var SkillCheck17
   ${If} $SkillName${INDEX} != ""
     ${NSD_CreateCheckbox} ${X} ${Y}u ${W} 10u "$SkillName${INDEX}"
     Pop $SkillCheck${INDEX}
-    ${NSD_SetState} $SkillCheck${INDEX} ${BST_UNCHECKED}
+    ${NSD_SetState} $SkillCheck${INDEX} ${BST_CHECKED}
     ClearErrors
     FileRead $2 $R0
   ${EndIf}
 done_add_skill_${INDEX}:
+!macroend
+
+!macro SetSkillOverwriteCheckboxFromSelectAll INDEX
+  ${If} $SkillName${INDEX} != ""
+    ${NSD_SetState} $SkillCheck${INDEX} $R1
+  ${EndIf}
 !macroend
 
 !macro WriteCheckedSkill INDEX
@@ -77,6 +86,28 @@ done_add_skill_${INDEX}:
     ${EndIf}
   ${EndIf}
 !macroend
+
+Function SkillOverwriteSelectAllChanged
+  ${NSD_GetState} $SkillSelectAllCheck $R1
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 0
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 1
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 2
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 3
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 4
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 5
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 6
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 7
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 8
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 9
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 10
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 11
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 12
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 13
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 14
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 15
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 16
+  !insertmacro SetSkillOverwriteCheckboxFromSelectAll 17
+FunctionEnd
 
 Function SkillOverwritePageCreate
   File /oname=$PLUGINSDIR\bundled-skills.json "${BUILD_RESOURCES_DIR}\nsis\bundled-skills.json"
@@ -102,24 +133,28 @@ Function SkillOverwritePageCreate
   ClearErrors
   FileRead $2 $R0
   IfErrors no_skill_conflicts
-  !insertmacro AddSkillOverwriteCheckbox 0 0 58 48%
-  !insertmacro AddSkillOverwriteCheckbox 1 0 70 48%
-  !insertmacro AddSkillOverwriteCheckbox 2 0 82 48%
-  !insertmacro AddSkillOverwriteCheckbox 3 0 94 48%
-  !insertmacro AddSkillOverwriteCheckbox 4 0 106 48%
-  !insertmacro AddSkillOverwriteCheckbox 5 0 118 48%
-  !insertmacro AddSkillOverwriteCheckbox 6 0 130 48%
-  !insertmacro AddSkillOverwriteCheckbox 7 0 142 48%
-  !insertmacro AddSkillOverwriteCheckbox 8 0 154 48%
-  !insertmacro AddSkillOverwriteCheckbox 9 50% 58 50%
-  !insertmacro AddSkillOverwriteCheckbox 10 50% 70 50%
-  !insertmacro AddSkillOverwriteCheckbox 11 50% 82 50%
-  !insertmacro AddSkillOverwriteCheckbox 12 50% 94 50%
-  !insertmacro AddSkillOverwriteCheckbox 13 50% 106 50%
-  !insertmacro AddSkillOverwriteCheckbox 14 50% 118 50%
-  !insertmacro AddSkillOverwriteCheckbox 15 50% 130 50%
-  !insertmacro AddSkillOverwriteCheckbox 16 50% 142 50%
-  !insertmacro AddSkillOverwriteCheckbox 17 50% 154 50%
+  ${NSD_CreateCheckbox} 0 54u 100% 10u "$(TasiSkillOverwriteSelectAll)"
+  Pop $SkillSelectAllCheck
+  ${NSD_SetState} $SkillSelectAllCheck ${BST_CHECKED}
+  ${NSD_OnClick} $SkillSelectAllCheck SkillOverwriteSelectAllChanged
+  !insertmacro AddSkillOverwriteCheckbox 0 0 70 48%
+  !insertmacro AddSkillOverwriteCheckbox 1 0 82 48%
+  !insertmacro AddSkillOverwriteCheckbox 2 0 94 48%
+  !insertmacro AddSkillOverwriteCheckbox 3 0 106 48%
+  !insertmacro AddSkillOverwriteCheckbox 4 0 118 48%
+  !insertmacro AddSkillOverwriteCheckbox 5 0 130 48%
+  !insertmacro AddSkillOverwriteCheckbox 6 0 142 48%
+  !insertmacro AddSkillOverwriteCheckbox 7 0 154 48%
+  !insertmacro AddSkillOverwriteCheckbox 8 0 166 48%
+  !insertmacro AddSkillOverwriteCheckbox 9 50% 70 50%
+  !insertmacro AddSkillOverwriteCheckbox 10 50% 82 50%
+  !insertmacro AddSkillOverwriteCheckbox 11 50% 94 50%
+  !insertmacro AddSkillOverwriteCheckbox 12 50% 106 50%
+  !insertmacro AddSkillOverwriteCheckbox 13 50% 118 50%
+  !insertmacro AddSkillOverwriteCheckbox 14 50% 130 50%
+  !insertmacro AddSkillOverwriteCheckbox 15 50% 142 50%
+  !insertmacro AddSkillOverwriteCheckbox 16 50% 154 50%
+  !insertmacro AddSkillOverwriteCheckbox 17 50% 166 50%
   FileClose $2
   Goto skill_conflict_page_done
 
