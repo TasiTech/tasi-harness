@@ -100,6 +100,7 @@ export function defaultConfig(): AppConfig {
       'browser_eval',
       'browser_viewport',
       'browser_close',
+      'wechat_send_file',
       'terminal'
     ]
   };

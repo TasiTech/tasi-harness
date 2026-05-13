@@ -130,6 +130,63 @@ describe('AgentLoop', () => {
     expect(deltas).toEqual(['r:Brief reasoning.', 'c:Streamed answer.', 'done:Streamed answer.']);
   });
 
+  it('persists user and streamed assistant messages before the run finishes', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: 'Streamed answer.',
+          reasoning_content: 'Brief reasoning.'
+        }
+      }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const snapshots: string[][] = [];
+    const result = await loop.run({
+      userInput: 'hello',
+      onMessageDelta: () => undefined,
+      onSessionUpdated: (session) => {
+        snapshots.push(session.messages.map((message) => `${message.role}:${message.content}`));
+      }
+    });
+
+    expect(snapshots.some((items) => items.includes('user:hello') && !items.includes('assistant:Streamed answer.'))).toBe(true);
+    expect(snapshots.some((items) => items.includes('assistant:Streamed answer.'))).toBe(true);
+
+    const rawSession = JSON.parse(readFileSync(join(env.home, 'sessions', `${result.sessionId}.json`), 'utf8')) as Record<string, unknown>;
+    const rawMessages = Array.isArray(rawSession.messages) ? rawSession.messages : [];
+    expect(rawMessages.some((message) => (
+      message &&
+      typeof message === 'object' &&
+      Object.prototype.hasOwnProperty.call(message, 'reasoning_parts')
+    ))).toBe(false);
+  });
+
   it('keeps tool-call reasoning on the same streamed assistant bubble as the final answer', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

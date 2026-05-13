@@ -557,6 +557,8 @@ export function App(): ReactElement {
 
   useEffect(() => {
     const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      void refreshSessions();
+      if (chatBusy && payload.source === 'chat') return;
       if (!sessionId || payload.sessionId !== sessionId) return;
       void window.tasiHarness.sessions.read(payload.sessionId).then((record) => {
         if (!record) return;
@@ -573,7 +575,7 @@ export function App(): ReactElement {
       });
     });
     return off;
-  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
+  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive, chatBusy]);
 
   useEffect(() => {
     const off = window.tasiHarness.security.onToolApprovalRequest((request) => {
@@ -923,6 +925,7 @@ function ChatPage(props: {
   const [sessionDocError, setSessionDocError] = useState('');
   const [multimediaAttachments, setMultimediaAttachments] = useState<AgentMessageAttachment[]>([]);
   const [multimediaError, setMultimediaError] = useState('');
+  const [wechatChipClearedAt, setWechatChipClearedAt] = useState(() => new Date().toISOString());
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
@@ -944,6 +947,7 @@ function ChatPage(props: {
   const previewMeasuredViewportRef = useRef<{ width: number; height: number } | null>(null);
   const previewNeedsMeasurementRef = useRef(true);
   const externalPreviewOpenUrlRef = useRef('');
+  const previousWechatBusyRef = useRef(false);
   const dragStateRef = useRef<{
     startClientX: number;
     startClientY: number;
@@ -977,6 +981,47 @@ function ChatPage(props: {
   );
   const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
   const runBusy = props.busy || wechatBusy;
+  const wechatSessionAttachments = useMemo(() => {
+    if (!isWechatSession) return [];
+    const seen = new Set<string>();
+    const attachments: AgentMessageAttachment[] = [];
+    for (const message of props.messages) {
+      if (message.role !== 'user') continue;
+      if (!message.createdAt || message.createdAt <= wechatChipClearedAt) continue;
+      for (const attachment of message.attachments ?? []) {
+        const key = attachment.id ?? `${attachment.kind}:${attachment.filename}:${attachment.sizeBytes ?? 0}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        attachments.push(attachment);
+      }
+    }
+    return attachments.slice(-12);
+  }, [isWechatSession, props.messages, wechatChipClearedAt]);
+  const activeSessionDocs = useMemo(() => (
+    isWechatSession ? sessionDocs.filter((doc) => doc.updatedAt > wechatChipClearedAt) : sessionDocs
+  ), [isWechatSession, sessionDocs, wechatChipClearedAt]);
+  const visibleSessionDocs = useMemo(() => (
+    isWechatSession ? activeSessionDocs.slice(0, 3) : activeSessionDocs
+  ), [isWechatSession, activeSessionDocs]);
+  const hiddenSessionDocCount = Math.max(0, activeSessionDocs.length - visibleSessionDocs.length);
+  const visibleWechatSessionAttachments = useMemo(() => (
+    isWechatSession ? wechatSessionAttachments.slice(-3) : wechatSessionAttachments
+  ), [isWechatSession, wechatSessionAttachments]);
+  const hiddenWechatAttachmentCount = Math.max(0, wechatSessionAttachments.length - visibleWechatSessionAttachments.length);
+  useEffect(() => {
+    setWechatChipClearedAt(new Date().toISOString());
+    previousWechatBusyRef.current = false;
+  }, [props.sessionId]);
+  useEffect(() => {
+    if (!isWechatSession) {
+      previousWechatBusyRef.current = false;
+      return;
+    }
+    if (previousWechatBusyRef.current && !wechatBusy) {
+      setWechatChipClearedAt(new Date().toISOString());
+    }
+    previousWechatBusyRef.current = wechatBusy;
+  }, [isWechatSession, wechatBusy]);
   useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
@@ -984,16 +1029,32 @@ function ChatPage(props: {
     if (props.personalKnowledgeDocCount > 0 || !usePersonalKnowledgeBase) return;
     setUsePersonalKnowledgeBase(false);
   }, [props.personalKnowledgeDocCount, usePersonalKnowledgeBase]);
+  async function refreshSessionDocuments(sessionId = props.sessionId): Promise<void> {
+    if (!sessionId) {
+      setSessionDocs([]);
+      setSessionDocError('');
+      return;
+    }
+    try {
+      const docs = await window.tasiHarness.sessionDocs.list(sessionId);
+      setSessionDocs(docs);
+      setSessionDocError('');
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
-    if (!props.sessionId) {
+    const sessionId = props.sessionId;
+    if (!sessionId) {
       setSessionDocs([]);
       setSessionDocError('');
       return () => {
         cancelled = true;
       };
     }
-    void window.tasiHarness.sessionDocs.list(props.sessionId)
+    void window.tasiHarness.sessionDocs.list(sessionId)
       .then((docs) => {
         if (cancelled) return;
         setSessionDocs(docs);
@@ -1006,6 +1067,13 @@ function ChatPage(props: {
     return () => {
       cancelled = true;
     };
+  }, [props.sessionId]);
+  useEffect(() => {
+    const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      if (!props.sessionId || payload.sessionId !== props.sessionId) return;
+      void refreshSessionDocuments(payload.sessionId);
+    });
+    return off;
   }, [props.sessionId]);
   useEffect(() => {
     if (!shouldShowWebPreview) {
@@ -2044,7 +2112,7 @@ function ChatPage(props: {
             }}
           />
           <div className="chat-session-doc-row">
-            {sessionDocs.map((doc) => (
+            {visibleSessionDocs.map((doc) => (
               <span key={doc.id} className="chat-session-doc-chip" title={doc.filename}>
                 <span className="chat-session-doc-name">{doc.filename}</span>
                 <span className="chat-session-doc-meta">{props.tr(`${doc.commentCount} comments`, `${doc.commentCount} comments`)}</span>
@@ -2059,8 +2127,13 @@ function ChatPage(props: {
                 </button>
               </span>
             ))}
+            {hiddenSessionDocCount > 0 && (
+              <span className="chat-overflow-chip" title={props.tr('Older WeChat documents are still stored in this session.', '较早的微信文档仍保存在当前 session 中。')}>
+                {props.tr(`+${hiddenSessionDocCount} more docs`, `还有 ${hiddenSessionDocCount} 个文档`)}
+              </span>
+            )}
           </div>
-          {multimediaAttachments.length > 0 && (
+          {(multimediaAttachments.length > 0 || visibleWechatSessionAttachments.length > 0) && (
             <div className="chat-media-row">
               {multimediaAttachments.map((attachment) => (
                 <span key={attachment.id} className={`chat-media-chip ${attachment.kind}`} title={attachment.filename}>
@@ -2078,6 +2151,23 @@ function ChatPage(props: {
                   </button>
                 </span>
               ))}
+              {visibleWechatSessionAttachments.map((attachment, index) => (
+                <span
+                  key={`wechat-${attachment.id ?? `${attachment.filename}-${index}`}`}
+                  className={`chat-media-chip ${attachment.kind} readonly`}
+                  title={attachment.filename}
+                >
+                  <span className="chat-media-kind">{attachment.kind}</span>
+                  <span className="chat-media-name">{attachment.filename}</span>
+                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  <span className="chat-media-source">{props.tr('WeChat', '微信')}</span>
+                </span>
+              ))}
+              {hiddenWechatAttachmentCount > 0 && (
+                <span className="chat-overflow-chip" title={props.tr('Older WeChat media is still stored in this session.', '较早的微信媒体仍保存在当前 session 中。')}>
+                  {props.tr(`+${hiddenWechatAttachmentCount} more media`, `还有 ${hiddenWechatAttachmentCount} 个媒体`)}
+                </span>
+              )}
             </div>
           )}
           <div className="chat-textarea-wrap">
@@ -3891,7 +3981,7 @@ function isWechatClawBotSession(session: SessionSummary, wechatSessionId?: strin
   const configuredId = wechatSessionId?.trim();
   if (configuredId && session.id === configuredId) return true;
   const title = session.title.trim().toLowerCase();
-  return title === 'wechat session' || title.startsWith('wechat clawbot');
+  return title === 'wechat session' || title.startsWith('wechat clawbot') || title.startsWith('[wechat:');
 }
 
 function SessionsPage({

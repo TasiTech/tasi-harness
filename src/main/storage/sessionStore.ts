@@ -73,21 +73,25 @@ export class SessionStore {
 
   appendMessages(id: string, messages: AgentMessage[], toolEvents: ToolEvent[] = [], execution?: AgentExecutionDetails): SessionRecord {
     const record = this.read(id) ?? this.create();
-    const next: SessionRecord = {
-      ...record,
-      messages: [...record.messages, ...messages.map((m) => ({ ...m, createdAt: m.createdAt ?? nowIso() }))],
-      toolEvents: [...(record.toolEvents ?? []), ...toolEvents],
-      lastExecution: execution ?? record.lastExecution,
-      updatedAt: nowIso()
-    };
-    if (record.title === 'New session') {
-      const firstUser = next.messages.find((m) => m.role === 'user')?.content ?? 'New session';
-      next.title = firstUser.slice(0, 64);
+    return this.writeMessages(record, [...record.messages, ...this.normalizeMessages(messages)], toolEvents, execution);
+  }
+
+  upsertMessages(id: string, messages: AgentMessage[], toolEvents: ToolEvent[] = [], execution?: AgentExecutionDetails): SessionRecord {
+    const record = this.read(id) ?? this.create();
+    const nextMessages = [...record.messages];
+    for (const message of this.normalizeMessages(messages)) {
+      const existingIndex = message.id ? nextMessages.findIndex((item) => item.id === message.id) : -1;
+      if (existingIndex >= 0) {
+        nextMessages[existingIndex] = {
+          ...nextMessages[existingIndex],
+          ...message,
+          createdAt: message.createdAt ?? nextMessages[existingIndex].createdAt ?? nowIso()
+        };
+      } else {
+        nextMessages.push(message);
+      }
     }
-    next.messageCount = next.messages.length;
-    next.domain = this.inferRecordDomain(next);
-    this.write(next);
-    return next;
+    return this.writeMessages(record, nextMessages, toolEvents, execution);
   }
 
   setSystemPrompt(id: string, systemPrompt: string): SessionRecord {
@@ -108,7 +112,8 @@ export class SessionStore {
 
   replaceMessages(id: string, messages: AgentMessage[]): SessionRecord {
     const record = this.read(id) ?? this.create();
-    const next = { ...record, messages, messageCount: messages.length, updatedAt: nowIso() };
+    const normalized = this.normalizeMessages(messages);
+    const next = { ...record, messages: normalized, messageCount: normalized.length, updatedAt: nowIso() };
     next.domain = this.inferRecordDomain(next);
     this.write(next);
     return next;
@@ -173,13 +178,46 @@ export class SessionStore {
     const history = this.buildSystemPromptHistory(record);
     const persisted: Record<string, unknown> = {
       ...record,
-      messages: record.messages ?? [],
+      messages: (record.messages ?? []).map((message) => this.persistableMessage(message)),
       systemPromptHistory: history
     };
     delete persisted.systemPrompt;
     delete persisted.messageCount;
     delete persisted.toolEvents;
     writeFileSync(this.fileFor(record.id), `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+  }
+
+  private writeMessages(
+    record: SessionRecord,
+    messages: AgentMessage[],
+    toolEvents: ToolEvent[] = [],
+    execution?: AgentExecutionDetails
+  ): SessionRecord {
+    const next: SessionRecord = {
+      ...record,
+      messages,
+      toolEvents: [...(record.toolEvents ?? []), ...toolEvents],
+      lastExecution: execution ?? record.lastExecution,
+      updatedAt: nowIso()
+    };
+    if (record.title === 'New session') {
+      const firstUser = next.messages.find((m) => m.role === 'user')?.content ?? 'New session';
+      next.title = firstUser.slice(0, 64);
+    }
+    next.messageCount = next.messages.length;
+    next.domain = this.inferRecordDomain(next);
+    this.write(next);
+    return next;
+  }
+
+  private normalizeMessages(messages: AgentMessage[]): AgentMessage[] {
+    return messages.map((message) => ({ ...message, createdAt: message.createdAt ?? nowIso() }));
+  }
+
+  private persistableMessage(message: AgentMessage): AgentMessage {
+    const next = { ...message };
+    delete next.reasoning_parts;
+    return next;
   }
 
   private fileFor(id: string): string {

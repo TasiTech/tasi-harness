@@ -989,6 +989,9 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   padding: 5px 8px 5px 10px;
   max-width: min(420px, 100%);
 }
+.chat-media-chip.readonly {
+  background: rgba(255, 255, 255, 0.06);
+}
 .chat-media-kind {
   color: var(--accent);
   font-size: 11px;
@@ -997,6 +1000,19 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
 }
 .chat-media-name { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
 .chat-media-size { color: var(--text-secondary); font-size: 11px; }
+.chat-media-source { color: var(--text-secondary); font-size: 11px; font-weight: 700; }
+.chat-overflow-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  border: 1px dashed var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
 .chat-session-doc-name { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
 .chat-session-doc-meta { color: var(--text-secondary); font-size: 11px; }
 .chat-session-doc-remove {
