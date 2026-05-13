@@ -98,6 +98,116 @@ function prettyDate(iso?: string): string {
   return new Date(iso).toLocaleString();
 }
 
+function padTimePart(value: unknown): string {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed)) return '00';
+  return String(Math.min(99, Math.max(0, parsed))).padStart(2, '0');
+}
+
+function taskTimeLabel(task: ScheduledTask): string {
+  return `${padTimePart(task.scheduleHour)}:${padTimePart(task.scheduleMinute)}`;
+}
+
+function weekdayLabel(day: unknown, tr: TranslateFn): string {
+  const labels = [
+    tr('Sunday', '周日'),
+    tr('Monday', '周一'),
+    tr('Tuesday', '周二'),
+    tr('Wednesday', '周三'),
+    tr('Thursday', '周四'),
+    tr('Friday', '周五'),
+    tr('Saturday', '周六')
+  ];
+  const index = Math.trunc(Number(day));
+  return labels[index >= 0 && index <= 6 ? index : 1];
+}
+
+function normalizeNumberSelection(value: unknown, min: number, max: number): number[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => Math.trunc(Number(item))).filter((item) => Number.isFinite(item) && item >= min && item <= max))]
+    .sort((a, b) => a - b);
+}
+
+function taskWeekdaySelection(task: ScheduledTask): number[] {
+  const days = normalizeNumberSelection(task.scheduleWeekdays, 0, 6);
+  if (days.length > 0) return days;
+  return [Math.min(6, Math.max(0, Math.trunc(Number(task.scheduleWeekday ?? 1))))];
+}
+
+function taskMonthDaySelection(task: ScheduledTask): number[] {
+  const days = normalizeNumberSelection(task.scheduleMonthDays, 1, 31);
+  if (days.length > 0) return days;
+  return [Math.min(31, Math.max(1, Math.trunc(Number(task.scheduleMonthDay ?? 1))))];
+}
+
+function weekdayOrderIndex(day: number): number {
+  return day === 0 ? 6 : day - 1;
+}
+
+function formatWeekdaySelection(days: number[], tr: TranslateFn): string {
+  const ordered = [...new Set(days)].sort((a, b) => weekdayOrderIndex(a) - weekdayOrderIndex(b));
+  const groups: number[][] = [];
+  ordered.forEach((day) => {
+    const last = groups[groups.length - 1];
+    if (last && weekdayOrderIndex(day) === weekdayOrderIndex(last[last.length - 1]) + 1) {
+      last.push(day);
+    } else {
+      groups.push([day]);
+    }
+  });
+  return groups
+    .map((group) => {
+      if (group.length >= 2) {
+        return tr(`${weekdayLabel(group[0], tr)}-${weekdayLabel(group[group.length - 1], tr)}`, `${weekdayLabel(group[0], tr)}至${weekdayLabel(group[group.length - 1], tr)}`);
+      }
+      return group.map((day) => weekdayLabel(day, tr)).join(tr(', ', '、'));
+    })
+    .join(tr(', ', '、'));
+}
+
+function formatNumberRanges(values: number[]): string {
+  const ordered = [...new Set(values)].sort((a, b) => a - b);
+  const groups: number[][] = [];
+  ordered.forEach((value) => {
+    const last = groups[groups.length - 1];
+    if (last && value === last[last.length - 1] + 1) {
+      last.push(value);
+    } else {
+      groups.push([value]);
+    }
+  });
+  return groups.map((group) => (group.length >= 2 ? `${group[0]}-${group[group.length - 1]}` : group.join(', '))).join(', ');
+}
+
+function formatMonthDaySelection(days: number[], tr: TranslateFn): string {
+  return tr(`days ${formatNumberRanges(days)}`, `${formatNumberRanges(days).replaceAll(', ', '、')}号`);
+}
+
+function taskScheduleLabel(task: ScheduledTask, tr: TranslateFn): string {
+  if (task.scheduleType === 'interval') return tr(`Every ${task.intervalMinutes} minutes`, `每 ${task.intervalMinutes} 分钟`);
+  if (task.scheduleType === 'daily') return tr(`Daily at ${taskTimeLabel(task)}`, `每日 ${taskTimeLabel(task)}`);
+  if (task.scheduleType === 'weekly') return tr(`Weekly on ${formatWeekdaySelection(taskWeekdaySelection(task), tr)} at ${taskTimeLabel(task)}`, `每周${formatWeekdaySelection(taskWeekdaySelection(task), tr).replace(/^周/, '')} ${taskTimeLabel(task)}`);
+  if (task.scheduleType === 'monthly') return tr(`Monthly on ${formatMonthDaySelection(taskMonthDaySelection(task), tr)} at ${taskTimeLabel(task)}`, `每月 ${formatMonthDaySelection(taskMonthDaySelection(task), tr)} ${taskTimeLabel(task)}`);
+  return tr(`Once at ${prettyDate(task.runAt)}`, `执行时间：${prettyDate(task.runAt)}`);
+}
+
+function parseMonthDaySelection(value: string): number[] {
+  const days = new Set<number>();
+  value.split(/[\s,，、;；]+/).forEach((part) => {
+    if (!part) return;
+    const range = part.match(/^(\d{1,2})\s*[-~至到]\s*(\d{1,2})$/);
+    if (range) {
+      const start = Math.max(1, Math.min(31, Number(range[1])));
+      const end = Math.max(1, Math.min(31, Number(range[2])));
+      for (let day = Math.min(start, end); day <= Math.max(start, end); day += 1) days.add(day);
+      return;
+    }
+    const day = Math.trunc(Number(part));
+    if (Number.isFinite(day) && day >= 1 && day <= 31) days.add(day);
+  });
+  return [...days].sort((a, b) => a - b);
+}
+
 function parseIsoMs(iso?: string): number | null {
   if (!iso) return null;
   const ms = Date.parse(iso);
@@ -3602,21 +3712,45 @@ function TasksPage(props: {
 }): ReactElement {
   const [name, setName] = useState('Daily digest');
   const [prompt, setPrompt] = useState('Summarize today\'s important progress and blockers.');
-  const [scheduleType, setScheduleType] = useState<'once' | 'interval'>('interval');
+  const [scheduleType, setScheduleType] = useState<ScheduledTask['scheduleType']>('daily');
   const [runAt, setRunAt] = useState('');
   const [intervalMinutes, setIntervalMinutes] = useState(60);
+  const [scheduleHour, setScheduleHour] = useState(9);
+  const [scheduleMinute, setScheduleMinute] = useState(0);
+  const [scheduleWeekdays, setScheduleWeekdays] = useState<number[]>([1, 2, 3, 4, 5]);
+  const [scheduleMonthDaysText, setScheduleMonthDaysText] = useState('1');
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('sandbox');
   const [notifyByEmail, setNotifyByEmail] = useState(true);
   const [notifyByWechat, setNotifyByWechat] = useState(false);
   const [notice, setNotice] = useState('');
 
+  function toggleWeekday(day: number): void {
+    setScheduleWeekdays((current) => {
+      if (current.includes(day)) return current.filter((item) => item !== day);
+      return [...current, day].sort((a, b) => weekdayOrderIndex(a) - weekdayOrderIndex(b));
+    });
+  }
+
   async function createTask(): Promise<void> {
+    const scheduleMonthDays = parseMonthDaySelection(scheduleMonthDaysText);
+    if (scheduleType === 'weekly' && scheduleWeekdays.length === 0) {
+      setNotice(props.tr('Select at least one weekday.', '请至少选择一个周几。'));
+      return;
+    }
+    if (scheduleType === 'monthly' && scheduleMonthDays.length === 0) {
+      setNotice(props.tr('Enter at least one valid day of month.', '请至少输入一个有效的每月日期。'));
+      return;
+    }
     await window.tasiHarness.tasks.create({
       name,
       prompt,
       scheduleType,
       runAt: scheduleType === 'once' ? new Date(runAt || Date.now()).toISOString() : undefined,
       intervalMinutes: scheduleType === 'interval' ? intervalMinutes : undefined,
+      scheduleHour: ['daily', 'weekly', 'monthly'].includes(scheduleType) ? scheduleHour : undefined,
+      scheduleMinute: ['daily', 'weekly', 'monthly'].includes(scheduleType) ? scheduleMinute : undefined,
+      scheduleWeekdays: scheduleType === 'weekly' ? scheduleWeekdays : undefined,
+      scheduleMonthDays: scheduleType === 'monthly' ? scheduleMonthDays : undefined,
       executionMode,
       notifyByEmail,
       notifyByWechat
@@ -3652,7 +3786,10 @@ function TasksPage(props: {
           <label>{props.tr('Prompt', '提示词')}</label>
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
           <label>{props.tr('Schedule', '调度')}</label>
-          <select value={scheduleType} onChange={(e) => setScheduleType(e.target.value as 'once' | 'interval')}>
+          <select value={scheduleType} onChange={(e) => setScheduleType(e.target.value as ScheduledTask['scheduleType'])}>
+            <option value="daily">{props.tr('Daily', '每日')}</option>
+            <option value="weekly">{props.tr('Weekly', '每周')}</option>
+            <option value="monthly">{props.tr('Monthly', '每月')}</option>
             <option value="interval">{props.tr('Repeat every N minutes', '每 N 分钟重复')}</option>
             <option value="once">{props.tr('Run once', '仅运行一次')}</option>
           </select>
@@ -3661,10 +3798,38 @@ function TasksPage(props: {
               <label>{props.tr('Run at', '运行时间')}</label>
               <input type="datetime-local" value={runAt} onChange={(e) => setRunAt(e.target.value)} />
             </>
-          ) : (
+          ) : scheduleType === 'interval' ? (
             <>
               <label>{props.tr('Interval minutes', '间隔分钟')}</label>
               <input type="number" min="1" value={intervalMinutes} onChange={(e) => setIntervalMinutes(Number(e.target.value))} />
+            </>
+          ) : (
+            <>
+              {scheduleType === 'weekly' && (
+                <>
+                  <label>{props.tr('Weekdays', '周几')}</label>
+                  <div className="check-grid">
+                    {[1, 2, 3, 4, 5, 6, 0].map((day) => (
+                      <label key={day} className="check-tile">
+                        <input type="checkbox" checked={scheduleWeekdays.includes(day)} onChange={() => toggleWeekday(day)} />
+                        <span>{weekdayLabel(day, props.tr)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
+              {scheduleType === 'monthly' && (
+                <>
+                  <label>{props.tr('Days of month', '每月日期')}</label>
+                  <input value={scheduleMonthDaysText} placeholder={props.tr('1, 3, 5 or 1-5', '1、3、5 或 1-5')} onChange={(e) => setScheduleMonthDaysText(e.target.value)} />
+                </>
+              )}
+              <label>{props.tr('Time', '时间')}</label>
+              <div className="inline-fields">
+                <input aria-label={props.tr('Hour', '小时')} type="number" min="0" max="23" value={scheduleHour} onChange={(e) => setScheduleHour(Number(e.target.value))} />
+                <span>:</span>
+                <input aria-label={props.tr('Minute', '分钟')} type="number" min="0" max="59" value={scheduleMinute} onChange={(e) => setScheduleMinute(Number(e.target.value))} />
+              </div>
             </>
           )}
           <label>{props.tr('Execution mode', '执行模式')}</label>
@@ -3688,9 +3853,7 @@ function TasksPage(props: {
                   <div>
                     <strong>{task.name}</strong>
                     <div className="card-subtle">
-                      {task.scheduleType === 'interval'
-                        ? props.tr(`Every ${task.intervalMinutes} minutes`, `每 ${task.intervalMinutes} 分钟`)
-                        : props.tr(`Once at ${prettyDate(task.runAt)}`, `执行时间：${prettyDate(task.runAt)}`)}
+                      {taskScheduleLabel(task, props.tr)}
                     </div>
                   </div>
                   <span className={`soft-badge ${task.enabled ? 'badge-ok' : 'badge-muted'}`}>{task.enabled ? props.tr('Enabled', '已启用') : props.tr('Paused', '已暂停')}</span>

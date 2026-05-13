@@ -242,6 +242,26 @@ input:focus, textarea:focus, select:focus { border-color: var(--accent); box-sha
 label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
 .toggle-line { display: flex; gap: 10px; align-items: center; text-transform: none; letter-spacing: 0; font-size: 14px; font-weight: 500; }
 .toggle-line input { width: auto; }
+.inline-fields { display: grid; grid-template-columns: minmax(72px, 1fr) auto minmax(72px, 1fr); gap: 8px; align-items: center; }
+.inline-fields span { color: var(--text-secondary); font-weight: 700; text-align: center; }
+.check-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(82px, 1fr)); gap: 8px; }
+.check-tile {
+  min-height: 38px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.check-tile input { width: auto; margin: 0; }
 .button-row, .inline-form { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
 .compact { margin: 0; }
 .primary-button, .ghost-button, .danger-button, .mini-button {
