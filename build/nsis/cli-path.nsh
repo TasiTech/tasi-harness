@@ -1,6 +1,17 @@
 !include LogicLib.nsh
 !include nsDialogs.nsh
 
+!macro customHeader
+  LangString TasiSkillOverwritePageTitle 1033 "Skill overwrite policy"
+  LangString TasiSkillOverwritePageTitle 2052 "技能覆盖策略"
+  LangString TasiSkillOverwritePageDescription 1033 "Select the local skills that may be overwritten by bundled installer versions. Nothing is selected by default."
+  LangString TasiSkillOverwritePageDescription 2052 "请选择允许安装包版本覆盖的本地技能。默认不选择任何技能。"
+  LangString TasiSkillOverwriteNoConflicts 1033 "No installed local skills conflict with this installer."
+  LangString TasiSkillOverwriteNoConflicts 2052 "没有与此安装包冲突的本地技能。"
+  LangString TasiCleanInstallFailed 1033 "Tasi Harness could not clean the existing installation directory. Close any running Tasi Harness windows and try the installer again."
+  LangString TasiCleanInstallFailed 2052 "Tasi Harness 无法清理现有安装目录。请关闭所有正在运行的 Tasi Harness 窗口，然后重试安装。"
+!macroend
+
 !ifndef BUILD_UNINSTALLER
 Var SkillConflictFile
 Var SkillSelectionFile
@@ -81,9 +92,9 @@ Function SkillOverwritePageCreate
     Abort
   ${EndIf}
 
-  ${NSD_CreateLabel} 0 0 100% 18u "Skill overwrite policy"
+  ${NSD_CreateLabel} 0 0 100% 18u "$(TasiSkillOverwritePageTitle)"
   Pop $1
-  ${NSD_CreateLabel} 0 20u 100% 32u "Select the local skills that may be overwritten by bundled installer versions. Nothing is selected by default."
+  ${NSD_CreateLabel} 0 20u 100% 32u "$(TasiSkillOverwritePageDescription)"
   Pop $1
 
   IfFileExists "$SkillConflictFile" 0 no_skill_conflicts
@@ -113,7 +124,7 @@ Function SkillOverwritePageCreate
   Goto skill_conflict_page_done
 
 no_skill_conflicts:
-  ${NSD_CreateLabel} 0 60u 100% 24u "No installed local skills conflict with this installer."
+  ${NSD_CreateLabel} 0 60u 100% 24u "$(TasiSkillOverwriteNoConflicts)"
   Pop $1
 
 skill_conflict_page_done:
@@ -152,7 +163,7 @@ FunctionEnd
   nsExec::ExecToLog `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\clean-install-dir.ps1" -InstallDir "$INSTDIR"`
   Pop $0
   StrCmp $0 "0" clean_install_done
-  MessageBox MB_ICONSTOP "Tasi Harness could not clean the existing installation directory. Close any running Tasi Harness windows and try the installer again."
+  MessageBox MB_ICONSTOP "$(TasiCleanInstallFailed)"
   Abort
 clean_install_done:
 !macroend

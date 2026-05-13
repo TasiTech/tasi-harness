@@ -98,6 +98,11 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "displayLanguageSelector": true,
+      "installerLanguages": [
+        "en_US",
+        "zh_CN"
+      ],
       "createDesktopShortcut": "always",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",
