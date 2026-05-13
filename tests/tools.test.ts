@@ -20,7 +20,7 @@ describe('builtin tools', () => {
     expect(cfg.sessionDocumentMaxDocs).toBe(10);
     expect(cfg.externalBrowserEngine).toBe('auto');
     expect(cfg.externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
-    expect(cfg.externalBrowserProfileMode).toBe('isolated');
+    expect(cfg.externalBrowserProfileMode).toBe('system');
     expect(cfg.browserHeadless).toBe(false);
     expect(cfg.browserExecutionLoggingEnabled).toBe(false);
   });
