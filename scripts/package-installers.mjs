@@ -11,6 +11,7 @@ const argv = new Set(process.argv.slice(2));
 const builderRetryCount = Math.max(1, Number(process.env.TASI_BUILDER_RETRIES ?? '3') || 3);
 const builderRetryDelayMs = Math.max(0, Number(process.env.TASI_BUILDER_RETRY_DELAY_MS ?? '2000') || 2000);
 const windowsExecutablePath = join(releaseDir, 'win-unpacked', 'Tasi Harness.exe');
+const packageMetadata = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
 const macCliScripts = [join(rootDir, 'build', 'cli', 'mac', 'tasi'), join(rootDir, 'build', 'cli', 'mac', 'tasi-harness')];
 const expectedWindowsMetadata = {
   productName: 'Tasi Harness',
@@ -41,10 +42,15 @@ function printUsage() {
 
 function run(command, args, title) {
   console.log(`\n==> ${title}`);
-  const result = spawnSync(command, args, {
+  const spawnCommand = process.platform === 'win32' && command.toLowerCase().endsWith('.cmd')
+    ? process.env.ComSpec || 'cmd.exe'
+    : command;
+  const spawnArgs = spawnCommand !== command
+    ? ['/d', '/c', command, ...args]
+    : args;
+  const result = spawnSync(spawnCommand, spawnArgs, {
     cwd: rootDir,
-    encoding: 'utf8',
-    shell: process.platform === 'win32'
+    encoding: 'utf8'
   });
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
@@ -118,11 +124,13 @@ function generateBundledSkillManifest(targets) {
   const manifestPath = join(rootDir, 'build', 'nsis', 'bundled-skills.json');
   const skills = findSkillFiles(skillsRoot).map((file) => {
     const frontmatter = parseSkillFrontmatter(readFileSync(file, 'utf8'));
+    const folder = String(file.split(/[\\/]/).at(-2) || '').trim();
     return {
-      name: String(frontmatter.name || file.split(/[\\/]/).at(-2) || '').trim(),
+      name: String(frontmatter.name || folder).trim(),
+      folder,
       category: String(frontmatter.category || file.split(/[\\/]/).at(-3) || '').trim()
     };
-  }).filter((skill) => skill.name).sort((a, b) => a.name.localeCompare(b.name));
+  }).filter((skill) => skill.name).sort((a, b) => (a.folder || a.name).localeCompare(b.folder || b.name));
   mkdirSync(join(rootDir, 'build', 'nsis'), { recursive: true });
   writeFileSync(manifestPath, `${JSON.stringify({ generatedAt: new Date().toISOString(), skills }, null, 2)}\n`, 'utf8');
   console.log(`Generated bundled skill manifest: ${manifestPath} (${skills.length} skills)`);
@@ -184,6 +192,38 @@ function hadRecoveredRceditFailure(result) {
   return output.includes('rcedit') && output.includes('Fatal error: Unable to commit changes');
 }
 
+function applyWindowsExecutableMetadata() {
+  if (process.platform !== 'win32') return;
+  if (!existsSync(windowsExecutablePath)) {
+    throw new Error(`Cannot repair Windows executable metadata because the executable is missing: ${windowsExecutablePath}`);
+  }
+  const localAppData = process.env.LOCALAPPDATA;
+  if (!localAppData) throw new Error('LOCALAPPDATA is not set; cannot locate rcedit.');
+  const rcedit = join(localAppData, 'electron-builder', 'Cache', 'winCodeSign', 'winCodeSign-2.6.0', 'rcedit-x64.exe');
+  if (!existsSync(rcedit)) throw new Error(`rcedit was not found: ${rcedit}`);
+  const productName = String(packageMetadata.build?.productName ?? packageMetadata.productName ?? expectedWindowsMetadata.productName);
+  const version = String(packageMetadata.version ?? '0.0.0');
+  const productVersion = /^\d+\.\d+\.\d+$/.test(version) ? `${version}.0` : version;
+  const copyright = `Copyright © ${new Date().getFullYear()} ${productName}`;
+  const result = spawnSync(rcedit, [
+    windowsExecutablePath,
+    '--set-version-string', 'FileDescription', productName,
+    '--set-version-string', 'ProductName', productName,
+    '--set-version-string', 'LegalCopyright', copyright,
+    '--set-file-version', version,
+    '--set-product-version', productVersion,
+    '--set-version-string', 'InternalName', productName,
+    '--set-version-string', 'CompanyName', productName,
+    '--set-icon', join(rootDir, 'build', 'icon.ico')
+  ], {
+    cwd: rootDir,
+    encoding: 'utf8'
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  ensureSuccess(result, 'Repairing Windows executable metadata');
+}
+
 function packageInstallers(command, args, targets) {
   let lastError;
   for (let attempt = 1; attempt <= builderRetryCount; attempt += 1) {
@@ -203,6 +243,19 @@ function packageInstallers(command, args, targets) {
       }
     } else {
       lastError = new Error(`electron-builder exited with code ${result.status ?? 'unknown'}.`);
+      if (targets.win && hadRecoveredRceditFailure(result) && existsSync(windowsExecutablePath)) {
+        try {
+          console.warn('electron-builder failed while writing Windows executable metadata. Repairing metadata and building NSIS from the prepackaged app...');
+          applyWindowsExecutableMetadata();
+          const prepackagedArgs = [...args, '--prepackaged', join('release', 'win-unpacked')];
+          const prepackagedResult = run(command, prepackagedArgs, 'Packaging Windows installer from prepackaged app');
+          ensureSuccess(prepackagedResult, 'Packaging Windows installer from prepackaged app');
+          verifyWindowsExecutableIdentity();
+          return;
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
     }
 
     if (attempt < builderRetryCount) {

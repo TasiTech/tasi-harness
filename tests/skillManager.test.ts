@@ -128,6 +128,24 @@ describe('SkillManager', () => {
     expect(readFileSync(join(localPptxDir, 'SKILL.md'), 'utf8')).toContain('Bundled pptx.');
   });
 
+  it('seeds selected bundled skills by versioned folder name', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const bundledRoot = join(env.home, 'bundled-skills');
+    const bundledSkillDir = join(bundledRoot, 'work', 'ui-ux-pro-max-0.1.0');
+    mkdirSync(bundledSkillDir, { recursive: true });
+    writeFileSync(join(bundledSkillDir, 'SKILL.md'), '---\nname: ui-ux-pro-max\ndescription: bundled\ncategory: work\n---\n\nBundled UI skill.\n', 'utf8');
+
+    const localSkillDir = join(env.home, 'skills', 'work', 'ui-ux-pro-max-0.1.0');
+    mkdirSync(localSkillDir, { recursive: true });
+    writeFileSync(join(localSkillDir, 'SKILL.md'), '---\nname: ui-ux-pro-max\ndescription: local\ncategory: work\n---\n\nLocal UI skill.\n', 'utf8');
+
+    const manager = new SkillManager(env.home, bundledRoot);
+    manager.seedBundledSkills({ overwriteSkillNames: ['ui-ux-pro-max-0.1.0'] });
+
+    expect(readFileSync(join(localSkillDir, 'SKILL.md'), 'utf8')).toContain('Bundled UI skill.');
+  });
+
   it('uploads root skill archives with nested supporting files', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

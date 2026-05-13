@@ -63,7 +63,8 @@ export class SkillManager {
       const rel = relative(this.bundledRoot, dirname(file));
       const targetDir = safeJoin(this.localRoot, rel);
       const skillName = this.metadataFromFile(file, true, 'bundled').name;
-      const shouldOverwrite = options.overwriteExisting || overwriteNames.has(slugifyName(skillName));
+      const skillFolder = basename(dirname(file));
+      const shouldOverwrite = options.overwriteExisting || overwriteNames.has(slugifyName(skillName)) || overwriteNames.has(slugifyName(skillFolder));
       if (existsSync(targetDir) && !shouldOverwrite) continue;
       this.replaceBundledSkillFiles(dirname(file), targetDir);
     }

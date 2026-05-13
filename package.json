@@ -82,6 +82,7 @@
     },
     "win": {
       "target": "nsis",
+      "executableName": "Tasi Harness",
       "icon": "build/icon.ico",
       "extraFiles": [
         {

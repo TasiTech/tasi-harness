@@ -45,11 +45,11 @@ Var SkillCheck17
   Page custom SkillOverwritePageCreate SkillOverwritePageLeave
 !macroend
 
-!macro AddSkillOverwriteCheckbox INDEX Y
+!macro AddSkillOverwriteCheckbox INDEX X Y W
   IfErrors done_add_skill_${INDEX}
   StrCpy $SkillName${INDEX} $R0 -2
   ${If} $SkillName${INDEX} != ""
-    ${NSD_CreateCheckbox} 0 ${Y}u 100% 10u "$SkillName${INDEX}"
+    ${NSD_CreateCheckbox} ${X} ${Y}u ${W} 10u "$SkillName${INDEX}"
     Pop $SkillCheck${INDEX}
     ${NSD_SetState} $SkillCheck${INDEX} ${BST_UNCHECKED}
     ClearErrors
@@ -69,7 +69,8 @@ done_add_skill_${INDEX}:
 
 Function SkillOverwritePageCreate
   File /oname=$PLUGINSDIR\bundled-skills.json "${BUILD_RESOURCES_DIR}\nsis\bundled-skills.json"
-  nsExec::ExecToLog `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$$manifestPath = '$PLUGINSDIR\bundled-skills.json'; $$outPath = '$PLUGINSDIR\skill-conflicts.txt'; $$localRoot = Join-Path $$env:USERPROFILE '.tasi-harness\skills'; $$local = @{}; if (Test-Path -LiteralPath $$localRoot) { Get-ChildItem -LiteralPath $$localRoot -Filter SKILL.md -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $$raw = Get-Content -LiteralPath $$_.FullName -Raw -ErrorAction SilentlyContinue; $$name = ''; if ($$raw -match '(?s)^---\s*(.*?)\s*---') { foreach ($$line in $$Matches[1] -split \"`r?`n\") { if ($$line -match '^\s*name\s*:\s*(.+?)\s*$$') { $$name = $$Matches[1].Trim().Trim('\"').Trim(\"'\"); break } } }; if (-not $$name) { $$name = Split-Path -Leaf (Split-Path -Parent $$_.FullName) }; if ($$name) { $$local[$$name.ToLowerInvariant()] = $$true } } }; $$manifest = Get-Content -LiteralPath $$manifestPath -Raw | ConvertFrom-Json; $$names = @(); foreach ($$skill in $$manifest.skills) { $$name = [string]$$skill.name; if ($$name -and $$local.ContainsKey($$name.ToLowerInvariant())) { $$names += $$name } }; $$names = $$names | Select-Object -First 18; Set-Content -LiteralPath $$outPath -Encoding ASCII -Value $$names"`
+  File /oname=$PLUGINSDIR\detect-skill-conflicts.ps1 "${BUILD_RESOURCES_DIR}\nsis\detect-skill-conflicts.ps1"
+  nsExec::ExecToLog `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$PLUGINSDIR\detect-skill-conflicts.ps1" -ManifestPath "$PLUGINSDIR\bundled-skills.json" -OutPath "$PLUGINSDIR\skill-conflicts.txt"`
   StrCpy $SkillConflictFile "$PLUGINSDIR\skill-conflicts.txt"
   StrCpy $SkillSelectionFile "$PLUGINSDIR\skill-overwrite-selection.txt"
   Delete "$SkillSelectionFile"
@@ -90,24 +91,24 @@ Function SkillOverwritePageCreate
   ClearErrors
   FileRead $2 $R0
   IfErrors no_skill_conflicts
-  !insertmacro AddSkillOverwriteCheckbox 0 58
-  !insertmacro AddSkillOverwriteCheckbox 1 70
-  !insertmacro AddSkillOverwriteCheckbox 2 82
-  !insertmacro AddSkillOverwriteCheckbox 3 94
-  !insertmacro AddSkillOverwriteCheckbox 4 106
-  !insertmacro AddSkillOverwriteCheckbox 5 118
-  !insertmacro AddSkillOverwriteCheckbox 6 130
-  !insertmacro AddSkillOverwriteCheckbox 7 142
-  !insertmacro AddSkillOverwriteCheckbox 8 154
-  !insertmacro AddSkillOverwriteCheckbox 9 166
-  !insertmacro AddSkillOverwriteCheckbox 10 178
-  !insertmacro AddSkillOverwriteCheckbox 11 190
-  !insertmacro AddSkillOverwriteCheckbox 12 202
-  !insertmacro AddSkillOverwriteCheckbox 13 214
-  !insertmacro AddSkillOverwriteCheckbox 14 226
-  !insertmacro AddSkillOverwriteCheckbox 15 238
-  !insertmacro AddSkillOverwriteCheckbox 16 250
-  !insertmacro AddSkillOverwriteCheckbox 17 262
+  !insertmacro AddSkillOverwriteCheckbox 0 0 58 48%
+  !insertmacro AddSkillOverwriteCheckbox 1 0 70 48%
+  !insertmacro AddSkillOverwriteCheckbox 2 0 82 48%
+  !insertmacro AddSkillOverwriteCheckbox 3 0 94 48%
+  !insertmacro AddSkillOverwriteCheckbox 4 0 106 48%
+  !insertmacro AddSkillOverwriteCheckbox 5 0 118 48%
+  !insertmacro AddSkillOverwriteCheckbox 6 0 130 48%
+  !insertmacro AddSkillOverwriteCheckbox 7 0 142 48%
+  !insertmacro AddSkillOverwriteCheckbox 8 0 154 48%
+  !insertmacro AddSkillOverwriteCheckbox 9 50% 58 50%
+  !insertmacro AddSkillOverwriteCheckbox 10 50% 70 50%
+  !insertmacro AddSkillOverwriteCheckbox 11 50% 82 50%
+  !insertmacro AddSkillOverwriteCheckbox 12 50% 94 50%
+  !insertmacro AddSkillOverwriteCheckbox 13 50% 106 50%
+  !insertmacro AddSkillOverwriteCheckbox 14 50% 118 50%
+  !insertmacro AddSkillOverwriteCheckbox 15 50% 130 50%
+  !insertmacro AddSkillOverwriteCheckbox 16 50% 142 50%
+  !insertmacro AddSkillOverwriteCheckbox 17 50% 154 50%
   FileClose $2
   Goto skill_conflict_page_done
 
