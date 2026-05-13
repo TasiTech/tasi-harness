@@ -32,6 +32,23 @@ describe('SkillManager', () => {
     expect(manager.list().map((s) => s.name)).toContain('repo-review');
   });
 
+  it('skips duplicate patches when the replacement is already present', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const manager = new SkillManager(env.home);
+    manager.create({
+      name: 'Repo Review',
+      category: 'developer',
+      content: '---\nname: repo-review\ndescription: Review repos\n---\n\nStep 1: inspect files.'
+    });
+
+    const patched = manager.patch({ name: 'repo-review', oldString: 'inspect files', newString: 'inspect files and tests' });
+    const repeated = manager.patch({ name: 'repo-review', oldString: 'inspect files', newString: 'inspect files and tests' });
+
+    expect(repeated.content).toBe(patched.content);
+    expect(repeated.content.match(/inspect files and tests/g)).toHaveLength(1);
+  });
+
   it('seeds bundled skills without overwriting existing local edits', () => {
     const env = tempHome();
     cleanup = env.cleanup;

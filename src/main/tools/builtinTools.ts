@@ -94,6 +94,40 @@ function saveBrowserBinary(result: BrowserBinaryResult, context: ToolExecutionCo
   return relative(context.workspaceDir, target);
 }
 
+function riskySkillOptimizationPatchReason(name: string, newString: string): string | null {
+  const skill = name.toLowerCase();
+  const text = newString.toLowerCase();
+  const domainHints = [
+    /browser|browser_screenshot|cdp|webdriver/,
+    /draw\.?io|diagram|svg|png export|connector|cropped/,
+    /docx|word|openability|office package|repair/,
+    /pptx|powerpoint|slide/,
+    /xlsx|excel|spreadsheet/,
+    /chart|visualization|plot/,
+    /travel|flight|hotel/,
+    /skill-creator|skill authoring|skill optimization/
+  ];
+  const mentionedDomains = domainHints.filter((hint) => hint.test(text)).length;
+  const broadLanguage = /all skills|every skill|every workflow|global|universal|generic|always|never|所有|全部|全局|通用|一律/.test(text);
+  if (!/skill-creator|skill|router|orchestr/i.test(name) && broadLanguage && mentionedDomains >= 3) {
+    return 'Rejected broad skill optimization patch. Patch the narrow owner skill for each failure instead of adding global cross-domain rules to one skill.';
+  }
+
+  const integritySignal = /image_or_diagram_integrity|validator|validation|openability|corrupt|repair|missing|cropped|connector|screenshot|failure|failed|error/.test(text);
+  const downplaysFailure = /routine signal|not a failure|non-failure|safe to ignore|can be ignored|ignore (the )?(signal|failure|error)|whitelist|allowlist|白名单|不是失败|忽略/.test(text);
+  if (integritySignal && downplaysFailure) {
+    return 'Rejected failure-signal whitelist patch. Do not downgrade validation, screenshot, image, diagram, or openability failures as routine; route the issue to the responsible skill and add verification.';
+  }
+
+  const isBrowserSkill = /browser/.test(skill);
+  const diagramOrOfficePolicy = /draw\.?io|diagram[- ]export|formal diagram|document figure|docx|pptx|xlsx|office package|word repair|powerpoint|excel/.test(text);
+  if (isBrowserSkill && diagramOrOfficePolicy) {
+    return 'Rejected skill responsibility pollution. Browser automation skills should not absorb diagram, Draw.io, Office, or document-export policy; patch the diagram or Office skill that owns the failure.';
+  }
+
+  return null;
+}
+
 export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
   const requireBrowserAutomation = (): { ok: true; browser: BrowserAutomation } | { ok: false; result: ToolExecutionResult } => {
     if (!deps.browserAutomation) {
@@ -298,7 +332,12 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         return { ok: true, content: `Saved skill ${doc.name}.`, data: doc };
       }
       if (action === 'patch') {
-        const doc = deps.skillManager.patch({ name, oldString: stringArg(obj, 'old_string'), newString: stringArg(obj, 'new_string') });
+        const before = deps.skillManager.read(name);
+        const newString = stringArg(obj, 'new_string');
+        const riskyPatchReason = riskySkillOptimizationPatchReason(name, newString);
+        if (riskyPatchReason) return { ok: false, content: riskyPatchReason };
+        const doc = deps.skillManager.patch({ name, oldString: stringArg(obj, 'old_string'), newString });
+        if (before?.content === doc.content) return { ok: true, content: `Skipped patch for ${doc.name}; requested content is already present.`, data: doc };
         return { ok: true, content: `Patched skill ${doc.name}.`, data: doc };
       }
       if (action === 'delete') return { ok: deps.skillManager.delete(name), content: `Deleted local skill ${name}.` };

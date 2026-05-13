@@ -220,6 +220,10 @@ function analyzeSession(record, sessionFile, skills) {
 
 function detectFailures(messages) {
   const patterns = [
+    { code: 'repeated_skill_patch', re: /"action"\s*:\s*"patch"[\s\S]{0,500}"old_?string"[\s\S]{0,3000}"new_?string"/i },
+    { code: 'overbroad_skill_optimization', re: /"action"\s*:\s*"patch"[\s\S]{0,2500}(all skills|every skill|every workflow|global|universal|generic|always|never|所有|全部|全局|通用|一律)[\s\S]{0,2500}(browser|draw\.?io|diagram|docx|pptx|xlsx|chart|travel|office|screenshot)/i },
+    { code: 'failure_signal_whitelist', re: /(image_or_diagram_integrity|validator|validation|openability|corrupt|repair|missing|cropped|connector|screenshot|failure|failed|error)[\s\S]{0,1200}(routine signal|not a failure|non-failure|safe to ignore|can be ignored|whitelist|allowlist|白名单|不是失败|忽略)|(routine signal|not a failure|non-failure|safe to ignore|can be ignored|whitelist|allowlist|白名单|不是失败|忽略)[\s\S]{0,1200}(image_or_diagram_integrity|validator|validation|openability|corrupt|repair|missing|cropped|connector|screenshot|failure|failed|error)/i },
+    { code: 'skill_responsibility_pollution', re: /"name"\s*:\s*"[^"]*(browser|automation|orchestrat|general|common)[^"]*"[\s\S]{0,2500}(draw\.?io|diagram[- ]export|formal diagram|document figure|docx|pptx|xlsx|office package|word repair|powerpoint|excel)/i },
     { code: 'validator_failed', re: /"ok"\s*:\s*false|\bok\s*:\s*false/i },
     { code: 'tool_exit_nonzero', re: /\bexit\s*=\s*(?!0\b)\d+/i },
     { code: 'exception_or_error', re: /\b(error|exception|traceback|stack trace|fatal|failed|failure|invalid|corrupt|unreadable|broken)\b/i },
@@ -304,6 +308,18 @@ function buildNextActions(candidates, failures) {
   actions.push('Open the selected session JSON and read the full messages around each failure signal before editing any skill.');
   actions.push('Map each failure to the narrowest affected skill; one session can require multiple skill updates.');
   actions.push('For repeatable structural failures, add or extend a script/validator in the affected skill and test it against the failing artifact when available.');
+  if (failures.some((failure) => failure.codes.includes('repeated_skill_patch'))) {
+    actions.push('Repeated skill patch attempts were detected. Re-read the target skill before patching, check whether the proposed new_string is already present, and skip duplicate patches instead of retrying the same replacement.');
+  }
+  if (failures.some((failure) => failure.codes.includes('overbroad_skill_optimization'))) {
+    actions.push('Potential overbroad skill optimization was detected. Reduce the change to the smallest owner skill and avoid adding global cross-domain rules from one session failure.');
+  }
+  if (failures.some((failure) => failure.codes.includes('failure_signal_whitelist'))) {
+    actions.push('Potential failure-signal whitelisting was detected. Do not mark validation, screenshot, image/diagram integrity, or openability failures as routine or ignorable; add a narrower condition and verification instead.');
+  }
+  if (failures.some((failure) => failure.codes.includes('skill_responsibility_pollution'))) {
+    actions.push('Potential skill responsibility pollution was detected. Move domain-specific export/openability rules out of broad/browser/orchestration skills and into the diagram, DOCX, PPTX, or XLSX owner skill.');
+  }
   if (candidates.length > 0) {
     actions.push(`Start with: ${candidates.slice(0, 5).map((skill) => skill.name).join(', ')}.`);
   }

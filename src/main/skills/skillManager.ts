@@ -128,6 +128,9 @@ export class SkillManager {
   patch(req: SkillPatchRequest): SkillDocument {
     const file = this.localSkillFile(req.name);
     const raw = readFileSync(file, 'utf8');
+    if (req.oldString === req.newString || (req.newString && raw.includes(req.newString))) {
+      return this.documentFromFile(file, true, 'local');
+    }
     if (!raw.includes(req.oldString)) throw new Error('oldString not found in skill.');
     writeFileSync(file, raw.replace(req.oldString, req.newString), 'utf8');
     return this.documentFromFile(file, true, 'local');

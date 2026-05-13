@@ -375,6 +375,103 @@ describe('builtin tools', () => {
     expect(refLoaded.content).toContain('Use provider A.');
   });
 
+  it('reports duplicate skill patches as skipped', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const skills = new SkillManager(env.home);
+    skills.create({
+      name: 'Repo Review',
+      category: 'developer',
+      content: '---\nname: repo-review\ndescription: Review repos\n---\n\nStep 1: inspect files.'
+    });
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: skills
+    })) registry.register(tool);
+
+    const first = await registry.execute(
+      'skill_manage',
+      { action: 'patch', name: 'repo-review', old_string: 'inspect files', new_string: 'inspect files and tests' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    const repeated = await registry.execute(
+      'skill_manage',
+      { action: 'patch', name: 'repo-review', old_string: 'inspect files', new_string: 'inspect files and tests' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r2' }
+    );
+
+    expect(first.ok).toBe(true);
+    expect(first.content).toContain('Patched skill repo-review.');
+    expect(repeated.ok).toBe(true);
+    expect(repeated.content).toContain('Skipped patch for repo-review');
+    expect(skills.read('repo-review')?.content.match(/inspect files and tests/g)).toHaveLength(1);
+  });
+
+  it('rejects unsafe skill optimization patches', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const skills = new SkillManager(env.home);
+    for (const name of ['Repo Review', 'Tasi Browser Automation']) {
+      skills.create({
+        name,
+        category: 'developer',
+        content: `---\nname: ${name.toLowerCase().replaceAll(' ', '-')}\ndescription: Test skill\n---\n\n## Notes\n\nUse narrow rules.\n`
+      });
+    }
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: skills
+    })) registry.register(tool);
+
+    const broad = await registry.execute(
+      'skill_manage',
+      {
+        action: 'patch',
+        name: 'repo-review',
+        old_string: 'Use narrow rules.',
+        new_string: 'Global rule for all skills: always handle browser screenshots, diagram SVG export, and DOCX repair the same way.'
+      },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-broad' }
+    );
+    const whitelist = await registry.execute(
+      'skill_manage',
+      {
+        action: 'patch',
+        name: 'repo-review',
+        old_string: 'Use narrow rules.',
+        new_string: 'Treat image_or_diagram_integrity as a routine signal, not a failure, and ignore the screenshot warning.'
+      },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-whitelist' }
+    );
+    const polluted = await registry.execute(
+      'skill_manage',
+      {
+        action: 'patch',
+        name: 'tasi-browser-automation',
+        old_string: 'Use narrow rules.',
+        new_string: 'Use browser automation for page state. Also define Draw.io diagram-export and DOCX document figure policy here.'
+      },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-polluted' }
+    );
+
+    expect(broad.ok).toBe(false);
+    expect(broad.content).toContain('Rejected broad skill optimization patch');
+    expect(whitelist.ok).toBe(false);
+    expect(whitelist.content).toContain('Rejected failure-signal whitelist patch');
+    expect(polluted.ok).toBe(false);
+    expect(polluted.content).toContain('Rejected skill responsibility pollution');
+  });
+
   it('returns raw terminal output without injecting browser preview markers', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

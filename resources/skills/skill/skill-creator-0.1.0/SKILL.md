@@ -383,6 +383,11 @@ Use this workflow when the user asks to select a session, inspect a session's fa
 
 4. Optimize each affected skill separately:
    - Update the smallest relevant `SKILL.md`, reference, or script.
+   - Scope guard: do not turn one session failure into a broad rule for all skills, all screenshots, all validators, or all document/image workflows. Fix the narrow failure owner first.
+   - Whitelist guard: do not describe failed validation, screenshot integrity, image/diagram integrity, openability, missing connectors, cropped output, or corrupt files as "routine", "not a failure", or safe to ignore. If a signal is noisy, narrow when it applies and add a concrete verification step.
+   - Responsibility guard: do not patch a broad orchestration, browser, or unrelated skill with domain rules owned by another skill. Browser/page-observation guidance belongs in browser skills; Draw.io/SVG/PNG export belongs in diagram-generation; DOCX/PPTX/XLSX openability belongs in the matching Office skill.
+   - Before applying a patch, re-read the target skill and check whether the proposed replacement text is already present. If it is present, skip the patch instead of retrying the same `old_string`/`new_string` pair.
+   - If `old_string` is missing but `new_string` is already present, treat the change as already applied. Do not broaden the patch just to make the same insertion again.
    - If the failure is structural or repeatable, prefer adding or extending a validator/converter script instead of only adding prose.
    - Preserve unrelated local edits. Review existing diffs before patching files that are already modified.
    - Do not let a fix for one skill hide another failure from the same session.

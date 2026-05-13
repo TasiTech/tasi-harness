@@ -484,8 +484,8 @@ export function App(): ReactElement {
   async function startSkillOptimization(target: SessionSummary): Promise<void> {
     if (chatBusy) return;
     const prompt = tr(
-      `Use skill-creator to inspect session ${target.id} for failed work, identify all related skills, and optimize each affected skill separately. Start by reading the session failure signals, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.`,
-      `使用 skill-creator，检查 session ${target.id} 中的失败问题，识别所有相关技能，并分别优化每个受影响的技能。先读取该 session 的失败信号，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。`
+      `Use skill-creator to inspect session ${target.id} for failed work, identify all related skills, and optimize each affected skill separately. Apply three guards: keep each optimization narrowly scoped, do not whitelist or downgrade failure signals as routine, and do not put domain-specific rules into unrelated skills. Start by reading the session failure signals, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.`,
+      `使用 skill-creator，检查 session ${target.id} 中的失败问题，识别所有相关技能，并分别优化每个受影响的技能。应用三项防护：每次优化保持窄范围，不要把失败信号白名单化或降级为 routine，不要把领域规则写进无关技能。先读取该 session 的失败信号，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。`
     );
     const userMessage: AgentMessage = {
       role: 'user',
