@@ -2171,66 +2171,75 @@ function ChatPage(props: {
             </div>
           )}
           <div className="chat-textarea-wrap">
-          <textarea
-            className="chat-textarea"
-          placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
-            value={input}
-            disabled={runBusy || !connected}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-          />
-            <button
-              className="chat-attach-button"
-              onClick={openSessionDocumentPicker}
-              disabled={runBusy || sessionDocBusy || !connected}
-              title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
-              aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.8"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </button>
-            <button
-              className="chat-attach-button chat-media-button"
-              onClick={openMultimediaPicker}
+            <textarea
+              className="chat-textarea"
+              placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
+              value={input}
               disabled={runBusy || !connected}
-              title={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
-              aria-label={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <div className="chat-attach-toolbar">
+              <button
+                className="chat-attach-button"
+                onClick={openSessionDocumentPicker}
+                disabled={runBusy || sessionDocBusy || !connected}
+                title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+                aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                className="chat-attach-button chat-media-button"
+                onClick={openMultimediaPicker}
+                disabled={runBusy || !connected}
+                title={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+                aria-label={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                  <path d="m7 15 3-3 2.4 2.4L14.5 12 18 15.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
+                </svg>
+              </button>
+            </div>
+            <button
+              className={`send-btn${runBusy ? ' stop' : ''}`}
+              disabled={runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected}
+              title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
+              onClick={() => {
+                if (runBusy) {
+                  void stopCurrentSession();
+                  return;
+                }
+                void send();
+              }}
             >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
-                <path d="m7 15 3-3 2.4 2.4L14.5 12 18 15.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
-              </svg>
+              {runBusy ? (
+                props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />
+              ) : (
+                <svg className="send-arrow-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 19V5" />
+                  <path d="m6 11 6-6 6 6" />
+                </svg>
+              )}
             </button>
           </div>
         </div>
-        <button
-          className={`send-btn${runBusy ? ' stop' : ''}`}
-          disabled={runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected}
-          title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
-          onClick={() => {
-            if (runBusy) {
-              void stopCurrentSession();
-              return;
-            }
-            void send();
-          }}
-        >
-          {runBusy ? (props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
-        </button>
       </div>
     </section>
   );

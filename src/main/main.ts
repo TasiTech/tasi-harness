@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -70,6 +70,42 @@ const pendingToolApprovals = new Map<string, {
   resolve: (decision: ToolApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
 }>();
+
+function logAgentChatError(details: {
+  error: unknown;
+  input?: string;
+  sessionId?: string;
+  executionMode?: 'workspace' | 'sandbox';
+  attachments?: AgentMessageAttachment[];
+}): void {
+  const cfg = context.getConfig();
+  const file = join(context.harnessHome, 'logs', 'agent-errors.log');
+  const error = details.error;
+  const record = {
+    at: new Date().toISOString(),
+    event: 'agent.chat.error',
+    provider: cfg.provider,
+    model: cfg.model,
+    baseUrl: cfg.baseUrl,
+    sessionId: details.sessionId,
+    executionMode: details.executionMode,
+    inputLength: details.input?.length ?? 0,
+    attachments: (details.attachments ?? []).map((attachment) => ({
+      kind: attachment.kind,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes
+    })),
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8');
+  } catch (logError) {
+    console.warn(`[agent] failed to write error log: ${logError instanceof Error ? logError.message : String(logError)}`);
+  }
+}
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -1793,6 +1829,13 @@ function registerIpc(): void {
       return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
     } catch (error) {
       if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      logAgentChatError({
+        error,
+        input,
+        sessionId,
+        executionMode,
+        attachments: Array.isArray(attachments) ? attachments : undefined
+      });
       throw new Error(error instanceof Error ? error.message : String(error));
     } finally {
       const active = activeChatControllers.get(senderId);
