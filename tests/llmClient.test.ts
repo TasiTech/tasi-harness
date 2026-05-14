@@ -290,6 +290,55 @@ describe('llmClient', () => {
     ]);
   });
 
+  it('normalizes historical tool call arguments to JSON for qwen-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.6-plus'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'user', content: 'open example.com' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_bad_args',
+              type: 'function',
+              function: { name: 'browser_open', arguments: 'url=https://example.com' }
+            }
+          ]
+        },
+        { role: 'tool', tool_call_id: 'call_bad_args', content: 'opened' },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages[1].tool_calls[0].function.arguments).toBe('{"raw":"url=https://example.com"}');
+    expect(() => JSON.parse(body.messages[1].tool_calls[0].function.arguments)).not.toThrow();
+  });
+
   it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {
     const events = [
       {

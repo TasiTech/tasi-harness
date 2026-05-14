@@ -193,6 +193,23 @@ function parseToolArguments(raw: string): unknown {
   }
 }
 
+function normalizeToolArgumentsForRequest(value: unknown): string {
+  if (typeof value === 'string') {
+    const raw = value.trim();
+    if (!raw) return '{}';
+    try {
+      return JSON.stringify(JSON.parse(raw));
+    } catch {
+      return JSON.stringify({ raw: value });
+    }
+  }
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return '{}';
+  }
+}
+
 function anthropicTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text: text.trim() || ' ' };
 }
@@ -315,7 +332,7 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
         type: 'function',
         function: {
           name: String(tc.function?.name ?? tc.name ?? ''),
-          arguments: typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments ?? {})
+          arguments: normalizeToolArgumentsForRequest(tc.function?.arguments)
         }
       }))
     : undefined;
@@ -369,7 +386,7 @@ function finalizeStreamingToolCalls(acc: OpenAiStreamingToolCall[]): ToolCall[] 
       type: 'function' as const,
       function: {
         name: String(call.function.name ?? ''),
-        arguments: call.function.arguments || '{}'
+        arguments: normalizeToolArgumentsForRequest(call.function.arguments)
       }
     }))
     .filter((call) => call.function.name);
@@ -406,7 +423,7 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
           type: 'function' as const,
           function: {
             name: String(call.function?.name ?? ''),
-            arguments: typeof call.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function?.arguments ?? {})
+            arguments: normalizeToolArgumentsForRequest(call.function?.arguments)
           }
         }))
         .filter((call) => call.function.name);
