@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, React, and Vite. It combines a desktop-oriented chat experience with an OpenAI-compatible tool-calling runtime, browser automation, persistent memory, skills, scheduled tasks, and a personal knowledge base that converts Office documents into Markdown for retrieval.
+Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, React, and Vite. It combines a streaming, desktop-oriented chat experience with an OpenAI-compatible tool-calling runtime, multimodal attachments, browser automation, persistent memory, skills, scheduled tasks, document writing/export, and a personal knowledge base that converts Office documents into Markdown for retrieval.
 
 > Tasi Harness is inspired by Hermes-Agent-style runtime patterns. It does not bundle the original Python Hermes Agent runtime.
 
@@ -11,29 +11,33 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 ## Highlights
 
 - Desktop-first AI agent with local sessions, local memory, and local skill files.
+- Streamed chat responses, plus image, video, and audio attachments for multimodal-capable models.
 - Built-in provider presets for OpenAI, Anthropic, DeepSeek, Qwen / Bailian, MiniMax, Kimi, OpenAI-compatible APIs, and Ollama.
 - Built-in browser automation tools with embedded web preview and external-browser bridge mode.
 - Deep-search skill for Baidu, Google, Bing, and other engines, turning opened webpages into cited answers.
+- Session document upload for one-off file-grounded work, alongside the reusable personal knowledge base.
 - Personal knowledge base that converts Office, PDF, OFD, Markdown, TXT, JSON, and CSV files into searchable Markdown.
-- Skill system based on editable `SKILL.md` files, plus bundled skills, marketplace sources, and Browser Coach recording.
-- Scheduled tasks, optional email notifications, and per-run workspace sandbox copies.
-- PDF / Word export, cited webpage display, open-workspace action, and installed command-line chat.
+- Skill system based on editable `SKILL.md` files, plus bundled skills, marketplace sources, Browser Coach recording, UI design guidance, and skill optimization.
+- Scheduled tasks, optional email / WeChat notifications, and per-run workspace sandbox copies.
+- PDF / Word export with formula-aware rendering, cited webpage display, image-and-text document drafting, open-workspace action, and installed command-line chat.
+- WeChat channel support for text, document/media uploads, and returning generated workspace files.
 - Conservative defaults: context isolation enabled, workspace-scoped file access, terminal disabled by default.
 
 ## Features
 
 | Area | What it does |
 | --- | --- |
-| Agent runtime | Runs a tool-aware chat loop with prompt building, iterative tool execution, and session persistence. |
+| Agent runtime | Runs a streaming, tool-aware chat loop with prompt building, iterative tool execution, multimodal attachments, and session persistence. |
 | Memory | Stores durable facts in local JSON-backed memory entries and injects relevant memory into prompts. |
 | Browser automation | Supports navigation, CDP-backed external Chromium automation with optional headless launches, snapshots with `@e` refs, semantic lookup, keyboard/mouse/form actions, extraction, screenshots/PDF, storage/cookies, console, network, viewport, and close/reset tools. |
 | Deep search and citations | Uses `deep-search` across Baidu, Google, Bing, and other engines, opens webpages for evidence, and keeps numbered Markdown citations in replies. |
+| Session documents and media | Uploads per-session documents for bounded chat context and sends image/video/audio attachments to providers that support multimodal input. |
 | Personal knowledge base | Converts local documents to Markdown, stores extracted assets, chunks content locally, and retrieves snippets with lexical search plus optional keyword expansion. Supports Office, PDF, OFD, and text formats without embeddings or an external vector DB. |
-| Skills | Reads, creates, patches, uploads, and installs `SKILL.md` workflows from local files and marketplace catalogs. Browser Coach can turn recorded browser behavior into a reusable skill. |
+| Skills | Reads, creates, patches, uploads, optimizes, and installs `SKILL.md` workflows from local files and marketplace catalogs. Browser Coach can turn recorded browser behavior into a reusable skill, and bundled skills include deep search, travel, browser automation, and UI design support. |
 | History | Keeps searchable local conversation history in JSON. |
-| Scheduled tasks | Runs prompts on a schedule, can reuse sessions, and can send email notifications. |
+| Scheduled tasks | Runs prompts on a schedule, can reuse sessions, and can send email or WeChat notifications. |
 | Workspace safety | Restricts file tools to the configured workspace and supports a copy-based sandbox execution mode. |
-| Export and CLI | Exports assistant replies to PDF / Word and exposes `tasi chat` after installation. |
+| Export, WeChat, and CLI | Exports assistant replies to formula-aware PDF / Word documents, returns generated files through WeChat, and exposes `tasi chat` after installation. |
 
 ## Installation
 
@@ -56,8 +60,8 @@ Quick commands:
 2. Open **Settings** and configure your model provider.
 3. Choose a workspace directory if you do not want to use the default one.
 4. Go to **Chat** and start a conversation.
-5. If you want document-grounded answers, open **Knowledge**, add files, then enable the **Personal KB** toggle in chat.
-6. If you want reusable workflows, open **Skills** and browse bundled or marketplace skills.
+5. Upload documents or media directly in **Chat** for one-off context, or use **Knowledge** plus the **Personal KB** toggle for reusable document grounding.
+6. If you want reusable workflows, open **Skills** to browse bundled or marketplace skills, record Browser Coach flows, or optimize an existing skill.
 7. If you want background execution, create a job in **Tasks**.
 
 ## Usage Guide
@@ -86,11 +90,17 @@ Detailed guide:
 
 - [Personal Knowledge Base](docs/PERSONAL_KNOWLEDGE_BASE.en.md)
 
+### Chat attachments and session documents
+
+Chat supports streamed replies and optional media attachments for multimodal-capable models. Images, video, and audio are sent as model attachments where the selected provider supports them.
+
+For file-grounded work, use session document upload in Chat. Session documents are converted to bounded XML context for the active conversation. Use **Knowledge** instead when the material should become reusable across sessions.
+
 ### Citations and export
 
 Browser/search-backed answers are prompted to include numbered Markdown citations such as `[1](https://example.com/source)`. The chat UI extracts these links and shows referenced webpages above the message and in the references panel.
 
-Assistant replies can be exported to PDF or Word, which is useful for reports, itinerary plans, web research summaries, and citation-backed tables.
+Assistant replies can be exported to PDF or Word, which is useful for reports, itinerary plans, web research summaries, citation-backed tables, and image-and-text document drafts. PDF export includes KaTeX styling for formulas, and DOCX export preserves readable formula text where possible.
 
 ### Skills and skill marketplace
 
@@ -100,8 +110,13 @@ Skills are plain `SKILL.md` files with frontmatter and instructions. You can:
 - create or patch local skills
 - upload skill archives
 - browse marketplace catalogs such as ClawHub and SkillHub
+- optimize skills from a previous session's failure signals
 
-Bundled browser automation guidance is available as the `tasi-browser-automation` skill. The `deep-search` skill provides multi-engine web research, `tasi-travel` provides itinerary planning with Ctrip-backed evidence and route links, and Browser Coach can generate a skill from recorded browser behavior.
+Bundled browser automation guidance is available as the `tasi-browser-automation` skill. The `deep-search` skill provides multi-engine web research, `tasi-travel` provides itinerary planning with Ctrip-backed evidence and route links, `ui-ux-pro-max` helps with UI design work, and Browser Coach can generate a skill from recorded browser behavior. The Skills page also includes an Optimize tab for targeted skill improvements.
+
+### WeChat channel
+
+The WeChat channel can receive text, document uploads, and image/audio/video media. Documents are converted into session document context, while media can be used as multimodal attachments. When a generated file should be returned, the agent can send workspace files back to the active WeChat conversation with the `wechat_send_file` tool.
 
 ### Sessions and memory
 
@@ -214,7 +229,8 @@ docs/         Engineering and security documentation
 - [Installation, Packaging, and Testing](docs/INSTALLATION_PACKAGING_TESTING.en.md)
 - [Browser Automation](docs/BROWSER_AUTOMATION.en.md)
 - [Personal Knowledge Base](docs/PERSONAL_KNOWLEDGE_BASE.en.md)
-- [Release Notes (v1.3.0)](docs/release_v1.3.0.en.md)
+- [Release Notes (v1.4.0)](docs/release_v1.4.0.en.md)
+- [Release Notes Archive (v1.3.0)](docs/release_v1.3.0.en.md)
 - [Release Notes Archive (v1.2.0)](docs/release_v1.2.0.en.md)
 - [Release Notes Archive (v1.1.0)](docs/release_v1.1.0.en.md)
 
