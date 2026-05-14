@@ -177,8 +177,9 @@ ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.loca
 - Electron context isolation + typed preload bridge
 - Renderer 不直接暴露 Node.js 能力
 - 文件工具限定工作区
-- 终端工具默认关闭
-- 启用终端时仍拦截部分高风险命令模式
+- 终端工具与网络工具默认开启
+- 开启安全审批后，风险终端命令需要审批
+- 终端工具仍会拦截部分明显高风险命令模式
 
 更多说明见：[docs/SECURITY.zh-CN.md](docs/SECURITY.zh-CN.md)
 

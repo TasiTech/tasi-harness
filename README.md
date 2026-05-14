@@ -21,7 +21,7 @@ Tasi Harness is a local-first desktop AI agent built with Electron, TypeScript, 
 - Scheduled tasks, optional email / WeChat notifications, and per-run workspace sandbox copies.
 - PDF / Word export with formula-aware rendering, cited webpage display, image-and-text document drafting, open-workspace action, and installed command-line chat.
 - WeChat channel support for text, document/media uploads, and returning generated workspace files.
-- Conservative defaults: context isolation enabled, workspace-scoped file access, terminal disabled by default.
+- Local safety defaults: context isolation enabled, workspace-scoped file access, terminal and network tools enabled, and risky terminal commands gated by approval.
 
 ## Features
 
@@ -198,7 +198,8 @@ Tasi Harness is designed with conservative local defaults, but it is still a pow
 - Electron context isolation with a typed preload bridge
 - no direct Node.js access from the renderer
 - workspace-confined file tools
-- terminal tool disabled by default
+- terminal and network tools enabled by default
+- risky terminal commands gated by approval when safety approval is enabled
 - blocking of several obviously dangerous shell command patterns even when terminal access is enabled
 
 This is not a complete sandbox for untrusted workloads. For higher-risk automation, keep terminal access disabled or run the app inside an OS/container sandbox.
