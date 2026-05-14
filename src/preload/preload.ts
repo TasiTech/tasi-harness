@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AgentToolEventStream,
+  AgentMessageDeltaStream,
+  AgentMessageAttachment,
   AssistantMessageExportRequest,
   BrowserCoachGenerateSkillRequest,
   BrowserCoachGenerateSkillResult,
@@ -36,12 +38,18 @@ const api = {
     wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
   },
   agent: {
-    chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) =>
-      ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase),
+    chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]) =>
+      ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase, attachments),
     stop: () => ipcRenderer.invoke('agent:stop'),
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';
       const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentToolEventStream) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    },
+    onMessageDelta: (listener: (payload: AgentMessageDeltaStream) => void) => {
+      const channel = 'agent:message-delta';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: AgentMessageDeltaStream) => listener(payload);
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }
@@ -90,6 +98,7 @@ const api = {
     create: (req: SkillWriteRequest) => ipcRenderer.invoke('skills:create', req),
     patch: (req: SkillPatchRequest) => ipcRenderer.invoke('skills:patch', req),
     delete: (name: string) => ipcRenderer.invoke('skills:delete', name),
+    installBundled: (name: string, overwrite?: boolean) => ipcRenderer.invoke('skills:installBundled', name, overwrite),
     uploadArchive: (req: SkillArchiveUploadRequest) => ipcRenderer.invoke('skills:uploadArchive', req),
     browseMarketplace: (query?: string) => ipcRenderer.invoke('skills:market:browse', query),
     installFromMarketplace: (req: SkillInstallRequest) => ipcRenderer.invoke('skills:market:install', req),

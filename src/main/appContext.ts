@@ -1,5 +1,5 @@
 import { app } from 'electron';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig, RegisteredTool } from '../shared/types.js';
@@ -23,6 +23,7 @@ import { BrowserAutomationRouter } from './browser/browserAutomationRouter.js';
 import { EmbeddedBrowserAutomation } from './browser/embeddedBrowserAutomation.js';
 import { ExternalBrowserAutomation } from './browser/externalBrowserAutomation.js';
 import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
+import { BrowserExecutionLogger } from './browser/browserExecutionLogger.js';
 import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
@@ -52,6 +53,29 @@ function findResourcesRoot(): string {
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? resolve(process.cwd(), 'resources');
 }
 
+function consumeInstallerSkillOverwriteChoice(harnessHome: string): { overwriteExisting?: boolean; overwriteSkillNames?: string[] } {
+  const marker = join(harnessHome, 'runtime', 'installer-skill-overwrite.json');
+  if (!existsSync(marker)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8')) as { overwriteBundledSkills?: unknown; overwriteSkillNames?: unknown };
+    const overwriteSkillNames = Array.isArray(parsed.overwriteSkillNames)
+      ? parsed.overwriteSkillNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    return {
+      overwriteExisting: parsed.overwriteBundledSkills === true,
+      overwriteSkillNames
+    };
+  } catch {
+    return {};
+  } finally {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // Best-effort cleanup. A stale marker should not block startup.
+    }
+  }
+}
+
 export class AppContext {
   readonly harnessHome: string;
   readonly configStore: ConfigStore;
@@ -71,6 +95,7 @@ export class AppContext {
   readonly externalBrowserBridge: ExternalBrowserBridge;
   readonly externalBrowserAutomation: ExternalBrowserAutomation;
   readonly browserAutomation: BrowserAutomation;
+  readonly browserExecutionLogger: BrowserExecutionLogger;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
 
@@ -82,13 +107,20 @@ export class AppContext {
     this.syncMemoryFromExistingSessions();
     this.scheduledTaskStore = new ScheduledTaskStore(this.harnessHome);
     this.skillManager = new SkillManager(this.harnessHome, findBundledSkillsRoot());
-    this.skillManager.seedBundledSkills();
+    this.skillManager.seedBundledSkills(consumeInstallerSkillOverwriteChoice(this.harnessHome));
     this.mcpConfigStore = new McpConfigStore(this.harnessHome);
     this.sandboxManager = new SandboxManager(this.harnessHome);
     this.emailNotifier = new EmailNotifier();
     this.embeddedBrowserAutomation = new EmbeddedBrowserAutomation();
-    this.externalBrowserBridge = new ExternalBrowserBridge({ runtimeDir: join(this.harnessHome, 'runtime', 'external-browser') });
-    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig());
+    this.browserExecutionLogger = new BrowserExecutionLogger(
+      join(this.harnessHome, 'logs', 'browser-execution.log'),
+      () => this.getConfig().browserExecutionLoggingEnabled
+    );
+    this.externalBrowserBridge = new ExternalBrowserBridge({
+      runtimeDir: join(this.harnessHome, 'runtime', 'external-browser'),
+      logger: this.browserExecutionLogger
+    });
+    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig(), this.browserExecutionLogger);
     this.browserAutomation = new BrowserAutomationRouter(() => this.getConfig(), this.embeddedBrowserAutomation, this.externalBrowserAutomation);
     this.personalKnowledgeBase = new PersonalKnowledgeBase(this.harnessHome, {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
@@ -157,7 +189,7 @@ export class AppContext {
         : config.externalBrowserEngine === 'cdp'
           ? 'browser_* tools attach to CDP targets; preview fallback can use shell.openExternal'
           : 'webdriver-safari preview only; browser_* tools require CDP for external-page automation';
-    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}; strategy=${strategy}.`;
+    return `- External browser bridge snapshot: engine=${config.externalBrowserEngine}; cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}; strategy=${strategy}; log=${join(this.harnessHome, 'logs', 'browser-execution.log')}.`;
   }
 
   private createTools(): RegisteredTool[] {

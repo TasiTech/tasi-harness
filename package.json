@@ -1,6 +1,6 @@
 {
   "name": "tasi-harness",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Tasi Harness - TypeScript Electron desktop agent inspired by Hermes Agent architecture.",
   "main": "dist/main/main.js",
   "author": "Tasi Harness",
@@ -27,6 +27,7 @@
     "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-react": "latest",
     "jszip": "^3.10.1",
+    "katex": "^0.16.46",
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "nodemailer": "^8.0.7",
@@ -82,6 +83,7 @@
     },
     "win": {
       "target": "nsis",
+      "executableName": "Tasi Harness",
       "icon": "build/icon.ico",
       "extraFiles": [
         {
@@ -95,6 +97,13 @@
       ]
     },
     "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "displayLanguageSelector": true,
+      "installerLanguages": [
+        "en_US",
+        "zh_CN"
+      ],
       "createDesktopShortcut": "always",
       "installerIcon": "build/icon.ico",
       "uninstallerIcon": "build/icon.ico",

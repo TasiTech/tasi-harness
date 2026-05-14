@@ -1,6 +1,6 @@
 ---
 name: docx
-description: "Comprehensive document creation, editing, and analysis with support for tracked changes, comments, formatting preservation, text extraction, and robust table generation. Use when working with professional documents (.docx files): creating documents, editing content, tracked changes, comments, reports with tables, comparison tables, pricing tables, schedules, or any other document tasks."
+description: "Comprehensive document creation, editing, and analysis with support for tracked changes, comments, formatting preservation, and text extraction. When agent needs to work with professional documents (.docx files) for: (1) Creating new documents, (2) Modifying or editing content, (3) Working with tracked changes, (4) Adding comments, or any other document tasks"
 category: document-processing
 license: Proprietary. LICENSE.txt has complete terms
 ---
@@ -81,65 +81,55 @@ When creating a new Word document from scratch, use **docx-js**, which allows yo
 ### Workflow
 1. **MANDATORY - READ ENTIRE FILE**: Read [`docx-js.md`](docx-js.md) (~500 lines) completely from start to finish. **NEVER set any range limits when reading this file.** Read the full file content for detailed syntax, critical formatting rules, and best practices before proceeding with document creation.
 2. Draft rich source content first (full sections, complete paragraphs, concrete details, and examples) based on the "Content Quality Defaults" above.
-3. If the user requests AI-generated illustrations or cover images, generate image files first using the **qwen-image** skill workflow (see "AI image generation for DOCX" section below).
-4. Create a JavaScript/TypeScript file using Document, Paragraph, TextRun, and ImageRun components (You can assume all dependencies are installed, but if not, refer to the dependencies section below)
+3. If the source content includes figures, diagrams, screenshots, chart placeholders, or generated assets, **embed the exported image files in the document body** at the relevant locations using `ImageRun` (docx-js) or OOXML image relationships. Do not merely list asset paths in an appendix. A Word document is incomplete if required figures are not embedded near the sections that reference them.
+   - For Draw.io diagrams, use assets exported from the `.drawio` source, not browser viewport screenshots or temporary HTML redraw screenshots.
+   - Prefer SVG for vector diagrams and illustrations. If an SVG asset exists, embed the SVG directly in the `.docx`; do not convert it to PNG solely for Word insertion.
+   - Use PNG/JPG only when the original asset is raster, when the user explicitly requests raster output, or when a target viewer/library requires a compatibility fallback. If a fallback PNG is needed from Draw.io SVG, render the SVG with Draw.io/diagrams.net export, Inkscape, rsvg-convert, Sharp, or resvg using the SVG viewBox/full canvas bounds; never use browser viewport screenshots or temporary HTML screenshots.
+   - Before embedding diagram PNG/SVG files, run:
+     ```bash
+     node resources/skills/work/diagram-generator-1.1.1/scripts/validate_diagram_exports.mjs --asset-dir diagrams/exports --drawio-dir diagrams/drawio
+     ```
+     If the images fail validation, regenerate them or mark the document degraded/incomplete.
+4. Create a JavaScript/TypeScript file using Document, Paragraph, TextRun, ImageRun, and related components (You can assume all dependencies are installed, but if not, refer to the dependencies section below)
 5. Export as .docx using Packer.toBuffer()
+6. Run the DOCX openability validator before delivery:
+   ```bash
+   node resources/skills/work/docx/scripts/validate_docx.mjs --input output.docx
+   ```
+   Treat any `ok: false` result as a failed document. The validator checks package readability, required parts, XML well-formedness, direct body runs, bare page breaks, duplicate drawing ids, unqualified Word XML tags such as `<text>`, broken relationship targets, missing image relationships, and invalid embedded image signatures.
+   If it reports repairable structural issues such as bare page-break runs, duplicate drawing ids, or bare page-number tags, repair and recheck:
+   ```bash
+   node resources/skills/work/docx/scripts/validate_docx.mjs --input output.docx --repair-output output.repaired.docx
+   node resources/skills/work/docx/scripts/validate_docx.mjs --input output.repaired.docx
+   ```
+7. For the final file, run at least one openability smoke test when available: Word COM open/save on Windows, or LibreOffice headless conversion/re-save. If no GUI/headless office is available, explicitly say static validation passed but live Word opening was not available.
+8. Verify figure completeness: every required figure mentioned in the source has an exported SVG/PNG/JPG asset, an embedded image in the `.docx`, and a nearby caption. For vector diagrams, prefer the SVG asset directly and do not rasterize it unless fallback compatibility is required. If an image asset is missing, cropped, screenshot-derived, or cannot be embedded, explicitly report a degraded/incomplete output instead of claiming the document is complete.
 
-### Table request reliability rules (critical)
+### Openability gate for generated DOCX
 
-If the user asks for a table (or structured tabular content), follow all rules below:
-- Always create at least one `new Table({...})` object and place that table object inside `sections[0].children`.
-- Ensure every `TableCell` contains at least one `Paragraph` child.
-- Set both table-level `columnWidths` and per-cell `width` values using `WidthType.DXA`.
-- Apply borders to each `TableCell` (not the `Table` object).
-- If bullets are used inside cells, define `numbering.config` and use `LevelFormat.BULLET`.
-- Before saving, do a quick structural check in code: verify that `sections[*].children` includes at least one `Table` object.
+Before delivering a generated Word file, follow this gate:
+- Generate the `.docx`.
+- Validate it with `scripts/validate_docx.mjs`.
+- If validation fails and repair is available, write a repaired copy, validate the repaired copy, and deliver only the passing file.
+- If validation still fails, do not claim the Word file is complete; report the failing issue codes.
+- Prefer a live open smoke test after static validation when Word or LibreOffice is available.
 
-If a previous attempt produced a document without tables, regenerate using the minimal, known-good table pattern from `docx-js.md` "Tables" section first, then add styling incrementally.
-- This is default behavior: when user requirements contain tabular data, comparisons, schedules, pricing, metrics, or matrix-like structure, generate tables automatically without requiring extra user prompt wording.
-- Do not ask for confirmation to add a table unless the user explicitly asks for paragraph-only output.
+Common failures this gate must catch:
+- Duplicate `wp:docPr` / `pic:cNvPr` ids from repeated image runs.
+- Bare run-level objects directly under `w:body`, including standalone `PageBreak`.
+- Broken internal `.rels` targets or missing image parts.
+- Invalid PNG/JPEG/SVG signatures.
+- Bare, unqualified tags inside `word/*.xml`, especially `<text>PAGE</text>` from incorrect page-number generation.
+- Page numbers must use docx-js field constants such as `PageNumber.CURRENT` and `PageNumber.TOTAL_PAGES`, not `{ text: "PAGE" }` or `{ text: "NUMPAGES" }`.
+- Vector figures should stay SVG in the DOCX; do not convert SVG diagrams to PNG merely to insert them.
 
 ### Drafting requirements for generated content
 - Start each section with a clear section purpose sentence, then expand with reasoning and evidence.
 - For recommendations/proposals, include: current situation, problem analysis, proposed solution, implementation steps, risk control, expected outcomes.
 - For plans, include: timeline, owner roles, milestones, and measurable acceptance criteria.
 - For analytical content, include: claim, supporting facts, interpretation, and conclusion.
+- For documents with required diagrams or charts, embed the exported image asset immediately after the paragraph that introduces it, then add a caption. Prefer SVG assets directly for vector diagrams. Keep any appendix file list only as a secondary inventory.
 - Close longer documents with a concise summary and explicit next-step checklist.
-
-## AI image generation for DOCX
-
-When the user asks to insert AI-generated images into a Word document, use this workflow:
-
-1. Generate image files locally via qwen-image script:
-   ```bash
-   python3 .qwen/skills/qwen-image/scripts/generate_image.py \
-     --prompt "<image description>" \
-     --size "1664*928" \
-     --filename "./tmp/docx-images/<image-name>.png"
-   ```
-2. If API key is missing, resolve it in this order:
-   - `models.providers.bailian.apiKey` in `./.qwen/settings.json`
-   - `skills."qwen-image".apiKey` in `./.qwen/settings.json`
-   - `DASHSCOPE_API_KEY` environment variable
-3. Ensure the script output contains `Image saved:` and keep the local file path for document assembly.
-4. Insert image with `ImageRun` in docx-js (image `type` is required):
-   ```javascript
-   new Paragraph({
-     alignment: AlignmentType.CENTER,
-     children: [
-       new ImageRun({
-         type: "png",
-         data: fs.readFileSync("./tmp/docx-images/cover.png"),
-         transformation: { width: 560, height: 315 },
-       }),
-     ],
-   })
-   ```
-
-Rules:
-- Generate and save images locally first; do not depend on temporary URL links inside the final DOCX.
-- Keep images under a working folder such as `./tmp/docx-images/` and reference them with stable local paths during generation.
-- Match image type with file extension (`png` -> `type: "png"`, `jpg/jpeg` -> `type: "jpg"` or `"jpeg"`).
 
 ## Editing an existing Word document
 
@@ -275,6 +265,7 @@ Before finishing document generation, verify:
 - The document includes concrete details (examples, constraints, assumptions, or metrics).
 - Tone and wording match the target audience (e.g., management, technical team, client, regulator).
 - The conclusion includes clear decisions or next actions.
+- The generated `.docx` passes `scripts/validate_docx.mjs` with no error issues. Do not deliver a Word file that contains direct `w:r` nodes under `w:body`, bare page-break runs, broken relationships, unqualified Word XML tags, invalid embedded image signatures, duplicate drawing ids, or malformed page-number fields.
 
 ## Dependencies
 

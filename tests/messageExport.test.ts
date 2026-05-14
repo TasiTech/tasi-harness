@@ -4,10 +4,11 @@ import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportB
 
 describe('message export helpers', () => {
   it('builds printable html with rendered answer content', () => {
-    const html = buildAssistantMessageExportHtml('Answer', '<p>Hello <strong>world</strong></p>');
+    const html = buildAssistantMessageExportHtml('Answer', '<p>Hello <strong>world</strong></p><span class="katex">x</span>');
 
     expect(html).toContain('<title>Answer</title>');
     expect(html).toContain('<p>Hello <strong>world</strong></p>');
+    expect(html).toContain('.katex');
   });
 
   it('builds a docx package containing reply text and citations', async () => {
@@ -156,6 +157,30 @@ describe('message export helpers', () => {
     expect(documentXml).toContain('Hotel');
     expect(relsXml).toContain('https://example.com/day1');
     expect(relsXml).toContain('https://example.com/hotel');
+  });
+
+  it('exports markdown formulas to readable Word math text', async () => {
+    const docx = await buildAssistantMessageDocx(
+      'Answer',
+      '$\\rho c \\frac{\\partial T}{\\partial \\tau} = k \\nabla^2 T + \\rho_b c_b \\omega_b(T_a - T) + Q_m + Q_{ext}$'
+    );
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+
+    expect(documentXml).toContain('ρc ∂T / ∂τ = k ∇²T');
+    expect(documentXml).toContain('ρ_b c_b ω_b(T_a - T)');
+    expect(documentXml).toContain('Q_ext');
+    expect(documentXml).not.toContain('frac');
+  });
+
+  it('prefers markdown over rendered KaTeX html for docx math export', async () => {
+    const html = '<p><span class="katex"><span>∂τ∂T</span></span></p>';
+    const docx = await buildAssistantMessageDocx('Answer', '$\\frac{\\partial T}{\\partial \\tau}$', html);
+    const zip = await JSZip.loadAsync(docx);
+    const documentXml = await zip.file('word/document.xml')?.async('string') ?? '';
+
+    expect(documentXml).toContain('∂T / ∂τ');
+    expect(documentXml).not.toContain('∂τ∂T');
   });
 
   it('sanitizes export filenames', () => {

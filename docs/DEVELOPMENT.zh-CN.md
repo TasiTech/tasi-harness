@@ -31,9 +31,8 @@ npm run pack
 
 在 `resources/skills/<category>/<skill-name>/SKILL.md` 下创建目录与文档。
 
-启动时，缺失的内置技能会自动复制到 `~/.tasi-harness/skills`，并按普通本地技能参与扫描。
+启动时，内置技能会同步到 `~/.tasi-harness/skills` 的对应目录：安装包里的文件会覆盖同路径内置技能副本，并清理该目录中旧版本残留文件；其他用户安装的技能目录保持不变。
 
 ## 测试说明
 
 测试使用临时目录，不会写入真实用户目录。agent-loop 测试依赖 `MockLlmClient`，无需网络或 API Key。
-

@@ -1,5 +1,7 @@
 import type {
   AgentToolEventStream,
+  AgentMessageDeltaStream,
+  AgentMessageAttachment,
   AgentRunResult,
   AppInfo,
   AssistantMessageExportRequest,
@@ -53,9 +55,10 @@ declare global {
         wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
       };
       agent: {
-        chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean): Promise<AgentRunResult>;
+        chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
+        onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;
       };
       security: {
         onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;
@@ -91,6 +94,7 @@ declare global {
         create(req: SkillWriteRequest): Promise<SkillDocument>;
         patch(req: SkillPatchRequest): Promise<SkillDocument>;
         delete(name: string): Promise<boolean>;
+        installBundled(name: string, overwrite?: boolean): Promise<SkillDocument>;
         uploadArchive(req: SkillArchiveUploadRequest): Promise<SkillDocument>;
         browseMarketplace(query?: string): Promise<MarketplaceBrowseResult>;
         installFromMarketplace(req: SkillInstallRequest): Promise<MarketplaceSkill>;

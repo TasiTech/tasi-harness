@@ -1,7 +1,9 @@
 import { normalizeCitationHref } from './citations.js';
+import katex from 'katex';
 
 const BARE_HTTP_URL_RE = /(^|[\s(>])((https?:\/\/[^\s<)]+))/gi;
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)\n]+)\)/g;
+const INLINE_TOKEN_RE = /@@INLINE_TOKEN_(\d+)@@/g;
 
 function restoreFlattenedTableLine(line: string): string {
   const pipeCount = (line.match(/\|/g) ?? []).length;
@@ -93,8 +95,135 @@ function renderMarkdownLink(label: string, href: string): string {
   return `<a href="${escapedHref}" target="_blank" rel="noreferrer">${label}</a>`;
 }
 
+function tokenFor(index: number): string {
+  return `@@INLINE_TOKEN_${index}@@`;
+}
+
+function protectInlineCode(text: string, tokens: string[]): string {
+  return text.replace(/`([^`\n]+)`/g, (_match, code: string) => {
+    const index = tokens.push(`<code>${escapeHtml(code)}</code>`) - 1;
+    return tokenFor(index);
+  });
+}
+
+function isEscaped(text: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
+    slashCount += 1;
+  }
+  return slashCount % 2 === 1;
+}
+
+function findUnescaped(text: string, needle: string, start: number): number {
+  let index = text.indexOf(needle, start);
+  while (index >= 0) {
+    if (!isEscaped(text, index)) return index;
+    index = text.indexOf(needle, index + needle.length);
+  }
+  return -1;
+}
+
+function renderMathHtml(tex: string, displayMode: boolean, raw: string): string {
+  try {
+    return katex.renderToString(tex.trim(), {
+      displayMode,
+      output: 'html',
+      strict: 'ignore',
+      throwOnError: false
+    });
+  } catch {
+    return escapeHtml(raw);
+  }
+}
+
+function pushMathToken(tokens: string[], tex: string, displayMode: boolean, raw: string): string {
+  const index = tokens.push(renderMathHtml(tex, displayMode, raw)) - 1;
+  return tokenFor(index);
+}
+
+function shouldStartDollarMath(text: string, index: number): boolean {
+  if (isEscaped(text, index)) return false;
+  const next = text[index + 1] ?? '';
+  const previous = text[index - 1] ?? '';
+  if (!next || /\s|\$/.test(next)) return false;
+  if (previous && /[\w)]/.test(previous)) return false;
+  return true;
+}
+
+function isLikelyDollarMath(tex: string): boolean {
+  const trimmed = tex.trim();
+  if (!trimmed) return false;
+  if (/\\[a-zA-Z]+/.test(trimmed)) return true;
+  if (/[_^{}=<>]/.test(trimmed)) return true;
+  if (/[∫∑∏√∞≤≥≠≈ΩαβγδΔθλμπσφω]/.test(trimmed)) return true;
+  if (/^[A-Za-z]$/.test(trimmed)) return true;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) return false;
+  return /[A-Za-z]/.test(trimmed) && /[+\-*/]/.test(trimmed);
+}
+
+function protectMath(text: string, tokens: string[]): string {
+  let out = '';
+  let index = 0;
+
+  while (index < text.length) {
+    if (text.startsWith('$$', index) && !isEscaped(text, index)) {
+      const end = findUnescaped(text, '$$', index + 2);
+      if (end > index + 2) {
+        const raw = text.slice(index, end + 2);
+        out += pushMathToken(tokens, text.slice(index + 2, end), true, raw);
+        index = end + 2;
+        continue;
+      }
+    }
+
+    if (text.startsWith('\\(', index)) {
+      const end = findUnescaped(text, '\\)', index + 2);
+      if (end > index + 2) {
+        const raw = text.slice(index, end + 2);
+        out += pushMathToken(tokens, text.slice(index + 2, end), false, raw);
+        index = end + 2;
+        continue;
+      }
+    }
+
+    if (text.startsWith('\\[', index)) {
+      const end = findUnescaped(text, '\\]', index + 2);
+      if (end > index + 2) {
+        const raw = text.slice(index, end + 2);
+        out += pushMathToken(tokens, text.slice(index + 2, end), true, raw);
+        index = end + 2;
+        continue;
+      }
+    }
+
+    if (text[index] === '$' && shouldStartDollarMath(text, index)) {
+      const end = findUnescaped(text, '$', index + 1);
+      if (end > index + 1) {
+        const raw = text.slice(index, end + 1);
+        const tex = text.slice(index + 1, end);
+        if (isLikelyDollarMath(tex)) {
+          out += pushMathToken(tokens, tex, false, raw);
+          index = end + 1;
+          continue;
+        }
+      }
+    }
+
+    out += text[index];
+    index += 1;
+  }
+
+  return out;
+}
+
+function restoreInlineTokens(html: string, tokens: string[]): string {
+  return html.replace(INLINE_TOKEN_RE, (_match, indexText: string) => tokens[Number(indexText)] ?? '');
+}
+
 function renderInlineHtml(text: string): string {
-  let html = escapeHtml(text);
+  const inlineTokens: string[] = [];
+  const protectedText = protectMath(protectInlineCode(text, inlineTokens), inlineTokens);
+  let html = escapeHtml(protectedText);
   html = html.replace(MARKDOWN_LINK_RE, (_match, label: string, href: string) => renderMarkdownLink(label, href));
   html = html.replace(BARE_HTTP_URL_RE, (_match, prefix: string, url: string) => {
     const safePrefix = prefix ?? '';
@@ -102,10 +231,9 @@ function renderInlineHtml(text: string): string {
     const normalizedUrl = trailing ? url.slice(0, -trailing.length) : url;
     return `${safePrefix}<a href="${normalizedUrl}" target="_blank" rel="noreferrer">${normalizedUrl}</a>${trailing}`;
   });
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
   html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-  return html;
+  return restoreInlineTokens(html, inlineTokens);
 }
 
 function isHorizontalRule(line: string): boolean {

@@ -1,0 +1,85 @@
+{
+  "generatedAt": "2026-05-14T03:45:10.103Z",
+  "skills": [
+    {
+      "name": "chart-generator",
+      "folder": "chart-generator",
+      "category": "work"
+    },
+    {
+      "name": "code-review",
+      "folder": "code-review",
+      "category": "developer"
+    },
+    {
+      "name": "deep-search",
+      "folder": "deep-search",
+      "category": "browser"
+    },
+    {
+      "name": "diagram-generator-1.1.1",
+      "folder": "diagram-generator-1.1.1",
+      "category": "local"
+    },
+    {
+      "name": "document",
+      "folder": "document",
+      "category": "work"
+    },
+    {
+      "name": "docx",
+      "folder": "docx",
+      "category": "document-processing"
+    },
+    {
+      "name": "embedded-browser-operator",
+      "folder": "embedded-browser-operator",
+      "category": "browser"
+    },
+    {
+      "name": "pdf",
+      "folder": "pdf",
+      "category": "work"
+    },
+    {
+      "name": "persistent-memory",
+      "folder": "persistent-memory",
+      "category": "productivity"
+    },
+    {
+      "name": "pptx",
+      "folder": "pptx",
+      "category": "work"
+    },
+    {
+      "name": "skill-creator",
+      "folder": "skill-creator-0.1.0",
+      "category": "skill"
+    },
+    {
+      "name": "tasi-browser-automation",
+      "folder": "tasi-browser-automation",
+      "category": "browser"
+    },
+    {
+      "name": "tasi-travel",
+      "folder": "tasi-travel",
+      "category": "travel"
+    },
+    {
+      "name": "typescript-project",
+      "folder": "typescript-project",
+      "category": "developer"
+    },
+    {
+      "name": "ui-ux-pro-max",
+      "folder": "ui-ux-pro-max-0.1.0",
+      "category": "work"
+    },
+    {
+      "name": "xlsx",
+      "folder": "xlsx",
+      "category": "work"
+    }
+  ]
+}

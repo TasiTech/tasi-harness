@@ -158,7 +158,13 @@ When creating a new PowerPoint presentation from scratch, use the **html2pptx** 
    - Use the `html2pptx()` function to process each HTML file
    - Add charts and tables to placeholder areas using PptxGenJS API
    - Save the presentation using `pptx.writeFile()`
-4. **Visual validation**: Generate thumbnails and inspect for layout issues
+4. **Package validation gate**: Validate the generated `.pptx` before delivery or visual review:
+   ```bash
+   node scripts/validate_pptx.mjs --input output.pptx
+   ```
+   Treat any `ok: false` result as a failed presentation. The validator checks ZIP readability, required PPTX parts, XML well-formedness, slide references, internal relationship targets, embedded media signatures, and duplicate slide shape ids.
+   If validation fails, fix/regenerate the deck and rerun the validator before continuing.
+5. **Visual validation**: Generate thumbnails and inspect for layout issues
    - Create thumbnail grid: `python scripts/thumbnail.py output.pptx workspace/thumbnails --cols 4`
    - Read and carefully examine the thumbnail image for:
      - **Text cutoff**: Text being cut off by header bars, shapes, or slide edges
@@ -167,6 +173,14 @@ When creating a new PowerPoint presentation from scratch, use the **html2pptx** 
      - **Contrast issues**: Insufficient contrast between text and backgrounds
    - If issues found, adjust HTML margins/spacing/colors and regenerate the presentation
    - Repeat until all slides are visually correct
+
+### PPTX openability gate
+
+Before delivering any generated or edited presentation:
+- Run `node scripts/validate_pptx.mjs --input output.pptx`.
+- Do not deliver a deck with missing parts, malformed XML, broken `.rels` targets, missing slide parts, invalid media signatures, or duplicate slide shape ids.
+- If the deck contains Draw.io diagrams or chart exports, validate those assets with the relevant diagram/chart workflow before insertion. Do not use browser viewport screenshots as formal slide figures.
+- After static validation, prefer a live smoke test when available: PowerPoint open/save on Windows or LibreOffice headless conversion to PDF/images.
 
 ## Editing an existing PowerPoint presentation
 
@@ -178,6 +192,10 @@ When edit slides in an existing PowerPoint presentation, you need to work with t
 3. Edit the XML files (primarily `ppt/slides/slide{N}.xml` and related files)
 4. **CRITICAL**: Validate immediately after each edit and fix any validation errors before proceeding: `python ooxml/scripts/validate.py <dir> --original <file>`
 5. Pack the final presentation: `python ooxml/scripts/pack.py <input_directory> <office_file>`
+6. Run final package validation before delivery:
+   ```bash
+   node scripts/validate_pptx.mjs --input <office_file>
+   ```
 
 ## Creating a new PowerPoint presentation **using a template**
 

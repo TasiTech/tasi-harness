@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
@@ -16,6 +16,8 @@ function parseToolArgs(raw: string): unknown {
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
+  onMessageDelta?: (sessionId: string, event: AgentMessageDeltaStream) => void;
+  onSessionUpdated?: (session: SessionRecord) => void;
   requestToolApproval?: ToolApprovalRequester;
   signal?: AbortSignal;
 }
@@ -28,6 +30,18 @@ function createAbortError(): Error {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw createAbortError();
+}
+
+function splitReasoningParts(content: string): string[] {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized) return [];
+  const lineItems = normalized
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, ''))
+    .filter(Boolean);
+  if (lineItems.length > 1) return lineItems;
+  const sentenceItems = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) ?? [];
+  return sentenceItems.length > 0 ? sentenceItems : [normalized];
 }
 
 export class AgentLoop {
@@ -53,7 +67,13 @@ export class AgentLoop {
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
     const session = options.sessionId ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create() : this.deps.sessions.create();
     this.deps.beginDeferredMemory(session.id);
-    const userMessage: AgentMessage = { id: createId('msg'), role: 'user', content: options.userInput, createdAt: nowIso() };
+    const userMessage: AgentMessage = {
+      id: createId('msg'),
+      role: 'user',
+      content: options.userInput,
+      attachments: options.attachments?.length ? options.attachments : undefined,
+      createdAt: nowIso()
+    };
     try {
       const history = [...session.messages, userMessage];
       const prompt = await this.deps.promptBuilder.build(cfg, {
@@ -69,19 +89,118 @@ export class AgentLoop {
       let usage = undefined as AgentRunResult['usage'];
       let finalResponse = '';
       let iterations = 0;
-      const appended: AgentMessage[] = [userMessage];
+      let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
+      options.onSessionUpdated?.(updatedSession);
+      const visibleAssistantId = createId('msg');
+      const visibleAssistantCreatedAt = nowIso();
+      let accumulatedReasoning = '';
+      const accumulatedReasoningParts: string[] = [];
+      let lastStreamPersistedAt = 0;
+      let lastStreamPersistedLength = 0;
+
+      const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
+      const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
+      const persistMessages = (messagesToPersist: AgentMessage[], events: ToolEvent[] = []): SessionRecord => {
+        updatedSession = this.deps.sessions.upsertMessages(session.id, messagesToPersist, events, execution);
+        options.onSessionUpdated?.(updatedSession);
+        return updatedSession;
+      };
+      const persistStreamSnapshot = (messageId: string, createdAt: string, content: string, reasoning: string | undefined, force = false): void => {
+        if (!content && !reasoning) return;
+        const now = Date.now();
+        if (!force && now - lastStreamPersistedAt < 250 && content.length - lastStreamPersistedLength < 160) return;
+        lastStreamPersistedAt = now;
+        lastStreamPersistedLength = content.length;
+        persistMessages([{
+          id: messageId,
+          role: 'assistant',
+          content,
+          reasoning_content: reasoning,
+          createdAt
+        }]);
+      };
 
       for (; iterations < cfg.maxIterations; iterations++) {
         throwIfAborted(options.signal);
-        const completion = await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
-        const assistant = { ...completion.message, id: completion.message.id ?? createId('msg'), createdAt: nowIso() };
+        const streamPersistId = createId('msg');
+        const streamPersistCreatedAt = nowIso();
+        lastStreamPersistedAt = 0;
+        lastStreamPersistedLength = 0;
+        let streamedContent = '';
+        let streamedReasoning = '';
+        const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
+        const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
+        const completion = canStream
+          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, signal: options.signal }, (delta) => {
+              if (delta.reasoning_content) {
+                streamedReasoning += delta.reasoning_content;
+                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                options.onMessageDelta?.(session.id, {
+                  sessionId: session.id,
+                  messageId: visibleAssistantId,
+                  role: 'assistant',
+                  type: 'reasoning_content',
+                  delta: delta.reasoning_content,
+                  reasoning_content: joinReasoning(visibleReasoningParts),
+                  reasoning_parts: visibleReasoningParts,
+                  content: streamedContent,
+                  createdAt: visibleAssistantCreatedAt
+                });
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
+              }
+              if (delta.content) {
+                streamedContent += delta.content;
+                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                options.onMessageDelta?.(session.id, {
+                  sessionId: session.id,
+                  messageId: visibleAssistantId,
+                  role: 'assistant',
+                  type: 'content',
+                  delta: delta.content,
+                  content: streamedContent,
+                  reasoning_content: joinReasoning(visibleReasoningParts) || undefined,
+                  reasoning_parts: visibleReasoningParts.length > 0 ? visibleReasoningParts : undefined,
+                  createdAt: visibleAssistantCreatedAt
+                });
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
+              }
+            })
+          : await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
+        const toolCalls = completion.message.tool_calls ?? [];
+        const assistant = {
+          ...completion.message,
+          id: streamPersistId,
+          createdAt: streamPersistCreatedAt
+        };
+        const currentReasoning = assistant.reasoning_content || streamedReasoning;
+        if (currentReasoning.trim()) {
+          const currentParts = splitReasoningParts(currentReasoning);
+          accumulatedReasoningParts.push(...currentParts);
+          accumulatedReasoning = joinReasoning(accumulatedReasoningParts);
+          assistant.reasoning_parts = currentParts.length > 0 ? currentParts : undefined;
+        }
         usage = completion.usage ?? usage;
         messages.push(assistant);
-        appended.push(assistant);
+        persistMessages([assistant]);
 
-        const toolCalls = assistant.tool_calls ?? [];
         if (toolCalls.length === 0) {
+          if (accumulatedReasoning) assistant.reasoning_content = accumulatedReasoning;
+          if (accumulatedReasoningParts.length > 0) assistant.reasoning_parts = [...accumulatedReasoningParts];
           finalResponse = assistant.content || '';
+          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true);
+          if (canStream) {
+            options.onMessageDelta?.(session.id, {
+              sessionId: session.id,
+              messageId: visibleAssistantId,
+              role: 'assistant',
+              type: 'done',
+              content: assistant.content,
+              reasoning_content: assistant.reasoning_content,
+              reasoning_parts: assistant.reasoning_parts,
+              createdAt: visibleAssistantCreatedAt
+            });
+          }
+          persistMessages([assistant]);
           break;
         }
 
@@ -116,23 +235,22 @@ export class AgentLoop {
             createdAt: nowIso()
           };
           messages.push(toolMessage);
-          appended.push(toolMessage);
+          persistMessages([toolMessage], [event]);
         }
       }
 
       if (!finalResponse) {
         finalResponse = `Reached iteration limit (${cfg.maxIterations}). Last tool events: ${toolEvents.map((e) => `${e.toolName}:${e.ok ? 'ok' : 'fail'}`).join(', ')}`;
         const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
-        appended.push(limitMessage);
+        persistMessages([limitMessage]);
       }
 
-      const updated = this.deps.sessions.appendMessages(session.id, appended, toolEvents, execution);
       this.deps.commitDeferredMemory(session.id);
-      this.deps.syncSessionMemory(updated);
+      this.deps.syncSessionMemory(updatedSession);
       return {
         sessionId: session.id,
         finalResponse,
-        messages: updated.messages,
+        messages: updatedSession.messages,
         toolEvents,
         usage,
         iterations: iterations + 1,

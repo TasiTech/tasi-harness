@@ -1,6 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, extname, join, relative } from 'node:path';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
 import { AppContext } from './appContext.js';
@@ -8,6 +9,7 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AgentMessageAttachment,
   AssistantMessageExportRequest,
   AppConfig,
   BrowserCoachGenerateSkillRequest,
@@ -20,6 +22,7 @@ import type {
   ToolExecutionResult,
   MemoryQueryOptions,
   PersonalKnowledgeUploadRequest,
+  RegisteredTool,
   SessionDocumentUploadRequest,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
@@ -38,6 +41,7 @@ import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } 
 import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
 import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
 import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
+import { isPathInside, objectArgs, resolveToolPath, stringArg } from './tools/toolRegistry.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
@@ -56,12 +60,52 @@ const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf', '.ofd']);
+const WECHAT_DOCUMENT_EXTENSIONS = new Set(['.docx', '.pptx', '.xlsx', '.pdf', '.ofd', '.xml', '.txt', '.md', '.markdown', '.json', '.csv', '.log', '.text']);
+const MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_WECHAT_DOCUMENT_BYTES = 32 * 1024 * 1024;
+const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 const pendingToolApprovals = new Map<string, {
   senderId: number;
   request: ToolApprovalRequest;
   resolve: (decision: ToolApprovalDecision) => void;
   timeout: ReturnType<typeof setTimeout>;
 }>();
+
+function logAgentChatError(details: {
+  error: unknown;
+  input?: string;
+  sessionId?: string;
+  executionMode?: 'workspace' | 'sandbox';
+  attachments?: AgentMessageAttachment[];
+}): void {
+  const cfg = context.getConfig();
+  const file = join(context.harnessHome, 'logs', 'agent-errors.log');
+  const error = details.error;
+  const record = {
+    at: new Date().toISOString(),
+    event: 'agent.chat.error',
+    provider: cfg.provider,
+    model: cfg.model,
+    baseUrl: cfg.baseUrl,
+    sessionId: details.sessionId,
+    executionMode: details.executionMode,
+    inputLength: details.input?.length ?? 0,
+    attachments: (details.attachments ?? []).map((attachment) => ({
+      kind: attachment.kind,
+      filename: attachment.filename,
+      mimeType: attachment.mimeType,
+      sizeBytes: attachment.sizeBytes
+    })),
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${JSON.stringify(record)}\n`, 'utf8');
+  } catch (logError) {
+    console.warn(`[agent] failed to write error log: ${logError instanceof Error ? logError.message : String(logError)}`);
+  }
+}
 
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -98,6 +142,14 @@ function requestInteractiveToolApproval(sender: WebContents, request: ToolApprov
     pendingToolApprovals.set(request.id, { senderId: sender.id, request, resolve, timeout });
     sender.send('tool-approval:request', request);
   });
+}
+
+function requestMainWindowToolApproval(request: ToolApprovalRequest): Promise<ToolApprovalDecision> {
+  const target = mainWindow && !mainWindow.isDestroyed()
+    ? mainWindow.webContents
+    : BrowserWindow.getAllWindows().find((win) => !win.isDestroyed())?.webContents;
+  if (!target || target.isDestroyed()) return Promise.resolve({ id: request.id, approved: false });
+  return requestInteractiveToolApproval(target, request);
 }
 
 function resolveToolApproval(senderId: number, decision: ToolApprovalDecision): ToolApprovalDecision {
@@ -152,6 +204,165 @@ function getNumberField(record: Record<string, unknown>, keys: string[]): number
   for (const key of keys) {
     const value = record[key];
     if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function getHeader(headers: Headers, name: string): string | undefined {
+  const value = headers.get(name);
+  return value?.trim() || undefined;
+}
+
+function extForMimeType(mimeType: string, fallback = ''): string {
+  const normalized = mimeType.split(';')[0]?.trim().toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+    'video/mp4': '.mp4',
+    'video/quicktime': '.mov',
+    'audio/mpeg': '.mp3',
+    'audio/mp3': '.mp3',
+    'audio/wav': '.wav',
+    'audio/x-wav': '.wav',
+    'audio/ogg': '.ogg',
+    'application/pdf': '.pdf',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+    'text/plain': '.txt',
+    'text/markdown': '.md',
+    'application/json': '.json',
+    'text/csv': '.csv',
+    'application/xml': '.xml',
+    'text/xml': '.xml'
+  };
+  return map[normalized] ?? fallback;
+}
+
+function mimeTypeForFilename(filename: string, fallback = 'application/octet-stream'): string {
+  const ext = extname(filename).toLowerCase();
+  const map: Record<string, string> = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.mp3': 'audio/mpeg',
+    '.wav': 'audio/wav',
+    '.ogg': 'audio/ogg',
+    '.m4a': 'audio/mp4',
+    '.pdf': 'application/pdf',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.txt': 'text/plain',
+    '.text': 'text/plain',
+    '.log': 'text/plain',
+    '.md': 'text/markdown',
+    '.markdown': 'text/markdown',
+    '.json': 'application/json',
+    '.csv': 'text/csv',
+    '.xml': 'application/xml',
+    '.ofd': 'application/octet-stream'
+  };
+  return map[ext] ?? fallback;
+}
+
+function multimediaKindFromMime(mimeType: string): AgentMessageAttachment['kind'] | null {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  return null;
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function firstStringByKeyDeep(value: unknown, keys: string[], depth = 0): string | undefined {
+  if (depth > 6 || value == null) return undefined;
+  if (typeof value !== 'object') return undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = firstStringByKeyDeep(item, keys, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedKeys = keys.map((key) => key.toLowerCase());
+  for (const [key, raw] of Object.entries(record)) {
+    if (!normalizedKeys.includes(key.toLowerCase())) continue;
+    if (typeof raw === 'string' && raw.trim()) return raw.trim();
+    if (typeof raw === 'number' && Number.isFinite(raw)) return String(raw);
+  }
+  for (const nested of Object.values(record)) {
+    const found = firstStringByKeyDeep(nested, keys, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function firstNumberByKeyDeep(value: unknown, keys: string[], depth = 0): number | undefined {
+  if (depth > 6 || value == null) return undefined;
+  if (typeof value !== 'object') return undefined;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = firstNumberByKeyDeep(item, keys, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const normalizedKeys = keys.map((key) => key.toLowerCase());
+  for (const [key, raw] of Object.entries(record)) {
+    if (!normalizedKeys.includes(key.toLowerCase())) continue;
+    const value = typeof raw === 'number' ? raw : Number(raw);
+    if (Number.isFinite(value)) return value;
+  }
+  for (const nested of Object.values(record)) {
+    const found = firstNumberByKeyDeep(nested, keys, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+function firstHttpUrlDeep(value: unknown, depth = 0): string | undefined {
+  if (depth > 6 || value == null) return undefined;
+  if (typeof value === 'string') {
+    const match = value.match(/https?:\/\/[^\s"'<>`)\]}]+/i);
+    return match?.[0]?.replace(/[),.;!?]+$/, '');
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = firstHttpUrlDeep(item, depth + 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const prioritized = ['url', 'download_url', 'downloadUrl', 'file_url', 'fileUrl', 'media_url', 'mediaUrl', 'cdn_url', 'cdnUrl'];
+  for (const key of prioritized) {
+    const found = firstHttpUrlDeep(record[key], depth + 1);
+    if (found) return found;
+  }
+  for (const [key, nested] of Object.entries(record)) {
+    if (!/url|href|download|media|file|cdn/i.test(key)) continue;
+    const found = firstHttpUrlDeep(nested, depth + 1);
+    if (found) return found;
+  }
+  for (const nested of Object.values(record)) {
+    const found = firstHttpUrlDeep(nested, depth + 1);
+    if (found) return found;
   }
   return undefined;
 }
@@ -287,33 +498,273 @@ function buildWechatAuthHeaders(botToken: string): Record<string, string> {
   };
 }
 
-function extractWechatTextPayload(value: unknown): string {
+interface WechatIncomingMedia {
+  itemType: number;
+  filename: string;
+  mimeType: string;
+  content: Buffer;
+}
+
+interface WechatPreparedPayload {
+  text: string;
+  attachments: AgentMessageAttachment[];
+  uploadedDocuments: string[];
+  failures: string[];
+}
+
+function extractWechatItemList(value: unknown): Record<string, unknown>[] {
   const record = asRecord(value);
-  if (!record) return '';
+  if (!record) return [];
   const items = Array.isArray(record.item_list) ? record.item_list : [];
+  return items.map((item) => asRecord(item)).filter((item): item is Record<string, unknown> => Boolean(item));
+}
+
+function extractWechatTextPayload(value: unknown): string {
+  const items = extractWechatItemList(value);
   const chunks: string[] = [];
-  for (const itemRaw of items) {
-    const item = asRecord(itemRaw);
-    if (!item) continue;
+  for (const item of items) {
     const type = getNumberField(item, ['type']);
     if (type === 1) {
       const textItem = asRecord(item.text_item);
       const text = textItem && typeof textItem.text === 'string' ? textItem.text.trim() : '';
       if (text) chunks.push(text);
-      continue;
     }
-    if (type === 2) chunks.push('[image]');
-    else if (type === 3) chunks.push('[voice]');
-    else if (type === 4) chunks.push('[file]');
-    else if (type === 5) chunks.push('[video]');
   }
   return chunks.join('\n').trim();
+}
+
+function isWechatSessionTitle(title: string): boolean {
+  const lower = title.trim().toLowerCase();
+  return lower === 'wechat session' || lower.startsWith('wechat clawbot') || lower.startsWith('[wechat:');
+}
+
+function filenameFromWechatItem(item: Record<string, unknown>, itemType: number, mimeType: string, url?: string): string {
+  const direct = firstStringByKeyDeep(item, [
+    'filename',
+    'fileName',
+    'file_name',
+    'name',
+    'title',
+    'display_name',
+    'displayName'
+  ]);
+  const fromUrl = url
+    ? safeDecodeURIComponent(url.split('?')[0]?.split('/').filter(Boolean).at(-1) ?? '')
+    : '';
+  const fallbackBase = itemType === 2
+    ? 'wechat-image'
+    : itemType === 3
+      ? 'wechat-audio'
+      : itemType === 5
+        ? 'wechat-video'
+        : 'wechat-file';
+  const raw = (direct || fromUrl || fallbackBase).replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').trim();
+  const ext = extname(raw);
+  if (ext) return raw;
+  return `${raw}${extForMimeType(mimeType, itemType === 2 ? '.jpg' : itemType === 3 ? '.mp3' : itemType === 5 ? '.mp4' : '.bin')}`;
+}
+
+function base64FromWechatItem(item: Record<string, unknown>): string | undefined {
+  const raw = firstStringByKeyDeep(item, [
+    'contentBase64',
+    'content_base64',
+    'fileBase64',
+    'file_base64',
+    'mediaBase64',
+    'media_base64',
+    'base64'
+  ]);
+  if (!raw) return undefined;
+  const dataUrl = raw.match(/^data:([^;,]+);base64,(.+)$/i);
+  return (dataUrl?.[2] ?? raw).replace(/\s+/g, '');
+}
+
+function wechatDownloadUrlFromItem(item: Record<string, unknown>): string | undefined {
+  const directUrl = firstHttpUrlDeep(item);
+  if (directUrl) return directUrl;
+  const encryptedParam = firstStringByKeyDeep(item, [
+    'encrypted_query_param',
+    'encryptedQueryParam',
+    'download_param',
+    'downloadParam',
+    'download_url_param',
+    'downloadUrlParam'
+  ]);
+  if (!encryptedParam) return undefined;
+  return `https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=${encodeURIComponent(encryptedParam)}`;
+}
+
+function decodeWechatAesKey(rawKey?: string): Buffer | null {
+  const clean = rawKey?.trim();
+  if (!clean) return null;
+  if (/^[0-9a-f]{32}$/i.test(clean)) return Buffer.from(clean, 'hex');
+  try {
+    const decoded = Buffer.from(clean, 'base64');
+    if (decoded.length === 16) return decoded;
+    const decodedText = decoded.toString('utf8').trim();
+    if (/^[0-9a-f]{32}$/i.test(decodedText)) return Buffer.from(decodedText, 'hex');
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function decryptWechatMedia(content: Buffer, rawKey?: string): Buffer {
+  const key = decodeWechatAesKey(rawKey);
+  if (!key) return content;
+  const decipher = createDecipheriv('aes-128-ecb', key, null);
+  decipher.setAutoPadding(true);
+  return Buffer.concat([decipher.update(content), decipher.final()]);
+}
+
+function encryptWechatMedia(content: Buffer, key: Buffer): Buffer {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  cipher.setAutoPadding(true);
+  return Buffer.concat([cipher.update(content), cipher.final()]);
+}
+
+async function fetchWechatMediaBuffer(url: string, botToken: string, maxBytes: number): Promise<{ content: Buffer; mimeType?: string; filename?: string }> {
+  async function attempt(withAuth: boolean): Promise<Response> {
+    return fetch(url, {
+      method: 'GET',
+      headers: withAuth ? buildWechatAuthHeaders(botToken) : undefined
+    });
+  }
+  let response = await attempt(true);
+  if (!response.ok && (response.status === 401 || response.status === 403)) {
+    response = await attempt(false);
+  }
+  if (!response.ok) throw new Error(`download HTTP ${response.status}`);
+  const length = Number(getHeader(response.headers, 'content-length') ?? 0);
+  if (Number.isFinite(length) && length > maxBytes) throw new Error(`file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`);
+  const arrayBuffer = await response.arrayBuffer();
+  if (arrayBuffer.byteLength > maxBytes) throw new Error(`file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`);
+  const disposition = getHeader(response.headers, 'content-disposition') ?? '';
+  const filenameMatch = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const filename = filenameMatch?.[1] ? safeDecodeURIComponent(filenameMatch[1]) : undefined;
+  return {
+    content: Buffer.from(arrayBuffer),
+    mimeType: getHeader(response.headers, 'content-type')?.split(';')[0]?.trim(),
+    filename
+  };
+}
+
+async function resolveWechatMediaItem(item: Record<string, unknown>, botToken: string): Promise<WechatIncomingMedia | null> {
+  const itemType = getNumberField(item, ['type']) ?? 0;
+  if (![2, 3, 4, 5].includes(itemType)) return null;
+  const url = wechatDownloadUrlFromItem(item);
+  const aesKey = firstStringByKeyDeep(item, ['aeskey', 'aes_key', 'aesKey']);
+  const mimeFromPayload = firstStringByKeyDeep(item, ['mimeType', 'mime_type', 'contentType', 'content_type', 'mediaType', 'media_type']) ?? '';
+  const base64 = base64FromWechatItem(item);
+  const sizeHint = firstNumberByKeyDeep(item, ['sizeBytes', 'size_bytes', 'fileSize', 'file_size', 'size']);
+  const fallbackMime = itemType === 2 ? 'image/jpeg' : itemType === 3 ? 'audio/mpeg' : itemType === 5 ? 'video/mp4' : 'application/octet-stream';
+  const initialMime = mimeFromPayload || fallbackMime;
+  const initialFilename = filenameFromWechatItem(item, itemType, initialMime, url);
+  const maxBytes = itemType === 4 ? MAX_WECHAT_DOCUMENT_BYTES : MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES;
+  if (sizeHint && sizeHint > maxBytes) throw new Error(`${initialFilename}: file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`);
+  if (base64) {
+    const content = decryptWechatMedia(Buffer.from(base64, 'base64'), aesKey);
+    if (content.length > maxBytes) throw new Error(`${initialFilename}: file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`);
+    return {
+      itemType,
+      filename: initialFilename,
+      mimeType: mimeFromPayload || mimeTypeForFilename(initialFilename, fallbackMime),
+      content
+    };
+  }
+  if (!url) return null;
+  const downloaded = await fetchWechatMediaBuffer(url, botToken, maxBytes);
+  const content = decryptWechatMedia(downloaded.content, aesKey);
+  if (content.length > maxBytes) throw new Error(`${initialFilename}: file is larger than ${Math.round(maxBytes / (1024 * 1024))} MB`);
+  const mimeType = downloaded.mimeType || mimeFromPayload || mimeTypeForFilename(downloaded.filename || initialFilename, fallbackMime);
+  return {
+    itemType,
+    filename: downloaded.filename || filenameFromWechatItem(item, itemType, mimeType, url),
+    mimeType,
+    content
+  };
+}
+
+async function prepareWechatIncomingPayload(msg: Record<string, unknown>, sessionId: string, botToken: string): Promise<WechatPreparedPayload> {
+  const items = extractWechatItemList(msg);
+  const textChunks = [extractWechatTextPayload(msg)].filter(Boolean);
+  const attachments: AgentMessageAttachment[] = [];
+  const uploadedDocuments: string[] = [];
+  const failures: string[] = [];
+
+  for (const item of items) {
+    const itemType = getNumberField(item, ['type']) ?? 0;
+    if (![2, 3, 4, 5].includes(itemType)) continue;
+    try {
+      const media = await resolveWechatMediaItem(item, botToken);
+      if (!media) {
+        textChunks.push(itemType === 2 ? '[image]' : itemType === 3 ? '[audio]' : itemType === 5 ? '[video]' : '[file]');
+        continue;
+      }
+      const ext = extname(media.filename).toLowerCase();
+      const mediaKind = multimediaKindFromMime(media.mimeType);
+      if (itemType === 4 && WECHAT_DOCUMENT_EXTENSIONS.has(ext)) {
+        await context.sessionDocumentContextStore.addDocument({
+          sessionId,
+          filename: media.filename,
+          contentBase64: media.content.toString('base64'),
+          workspaceDir: context.getConfig().workspaceDir
+        });
+        uploadedDocuments.push(media.filename);
+        textChunks.push(`[document: ${media.filename}]`);
+        continue;
+      }
+      if (mediaKind) {
+        if (media.content.length > MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES) {
+          throw new Error(`${media.filename}: file is larger than ${Math.round(MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES / (1024 * 1024))} MB`);
+        }
+        attachments.push({
+          id: createId('wx_media'),
+          kind: mediaKind,
+          filename: media.filename,
+          mimeType: media.mimeType,
+          contentBase64: media.content.toString('base64'),
+          sizeBytes: media.content.length
+        });
+        textChunks.push(`[${mediaKind}: ${media.filename}]`);
+        continue;
+      }
+      failures.push(`${media.filename}: unsupported WeChat file type`);
+      textChunks.push(`[file: ${media.filename}]`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failures.push(message);
+      textChunks.push(`[WeChat attachment failed: ${message}]`);
+    }
+  }
+
+  return {
+    text: textChunks.join('\n').trim(),
+    attachments,
+    uploadedDocuments,
+    failures
+  };
 }
 
 function ensureWechatSessionId(): string {
   const current = context.getConfig().wechatChannel;
   const configured = current.sessionId?.trim();
-  if (configured) return configured;
+  if (configured && context.sessionStore.read(configured)) return configured;
+  let existingId = '';
+  try {
+    existingId = context.sessionStore.list().find((session) => isWechatSessionTitle(session.title))?.id ?? '';
+  } catch {
+    existingId = '';
+  }
+  if (existingId) {
+    context.configStore.update({
+      wechatChannel: {
+        ...current,
+        sessionId: existingId
+      }
+    });
+    return existingId;
+  }
   const created = context.sessionStore.create('WeChat ClawBot');
   context.configStore.update({
     wechatChannel: {
@@ -377,6 +828,113 @@ async function sendWechatText(
     const errMsg = typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`;
     throw new Error(errMsg);
   }
+}
+
+async function postWechatJson<T = Record<string, unknown>>(baseUrl: string, botToken: string, path: string, body: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: 'POST',
+    headers: buildWechatAuthHeaders(botToken),
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) throw new Error(`${path} HTTP ${response.status}`);
+  const parsed = await response.json() as unknown;
+  const record = asRecord(parsed);
+  if (!record) throw new Error(`Invalid ${path} response.`);
+  const errcode = getNumberField(record, ['errcode']);
+  if (typeof errcode === 'number' && errcode !== 0) {
+    throw new Error(typeof record.errmsg === 'string' ? record.errmsg : `errcode=${errcode}`);
+  }
+  const ret = getNumberField(record, ['ret']);
+  if (typeof ret === 'number' && ret !== 0) {
+    throw new Error(typeof record.errmsg === 'string' ? record.errmsg : `ret=${ret}`);
+  }
+  return record as T;
+}
+
+async function uploadWechatMediaFile(baseUrl: string, botToken: string, toUserId: string, filePath: string, mediaType: 1 | 2 | 3): Promise<{
+  aeskeyHex: string;
+  downloadEncryptedQueryParam: string;
+  fileSize: number;
+  fileSizeCiphertext: number;
+}> {
+  const plaintext = readFileSync(filePath);
+  const aeskey = randomBytes(16);
+  const ciphertext = encryptWechatMedia(plaintext, aeskey);
+  const filekey = randomBytes(16).toString('hex');
+  const uploadUrlResp = await postWechatJson<Record<string, unknown>>(baseUrl, botToken, '/ilink/bot/getuploadurl', {
+    filekey,
+    media_type: mediaType,
+    to_user_id: toUserId,
+    rawsize: plaintext.length,
+    rawfilemd5: createHash('md5').update(plaintext).digest('hex'),
+    filesize: ciphertext.length,
+    no_need_thumb: true,
+    aeskey: aeskey.toString('hex'),
+    base_info: { channel_version: '1.0.0' }
+  });
+  const uploadParam = typeof uploadUrlResp.upload_param === 'string' ? uploadUrlResp.upload_param : '';
+  if (!uploadParam) throw new Error(`getuploadurl returned no upload_param: ${JSON.stringify(uploadUrlResp)}`);
+  const uploadUrl = `${WECHAT_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+  const response = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: new Uint8Array(ciphertext)
+  });
+  if (response.status !== 200) {
+    const message = response.headers.get('x-error-message') ?? await response.text();
+    throw new Error(`CDN upload failed ${response.status}: ${message}`);
+  }
+  const downloadEncryptedQueryParam = response.headers.get('x-encrypted-param') ?? '';
+  if (!downloadEncryptedQueryParam) throw new Error('CDN upload response missing x-encrypted-param header.');
+  return {
+    aeskeyHex: aeskey.toString('hex'),
+    downloadEncryptedQueryParam,
+    fileSize: plaintext.length,
+    fileSizeCiphertext: ciphertext.length
+  };
+}
+
+async function sendWechatFile(baseUrl: string, botToken: string, payload: {
+  toUserId: string;
+  contextToken: string;
+  filePath: string;
+  caption?: string;
+  fromUserId?: string;
+}): Promise<void> {
+  const filename = basename(payload.filePath);
+  const mimeType = mimeTypeForFilename(filename);
+  const mediaType: 1 | 2 | 3 = mimeType.startsWith('image/') ? 1 : mimeType.startsWith('video/') ? 2 : 3;
+  const uploaded = await uploadWechatMediaFile(baseUrl, botToken, payload.toUserId, payload.filePath, mediaType);
+  if (payload.caption?.trim()) {
+    await sendWechatText(baseUrl, botToken, {
+      toUserId: payload.toUserId,
+      contextToken: payload.contextToken,
+      text: payload.caption.trim(),
+      fromUserId: payload.fromUserId
+    });
+  }
+  const media = {
+    encrypt_query_param: uploaded.downloadEncryptedQueryParam,
+    aes_key: Buffer.from(uploaded.aeskeyHex).toString('base64'),
+    encrypt_type: 1
+  };
+  const item = mediaType === 1
+    ? { type: 2, image_item: { media, mid_size: uploaded.fileSizeCiphertext } }
+    : mediaType === 2
+      ? { type: 5, video_item: { media, video_size: uploaded.fileSizeCiphertext } }
+      : { type: 4, file_item: { media, file_name: filename, len: String(uploaded.fileSize) } };
+  await postWechatJson(baseUrl, botToken, '/ilink/bot/sendmessage', {
+    msg: {
+      from_user_id: payload.fromUserId ?? '',
+      to_user_id: payload.toUserId,
+      client_id: `tasi-${createId('wxfile')}`,
+      message_type: 2,
+      message_state: 2,
+      context_token: payload.contextToken,
+      item_list: [item]
+    },
+    base_info: { channel_version: '1.0.0' }
+  });
 }
 
 async function sendWechatTaskNotification(taskName: string, runAtIso: string, executionMode: 'workspace' | 'sandbox', content: string): Promise<void> {
@@ -514,8 +1072,6 @@ function startWechatPoller(): void {
           const fromUser = getStringField(msg, ['from_user_id']) ?? '';
           if (!fromUser || fromUser.endsWith('@im.bot')) continue;
           const contextToken = getStringField(msg, ['context_token']) ?? '';
-          const text = extractWechatTextPayload(msg);
-          if (!text) continue;
           context.configStore.update({
             wechatChannel: {
               ...context.getConfig().wechatChannel,
@@ -525,9 +1081,30 @@ function startWechatPoller(): void {
           });
           const rawMessageId = getStringField(msg, ['message_id']) ?? String(getNumberField(msg, ['message_id']) ?? '');
           if (rawMessageId && markWechatMessageSeen(rawMessageId)) continue;
+          const incoming = await prepareWechatIncomingPayload(msg, sessionId, token);
+          if (!incoming.text && incoming.attachments.length === 0 && incoming.uploadedDocuments.length === 0) continue;
+          const text = incoming.text || '[WeChat attachment]';
+          const hasMediaItems = extractWechatItemList(msg).some((item) => [2, 3, 4, 5].includes(getNumberField(item, ['type']) ?? 0));
           const ts = getNumberField(msg, ['create_time_ms']);
           const createdAt = typeof ts === 'number' ? new Date(ts).toISOString() : new Date().toISOString();
-          const shadowUserId = createId('wx_shadow_user');
+          if (hasMediaItems) {
+            const shadowUserId = createId('wx_shadow_user');
+            const updatedInbound = context.sessionStore.appendMessages(sessionId, [
+              {
+                id: shadowUserId,
+                role: 'user',
+                content: `[WeChat:${fromUser}] ${text}`,
+                attachments: incoming.attachments.length > 0 ? incoming.attachments : undefined,
+                createdAt
+              }
+            ], []);
+            broadcastSessionUpdated({
+              sessionId: updatedInbound.id,
+              source: 'external',
+              updatedAt: updatedInbound.updatedAt
+            });
+            continue;
+          }
           const pendingAssistantId = createId('wx_pending');
           const conversationKey = buildWechatConversationKey(sessionId, fromUser, contextToken);
           const previousController = activeWechatRuns.get(conversationKey);
@@ -536,12 +1113,6 @@ function startWechatPoller(): void {
             activeWechatRuns.delete(conversationKey);
           }
           const updatedInbound = context.sessionStore.appendMessages(sessionId, [
-            {
-              id: shadowUserId,
-              role: 'user',
-              content: `[WeChat:${fromUser}] ${text}`,
-              createdAt
-            },
             {
               id: pendingAssistantId,
               role: 'assistant',
@@ -563,7 +1134,9 @@ function startWechatPoller(): void {
               sessionId,
               executionMode: context.getConfig().defaultExecutionMode,
               origin: 'scheduled',
+              attachments: incoming.attachments,
               signal: runController.signal,
+              requestToolApproval: (request) => requestMainWindowToolApproval(request),
               onToolEvent: (eventSessionId, toolEvent) => {
                 const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
                 broadcastAgentToolEvent(payload);
@@ -573,11 +1146,18 @@ function startWechatPoller(): void {
                   const message = error instanceof Error ? error.message : String(error);
                   console.warn(`[wechat] failed to open external browser preview: ${message}`);
                 });
+              },
+              onSessionUpdated: (record) => {
+                broadcastSessionUpdated({
+                  sessionId: record.id,
+                  source: 'external',
+                  updatedAt: record.updatedAt
+                });
               }
             });
             const postRunRecord = context.sessionStore.read(sessionId);
             if (postRunRecord) {
-              const cleaned = postRunRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+              const cleaned = postRunRecord.messages.filter((item) => item.id !== pendingAssistantId);
               context.sessionStore.replaceMessages(sessionId, cleaned);
             }
             const reply = runResult.finalResponse.trim();
@@ -599,7 +1179,7 @@ function startWechatPoller(): void {
             if (runController.signal.aborted || isAbortLikeError(error)) {
               const fallbackRecord = context.sessionStore.read(sessionId);
               if (fallbackRecord) {
-                const cleaned = fallbackRecord.messages.filter((item) => item.id !== shadowUserId && item.id !== pendingAssistantId);
+                const cleaned = fallbackRecord.messages.filter((item) => item.id !== pendingAssistantId);
                 context.sessionStore.replaceMessages(sessionId, cleaned);
                 broadcastSessionUpdated({
                   sessionId,
@@ -1077,6 +1657,60 @@ async function createWindow(): Promise<void> {
   }
 }
 
+function registerWechatTools(): void {
+  if (context.toolRegistry.has('wechat_send_file')) return;
+  const tool: RegisteredTool = {
+    safety: 'network',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'wechat_send_file',
+        description: 'Send a file from the workspace back to the active WeChat conversation. Use only when the WeChat user explicitly asks to receive, download, or send a specific file.',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Workspace-relative path to the file to send.' },
+            caption: { type: 'string', description: 'Optional short caption to send before the file.' }
+          },
+          required: ['path']
+        }
+      }
+    },
+    async execute(args, contextArg) {
+      const cfg = context.getConfig();
+      const wechatSessionId = cfg.wechatChannel.sessionId?.trim();
+      if (!wechatSessionId || contextArg.sessionId !== wechatSessionId) {
+        return { ok: false, content: 'wechat_send_file is only available inside the configured WeChat session.' };
+      }
+      const token = cfg.wechatChannel.botToken?.trim();
+      const toUserId = cfg.wechatChannel.lastInboundUserId?.trim();
+      const contextToken = cfg.wechatChannel.lastContextToken?.trim();
+      if (!cfg.wechatChannel.enabled || !token || !toUserId || !contextToken) {
+        return { ok: false, content: 'WeChat channel is not ready. It needs an enabled channel, bot token, latest user id, and context token.' };
+      }
+      const obj = objectArgs(args);
+      const target = resolveToolPath(contextArg.workspaceDir, stringArg(obj, 'path'));
+      const workspaceRoot = resolve(contextArg.workspaceDir);
+      if (!isPathInside(workspaceRoot, target)) return { ok: false, content: 'Only workspace files can be sent to WeChat.' };
+      if (!existsSync(target)) return { ok: false, content: 'File not found.' };
+      if (!statSync(target).isFile()) return { ok: false, content: 'Path is not a file.' };
+      const baseUrl = (cfg.wechatChannel.baseUrl?.trim() || 'https://ilinkai.weixin.qq.com').replace(/\/+$/, '');
+      await sendWechatFile(baseUrl, token, {
+        toUserId,
+        contextToken,
+        filePath: target,
+        caption: stringArg(obj, 'caption', ''),
+        fromUserId: cfg.wechatChannel.botId?.trim() || undefined
+      });
+      return {
+        ok: true,
+        content: `Sent ${relative(workspaceRoot, target)} to WeChat.`
+      };
+    }
+  };
+  context.toolRegistry.register(tool);
+}
+
 function registerIpc(): void {
   ipcMain.on('browser-coach:event', (event, payload) => browserCoachRecorder.acceptEvent(event, payload));
   ipcMain.handle('config:get', () => context.configStore.publicConfig(false));
@@ -1143,8 +1777,15 @@ function registerIpc(): void {
     return resolveToolApproval(_event.sender.id, decision);
   });
 
-  ipcMain.handle('agent:chat', async (_event, input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean) => {
-    if (!input || !input.trim()) throw new Error('Message cannot be empty.');
+  ipcMain.handle('agent:chat', async (
+    _event,
+    input: string,
+    sessionId?: string,
+    executionMode?: 'workspace' | 'sandbox',
+    usePersonalKnowledgeBase?: boolean,
+    attachments?: AgentMessageAttachment[]
+  ) => {
+    if ((!input || !input.trim()) && (!Array.isArray(attachments) || attachments.length === 0)) throw new Error('Message cannot be empty.');
     const senderId = _event.sender.id;
     if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
     const controller = new AbortController();
@@ -1152,6 +1793,7 @@ function registerIpc(): void {
     try {
       const result = await context.agentLoop.run({
         userInput: input,
+        attachments: Array.isArray(attachments) ? attachments : undefined,
         sessionId,
         executionMode,
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
@@ -1161,6 +1803,16 @@ function registerIpc(): void {
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
           _event.sender.send('agent:tool-event', payload);
+        },
+        onMessageDelta: (_eventSessionId, messageDelta) => {
+          _event.sender.send('agent:message-delta', messageDelta);
+        },
+        onSessionUpdated: (record) => {
+          broadcastSessionUpdated({
+            sessionId: record.id,
+            source: 'chat',
+            updatedAt: record.updatedAt
+          });
         }
       });
       const followUpQuestions = await generateFollowUpQuestions(
@@ -1177,6 +1829,13 @@ function registerIpc(): void {
       return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
     } catch (error) {
       if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      logAgentChatError({
+        error,
+        input,
+        sessionId,
+        executionMode,
+        attachments: Array.isArray(attachments) ? attachments : undefined
+      });
       throw new Error(error instanceof Error ? error.message : String(error));
     } finally {
       const active = activeChatControllers.get(senderId);
@@ -1236,8 +1895,15 @@ function registerIpc(): void {
     const content = req.content?.trim();
     if (!content) throw new Error('content is required.');
     const role = req.role === 'assistant' ? 'assistant' : 'user';
-    const existing = req.sessionId?.trim() ? context.sessionStore.read(req.sessionId.trim()) : null;
-    const session = existing ?? context.sessionStore.create(req.title?.trim() || 'WeChat session');
+    const requestedSessionId = req.sessionId?.trim();
+    const existing = requestedSessionId ? context.sessionStore.read(requestedSessionId) : null;
+    const title = req.title?.trim() || 'WeChat session';
+    const shouldUseWechatSession = !existing && isWechatSessionTitle(title);
+    const session = existing ?? (
+      shouldUseWechatSession
+        ? context.sessionStore.read(ensureWechatSessionId()) ?? context.sessionStore.create('WeChat ClawBot')
+        : context.sessionStore.create(title)
+    );
     const updated = context.sessionStore.appendMessages(session.id, [{
       role,
       content,
@@ -1309,6 +1975,7 @@ function registerIpc(): void {
   ipcMain.handle('skills:create', (_event, req: SkillWriteRequest) => context.skillManager.create(req));
   ipcMain.handle('skills:patch', (_event, req: SkillPatchRequest) => context.skillManager.patch(req));
   ipcMain.handle('skills:delete', (_event, name: string) => context.skillManager.delete(name));
+  ipcMain.handle('skills:installBundled', (_event, name: string, overwrite?: boolean) => context.skillManager.installBundled(name, Boolean(overwrite)));
   ipcMain.handle('skills:uploadArchive', (_event, req: SkillArchiveUploadRequest) => context.skillManager.uploadArchive(req));
   ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));
@@ -1472,6 +2139,7 @@ app.on('before-quit', () => {
 app.whenReady().then(() => {
   applyPlatformAppIdentity();
   applyAppDockIcon();
+  registerWechatTools();
   app.on('web-contents-created', (_event, contents) => {
     contents.once('destroyed', () => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;

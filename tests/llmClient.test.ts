@@ -242,6 +242,198 @@ describe('llmClient', () => {
     expect(secondBody.messages[1].reasoning_content).toBe('internal chain');
   });
 
+  it('sends multimodal attachments as openai-compatible content parts', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.5-plus'
+    });
+
+    await client.complete({
+      messages: [
+        {
+          role: 'user',
+          content: 'Describe these files.',
+          attachments: [
+            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'aW1hZ2U=' },
+            { kind: 'video', filename: 'clip.mp4', mimeType: 'video/mp4', contentBase64: 'dmlkZW8=' },
+            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'YXVkaW8=' }
+          ]
+        }
+      ]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    const content = body.messages[0].content;
+    expect(content).toEqual([
+      { type: 'text', text: 'Describe these files.' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,aW1hZ2U=' } },
+      { type: 'video_url', video_url: { url: 'data:video/mp4;base64,dmlkZW8=' } },
+      { type: 'input_audio', input_audio: { data: 'data:audio/mpeg;base64,YXVkaW8=', format: 'mp3' } }
+    ]);
+  });
+
+  it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {
+    const events = [
+      {
+        id: 'chatcmpl_stream',
+        choices: [
+          {
+            delta: {
+              reasoning_content: 'think ',
+              content: 'Hello ',
+              tool_calls: [
+                {
+                  index: 0,
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'browser_open', arguments: '{"url"' }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      {
+        choices: [
+          {
+            delta: {
+              reasoning_content: 'now',
+              content: 'world',
+              tool_calls: [
+                {
+                  index: 0,
+                  function: { arguments: ':"https://example.com"}' }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [...events.map((event) => `data: ${JSON.stringify(event)}`), 'data: [DONE]'].join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'deepseek',
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-reasoner'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.(
+      {
+        messages: [{ role: 'user', content: 'open example.com' }],
+        tools: [browserOpenTool]
+      },
+      (delta) => {
+        if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+        if (delta.content) deltas.push(`c:${delta.content}`);
+      }
+    );
+
+    expect(result?.message.content).toBe('Hello world');
+    expect(result?.message.reasoning_content).toBe('think now');
+    expect(result?.message.tool_calls?.[0].function.name).toBe('browser_open');
+    expect(result?.message.tool_calls?.[0].function.arguments).toBe('{"url":"https://example.com"}');
+    expect(deltas).toEqual(['r:think ', 'c:Hello ', 'r:now', 'c:world']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
+  it('streams anthropic content deltas', async () => {
+    const events = [
+      { type: 'message_start', message: { id: 'msg_stream', usage: { input_tokens: 3, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Claude' } },
+      { type: 'message_delta', usage: { output_tokens: 4 } },
+      { type: 'message_stop' }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}`).join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com/v1',
+      apiKey: 'anthropic-test-key',
+      model: 'claude-3-7-sonnet-latest'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.content) deltas.push(delta.content);
+    });
+
+    expect(result?.message.content).toBe('Hello Claude');
+    expect(result?.usage?.totalTokens).toBe(7);
+    expect(deltas).toEqual(['Hello ', 'Claude']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
+  it('streams ollama content deltas', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          JSON.stringify({ message: { role: 'assistant', content: 'Hello ' }, done: false }),
+          JSON.stringify({ message: { role: 'assistant', content: 'Ollama' }, done: false }),
+          JSON.stringify({ done: true })
+        ].join('\n'),
+        { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'ollama',
+      baseUrl: 'http://127.0.0.1:11434',
+      apiKey: '',
+      model: 'qwen3:8b'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.content) deltas.push(delta.content);
+    });
+
+    expect(result?.message.content).toBe('Hello Ollama');
+    expect(deltas).toEqual(['Hello ', 'Ollama']);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
   it('drops malformed deepseek historical tool traces that miss reasoning_content', async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

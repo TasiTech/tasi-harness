@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
 import type {
   AgentMessage,
+  AgentMessageAttachment,
   AppInfo,
   BrowserCoachRecordedEvent,
   BrowserCoachRecording,
@@ -33,6 +34,7 @@ import {
 import { extractCitationLinks, type CitationLink } from './citations.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
+import JSZip from 'jszip';
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -47,8 +49,8 @@ const defaultConfig: PublicAppConfig = {
   maxIterations: 100,
   sessionDocumentMaxDocs: 10,
   workspaceDir: '',
-  allowShellTools: false,
-  enableNetworkTools: false,
+  allowShellTools: true,
+  enableNetworkTools: true,
   safetyApproval: {
     enabled: true,
     approveRiskyTerminalCommands: true,
@@ -58,8 +60,9 @@ const defaultConfig: PublicAppConfig = {
   browserMode: 'embedded',
   externalBrowserEngine: 'auto',
   externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
-  externalBrowserProfileMode: 'isolated',
+  externalBrowserProfileMode: 'system',
   browserHeadless: false,
+  browserExecutionLoggingEnabled: false,
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   enabledToolNames: [],
@@ -83,6 +86,7 @@ const defaultConfig: PublicAppConfig = {
   }
 };
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -92,6 +96,116 @@ type SettingsDraft = PublicAppConfig & {
 function prettyDate(iso?: string): string {
   if (!iso) return '';
   return new Date(iso).toLocaleString();
+}
+
+function padTimePart(value: unknown): string {
+  const parsed = Math.trunc(Number(value));
+  if (!Number.isFinite(parsed)) return '00';
+  return String(Math.min(99, Math.max(0, parsed))).padStart(2, '0');
+}
+
+function taskTimeLabel(task: ScheduledTask): string {
+  return `${padTimePart(task.scheduleHour)}:${padTimePart(task.scheduleMinute)}`;
+}
+
+function weekdayLabel(day: unknown, tr: TranslateFn): string {
+  const labels = [
+    tr('Sunday', '周日'),
+    tr('Monday', '周一'),
+    tr('Tuesday', '周二'),
+    tr('Wednesday', '周三'),
+    tr('Thursday', '周四'),
+    tr('Friday', '周五'),
+    tr('Saturday', '周六')
+  ];
+  const index = Math.trunc(Number(day));
+  return labels[index >= 0 && index <= 6 ? index : 1];
+}
+
+function normalizeNumberSelection(value: unknown, min: number, max: number): number[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.map((item) => Math.trunc(Number(item))).filter((item) => Number.isFinite(item) && item >= min && item <= max))]
+    .sort((a, b) => a - b);
+}
+
+function taskWeekdaySelection(task: ScheduledTask): number[] {
+  const days = normalizeNumberSelection(task.scheduleWeekdays, 0, 6);
+  if (days.length > 0) return days;
+  return [Math.min(6, Math.max(0, Math.trunc(Number(task.scheduleWeekday ?? 1))))];
+}
+
+function taskMonthDaySelection(task: ScheduledTask): number[] {
+  const days = normalizeNumberSelection(task.scheduleMonthDays, 1, 31);
+  if (days.length > 0) return days;
+  return [Math.min(31, Math.max(1, Math.trunc(Number(task.scheduleMonthDay ?? 1))))];
+}
+
+function weekdayOrderIndex(day: number): number {
+  return day === 0 ? 6 : day - 1;
+}
+
+function formatWeekdaySelection(days: number[], tr: TranslateFn): string {
+  const ordered = [...new Set(days)].sort((a, b) => weekdayOrderIndex(a) - weekdayOrderIndex(b));
+  const groups: number[][] = [];
+  ordered.forEach((day) => {
+    const last = groups[groups.length - 1];
+    if (last && weekdayOrderIndex(day) === weekdayOrderIndex(last[last.length - 1]) + 1) {
+      last.push(day);
+    } else {
+      groups.push([day]);
+    }
+  });
+  return groups
+    .map((group) => {
+      if (group.length >= 2) {
+        return tr(`${weekdayLabel(group[0], tr)}-${weekdayLabel(group[group.length - 1], tr)}`, `${weekdayLabel(group[0], tr)}至${weekdayLabel(group[group.length - 1], tr)}`);
+      }
+      return group.map((day) => weekdayLabel(day, tr)).join(tr(', ', '、'));
+    })
+    .join(tr(', ', '、'));
+}
+
+function formatNumberRanges(values: number[]): string {
+  const ordered = [...new Set(values)].sort((a, b) => a - b);
+  const groups: number[][] = [];
+  ordered.forEach((value) => {
+    const last = groups[groups.length - 1];
+    if (last && value === last[last.length - 1] + 1) {
+      last.push(value);
+    } else {
+      groups.push([value]);
+    }
+  });
+  return groups.map((group) => (group.length >= 2 ? `${group[0]}-${group[group.length - 1]}` : group.join(', '))).join(', ');
+}
+
+function formatMonthDaySelection(days: number[], tr: TranslateFn): string {
+  return tr(`days ${formatNumberRanges(days)}`, `${formatNumberRanges(days).replaceAll(', ', '、')}号`);
+}
+
+function taskScheduleLabel(task: ScheduledTask, tr: TranslateFn): string {
+  if (task.scheduleType === 'interval') return tr(`Every ${task.intervalMinutes} minutes`, `每 ${task.intervalMinutes} 分钟`);
+  if (task.scheduleType === 'daily') return tr(`Daily at ${taskTimeLabel(task)}`, `每日 ${taskTimeLabel(task)}`);
+  if (task.scheduleType === 'weekly') return tr(`Weekly on ${formatWeekdaySelection(taskWeekdaySelection(task), tr)} at ${taskTimeLabel(task)}`, `每周${formatWeekdaySelection(taskWeekdaySelection(task), tr).replace(/^周/, '')} ${taskTimeLabel(task)}`);
+  if (task.scheduleType === 'monthly') return tr(`Monthly on ${formatMonthDaySelection(taskMonthDaySelection(task), tr)} at ${taskTimeLabel(task)}`, `每月 ${formatMonthDaySelection(taskMonthDaySelection(task), tr)} ${taskTimeLabel(task)}`);
+  return tr(`Once at ${prettyDate(task.runAt)}`, `执行时间：${prettyDate(task.runAt)}`);
+}
+
+function parseMonthDaySelection(value: string): number[] {
+  const days = new Set<number>();
+  value.split(/[\s,，、;；]+/).forEach((part) => {
+    if (!part) return;
+    const range = part.match(/^(\d{1,2})\s*[-~至到]\s*(\d{1,2})$/);
+    if (range) {
+      const start = Math.max(1, Math.min(31, Number(range[1])));
+      const end = Math.max(1, Math.min(31, Number(range[2])));
+      for (let day = Math.min(start, end); day <= Math.max(start, end); day += 1) days.add(day);
+      return;
+    }
+    const day = Math.trunc(Number(part));
+    if (Number.isFinite(day) && day >= 1 && day <= 31) days.add(day);
+  });
+  return [...days].sort((a, b) => a - b);
 }
 
 function parseIsoMs(iso?: string): number | null {
@@ -119,6 +233,24 @@ function safeJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function createLocalId(prefix = 'ui'): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function multimediaKind(mimeType: string): AgentMessageAttachment['kind'] | null {
+  if (mimeType.startsWith('image/')) return 'image';
+  if (mimeType.startsWith('video/')) return 'video';
+  if (mimeType.startsWith('audio/')) return 'audio';
+  return null;
+}
+
+function formatBytes(bytes?: number): string {
+  const value = Number(bytes ?? 0);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function findFirstHttpUrl(text: string): string | undefined {
@@ -425,6 +557,8 @@ export function App(): ReactElement {
 
   useEffect(() => {
     const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      void refreshSessions();
+      if (chatBusy && payload.source === 'chat') return;
       if (!sessionId || payload.sessionId !== sessionId) return;
       void window.tasiHarness.sessions.read(payload.sessionId).then((record) => {
         if (!record) return;
@@ -441,7 +575,7 @@ export function App(): ReactElement {
       });
     });
     return off;
-  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive]);
+  }, [sessionId, config.defaultExecutionMode, isWechatSessionActive, chatBusy]);
 
   useEffect(() => {
     const off = window.tasiHarness.security.onToolApprovalRequest((request) => {
@@ -456,6 +590,50 @@ export function App(): ReactElement {
     if (approved && neverAskAgain) {
       const next = await window.tasiHarness.config.get();
       setConfig(next);
+    }
+  }
+
+  async function startSkillOptimization(target: SessionSummary): Promise<void> {
+    if (chatBusy) return;
+    const prompt = tr(
+      `Use skill-creator to inspect session ${target.id} for failed work, identify all related skills, and optimize each affected skill separately. Apply three guards: keep each optimization narrowly scoped, do not whitelist or downgrade failure signals as routine, and do not put domain-specific rules into unrelated skills. Start by reading the session failure signals, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.`,
+      `使用 skill-creator，检查 session ${target.id} 中的失败问题，识别所有相关技能，并分别优化每个受影响的技能。应用三项防护：每次优化保持窄范围，不要把失败信号白名单化或降级为 routine，不要把领域规则写进无关技能。先读取该 session 的失败信号，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。`
+    );
+    const userMessage: AgentMessage = {
+      role: 'user',
+      content: prompt,
+      createdAt: new Date().toISOString()
+    };
+    setPage('chat');
+    setChatBusy(true);
+    setChatStopping(false);
+    setSessionId(undefined);
+    setToolEvents([]);
+    setMessages([userMessage]);
+    setLastUsage(undefined);
+    try {
+      const result = await window.tasiHarness.agent.chat(prompt, undefined, executionMode, false);
+      setSessionId(result.sessionId);
+      setMessages(result.messages.filter((m) => m.role !== 'system'));
+      setLastUsage(result.usage);
+      setTotalUsage(result.totalUsage);
+      setToolEvents(result.toolEvents);
+      setExecutionMode(result.execution.mode);
+      await refreshSessions();
+      await refreshSkills();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMessages([
+        userMessage,
+        {
+          role: 'assistant',
+          content: tr(`Skill optimization failed: ${message}`, `技能优化失败：${message}`),
+          createdAt: new Date().toISOString()
+        }
+      ]);
+    } finally {
+      setChatStopping(false);
+      setChatBusy(false);
     }
   }
 
@@ -486,7 +664,14 @@ export function App(): ReactElement {
             </button>
           </div>
           {sidebarNav.map((item) => (
-            <button key={item.page} className={`nav-item ${page === item.page ? 'active' : ''}`} onClick={() => setPage(item.page)}>
+            <button
+              key={item.page}
+              className={`nav-item ${page === item.page ? 'active' : ''}`}
+              onClick={() => setPage(item.page)}
+              title={item.label}
+              aria-label={item.label}
+              data-label={item.label}
+            >
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
             </button>
@@ -532,12 +717,23 @@ export function App(): ReactElement {
         )}
         {page === 'knowledge' && <KnowledgePage tr={tr} knowledge={knowledge} refreshKnowledge={refreshKnowledge} />}
         {page === 'memory' && <MemoryPage tr={tr} memory={memory} sessionId={sessionId} />}
-        {page === 'skills' && <SkillsPage tr={tr} skills={skills} refreshSkills={refreshSkills} />}
+        {page === 'skills' && (
+          <SkillsPage
+            tr={tr}
+            skills={skills}
+            sessions={sessions}
+            refreshSkills={refreshSkills}
+            refreshSessions={refreshSessions}
+            optimizeBusy={chatBusy}
+            onOptimizeSession={startSkillOptimization}
+          />
+        )}
         {page === 'tasks' && <TasksPage tr={tr} tasks={tasks} refreshTasks={refreshTasks} refreshSessions={refreshSessions} />}
         {page === 'sessions' && (
           <SessionsPage
             tr={tr}
             sessions={sessions}
+            wechatSessionId={activeWechatSessionId}
             onOpen={async (id) => {
               const record = await window.tasiHarness.sessions.read(id);
               if (record) {
@@ -703,7 +899,7 @@ function ChatPage(props: {
   config: PublicAppConfig;
   setConfig: (cfg: PublicAppConfig) => void;
   messages: AgentMessage[];
-  setMessages: (messages: AgentMessage[]) => void;
+  setMessages: Dispatch<SetStateAction<AgentMessage[]>>;
   sessionId?: string;
   setSessionId: (id?: string) => void;
   lastUsage?: LlmUsage;
@@ -727,6 +923,9 @@ function ChatPage(props: {
   const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
   const [sessionDocBusy, setSessionDocBusy] = useState(false);
   const [sessionDocError, setSessionDocError] = useState('');
+  const [multimediaAttachments, setMultimediaAttachments] = useState<AgentMessageAttachment[]>([]);
+  const [multimediaError, setMultimediaError] = useState('');
+  const [wechatChipClearedAt, setWechatChipClearedAt] = useState(() => new Date().toISOString());
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
@@ -741,12 +940,14 @@ function ChatPage(props: {
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
   const uploadSessionDocInputRef = useRef<HTMLInputElement | null>(null);
+  const uploadMultimediaInputRef = useRef<HTMLInputElement | null>(null);
   const previewZoomFactorRef = useRef(1);
   const previewZoomSyncIdRef = useRef(0);
   const previewContentMetricsRef = useRef<{ contentWidth: number; contentHeight: number } | null>(null);
   const previewMeasuredViewportRef = useRef<{ width: number; height: number } | null>(null);
   const previewNeedsMeasurementRef = useRef(true);
   const externalPreviewOpenUrlRef = useRef('');
+  const previousWechatBusyRef = useRef(false);
   const dragStateRef = useRef<{
     startClientX: number;
     startClientY: number;
@@ -757,7 +958,9 @@ function ChatPage(props: {
   const visibleMessages = useMemo(
     () => props.messages.filter((m) => {
       if (m.role === 'assistant' && m.content === WECHAT_PENDING_MARKER) return false;
-      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim()));
+      const isIntermediateToolAssistant = m.role === 'assistant' && !m.content?.trim() && (m.tool_calls?.length ?? 0) > 0;
+      if (isIntermediateToolAssistant) return false;
+      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim() || m.reasoning_content?.trim()));
     }),
     [props.messages]
   );
@@ -778,6 +981,47 @@ function ChatPage(props: {
   );
   const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
   const runBusy = props.busy || wechatBusy;
+  const wechatSessionAttachments = useMemo(() => {
+    if (!isWechatSession) return [];
+    const seen = new Set<string>();
+    const attachments: AgentMessageAttachment[] = [];
+    for (const message of props.messages) {
+      if (message.role !== 'user') continue;
+      if (!message.createdAt || message.createdAt <= wechatChipClearedAt) continue;
+      for (const attachment of message.attachments ?? []) {
+        const key = attachment.id ?? `${attachment.kind}:${attachment.filename}:${attachment.sizeBytes ?? 0}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        attachments.push(attachment);
+      }
+    }
+    return attachments.slice(-12);
+  }, [isWechatSession, props.messages, wechatChipClearedAt]);
+  const activeSessionDocs = useMemo(() => (
+    isWechatSession ? sessionDocs.filter((doc) => doc.updatedAt > wechatChipClearedAt) : sessionDocs
+  ), [isWechatSession, sessionDocs, wechatChipClearedAt]);
+  const visibleSessionDocs = useMemo(() => (
+    isWechatSession ? activeSessionDocs.slice(0, 3) : activeSessionDocs
+  ), [isWechatSession, activeSessionDocs]);
+  const hiddenSessionDocCount = Math.max(0, activeSessionDocs.length - visibleSessionDocs.length);
+  const visibleWechatSessionAttachments = useMemo(() => (
+    isWechatSession ? wechatSessionAttachments.slice(-3) : wechatSessionAttachments
+  ), [isWechatSession, wechatSessionAttachments]);
+  const hiddenWechatAttachmentCount = Math.max(0, wechatSessionAttachments.length - visibleWechatSessionAttachments.length);
+  useEffect(() => {
+    setWechatChipClearedAt(new Date().toISOString());
+    previousWechatBusyRef.current = false;
+  }, [props.sessionId]);
+  useEffect(() => {
+    if (!isWechatSession) {
+      previousWechatBusyRef.current = false;
+      return;
+    }
+    if (previousWechatBusyRef.current && !wechatBusy) {
+      setWechatChipClearedAt(new Date().toISOString());
+    }
+    previousWechatBusyRef.current = wechatBusy;
+  }, [isWechatSession, wechatBusy]);
   useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
@@ -785,16 +1029,32 @@ function ChatPage(props: {
     if (props.personalKnowledgeDocCount > 0 || !usePersonalKnowledgeBase) return;
     setUsePersonalKnowledgeBase(false);
   }, [props.personalKnowledgeDocCount, usePersonalKnowledgeBase]);
+  async function refreshSessionDocuments(sessionId = props.sessionId): Promise<void> {
+    if (!sessionId) {
+      setSessionDocs([]);
+      setSessionDocError('');
+      return;
+    }
+    try {
+      const docs = await window.tasiHarness.sessionDocs.list(sessionId);
+      setSessionDocs(docs);
+      setSessionDocError('');
+    } catch (e) {
+      setSessionDocError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
-    if (!props.sessionId) {
+    const sessionId = props.sessionId;
+    if (!sessionId) {
       setSessionDocs([]);
       setSessionDocError('');
       return () => {
         cancelled = true;
       };
     }
-    void window.tasiHarness.sessionDocs.list(props.sessionId)
+    void window.tasiHarness.sessionDocs.list(sessionId)
       .then((docs) => {
         if (cancelled) return;
         setSessionDocs(docs);
@@ -807,6 +1067,13 @@ function ChatPage(props: {
     return () => {
       cancelled = true;
     };
+  }, [props.sessionId]);
+  useEffect(() => {
+    const off = window.tasiHarness.sessions.onUpdated((payload) => {
+      if (!props.sessionId || payload.sessionId !== props.sessionId) return;
+      void refreshSessionDocuments(payload.sessionId);
+    });
+    return off;
   }, [props.sessionId]);
   useEffect(() => {
     if (!shouldShowWebPreview) {
@@ -879,6 +1146,38 @@ function ChatPage(props: {
     });
     return off;
   }, [props.sessionId, props.setToolEvents]);
+  useEffect(() => {
+    const off = window.tasiHarness.agent.onMessageDelta((payload) => {
+      if (props.sessionId && payload.sessionId !== props.sessionId) return;
+      props.setMessages((old) => {
+        const existing = old.find((message) => message.id === payload.messageId);
+        if (!existing) {
+          return [
+            ...old,
+            {
+              id: payload.messageId,
+              role: 'assistant',
+              content: payload.content ?? '',
+              reasoning_content: payload.reasoning_content,
+              reasoning_parts: payload.reasoning_parts,
+              createdAt: payload.createdAt
+            }
+          ];
+        }
+        return old.map((message) => {
+          if (message.id !== payload.messageId) return message;
+          return {
+            ...message,
+            content: payload.content ?? message.content,
+            reasoning_content: payload.reasoning_content ?? message.reasoning_content,
+            reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
+            createdAt: message.createdAt ?? payload.createdAt
+          };
+        });
+      });
+    });
+    return off;
+  }, [props.sessionId, props.setMessages]);
   useEffect(() => {
     if (!showEmbeddedWebPreview) {
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
@@ -1230,16 +1529,19 @@ function ChatPage(props: {
 
   async function submitMessage(rawText: string): Promise<void> {
     const text = rawText.trim();
-    if (!text || props.busy) return;
+    const outgoingAttachments = multimediaAttachments;
+    if ((!text && outgoingAttachments.length === 0) || props.busy) return;
     setInput('');
     setError('');
+    setMultimediaError('');
+    setMultimediaAttachments([]);
     props.setBusy(true);
     props.setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
-    props.setMessages([...props.messages, { role: 'user', content: text, createdAt: new Date().toISOString() }]);
+    props.setMessages([...props.messages, { role: 'user', content: text, attachments: outgoingAttachments.length > 0 ? outgoingAttachments : undefined, createdAt: new Date().toISOString() }]);
     try {
-      const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled);
+      const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled, outgoingAttachments);
       props.setSessionId(result.sessionId);
       props.setMessages(result.messages.filter((m) => m.role !== 'system'));
       props.setLastUsage(result.usage);
@@ -1420,6 +1722,13 @@ function ChatPage(props: {
     uploadSessionDocInputRef.current.click();
   }
 
+  function openMultimediaPicker(): void {
+    if (runBusy) return;
+    if (!uploadMultimediaInputRef.current) return;
+    uploadMultimediaInputRef.current.value = '';
+    uploadMultimediaInputRef.current.click();
+  }
+
   async function openWorkspaceDirectory(): Promise<void> {
     const workspaceDir = props.config.workspaceDir.trim();
     if (!workspaceDir) {
@@ -1474,6 +1783,43 @@ function ChatPage(props: {
     } finally {
       setSessionDocBusy(false);
     }
+  }
+
+  async function addMultimediaAttachments(files: File[]): Promise<void> {
+    if (files.length === 0) return;
+    setMultimediaError('');
+    const next: AgentMessageAttachment[] = [];
+    const failures: string[] = [];
+    for (const file of files) {
+      const kind = multimediaKind(file.type);
+      if (!kind) {
+        failures.push(`${file.name}: ${props.tr('unsupported media type', '不支持的媒体类型')}`);
+        continue;
+      }
+      if (file.size > MAX_MULTIMEDIA_ATTACHMENT_BYTES) {
+        failures.push(`${file.name}: ${props.tr('file is larger than 8 MB', '文件超过 8 MB')}`);
+        continue;
+      }
+      try {
+        next.push({
+          id: createLocalId('media'),
+          kind,
+          filename: file.name,
+          mimeType: file.type,
+          contentBase64: await fileToBase64(file),
+          sizeBytes: file.size
+        });
+      } catch (error) {
+        failures.push(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (next.length > 0) setMultimediaAttachments((old) => [...old, ...next]);
+    if (failures.length > 0) setMultimediaError(failures.join('\n'));
+  }
+
+  function removeMultimediaAttachment(id: string | undefined): void {
+    if (!id) return;
+    setMultimediaAttachments((old) => old.filter((item) => item.id !== id));
   }
 
   async function removeSessionDocument(id: string): Promise<void> {
@@ -1533,6 +1879,8 @@ function ChatPage(props: {
               setFollowUpQuestions([]);
               setSessionDocs([]);
               setSessionDocError('');
+              setMultimediaAttachments([]);
+              setMultimediaError('');
             }}
           >
             {props.tr('New session', '新会话')}
@@ -1736,6 +2084,7 @@ function ChatPage(props: {
       </div>
       {error && <div className="error-box">{error}</div>}
       {sessionDocError && <div className="error-box">{sessionDocError}</div>}
+      {multimediaError && <div className="error-box">{multimediaError}</div>}
       <div className="chat-input-area">
         <div className="chat-input-main">
           <input
@@ -1750,8 +2099,20 @@ function ChatPage(props: {
               void uploadSessionDocuments(files);
             }}
           />
+          <input
+            ref={uploadMultimediaInputRef}
+            className="hidden-file-input"
+            type="file"
+            multiple
+            accept="image/*,video/*,audio/*"
+            onChange={(event) => {
+              const files = Array.from(event.target.files ?? []);
+              if (files.length === 0) return;
+              void addMultimediaAttachments(files);
+            }}
+          />
           <div className="chat-session-doc-row">
-            {sessionDocs.map((doc) => (
+            {visibleSessionDocs.map((doc) => (
               <span key={doc.id} className="chat-session-doc-chip" title={doc.filename}>
                 <span className="chat-session-doc-name">{doc.filename}</span>
                 <span className="chat-session-doc-meta">{props.tr(`${doc.commentCount} comments`, `${doc.commentCount} comments`)}</span>
@@ -1766,55 +2127,119 @@ function ChatPage(props: {
                 </button>
               </span>
             ))}
+            {hiddenSessionDocCount > 0 && (
+              <span className="chat-overflow-chip" title={props.tr('Older WeChat documents are still stored in this session.', '较早的微信文档仍保存在当前 session 中。')}>
+                {props.tr(`+${hiddenSessionDocCount} more docs`, `还有 ${hiddenSessionDocCount} 个文档`)}
+              </span>
+            )}
           </div>
+          {(multimediaAttachments.length > 0 || visibleWechatSessionAttachments.length > 0) && (
+            <div className="chat-media-row">
+              {multimediaAttachments.map((attachment) => (
+                <span key={attachment.id} className={`chat-media-chip ${attachment.kind}`} title={attachment.filename}>
+                  <span className="chat-media-kind">{attachment.kind}</span>
+                  <span className="chat-media-name">{attachment.filename}</span>
+                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  <button
+                    className="chat-session-doc-remove"
+                    onClick={() => removeMultimediaAttachment(attachment.id)}
+                    disabled={runBusy}
+                    title={props.tr('Remove media', '移除多媒体')}
+                    aria-label={props.tr('Remove media', '移除多媒体')}
+                  >
+                    x
+                  </button>
+                </span>
+              ))}
+              {visibleWechatSessionAttachments.map((attachment, index) => (
+                <span
+                  key={`wechat-${attachment.id ?? `${attachment.filename}-${index}`}`}
+                  className={`chat-media-chip ${attachment.kind} readonly`}
+                  title={attachment.filename}
+                >
+                  <span className="chat-media-kind">{attachment.kind}</span>
+                  <span className="chat-media-name">{attachment.filename}</span>
+                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  <span className="chat-media-source">{props.tr('WeChat', '微信')}</span>
+                </span>
+              ))}
+              {hiddenWechatAttachmentCount > 0 && (
+                <span className="chat-overflow-chip" title={props.tr('Older WeChat media is still stored in this session.', '较早的微信媒体仍保存在当前 session 中。')}>
+                  {props.tr(`+${hiddenWechatAttachmentCount} more media`, `还有 ${hiddenWechatAttachmentCount} 个媒体`)}
+                </span>
+              )}
+            </div>
+          )}
           <div className="chat-textarea-wrap">
-          <textarea
-            className="chat-textarea"
-          placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
-            value={input}
-            disabled={runBusy || !connected}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                void send();
-              }
-            }}
-          />
+            <textarea
+              className="chat-textarea"
+              placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
+              value={input}
+              disabled={runBusy || !connected}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+            />
+            <div className="chat-attach-toolbar">
+              <button
+                className="chat-attach-button"
+                onClick={openSessionDocumentPicker}
+                disabled={runBusy || sessionDocBusy || !connected}
+                title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+                aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                className="chat-attach-button chat-media-button"
+                onClick={openMultimediaPicker}
+                disabled={runBusy || !connected}
+                title={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+                aria-label={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <rect x="4" y="5" width="16" height="14" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+                  <path d="m7 15 3-3 2.4 2.4L14.5 12 18 15.5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
+                </svg>
+              </button>
+            </div>
             <button
-              className="chat-attach-button"
-              onClick={openSessionDocumentPicker}
-              disabled={runBusy || sessionDocBusy || !connected}
-              title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
-              aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
+              className={`send-btn${runBusy ? ' stop' : ''}`}
+              disabled={runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected}
+              title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
+              onClick={() => {
+                if (runBusy) {
+                  void stopCurrentSession();
+                  return;
+                }
+                void send();
+              }}
             >
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  d="M21 11.5 12.2 20.3a6 6 0 0 1-8.5-8.5l9.3-9.3a4 4 0 0 1 5.7 5.7l-9.9 9.9a2 2 0 0 1-2.8-2.8l8.4-8.4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.8"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              {runBusy ? (
+                props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />
+              ) : (
+                <svg className="send-arrow-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 19V5" />
+                  <path d="m6 11 6-6 6 6" />
+                </svg>
+              )}
             </button>
           </div>
         </div>
-        <button
-          className={`send-btn${runBusy ? ' stop' : ''}`}
-          disabled={runBusy ? props.stopping : !input.trim() || !connected}
-          title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
-          onClick={() => {
-            if (runBusy) {
-              void stopCurrentSession();
-              return;
-            }
-            void send();
-          }}
-        >
-          {runBusy ? (props.stopping ? '...' : <span className="send-stop-icon" aria-hidden="true" />) : props.tr('->', '->')}
-        </button>
       </div>
     </section>
   );
@@ -1839,6 +2264,40 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
       onClick={handleLinkClick}
       dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(normalized) }}
     />
+  );
+}
+
+function reasoningItems(content: string, parts?: string[]): string[] {
+  const explicitParts = parts?.map((part) => part.trim()).filter(Boolean) ?? [];
+  if (explicitParts.length > 0) return explicitParts;
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized) return [];
+
+  const lineItems = normalized
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, ''))
+    .filter(Boolean);
+  if (lineItems.length > 1) return lineItems;
+
+  const sentenceItems = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) ?? [];
+  return sentenceItems.length > 0 ? sentenceItems : [normalized];
+}
+
+function ReasoningList({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
+  const items = reasoningItems(content, parts);
+  if (items.length === 0) return null;
+  return (
+    <div className="msg-reasoning">
+      <div className="msg-reasoning-title">{tr('Reasoning', '推理过程')}</div>
+      <div className="msg-reasoning-list">
+        {items.map((item, index) => (
+          <details key={`${index}-${item.slice(0, 24)}`} className="msg-reasoning-item" open>
+            <summary>{tr(`Step ${index + 1}`, `第 ${index + 1} 条`)}</summary>
+            <div className="msg-reasoning-item-body">{item}</div>
+          </details>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -1929,6 +2388,21 @@ function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactEleme
   );
 }
 
+function MessageAttachments({ attachments }: { attachments?: AgentMessageAttachment[] }): ReactElement | null {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div className="msg-attachment-list">
+      {attachments.map((attachment, index) => (
+        <div key={attachment.id ?? `${attachment.filename}-${index}`} className={`msg-attachment ${attachment.kind}`}>
+          <span className="msg-attachment-kind">{attachment.kind}</span>
+          <span className="msg-attachment-name">{attachment.filename}</span>
+          <span className="msg-attachment-size">{formatBytes(attachment.sizeBytes)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
@@ -1989,7 +2463,11 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
           ) : (
             <>
               <CitationLinkStrip citations={citations} />
-              {renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}
+              <MessageAttachments attachments={message.attachments} />
+              {message.role === 'assistant' && message.reasoning_content?.trim()
+                ? <ReasoningList content={message.reasoning_content} parts={message.reasoning_parts} tr={tr} />
+                : null}
+              {message.content.trim() ? renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`) : null}
               <div className="msg-bubble-actions">
                 {message.role === 'assistant' && (
                   <>
@@ -2478,6 +2956,34 @@ function normalizeSkillContent(content: string, name: string, category: string):
   return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, '---', '', body, ''].join('\n');
 }
 
+function parseSkillFrontmatter(content: string): Record<string, string> {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!match) return {};
+  const out: Record<string, string> = {};
+  for (const raw of match[1].split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf(':');
+    if (idx < 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (key) out[key] = value;
+  }
+  return out;
+}
+
+async function inspectSkillArchive(file: File): Promise<{ name?: string; category?: string }> {
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const entries = Object.values(zip.files).filter((entry) => !entry.dir);
+  const skillEntry = entries.find((entry) => /(^|\/)SKILL\.md$/i.test(entry.name.replace(/\\/g, '/')));
+  if (!skillEntry) throw new Error('Archive must include SKILL.md.');
+  const frontmatter = parseSkillFrontmatter(await skillEntry.async('string'));
+  return {
+    name: frontmatter.name,
+    category: frontmatter.category
+  };
+}
+
 const emptyCoachRecording: BrowserCoachRecording = {
   id: '',
   startUrl: '',
@@ -2492,8 +2998,24 @@ function formatCoachEvent(event: BrowserCoachRecordedEvent): string {
   return `${event.index}. ${event.type}${target ? ` | ${target}` : ''}${detail}`;
 }
 
-function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: SkillMetadata[]; refreshSkills: () => Promise<void> }): ReactElement {
-  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach'>('installed');
+function SkillsPage({
+  tr,
+  skills,
+  sessions,
+  refreshSkills,
+  refreshSessions,
+  optimizeBusy,
+  onOptimizeSession
+}: {
+  tr: TranslateFn;
+  skills: SkillMetadata[];
+  sessions: SessionSummary[];
+  refreshSkills: () => Promise<void>;
+  refreshSessions: () => Promise<void>;
+  optimizeBusy: boolean;
+  onOptimizeSession: (session: SessionSummary) => Promise<void>;
+}): ReactElement {
+  const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach' | 'optimize'>('installed');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
@@ -2506,6 +3028,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadNotice, setUploadNotice] = useState('');
   const [uploadError, setUploadError] = useState('');
+  const [uploadOverwrite, setUploadOverwrite] = useState(false);
+  const [uploadPackageSkillName, setUploadPackageSkillName] = useState('');
+  const [overwriteSelections, setOverwriteSelections] = useState<Record<string, boolean>>({});
   const [coachUrl, setCoachUrl] = useState('https://www.baidu.com');
   const [coachRecording, setCoachRecording] = useState<BrowserCoachRecording>(emptyCoachRecording);
   const [coachSkillName, setCoachSkillName] = useState('recorded-browser-workflow');
@@ -2514,6 +3039,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   const [coachBusy, setCoachBusy] = useState(false);
   const [coachNotice, setCoachNotice] = useState('');
   const [coachError, setCoachError] = useState('');
+  const [optimizeSessionId, setOptimizeSessionId] = useState('');
+  const [optimizeError, setOptimizeError] = useState('');
+  const [optimizeRefreshing, setOptimizeRefreshing] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editorMode, setEditorMode] = useState<'create' | 'edit'>('create');
   const [editorName, setEditorName] = useState('my-workflow');
@@ -2563,6 +3091,11 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
       window.clearInterval(timer);
     };
   }, [activeTab]);
+
+  useEffect(() => {
+    if (optimizeSessionId || sessions.length === 0) return;
+    setOptimizeSessionId(sessions[0]?.id ?? '');
+  }, [optimizeSessionId, sessions]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -2621,6 +3154,31 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     return normalized || 'uploaded-skill';
   }
 
+  function normalizeSkillNameForCompare(name: string): string {
+    return name.trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  }
+
+  function existingSkillForName(name: string): SkillMetadata | undefined {
+    const target = normalizeSkillNameForCompare(name);
+    if (!target) return undefined;
+    return skills.find((skill) => normalizeSkillNameForCompare(skill.name) === target);
+  }
+
+  function marketplaceExistingSkill(skill: MarketplaceSkill): SkillMetadata | undefined {
+    return [skill.installedSkillName, skill.name, skill.id]
+      .filter((name): name is string => Boolean(name?.trim()))
+      .map((name) => existingSkillForName(name))
+      .find((item): item is SkillMetadata => Boolean(item));
+  }
+
+  function overwriteSelected(key: string): boolean {
+    return Boolean(overwriteSelections[key]);
+  }
+
+  function setOverwriteSelection(key: string, checked: boolean): void {
+    setOverwriteSelections((old) => ({ ...old, [key]: checked }));
+  }
+
   async function fileToBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -2633,6 +3191,21 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
       reader.onerror = () => reject(reader.error ?? new Error('Failed to read file.'));
       reader.readAsDataURL(file);
     });
+  }
+
+  async function inspectUploadPackage(file: File): Promise<void> {
+    setUploadPackageSkillName('');
+    try {
+      const metadata = await inspectSkillArchive(file);
+      if (metadata.name?.trim()) {
+        setUploadName(metadata.name.trim());
+        setUploadPackageSkillName(metadata.name.trim());
+      }
+      if (metadata.category?.trim()) setUploadCategory(metadata.category.trim());
+      setUploadOverwrite(false);
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function saveEditor(): Promise<void> {
@@ -2683,6 +3256,15 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
   async function install(skill: MarketplaceSkill): Promise<void> {
     const { sourceId, id: skillId } = skill;
     const actionKey = `install:${sourceId}:${skillId}`;
+    const existing = marketplaceExistingSkill(skill);
+    const overwrite = existing ? overwriteSelected(actionKey) : false;
+    if (existing && !overwrite) {
+      setMarketError(tr(
+        `Skill ${existing.name} already exists. Check "Overwrite existing skill" to replace it.`,
+        `技能 ${existing.name} 已存在。勾选“覆盖现有技能”后才会替换。`
+      ));
+      return;
+    }
     setMarketActionKey(actionKey);
     setMarketError('');
     try {
@@ -2703,7 +3285,8 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
           homepage: skill.homepage,
           remoteVersionId: skill.remoteVersionId,
           installCommand: skill.installCommand
-        }
+        },
+        overwrite
       });
       setNotice(`Marketplace skill installed: ${installed.installedSkillName ?? installed.name}.`);
       await refreshSkills();
@@ -2746,6 +3329,15 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
       setUploadError('Please fill in a skill name.');
       return;
     }
+    const existing = existingSkillForName(skillName);
+    const overwrite = existing ? uploadOverwrite : false;
+    if (existing && !overwrite) {
+      setUploadError(tr(
+        `Skill ${existing.name} already exists. Check "Overwrite existing skill" to replace it.`,
+        `技能 ${existing.name} 已存在。勾选“覆盖现有技能”后才会替换。`
+      ));
+      return;
+    }
     setUploadBusy(true);
     try {
       const contentBase64 = await fileToBase64(uploadFile);
@@ -2753,7 +3345,8 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
         filename: uploadFile.name,
         contentBase64,
         name: skillName,
-        category: uploadCategory.trim() || 'local'
+        category: uploadCategory.trim() || 'local',
+        overwrite
       });
       setUploadNotice(`Uploaded and installed ${created.name}.`);
       setNotice(`Uploaded and installed ${created.name}.`);
@@ -2841,6 +3434,56 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
     }
   }
 
+  async function installBundledVersion(skill: SkillMetadata): Promise<void> {
+    const actionKey = `bundled:${skill.name}`;
+    const overwrite = overwriteSelected(actionKey);
+    if (!overwrite) {
+      setNotice(tr(
+        `Skill ${skill.name} was kept. Check "Overwrite existing skill" to replace it with the bundled version.`,
+        `已保留技能 ${skill.name}。勾选“覆盖现有技能”后才会用内置版本替换。`
+      ));
+      return;
+    }
+    setMarketActionKey(actionKey);
+    setMarketError('');
+    try {
+      const installed = await window.tasiHarness.skills.installBundled(skill.name, true);
+      setNotice(tr(`Replaced ${skill.name} with bundled skill.`, `已用内置版本覆盖 ${skill.name}。`));
+      await refreshSkills();
+      await openInstalledSkill(installed.name);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMarketActionKey(null);
+    }
+  }
+
+  async function refreshOptimizationSessions(): Promise<void> {
+    setOptimizeRefreshing(true);
+    setOptimizeError('');
+    try {
+      await refreshSessions();
+    } catch (error) {
+      setOptimizeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setOptimizeRefreshing(false);
+    }
+  }
+
+  async function optimizeSelectedSession(): Promise<void> {
+    const selected = sessions.find((item) => item.id === optimizeSessionId);
+    if (!selected) {
+      setOptimizeError(tr('Choose a session first.', '请先选择一个 session。'));
+      return;
+    }
+    setOptimizeError('');
+    try {
+      await onOptimizeSession(selected);
+    } catch (error) {
+      setOptimizeError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   return (
     <section className="page">
       <PageHeader
@@ -2862,6 +3505,9 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
           <button className={`skill-tab ${activeTab === 'coach' ? 'active' : ''}`} onClick={() => setActiveTab('coach')}>
             {tr('Coach', '教练')}
           </button>
+          <button className={`skill-tab ${activeTab === 'optimize' ? 'active' : ''}`} onClick={() => setActiveTab('optimize')}>
+            {tr('Optimize', '技能优化')}
+          </button>
         </div>
         {activeTab === 'installed' && (
           <>
@@ -2875,8 +3521,30 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
                     <span>{skill.category}</span>
                     <span>{skill.marketplaceSourceId ?? skill.source}</span>
                   </div>
+                  {skill.bundledPath && (
+                    <div className="meta-row wrap upload-file-row">
+                      <span className="soft-badge">{tr('Bundled version available', '有内置版本')}</span>
+                      <label className="toggle-line overwrite-toggle">
+                        <input
+                          type="checkbox"
+                          checked={overwriteSelected(`bundled:${skill.name}`)}
+                          onChange={(event) => setOverwriteSelection(`bundled:${skill.name}`, event.target.checked)}
+                        />
+                        {tr('Overwrite existing skill', '覆盖现有技能')}
+                      </label>
+                    </div>
+                  )}
                   <div className="button-row compact skill-actions">
                     <button className="ghost-button" onClick={() => void openInstalledSkill(skill.name)}>{tr('Open', '打开')}</button>
+                    {skill.bundledPath && (
+                      <button
+                        className="ghost-button"
+                        disabled={marketActionKey === `bundled:${skill.name}` || !overwriteSelected(`bundled:${skill.name}`)}
+                        onClick={() => void installBundledVersion(skill)}
+                      >
+                        {marketActionKey === `bundled:${skill.name}` ? tr('Replacing...', '覆盖中...') : tr('Use Bundled', '用内置版本覆盖')}
+                      </button>
+                    )}
                     {!skill.readonly && <button className="danger-button" onClick={() => void uninstall(skill.name)}>{tr('Uninstall', '卸载')}</button>}
                   </div>
                 </div>
@@ -2906,18 +3574,30 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
                     const uninstallActionKey = `uninstall:${skill.installedSkillName ?? ''}`;
                     const installBusy = marketActionKey === installActionKey;
                     const uninstallBusy = marketActionKey === uninstallActionKey;
+                    const existing = marketplaceExistingSkill(skill);
+                    const needsOverwrite = Boolean(existing && !skill.installed);
                     return (
                   <div className="marketplace-card-top">
                     <div>
                       <strong>{skill.name}</strong>
                       <div className="card-subtle">{skill.sourceName} | {skill.category} | v{skill.version}</div>
+                      {needsOverwrite && (
+                        <label className="toggle-line overwrite-toggle">
+                          <input
+                            type="checkbox"
+                            checked={overwriteSelected(installActionKey)}
+                            onChange={(event) => setOverwriteSelection(installActionKey, event.target.checked)}
+                          />
+                          {tr(`Overwrite existing skill ${existing?.name}`, `覆盖现有技能 ${existing?.name}`)}
+                        </label>
+                      )}
                     </div>
                     {skill.installed && skill.installedSkillName ? (
                       <button className="danger-button" disabled={uninstallBusy || marketActionKey !== null} onClick={() => void uninstall(skill.installedSkillName ?? '')}>
                         {uninstallBusy ? tr('Uninstalling...', '卸载中...') : tr('Uninstall', '卸载')}
                       </button>
                     ) : (
-                      <button className="primary-button" disabled={installBusy || marketActionKey !== null} onClick={() => void install(skill)}>
+                      <button className="primary-button" disabled={installBusy || marketActionKey !== null || (needsOverwrite && !overwriteSelected(installActionKey))} onClick={() => void install(skill)}>
                         {installBusy ? tr('Installing...', '安装中...') : tr('Install', '安装')}
                       </button>
                     )}
@@ -2938,28 +3618,45 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             <label>{tr('ZIP package', 'ZIP 文件')}</label>
             <input
               type="file"
-              accept=".zip,application/zip"
+              accept=".zip,.skill,application/zip"
               onChange={(e) => {
                 const file = e.target.files?.[0] ?? null;
                 setUploadFile(file);
+                setUploadPackageSkillName('');
+                setUploadOverwrite(false);
                 if (file) {
                   setUploadName(suggestSkillNameFromFilename(file.name));
                   setUploadError('');
+                  void inspectUploadPackage(file);
                 }
               }}
             />
             <label>{tr('Skill name', '技能名')}</label>
-            <input value={uploadName} onChange={(e) => setUploadName(e.target.value)} placeholder={tr('required, e.g. my-automation-skill', '必填，例如：my-automation-skill')} />
+            <input
+              value={uploadName}
+              onChange={(e) => {
+                setUploadName(e.target.value);
+                setUploadOverwrite(false);
+              }}
+              placeholder={tr('required, e.g. my-automation-skill', '必填，例如：my-automation-skill')}
+            />
             <label>{tr('Category', '分类')}</label>
             <input value={uploadCategory} onChange={(e) => setUploadCategory(e.target.value)} placeholder="local" />
+            {existingSkillForName(uploadName) && (
+              <label className="toggle-line overwrite-toggle">
+                <input type="checkbox" checked={uploadOverwrite} onChange={(event) => setUploadOverwrite(event.target.checked)} />
+                {tr(`Overwrite existing skill ${existingSkillForName(uploadName)?.name}`, `覆盖现有技能 ${existingSkillForName(uploadName)?.name}`)}
+              </label>
+            )}
             {uploadFile && (
               <div className="meta-row wrap upload-file-row">
                 <span className="soft-badge">{tr('File', '文件')}: {uploadFile.name}</span>
                 <span className="soft-badge">{tr('Size', '大小')}: {(uploadFile.size / 1024).toFixed(1)} KB</span>
+                {uploadPackageSkillName && <span className="soft-badge">{tr('Package skill', '包内技能')}: {uploadPackageSkillName}</span>}
               </div>
             )}
             <div className="button-row">
-              <button className="primary-button" disabled={uploadBusy} onClick={() => void uploadArchive()}>
+              <button className="primary-button" disabled={uploadBusy || Boolean(existingSkillForName(uploadName) && !uploadOverwrite)} onClick={() => void uploadArchive()}>
                 {uploadBusy ? tr('Uploading...', '上传中...') : tr('Upload and Install', '上传并安装')}
               </button>
             </div>
@@ -3033,6 +3730,43 @@ function SkillsPage({ tr, skills, refreshSkills }: { tr: TranslateFn; skills: Sk
             {coachNotice && <div className="notice-box">{coachNotice}</div>}
           </>
         )}
+        {activeTab === 'optimize' && (
+          <>
+            <h2>{tr('Skill Optimization', '技能优化')}</h2>
+            <p className="card-subtle">
+              {tr(
+                'Choose a previous session. Tasi will start a new agent run that inspects its failures, maps them to one or more skills, and patches the affected skill instructions or scripts.',
+                '选择一个历史 session。系统会启动新的智能体任务，检查其中的失败问题，映射到一个或多个技能，并修改受影响的技能说明或脚本。'
+              )}
+            </p>
+            <label>{tr('Session', 'Session')}</label>
+            <select value={optimizeSessionId} onChange={(event) => setOptimizeSessionId(event.target.value)} disabled={optimizeBusy || optimizeRefreshing}>
+              {sessions.map((session) => (
+                <option key={session.id} value={session.id}>
+                  {`${prettyDate(session.updatedAt)} · ${session.title || session.id}`}
+                </option>
+              ))}
+            </select>
+            {optimizeSessionId && (
+              <div className="meta-row wrap upload-file-row">
+                <span className="soft-badge">{optimizeSessionId}</span>
+                <span className="soft-badge">
+                  {tr('Messages', '消息')}: {sessions.find((session) => session.id === optimizeSessionId)?.messageCount ?? 0}
+                </span>
+              </div>
+            )}
+            <div className="button-row">
+              <button className="primary-button" disabled={optimizeBusy || optimizeRefreshing || sessions.length === 0} onClick={() => void optimizeSelectedSession()}>
+                {optimizeBusy ? tr('Optimizing...', '优化中...') : tr('Optimize Skills From Session', '从 Session 优化技能')}
+              </button>
+              <button className="ghost-button" disabled={optimizeBusy || optimizeRefreshing} onClick={() => void refreshOptimizationSessions()}>
+                {optimizeRefreshing ? tr('Refreshing...', '刷新中...') : tr('Refresh Sessions', '刷新 Session')}
+              </button>
+            </div>
+            {sessions.length === 0 && <div className="tool-empty">{tr('No sessions found.', '暂无 session。')}</div>}
+            {optimizeError && <div className="error-box market-error">{optimizeError}</div>}
+          </>
+        )}
         {notice && <div className="notice-box">{notice}</div>}
       </div>
       {editorOpen && (
@@ -3078,21 +3812,45 @@ function TasksPage(props: {
 }): ReactElement {
   const [name, setName] = useState('Daily digest');
   const [prompt, setPrompt] = useState('Summarize today\'s important progress and blockers.');
-  const [scheduleType, setScheduleType] = useState<'once' | 'interval'>('interval');
+  const [scheduleType, setScheduleType] = useState<ScheduledTask['scheduleType']>('daily');
   const [runAt, setRunAt] = useState('');
   const [intervalMinutes, setIntervalMinutes] = useState(60);
+  const [scheduleHour, setScheduleHour] = useState(9);
+  const [scheduleMinute, setScheduleMinute] = useState(0);
+  const [scheduleWeekdays, setScheduleWeekdays] = useState<number[]>([1, 2, 3, 4, 5]);
+  const [scheduleMonthDaysText, setScheduleMonthDaysText] = useState('1');
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('sandbox');
   const [notifyByEmail, setNotifyByEmail] = useState(true);
   const [notifyByWechat, setNotifyByWechat] = useState(false);
   const [notice, setNotice] = useState('');
 
+  function toggleWeekday(day: number): void {
+    setScheduleWeekdays((current) => {
+      if (current.includes(day)) return current.filter((item) => item !== day);
+      return [...current, day].sort((a, b) => weekdayOrderIndex(a) - weekdayOrderIndex(b));
+    });
+  }
+
   async function createTask(): Promise<void> {
+    const scheduleMonthDays = parseMonthDaySelection(scheduleMonthDaysText);
+    if (scheduleType === 'weekly' && scheduleWeekdays.length === 0) {
+      setNotice(props.tr('Select at least one weekday.', '请至少选择一个周几。'));
+      return;
+    }
+    if (scheduleType === 'monthly' && scheduleMonthDays.length === 0) {
+      setNotice(props.tr('Enter at least one valid day of month.', '请至少输入一个有效的每月日期。'));
+      return;
+    }
     await window.tasiHarness.tasks.create({
       name,
       prompt,
       scheduleType,
       runAt: scheduleType === 'once' ? new Date(runAt || Date.now()).toISOString() : undefined,
       intervalMinutes: scheduleType === 'interval' ? intervalMinutes : undefined,
+      scheduleHour: ['daily', 'weekly', 'monthly'].includes(scheduleType) ? scheduleHour : undefined,
+      scheduleMinute: ['daily', 'weekly', 'monthly'].includes(scheduleType) ? scheduleMinute : undefined,
+      scheduleWeekdays: scheduleType === 'weekly' ? scheduleWeekdays : undefined,
+      scheduleMonthDays: scheduleType === 'monthly' ? scheduleMonthDays : undefined,
       executionMode,
       notifyByEmail,
       notifyByWechat
@@ -3128,7 +3886,10 @@ function TasksPage(props: {
           <label>{props.tr('Prompt', '提示词')}</label>
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} />
           <label>{props.tr('Schedule', '调度')}</label>
-          <select value={scheduleType} onChange={(e) => setScheduleType(e.target.value as 'once' | 'interval')}>
+          <select value={scheduleType} onChange={(e) => setScheduleType(e.target.value as ScheduledTask['scheduleType'])}>
+            <option value="daily">{props.tr('Daily', '每日')}</option>
+            <option value="weekly">{props.tr('Weekly', '每周')}</option>
+            <option value="monthly">{props.tr('Monthly', '每月')}</option>
             <option value="interval">{props.tr('Repeat every N minutes', '每 N 分钟重复')}</option>
             <option value="once">{props.tr('Run once', '仅运行一次')}</option>
           </select>
@@ -3137,10 +3898,38 @@ function TasksPage(props: {
               <label>{props.tr('Run at', '运行时间')}</label>
               <input type="datetime-local" value={runAt} onChange={(e) => setRunAt(e.target.value)} />
             </>
-          ) : (
+          ) : scheduleType === 'interval' ? (
             <>
               <label>{props.tr('Interval minutes', '间隔分钟')}</label>
               <input type="number" min="1" value={intervalMinutes} onChange={(e) => setIntervalMinutes(Number(e.target.value))} />
+            </>
+          ) : (
+            <>
+              {scheduleType === 'weekly' && (
+                <>
+                  <label>{props.tr('Weekdays', '周几')}</label>
+                  <div className="check-grid">
+                    {[1, 2, 3, 4, 5, 6, 0].map((day) => (
+                      <label key={day} className="check-tile">
+                        <input type="checkbox" checked={scheduleWeekdays.includes(day)} onChange={() => toggleWeekday(day)} />
+                        <span>{weekdayLabel(day, props.tr)}</span>
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
+              {scheduleType === 'monthly' && (
+                <>
+                  <label>{props.tr('Days of month', '每月日期')}</label>
+                  <input value={scheduleMonthDaysText} placeholder={props.tr('1, 3, 5 or 1-5', '1、3、5 或 1-5')} onChange={(e) => setScheduleMonthDaysText(e.target.value)} />
+                </>
+              )}
+              <label>{props.tr('Time', '时间')}</label>
+              <div className="inline-fields">
+                <input aria-label={props.tr('Hour', '小时')} type="number" min="0" max="23" value={scheduleHour} onChange={(e) => setScheduleHour(Number(e.target.value))} />
+                <span>:</span>
+                <input aria-label={props.tr('Minute', '分钟')} type="number" min="0" max="59" value={scheduleMinute} onChange={(e) => setScheduleMinute(Number(e.target.value))} />
+              </div>
             </>
           )}
           <label>{props.tr('Execution mode', '执行模式')}</label>
@@ -3164,9 +3953,7 @@ function TasksPage(props: {
                   <div>
                     <strong>{task.name}</strong>
                     <div className="card-subtle">
-                      {task.scheduleType === 'interval'
-                        ? props.tr(`Every ${task.intervalMinutes} minutes`, `每 ${task.intervalMinutes} 分钟`)
-                        : props.tr(`Once at ${prettyDate(task.runAt)}`, `执行时间：${prettyDate(task.runAt)}`)}
+                      {taskScheduleLabel(task, props.tr)}
                     </div>
                   </div>
                   <span className={`soft-badge ${task.enabled ? 'badge-ok' : 'badge-muted'}`}>{task.enabled ? props.tr('Enabled', '已启用') : props.tr('Paused', '已暂停')}</span>
@@ -3197,41 +3984,123 @@ function TasksPage(props: {
   );
 }
 
-function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: TranslateFn; sessions: SessionSummary[]; onOpen: (id: string) => Promise<void>; refreshSessions: () => Promise<void> }): ReactElement {
+type SessionHistoryCategory = MemoryDomain | 'all' | 'wechat-clawbot';
+
+function isWechatClawBotSession(session: SessionSummary, wechatSessionId?: string): boolean {
+  const configuredId = wechatSessionId?.trim();
+  if (configuredId && session.id === configuredId) return true;
+  const title = session.title.trim().toLowerCase();
+  return title === 'wechat session' || title.startsWith('wechat clawbot') || title.startsWith('[wechat:');
+}
+
+function SessionsPage({
+  tr,
+  sessions,
+  wechatSessionId,
+  onOpen,
+  refreshSessions
+}: {
+  tr: TranslateFn;
+  sessions: SessionSummary[];
+  wechatSessionId?: string;
+  onOpen: (id: string) => Promise<void>;
+  refreshSessions: () => Promise<void>;
+}): ReactElement {
   const [query, setQuery] = useState('');
-  const [activeCategory, setActiveCategory] = useState<MemoryDomain | 'all'>('all');
+  const [activeCategory, setActiveCategory] = useState<SessionHistoryCategory>('all');
+  const [deletingCategory, setDeletingCategory] = useState(false);
   const categoryCounts = useMemo(() => {
-    const counts = new Map<MemoryDomain | 'all', number>([['all', sessions.length]]);
+    const counts = new Map<SessionHistoryCategory, number>([
+      ['all', sessions.length],
+      ['wechat-clawbot', 0]
+    ]);
     for (const session of sessions) {
+      if (isWechatClawBotSession(session, wechatSessionId)) {
+        counts.set('wechat-clawbot', (counts.get('wechat-clawbot') ?? 0) + 1);
+        continue;
+      }
       const domain = knownMemoryDomain(session.domain);
       counts.set(domain, (counts.get(domain) ?? 0) + 1);
     }
     return counts;
-  }, [sessions]);
+  }, [sessions, wechatSessionId]);
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
     return sessions.filter((s) => {
-      if (activeCategory !== 'all' && knownMemoryDomain(s.domain) !== activeCategory) return false;
+      const isWechat = isWechatClawBotSession(s, wechatSessionId);
+      if (activeCategory === 'wechat-clawbot' && !isWechat) return false;
+      if (activeCategory !== 'all' && activeCategory !== 'wechat-clawbot' && (isWechat || knownMemoryDomain(s.domain) !== activeCategory)) return false;
       if (!needle) return true;
       return s.title.toLowerCase().includes(needle);
     });
-  }, [sessions, query, activeCategory]);
+  }, [sessions, query, activeCategory, wechatSessionId]);
+  const activeCategoryLabel = useMemo(() => {
+    if (activeCategory === 'all') return tr('All', '全部');
+    if (activeCategory === 'wechat-clawbot') return tr('WeChat', '微信');
+    const domain = MEMORY_DOMAINS.find((item) => item.value === activeCategory);
+    return domain ? tr(domain.labelEn, domain.labelZh) : activeCategory;
+  }, [activeCategory, tr]);
+  const activeCategoryDeleteCount = categoryCounts.get(activeCategory) ?? 0;
 
   async function remove(id: string): Promise<void> {
     await window.tasiHarness.sessions.delete(id);
     await refreshSessions();
   }
 
+  async function removeActiveCategory(): Promise<void> {
+    const targets = activeCategory === 'all'
+      ? sessions
+      : activeCategory === 'wechat-clawbot'
+        ? sessions.filter((session) => isWechatClawBotSession(session, wechatSessionId))
+        : sessions.filter((session) => !isWechatClawBotSession(session, wechatSessionId) && knownMemoryDomain(session.domain) === activeCategory);
+    if (targets.length === 0 || deletingCategory) return;
+    const confirmed = window.confirm(
+      activeCategory === 'all'
+        ? tr(
+          `Delete all ${targets.length} sessions? This cannot be undone.`,
+          `删除全部 ${targets.length} 个会话？此操作无法撤销。`
+        )
+        : tr(
+          `Delete ${targets.length} sessions in category "${activeCategoryLabel}"? This cannot be undone.`,
+          `删除“${activeCategoryLabel}”分类下的 ${targets.length} 个会话？此操作无法撤销。`
+        )
+    );
+    if (!confirmed) return;
+    setDeletingCategory(true);
+    try {
+      await Promise.all(targets.map((session) => window.tasiHarness.sessions.delete(session.id)));
+      await refreshSessions();
+    } finally {
+      setDeletingCategory(false);
+    }
+  }
+
   return (
     <section className="page">
-      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by the same domains as memory.', '本地 JSON 会话历史，按记忆相同分类展示。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by memory domain, with WeChat separated for quick access.', '本地 JSON 会话历史，按记忆分类展示，并单独列出微信，方便快速查找。')} />
       <div className="card">
         <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
+        <div className="history-actions">
+          <div className="card-subtle">
+            {tr('Current category', '当前分类')}: {activeCategoryLabel} · {activeCategoryDeleteCount} {tr('sessions', '个会话')}
+          </div>
+          <button className="danger-button" disabled={deletingCategory || activeCategoryDeleteCount === 0} onClick={() => void removeActiveCategory()}>
+            {deletingCategory
+              ? tr('Deleting...', '删除中...')
+              : activeCategory === 'all'
+                ? tr('Delete All Sessions', '删除全部会话')
+                : tr('Delete This Category', '删除当前分类')}
+          </button>
+        </div>
         <div className="memory-browser session-browser">
           <div className="memory-category-list">
             <button className={`memory-category-item ${activeCategory === 'all' ? 'active' : ''}`} onClick={() => setActiveCategory('all')}>
               <span>{tr('All', '全部')}</span>
               <span className="soft-badge">{categoryCounts.get('all') ?? 0}</span>
+            </button>
+            <button className={`memory-category-item ${activeCategory === 'wechat-clawbot' ? 'active' : ''}`} onClick={() => setActiveCategory('wechat-clawbot')}>
+              <span>{tr('WeChat', '微信')}</span>
+              <span className="soft-badge">{categoryCounts.get('wechat-clawbot') ?? 0}</span>
             </button>
             {MEMORY_DOMAINS.map((category) => (
               <button
@@ -3246,12 +4115,14 @@ function SessionsPage({ tr, sessions, onOpen, refreshSessions }: { tr: Translate
           </div>
           <div className="session-list">
             {filtered.map((s) => {
+              const isWechat = isWechatClawBotSession(s, wechatSessionId);
               const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
               return (
                 <div className="session-card" key={s.id}>
                   <div>
                     <strong>{s.title}</strong>
                     <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
+                    {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
                     {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
                   </div>
                   <div className="button-row compact">
@@ -3512,6 +4383,15 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
             <option value="system">{tr('System profile (reuse login)', '系统配置（复用登录态）')}</option>
           </select>
           <label className="toggle-line"><input type="checkbox" checked={draft.browserHeadless} onChange={(e) => setDraft((old) => ({ ...old, browserHeadless: e.target.checked }))} /> {tr('Run external CDP browser headless', '以无头模式运行外部 CDP 浏览器')}</label>
+          <label className="toggle-line">
+            <input
+              type="checkbox"
+              checked={draft.browserExecutionLoggingEnabled}
+              onChange={(e) => setDraft((old) => ({ ...old, browserExecutionLoggingEnabled: e.target.checked }))}
+            />
+            {tr('Enable browser execution log', '启用浏览器执行日志')}
+          </label>
+          <div className="card-subtle">{tr('Log file:', '日志文件：')} ~/.tasi-harness/logs/browser-execution.log</div>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
         </div>

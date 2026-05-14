@@ -21,8 +21,8 @@ export function defaultConfig(): AppConfig {
     maxIterations: 100,
     sessionDocumentMaxDocs: 10,
     workspaceDir: join(DEFAULT_HOME, 'workspace'),
-    allowShellTools: false,
-    enableNetworkTools: false,
+    allowShellTools: true,
+    enableNetworkTools: true,
     safetyApproval: {
       enabled: true,
       approveRiskyTerminalCommands: true,
@@ -32,8 +32,9 @@ export function defaultConfig(): AppConfig {
     browserMode: 'external',
     externalBrowserEngine: 'auto',
     externalBrowserCdpEndpoint: 'http://127.0.0.1:9222',
-    externalBrowserProfileMode: 'isolated',
+    externalBrowserProfileMode: 'system',
     browserHeadless: false,
+    browserExecutionLoggingEnabled: false,
     theme: 'dark',
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
@@ -99,6 +100,7 @@ export function defaultConfig(): AppConfig {
       'browser_eval',
       'browser_viewport',
       'browser_close',
+      'wechat_send_file',
       'terminal'
     ]
   };

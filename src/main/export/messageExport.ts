@@ -1,4 +1,6 @@
 import JSZip from 'jszip';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 export type AssistantMessageExportFormat = 'pdf' | 'docx';
 
@@ -8,6 +10,9 @@ export interface AssistantMessageExportRequest {
   content: string;
   html?: string;
 }
+
+const require = createRequire(import.meta.url);
+let cachedKatexCss: string | undefined;
 
 function escapeHtml(input: string): string {
   return input
@@ -25,6 +30,20 @@ function escapeXml(input: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
+}
+
+function katexCssForExport(): string {
+  if (cachedKatexCss !== undefined) return cachedKatexCss;
+  try {
+    cachedKatexCss = readFileSync(require.resolve('katex/dist/katex.min.css'), 'utf8');
+  } catch {
+    cachedKatexCss = [
+      '.katex { font: normal 1.08em "Cambria Math", "Times New Roman", serif; line-height: 1.2; }',
+      '.katex-display { display: block; margin: 0.65em 0; text-align: center; overflow-x: auto; overflow-y: hidden; }',
+      '.katex .katex-mathml { display: none; }'
+    ].join('\n');
+  }
+  return cachedKatexCss;
 }
 
 export function safeExportBasename(input: string | undefined, fallback = 'assistant-reply'): string {
@@ -60,6 +79,8 @@ export function buildAssistantMessageExportHtml(title: string, bodyHtml: string)
     'table { width: 100%; border-collapse: collapse; margin: 0 0 12px; font-size: 13px; }',
     'th, td { border: 1px solid #dce1e8; padding: 7px 8px; vertical-align: top; }',
     'th { background: #f5f6f8; }',
+    katexCssForExport(),
+    '.katex-display { overflow-x: auto; overflow-y: hidden; }',
     '</style>',
     '</head>',
     '<body>',
@@ -187,6 +208,174 @@ function hyperlinkXml(label: string, href: string, ctx: WordExportContext, optio
   ].join('');
 }
 
+function isEscaped(text: string, index: number): boolean {
+  let slashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
+    slashCount += 1;
+  }
+  return slashCount % 2 === 1;
+}
+
+function findUnescaped(text: string, needle: string, start: number): number {
+  let index = text.indexOf(needle, start);
+  while (index >= 0) {
+    if (!isEscaped(text, index)) return index;
+    index = text.indexOf(needle, index + needle.length);
+  }
+  return -1;
+}
+
+function shouldStartDollarMath(text: string, index: number): boolean {
+  if (isEscaped(text, index)) return false;
+  const next = text[index + 1] ?? '';
+  const previous = text[index - 1] ?? '';
+  if (!next || /\s|\$/.test(next)) return false;
+  if (previous && /[\w)]/.test(previous)) return false;
+  return true;
+}
+
+function isLikelyDollarMath(tex: string): boolean {
+  const trimmed = tex.trim();
+  if (!trimmed) return false;
+  if (/\\[a-zA-Z]+/.test(trimmed)) return true;
+  if (/[_^{}=<>]/.test(trimmed)) return true;
+  if (/[∫∑∏√∞≤≥≠≈ΩαβγδΔθλμπρσφω∂∇]/.test(trimmed)) return true;
+  if (/^[A-Za-z]$/.test(trimmed)) return true;
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) return false;
+  return /[A-Za-z]/.test(trimmed) && /[+\-*/]/.test(trimmed);
+}
+
+function splitMathSegments(input: string): Array<{ kind: 'text' | 'math'; value: string }> {
+  const segments: Array<{ kind: 'text' | 'math'; value: string }> = [];
+  let textStart = 0;
+  let index = 0;
+
+  function pushText(until: number): void {
+    if (until > textStart) segments.push({ kind: 'text', value: input.slice(textStart, until) });
+  }
+
+  while (index < input.length) {
+    if (input.startsWith('$$', index) && !isEscaped(input, index)) {
+      const end = findUnescaped(input, '$$', index + 2);
+      if (end > index + 2) {
+        pushText(index);
+        segments.push({ kind: 'math', value: input.slice(index + 2, end) });
+        index = end + 2;
+        textStart = index;
+        continue;
+      }
+    }
+
+    if (input.startsWith('\\(', index)) {
+      const end = findUnescaped(input, '\\)', index + 2);
+      if (end > index + 2) {
+        pushText(index);
+        segments.push({ kind: 'math', value: input.slice(index + 2, end) });
+        index = end + 2;
+        textStart = index;
+        continue;
+      }
+    }
+
+    if (input.startsWith('\\[', index)) {
+      const end = findUnescaped(input, '\\]', index + 2);
+      if (end > index + 2) {
+        pushText(index);
+        segments.push({ kind: 'math', value: input.slice(index + 2, end) });
+        index = end + 2;
+        textStart = index;
+        continue;
+      }
+    }
+
+    if (input[index] === '$' && shouldStartDollarMath(input, index)) {
+      const end = findUnescaped(input, '$', index + 1);
+      if (end > index + 1) {
+        const tex = input.slice(index + 1, end);
+        if (isLikelyDollarMath(tex)) {
+          pushText(index);
+          segments.push({ kind: 'math', value: tex });
+          index = end + 1;
+          textStart = index;
+          continue;
+        }
+      }
+    }
+
+    index += 1;
+  }
+
+  pushText(input.length);
+  return segments.length > 0 ? segments : [{ kind: 'text', value: input }];
+}
+
+function replaceLatexFractions(input: string): string {
+  let output = input;
+  const fracRe = /\\(?:d?frac|tfrac)\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g;
+  let previous = '';
+  while (output !== previous) {
+    previous = output;
+    output = output.replace(fracRe, (_match, numerator: string, denominator: string) => `${numerator}/${denominator}`);
+  }
+  return output;
+}
+
+function latexToPlainMath(input: string): string {
+  let text = decodeHtmlEntities(input).trim();
+  text = text.replace(/\\(?:left|right)\s*/g, '');
+  text = replaceLatexFractions(text);
+  text = text.replace(/\\(?:mathrm|operatorname|text)\s*\{([^{}]*)\}/g, '$1');
+  text = text.replace(/\\exp\b/g, 'exp');
+  const commands: Record<string, string> = {
+    alpha: 'α',
+    beta: 'β',
+    gamma: 'γ',
+    delta: 'δ',
+    Delta: 'Δ',
+    epsilon: 'ε',
+    theta: 'θ',
+    lambda: 'λ',
+    mu: 'μ',
+    pi: 'π',
+    rho: 'ρ',
+    sigma: 'σ',
+    tau: 'τ',
+    phi: 'φ',
+    omega: 'ω',
+    Omega: 'Ω',
+    partial: '∂',
+    nabla: '∇',
+    int: '∫',
+    sum: '∑',
+    sqrt: '√',
+    infty: '∞',
+    le: '≤',
+    leq: '≤',
+    ge: '≥',
+    geq: '≥',
+    neq: '≠',
+    approx: '≈',
+    times: '×',
+    cdot: '·',
+    pm: '±'
+  };
+  text = text.replace(/\\([A-Za-z]+)(?![A-Za-z])/g, (_match, name: string) => commands[name] ?? name);
+  text = text.replace(/\^\{?2\}?/g, '²');
+  text = text.replace(/\^\{?3\}?/g, '³');
+  text = text.replace(/\^\{([^{}]+)\}/g, '^($1)');
+  text = text.replace(/_\{([^{}]+)\}/g, '_$1');
+  text = text.replace(/_([A-Za-z0-9])/g, '_$1');
+  text = text.replace(/[{}]/g, '');
+  text = text.replace(/\\[,;:! ]/g, ' ');
+  text = text.replace(/\\([()[\]])/g, '$1');
+  text = text.replace(/\s*([=<>≤≥≈≠+\-×·/])\s*/g, ' $1 ');
+  text = text.replace(/\s+/g, ' ').trim();
+  text = text.replace(/∇\s*²\s*/g, '∇²');
+  text = text.replace(/ρ\s+c\b/g, 'ρc');
+  text = text.replace(/∂\s+/g, '∂');
+  return text;
+}
+
 function inlineMarkdownXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string } = {}): string {
   const source = input.trim();
   const linkRe = /\[([^\]]+)\]\((https?:\/\/[^)\n]+)\)/g;
@@ -213,7 +402,7 @@ function inlineMarkdownXml(input: string, ctx: WordExportContext, options: { bol
   return parts.join('') || runXml('', options);
 }
 
-function inlinePlainTextXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }): string {
+function inlinePlainTextWithoutMathXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }): string {
   const tokenRe = /\[(\d+)\]|https?:\/\/[^\s<]+/g;
   const parts: string[] = [];
   let cursor = 0;
@@ -238,6 +427,17 @@ function inlinePlainTextXml(input: string, ctx: WordExportContext, options: { bo
   const tail = input.slice(cursor);
   if (tail) parts.push(runXml(cleanInlineMarkdown(tail), options));
   return parts.join('');
+}
+
+function inlinePlainTextXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string }): string {
+  return splitMathSegments(input)
+    .map((segment) => {
+      if (segment.kind === 'math') {
+        return runXml(latexToPlainMath(segment.value), { ...options, font: options.font ?? 'Cambria Math' });
+      }
+      return inlinePlainTextWithoutMathXml(segment.value, ctx, options);
+    })
+    .join('');
 }
 
 function htmlInlineXml(input: string, ctx: WordExportContext, options: { bold?: boolean; size?: number; font?: string } = {}): string {
@@ -485,6 +685,10 @@ function collectMarkdownCitationHrefs(markdown: string, ctx: WordExportContext):
   }
 }
 
+function containsMarkdownMath(markdown: string): boolean {
+  return splitMathSegments(markdown).some((segment) => segment.kind === 'math');
+}
+
 function normalizeTitleForCompare(input: string): string {
   return input
     .replace(/\s+/g, ' ')
@@ -511,9 +715,10 @@ export async function buildAssistantMessageDocx(title: string, markdown: string,
   const zip = new JSZip();
   const ctx: WordExportContext = { relationships: [], citationHrefs: new Map() };
   collectMarkdownCitationHrefs(markdown, ctx);
-  const htmlBlocks = html?.trim() ? htmlToWordBlocks(html, ctx) : [];
+  const shouldPreferMarkdown = containsMarkdownMath(markdown);
+  const htmlBlocks = !shouldPreferMarkdown && html?.trim() ? htmlToWordBlocks(html, ctx) : [];
   const contentBlocks = htmlBlocks.length > 0 ? htmlBlocks : markdownToWordBlocks(markdown, ctx);
-  const firstContentHeading = html?.trim() ? firstHtmlHeading(html) : firstMarkdownHeading(markdown);
+  const firstContentHeading = html?.trim() && !shouldPreferMarkdown ? firstHtmlHeading(html) : firstMarkdownHeading(markdown);
   const shouldPrependTitle = normalizeTitleForCompare(title) !== normalizeTitleForCompare(firstContentHeading);
   const documentXml = [
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',

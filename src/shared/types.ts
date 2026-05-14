@@ -30,11 +30,24 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  attachments?: AgentMessageAttachment[];
   reasoning_content?: string;
+  reasoning_parts?: string[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
   createdAt?: string;
+}
+
+export type AgentMessageAttachmentKind = 'image' | 'video' | 'audio';
+
+export interface AgentMessageAttachment {
+  id?: string;
+  kind: AgentMessageAttachmentKind;
+  filename: string;
+  mimeType: string;
+  contentBase64: string;
+  sizeBytes?: number;
 }
 
 export interface JsonSchema {
@@ -160,6 +173,7 @@ export interface AppConfig {
   externalBrowserCdpEndpoint: string;
   externalBrowserProfileMode: ExternalBrowserProfileMode;
   browserHeadless: boolean;
+  browserExecutionLoggingEnabled: boolean;
   theme: 'dark' | 'light';
   systemPersona: string;
   enabledToolNames: string[];
@@ -247,6 +261,8 @@ export interface SkillMetadata {
   readonly: boolean;
   source: 'bundled' | 'local';
   updatedAt?: string;
+  bundledPath?: string;
+  bundledUpdatedAt?: string;
   marketplaceSourceId?: string;
   marketplaceSkillId?: string;
   version?: string;
@@ -298,10 +314,12 @@ export interface ExternalSessionMessageRequest {
 export interface AgentRunOptions {
   sessionId?: string;
   userInput: string;
+  attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
   usePersonalKnowledgeBase?: boolean;
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
+  stream?: boolean;
 }
 
 export interface AgentRunResult {
@@ -329,6 +347,18 @@ export interface ToolEvent {
 export interface AgentToolEventStream {
   sessionId: string;
   event: ToolEvent;
+}
+
+export interface AgentMessageDeltaStream {
+  sessionId: string;
+  messageId: string;
+  role: 'assistant';
+  type: 'content' | 'reasoning_content' | 'done';
+  delta?: string;
+  content?: string;
+  reasoning_content?: string;
+  reasoning_parts?: string[];
+  createdAt?: string;
 }
 
 export type ExecutionMode = 'workspace' | 'sandbox';
@@ -396,6 +426,7 @@ export interface SkillInstallRequest {
   sourceId: string;
   skillId: string;
   skill?: MarketplaceSkillSnapshot;
+  overwrite?: boolean;
 }
 
 export interface EmailNotificationSettings {
@@ -446,9 +477,15 @@ export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
-  scheduleType: 'once' | 'interval';
+  scheduleType: 'once' | 'interval' | 'daily' | 'weekly' | 'monthly';
   runAt?: string;
   intervalMinutes?: number;
+  scheduleHour?: number;
+  scheduleMinute?: number;
+  scheduleWeekday?: number;
+  scheduleWeekdays?: number[];
+  scheduleMonthDay?: number;
+  scheduleMonthDays?: number[];
   nextRunAt: string;
   enabled: boolean;
   isRunning?: boolean;
@@ -470,9 +507,15 @@ export interface ScheduledTask {
 export interface ScheduledTaskCreateRequest {
   name: string;
   prompt: string;
-  scheduleType: 'once' | 'interval';
+  scheduleType: 'once' | 'interval' | 'daily' | 'weekly' | 'monthly';
   runAt?: string;
   intervalMinutes?: number;
+  scheduleHour?: number;
+  scheduleMinute?: number;
+  scheduleWeekday?: number;
+  scheduleWeekdays?: number[];
+  scheduleMonthDay?: number;
+  scheduleMonthDays?: number[];
   executionMode: ExecutionMode;
   notifyByEmail: boolean;
   notifyByWechat?: boolean;
@@ -482,9 +525,15 @@ export interface ScheduledTaskPatchRequest {
   id: string;
   name?: string;
   prompt?: string;
-  scheduleType?: 'once' | 'interval';
+  scheduleType?: 'once' | 'interval' | 'daily' | 'weekly' | 'monthly';
   runAt?: string;
   intervalMinutes?: number;
+  scheduleHour?: number;
+  scheduleMinute?: number;
+  scheduleWeekday?: number;
+  scheduleWeekdays?: number[];
+  scheduleMonthDay?: number;
+  scheduleMonthDays?: number[];
   executionMode?: ExecutionMode;
   notifyByEmail?: boolean;
   notifyByWechat?: boolean;
@@ -510,6 +559,7 @@ export interface SkillWriteRequest {
   name: string;
   content: string;
   category?: string;
+  overwrite?: boolean;
 }
 
 export interface SkillPatchRequest {
@@ -523,6 +573,7 @@ export interface SkillArchiveUploadRequest {
   contentBase64: string;
   name?: string;
   category?: string;
+  overwrite?: boolean;
 }
 
 export type BrowserCoachEventType = 'navigation' | 'click' | 'input' | 'change' | 'submit' | 'keydown' | 'window_closed';

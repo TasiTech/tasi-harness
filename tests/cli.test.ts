@@ -14,7 +14,8 @@ describe('CLI argument parsing', () => {
     const parsed = parseArgs(['chat', 'write a plan']);
     expect(parsed).toMatchObject({
       command: 'chat',
-      message: 'write a plan'
+      message: 'write a plan',
+      stream: true
     });
     expect(parsed.sessionId).toBeUndefined();
   });
@@ -39,12 +40,24 @@ describe('CLI argument parsing', () => {
     expect(parsed.message).toBe('abc123 hello');
   });
 
-  it('renders headings without markdown prefixes and de-indents markdown list items', () => {
-    const rendered = renderMarkdownForTerminal(['## 北京当前天气', '', '    * **温度**：21°C'].join('\n'));
-
-    expect(rendered).toContain('北京当前天气');
-    expect(rendered).not.toContain('## 北京当前天气');
-    expect(rendered).toContain('温度');
-    expect(rendered).not.toContain('**温度**');
+  it('supports explicit stream and no-stream flags', () => {
+    expect(parseArgs(['chat', '--no-stream', 'hello'])).toMatchObject({
+      message: 'hello',
+      stream: false
+    });
+    expect(parseArgs(['chat', '--no-stream', '--stream', 'hello'])).toMatchObject({
+      message: 'hello',
+      stream: true
+    });
   });
+
+  it('renders headings without markdown prefixes and de-indents markdown list items', () => {
+    const rendered = renderMarkdownForTerminal(['## Current weather', '', '    * **Temperature**: 21 C'].join('\n'));
+
+    expect(rendered).toContain('Current weather');
+    expect(rendered).not.toContain('## Current weather');
+    expect(rendered).toContain('Temperature');
+    expect(rendered).not.toContain('**Temperature**');
+  });
+
 });

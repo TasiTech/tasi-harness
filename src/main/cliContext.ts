@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentRunOptions, AgentRunResult, AppConfig, RegisteredTool, ToolApprovalRequester } from '../shared/types.js';
@@ -7,6 +7,7 @@ import { createLlmClient } from './agent/llmClient.js';
 import { PromptBuilder } from './agent/promptBuilder.js';
 import { ExternalBrowserAutomation } from './browser/externalBrowserAutomation.js';
 import { ExternalBrowserBridge } from './browser/externalBrowserBridge.js';
+import { BrowserExecutionLogger } from './browser/browserExecutionLogger.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
@@ -52,6 +53,29 @@ function findResourcesRoot(): string {
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? resolve(process.cwd(), 'resources');
 }
 
+function consumeInstallerSkillOverwriteChoice(harnessHome: string): { overwriteExisting?: boolean; overwriteSkillNames?: string[] } {
+  const marker = join(harnessHome, 'runtime', 'installer-skill-overwrite.json');
+  if (!existsSync(marker)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(marker, 'utf8')) as { overwriteBundledSkills?: unknown; overwriteSkillNames?: unknown };
+    const overwriteSkillNames = Array.isArray(parsed.overwriteSkillNames)
+      ? parsed.overwriteSkillNames.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    return {
+      overwriteExisting: parsed.overwriteBundledSkills === true,
+      overwriteSkillNames
+    };
+  } catch {
+    return {};
+  } finally {
+    try {
+      unlinkSync(marker);
+    } catch {
+      // Best-effort cleanup. A stale marker should not block CLI startup.
+    }
+  }
+}
+
 function isCliAvailableTool(tool: RegisteredTool): boolean {
   const name = tool.definition.function.name;
   return !CLI_UNAVAILABLE_TOOLS.has(name);
@@ -70,12 +94,13 @@ function createCliCdpEndpoint(runtimeId: string): string {
 }
 
 function cliConfig(config: AppConfig, cdpEndpoint: string): AppConfig {
+  const isolated = config.externalBrowserProfileMode !== 'system';
   return {
     ...config,
     browserMode: 'external',
     externalBrowserEngine: config.externalBrowserEngine === 'webdriver-safari' ? 'auto' : config.externalBrowserEngine,
-    externalBrowserCdpEndpoint: cdpEndpoint,
-    externalBrowserProfileMode: 'isolated',
+    externalBrowserCdpEndpoint: isolated ? cdpEndpoint : config.externalBrowserCdpEndpoint,
+    externalBrowserProfileMode: config.externalBrowserProfileMode,
     enabledToolNames: config.enabledToolNames.filter((name) => !CLI_UNAVAILABLE_TOOLS.has(name))
   };
 }
@@ -95,6 +120,7 @@ export class CliContext {
   readonly sandboxManager: SandboxManager;
   readonly externalBrowserBridge: ExternalBrowserBridge;
   readonly externalBrowserAutomation: ExternalBrowserAutomation;
+  readonly browserExecutionLogger: BrowserExecutionLogger;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
   private readonly cliRuntimeId: string;
@@ -110,14 +136,19 @@ export class CliContext {
     this.syncMemoryFromExistingSessions();
     this.scheduledTaskStore = new ScheduledTaskStore(this.harnessHome);
     this.skillManager = new SkillManager(this.harnessHome, findBundledSkillsRoot());
-    this.skillManager.seedBundledSkills();
+    this.skillManager.seedBundledSkills(consumeInstallerSkillOverwriteChoice(this.harnessHome));
     this.mcpConfigStore = new McpConfigStore(this.harnessHome);
     this.sandboxManager = new SandboxManager(this.harnessHome);
+    this.browserExecutionLogger = new BrowserExecutionLogger(
+      join(this.harnessHome, 'logs', 'browser-execution.log'),
+      () => this.getConfig().browserExecutionLoggingEnabled
+    );
     this.externalBrowserBridge = new ExternalBrowserBridge({
       runtimeDir: join(this.harnessHome, 'runtime', 'external-browser-cli', this.cliRuntimeId),
-      strictCdpEndpoint: true
+      strictCdpEndpoint: true,
+      logger: this.browserExecutionLogger
     });
-    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig());
+    this.externalBrowserAutomation = new ExternalBrowserAutomation(this.externalBrowserBridge, () => this.getConfig(), this.browserExecutionLogger);
     this.personalKnowledgeBase = new PersonalKnowledgeBase(this.harnessHome, {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
     });
@@ -162,6 +193,7 @@ export class CliContext {
     runtime?: {
       requestToolApproval?: ToolApprovalRequester;
       onToolEvent?: Parameters<AgentLoop['run']>[0]['onToolEvent'];
+      onMessageDelta?: Parameters<AgentLoop['run']>[0]['onMessageDelta'];
       signal?: AbortSignal;
       browserLogEnabled?: boolean;
     }
@@ -172,6 +204,7 @@ export class CliContext {
         origin: 'chat',
         requestToolApproval: runtime?.requestToolApproval,
         onToolEvent: runtime?.onToolEvent,
+        onMessageDelta: runtime?.onMessageDelta,
         signal: runtime?.signal
       });
       const usageRecord = this.sessionStore.recordUsage(result.sessionId, result.usage);
@@ -207,9 +240,10 @@ export class CliContext {
   private describeCliBrowserAutomation(config: AppConfig): string {
     return [
       '- CLI browser automation is available through the browser_* tools using external Chromium/Edge CDP.',
-      `- CLI browser settings: cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=isolated; headless=${config.browserHeadless ? 'on' : 'off'}.`,
-      '- CLI browser automation uses an isolated browser profile so it does not close or take over the user\'s normal Chrome/Edge windows.',
-      '- Each CLI process uses its own CDP port and isolated browser profile, so parallel CLI runs do not share browser targets.',
+      `- CLI browser settings: cdpEndpoint=${config.externalBrowserCdpEndpoint}; profileMode=${config.externalBrowserProfileMode}; headless=${config.browserHeadless ? 'on' : 'off'}.`,
+      '- CLI browser automation uses the configured external browser profile mode. Use system mode to reuse existing login state, or isolated mode for a separate temporary profile.',
+      '- In isolated mode, each CLI process uses its own CDP port and browser profile, so login state is not shared with the system browser.',
+      `- Browser execution diagnostics are written to ${join(this.harnessHome, 'logs', 'browser-execution.log')}.`,
       '- In CLI mode, use browser_open/browser_extract/browser_snapshot for live web lookups when the user asks to browse or verify current information.'
     ].join('\n');
   }

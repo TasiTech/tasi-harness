@@ -58,7 +58,12 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('return a degraded answer rather than presenting an unverified answer as complete');
     expect(prompt).toContain('2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。');
     expect(prompt).toContain('inline citations near claims are required for web-backed answers');
+    expect(prompt).toContain('Do not use named Markdown links such as `[Source Title](https://example.com)` as evidence citations');
+    expect(prompt).toContain('Convert every evidence URL to a numbered citation like `[1](https://example.com)`');
+    expect(prompt).toContain('Do not output source-only named links without numeric labels');
     expect(prompt).toContain('Preserve source traceability from tool use to final answer');
+    expect(prompt).toContain('Important data and important viewpoints taken from retrieved/opened content must include numbered citation links');
+    expect(prompt).toContain('study conclusions, policy positions, quoted or paraphrased expert views');
     expect(prompt).toContain('For data-heavy answers, cite every important number or live-data item near the value');
     expect(prompt).toContain('In tables, put the citation in the same row or source column');
     expect(prompt).toContain('cite article-level or official-page URLs for timelines, quotes, official responses');

@@ -17,20 +17,39 @@ describe('CliContext', () => {
       const result = await context.runChat({ userInput: 'hello from cli' });
       expect(result.finalResponse).toBe('Mock provider is active.');
       expect(context.sessionStore.read(result.sessionId)?.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
-      expect(context.getConfig().externalBrowserProfileMode).toBe('isolated');
+      expect(context.getConfig().externalBrowserProfileMode).toBe('system');
       expect(context.getConfig().externalBrowserCdpEndpoint).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
-      expect(context.getConfig().externalBrowserCdpEndpoint).not.toBe('http://127.0.0.1:9222');
+      expect(context.getConfig().externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     } finally {
       env.cleanup();
     }
   });
 
-  it('uses a separate CDP endpoint for each CLI context', () => {
+  it('uses the configured CDP endpoint for system profile CLI contexts', () => {
     const env = tempHome();
     try {
       const first = new CliContext(env.home);
       const second = new CliContext(env.home);
-      expect(first.getConfig().externalBrowserCdpEndpoint).not.toBe(second.getConfig().externalBrowserCdpEndpoint);
+      expect(first.getConfig().externalBrowserProfileMode).toBe('system');
+      expect(second.getConfig().externalBrowserProfileMode).toBe('system');
+      expect(first.getConfig().externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
+      expect(second.getConfig().externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('preserves system browser profile settings for login-state reuse', () => {
+    const env = tempHome();
+    try {
+      const context = new CliContext(env.home);
+      context.configStore.update({
+        externalBrowserProfileMode: 'system',
+        externalBrowserCdpEndpoint: 'http://127.0.0.1:9222'
+      });
+
+      expect(context.getConfig().externalBrowserProfileMode).toBe('system');
+      expect(context.getConfig().externalBrowserCdpEndpoint).toBe('http://127.0.0.1:9222');
     } finally {
       env.cleanup();
     }
