@@ -54,3 +54,16 @@ describe('renderMarkdownToHtml', () => {
     expect(citations[0]?.excerpt).toContain('1035 元[1]');
   });
 });
+
+describe('extractCitationLinks fallback links', () => {
+  it('auto-numbers named markdown source links for the referenced pages panel', () => {
+    const citations = extractCitationLinks([
+      'Useful sources:',
+      '[American Physiological Society Journal](https://journals.physiology.org/doi/full/10.1152/jappl.1948.1.2.93)',
+      '[Frontiers in Physics](https://www.frontiersin.org/journals/physics/articles/10.3389/fphy.2019.00189/full)'
+    ].join('\n'));
+
+    expect(citations.map((citation) => citation.label)).toEqual(['1', '2']);
+    expect(citations.map((citation) => citation.host)).toEqual(['journals.physiology.org', 'frontiersin.org']);
+  });
+});

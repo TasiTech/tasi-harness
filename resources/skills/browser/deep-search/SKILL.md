@@ -29,19 +29,52 @@ Use more than one engine when coverage matters, results look thin, the topic may
 - If an engine returns zero usable organic links, captcha/interstitial content, consent-only content, or regional blocking, record it and switch engines. Do not try to bypass captchas, paywalls, login walls, or explicit access controls.
 - Prefer visible or headless CDP browser tools over raw network fetching because search pages often need JavaScript, redirects, and accessibility-aware link inspection.
 
+## De-duplication and Retry Discipline
+
+Before each search, extraction, or page open, maintain a short in-turn search ledger. The ledger is internal, but it must guide tool use:
+
+```text
+searched_queries:
+  - engine: <engine>
+    query: <normalized query>
+    url: <search URL>
+    result_status: <usable|thin|blocked|failed>
+    result_summary: <brief notes>
+opened_pages:
+  - canonical_url: <URL without tracking parameters when possible>
+    title: <title>
+    status: <usable|blocked|failed|duplicate>
+extractions:
+  - page_url: <current page URL>
+    selector: <selector>
+    status: <usable|empty|failed>
+    attempt_count: <number>
+```
+
+Rules:
+
+- Do not run the same query on the same search engine twice in the same user request. Reuse the earlier snapshot/extract result unless the query changed, the earlier attempt clearly failed, or the user explicitly asks to re-check.
+- If you need to return to a search results page, prefer using the existing result ledger or browser history/state. Re-open the same search URL only when navigation state was lost, the browser session failed, or the previous result page is no longer reachable.
+- Do not repeat the same `browser_extract` selector on the same page more than twice. If it is empty, unchanged, or fails twice, switch strategy: use `browser_snapshot`, a narrower result selector, `browser_find`, another engine, or open visible result URLs directly.
+- Do not repeat generic waits or snapshots in a loop. After two `browser_wait`/`browser_snapshot` attempts on the same URL without new information, mark the page as blocked/dynamic/failed and move on.
+- Treat search-engine result pages as navigation aids, not evidence sources. Once promising result URLs have been captured, open candidate pages directly rather than repeatedly re-searching the same query.
+- When a click on a search result does not navigate, extract or decode the URL and open it directly. Do not keep clicking or reopening the same search result page without a changed tactic.
+- When a source page is slow, blocked, or times out, mark that source status and continue with another source. Avoid restarting the same broad query unless it is needed to find a substitute source.
+
 ## Workflow
 
 1. Clarify only if the search target is ambiguous enough that different interpretations would change the query.
 2. Build 2-4 focused search queries. Include exact names, key terms, locations, dates, source type, language, or file/type terms when relevant.
 3. Pick 2-4 engines from the engine list. Default to Bing + Google/DuckDuckGo for international work, and Bing CN + Baidu/Sogou/360 for Chinese work.
-4. Open the first search engine with `browser_open`.
-5. Use `browser_wait` for load state, text, or search result selectors, then use `browser_snapshot` to inspect the result page. Treat `browser_snapshot.snapshot` as the primary map of result links and refs.
-6. Use `browser_extract format=json` when links/snippets are not clear from the snapshot. Capture title, URL, snippet, visible source, and result ref if available.
-7. Normalize and de-duplicate candidate results by canonical URL and near-identical title. Keep a source list for duplicates found by multiple engines.
-8. Open 3-8 promising result links with `browser_open`, one at a time. Use official/primary sources first, then reputable secondary sources for comparison.
-9. For each opened page, use `browser_wait` then `browser_snapshot` to capture page structure and source context. Use `browser_extract format=json` for article/body text, links, metadata, and dates.
-10. Cross-check important claims across at least two independent sources when the question is current, financial, medical, legal, or high-impact.
-11. Stop when evidence is sufficient, sources converge, or the best available pages are exhausted. Mark gaps, blocked engines/pages, and uncertainty explicitly.
+4. Initialize the search ledger from the De-duplication and Retry Discipline section. Before every `browser_open`, `browser_extract`, `browser_wait`, or `browser_snapshot`, check whether the same action has already been tried for the same engine/query/page/selector.
+5. Open the first search engine with `browser_open` only if that exact engine/query pair has not already been searched in this user request.
+6. Use `browser_wait` for load state, text, or search result selectors, then use `browser_snapshot` to inspect the result page. Treat `browser_snapshot.snapshot` as the primary map of result links and refs.
+7. Use `browser_extract format=json` when links/snippets are not clear from the snapshot. Capture title, URL, snippet, visible source, and result ref if available. Do not repeat the same extraction on the same page more than twice.
+8. Normalize and de-duplicate candidate results by canonical URL and near-identical title. Keep a source list for duplicates found by multiple engines.
+9. Open 3-8 promising result links with `browser_open`, one at a time. Use official/primary sources first, then reputable secondary sources for comparison. Skip URLs already opened unless the previous status was failed and a changed tactic is available.
+10. For each opened page, use `browser_wait` then `browser_snapshot` to capture page structure and source context. Use `browser_extract format=json` for article/body text, links, metadata, and dates.
+11. Cross-check important claims across at least two independent sources when the question is current, financial, medical, legal, or high-impact.
+12. Stop when evidence is sufficient, sources converge, or the best available pages are exhausted. Mark gaps, blocked engines/pages, repeated-result avoidance, and uncertainty explicitly.
 
 ## Result Page Hints
 
@@ -124,6 +157,7 @@ When answering the user, cite or name the opened pages used as evidence. If brow
 Before finalizing, make sure you can state:
 
 - Which search engines and queries were used.
+- Which same-engine/same-query searches were avoided or reused from the ledger.
 - Which result links were opened.
 - Which pages produced usable `browser_snapshot` or `browser_extract` evidence.
 - Any blocked engines/pages, captchas, regional differences, or remaining uncertainty.

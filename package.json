@@ -27,6 +27,7 @@
     "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-react": "latest",
     "jszip": "^3.10.1",
+    "katex": "^0.16.46",
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "nodemailer": "^8.0.7",

@@ -5,6 +5,48 @@ function render(input: string): string {
   return renderMarkdownToHtml(normalizeMarkdownForRender(input));
 }
 
+describe('renderer markdown math', () => {
+  it('renders dollar-delimited inline LaTeX with KaTeX', () => {
+    const html = render('Arrhenius damage: $\\Omega = \\int_0^t A \\exp(-\\frac{\\Delta E}{RT}) dt$.');
+
+    expect(html).toContain('class="katex"');
+    expect(html).toContain('Ω');
+    expect(html).not.toContain('$\\Omega');
+  });
+
+  it('renders bracket-delimited display LaTeX with KaTeX', () => {
+    const html = render('\\[E = mc^2\\]');
+
+    expect(html).toContain('class="katex-display"');
+    expect(html).toContain('m');
+    expect(html).not.toContain('\\[E = mc^2\\]');
+  });
+
+  it('does not render math inside inline code', () => {
+    const html = render('Keep `$x$` literal, render $y$.');
+
+    expect(html).toContain('<code>$x$</code>');
+    expect(html).toContain('class="katex"');
+    expect(html).not.toContain('<code><span class="katex"');
+  });
+
+  it('renders numeric range formulas that start with a number', () => {
+    const html = render('$0.53 \\leq \\Omega < 1.0$ 一度烧伤；$1.0 \\leq \\Omega < 10^4$ 二度烧伤');
+
+    expect(html.match(/class="katex"/g)).toHaveLength(2);
+    expect(html).toContain('一度烧伤');
+    expect(html).toContain('二度烧伤');
+    expect(html).not.toContain('$0.53');
+  });
+
+  it('keeps plain dollar amounts literal', () => {
+    const html = render('The price is $5$ today.');
+
+    expect(html).toContain('$5$');
+    expect(html).not.toContain('class="katex"');
+  });
+});
+
 describe('renderer markdown tables', () => {
   it('keeps escaped pipes inside table cells', () => {
     const input = [
