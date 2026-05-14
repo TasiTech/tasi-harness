@@ -51,6 +51,10 @@ if [[ "$SKIP_BUILD" -ne 1 ]]; then
 fi
 
 echo
+echo "==> Clearing release directory before packaging"
+rm -rf "$RELEASE_DIR"
+
+echo
 echo "==> Packaging macOS DMG installer"
 npm exec electron-builder -- --publish never --mac dmg
 
