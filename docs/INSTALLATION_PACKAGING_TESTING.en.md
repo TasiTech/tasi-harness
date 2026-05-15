@@ -139,6 +139,8 @@ tasi chat "write a work plan for today"
 tasi chat --session xxx "continue the last proposal"
 tasi chat -s xxx -e sandbox "continue the last proposal"
 tasi chat --execution sandbox --knowledge "answer with my personal knowledge base"
+tasi chat --no-memory --no-skills --tools none "answer without memory, skills, or tools"
+tasi chat --skill deep-search --tools browser_open,browser_extract "research this topic"
 tasi sessions
 ```
 
@@ -163,12 +165,26 @@ Common options:
 - `--session <id>` / `-s <id>`: continue an existing session; `<id>` is the full session id and does not need a fixed prefix; omit it to create a new session
 - `--execution workspace|sandbox` / `-e workspace|sandbox`: choose the execution mode
 - `--knowledge` / `-k`: include personal knowledge base context
-- `--plain` / `-p`: only print the raw Markdown stream; normal streamed output prints raw text first and then replaces it with a `marked-terminal` rendered version when complete
+- `--no-memory`: disable persistent memory for this run
+- `--memory-domains <list>`: use comma-separated memory domains instead of auto inference; valid domains include `finance`, `daily_life`, `work`, `travel`, `reading`, `education`, `health`, and `other`
+- `--no-skills`: omit the skill index from the prompt
+- `--skill <name>`: enable one named skill; can be repeated
+- `--skills <list>`: enable comma-separated skills
+- `--tools <list>`: use comma-separated tools instead of config defaults; use `--tools none` for no tools
+- `--stream` / `--no-stream`: stream output by default, or wait for the full response before printing
+- `--plain` / `-p`: print raw Markdown instead of terminal-rendered Markdown
 - `--json` / `-j`: print the full JSON result, including `sessionId`, `finalResponse`, `messages`, `toolEvents`, `usage`, and `execution`, for scripts to parse
-- `--verbose` / `-V`: print tool events
+- `--log-probs` and `--top-logprobs <0-5>`: in `--json` mode, request token log probabilities and optional top token alternatives
+- `--verbose` / `-V`: print tool events to stderr
 - `--home <path>` / `-H <path>`: override the default data directory
 
-Running `tasi` with no message starts an interactive chat with `:new`, `:session <id>`, and `:exit`. Each reply prints the current session id. The CLI shares the desktop app configuration and local data; browser automation tools run through external Chrome / Edge CDP mode.
+The CLI accepts piped input:
+
+```powershell
+Get-Content .\prompt.md | tasi chat --plain
+```
+
+Running `tasi` with no message starts an interactive chat with `:new`, `:session <id>`, and `:exit`. Each reply prints the current session id. `tasi sessions` lists saved sessions and supports `--json`; `tasi help` / `tasi --help` prints built-in usage; `tasi version` / `tasi --version` prints the packaged app version. The CLI shares the desktop app configuration and local data; browser automation tools run through external Chrome / Edge CDP mode.
 
 ## Test
 

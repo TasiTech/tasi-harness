@@ -139,6 +139,8 @@ tasi chat "写一个今天的工作计划"
 tasi chat --session xxx "继续上次的方案"
 tasi chat -s xxx -e sandbox "继续上次的方案"
 tasi chat --execution sandbox --knowledge "基于个人知识库回答"
+tasi chat --no-memory --no-skills --tools none "不使用记忆、技能或工具回答"
+tasi chat --skill deep-search --tools browser_open,browser_extract "调研这个主题"
 tasi sessions
 ```
 
@@ -163,12 +165,26 @@ ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.loca
 - `--session <id>` / `-s <id>`：复用已有会话；`<id>` 就是完整 session id，不需要固定前缀；不传则新建会话
 - `--execution workspace|sandbox` / `-e workspace|sandbox`：选择执行模式
 - `--knowledge` / `-k`：启用个人知识库上下文
-- `--plain` / `-p`：只输出 Markdown 原文流；默认流式输出会先实时打印原文，完成后清掉原文并替换成 `marked-terminal` 渲染版
+- `--no-memory`：本次运行禁用持久记忆
+- `--memory-domains <list>`：用逗号分隔的记忆域替代自动推断；可用域包括 `finance`、`daily_life`、`work`、`travel`、`reading`、`education`、`health`、`other`
+- `--no-skills`：不把技能索引注入提示词
+- `--skill <name>`：启用一个指定技能，可重复传入
+- `--skills <list>`：启用逗号分隔的多个技能
+- `--tools <list>`：用逗号分隔的工具列表替代配置默认值；`--tools none` 表示禁用工具
+- `--stream` / `--no-stream`：默认流式输出；也可等待完整回复后再输出
+- `--plain` / `-p`：输出 Markdown 原文，而不是终端渲染版 Markdown
 - `--json` / `-j`：输出完整 JSON 结果，包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage`、`execution` 等字段，便于脚本解析
-- `--verbose` / `-V`：输出工具事件
+- `--log-probs` 与 `--top-logprobs <0-5>`：在 `--json` 模式下请求 token log probabilities 和可选候选 token
+- `--verbose` / `-V`：将工具事件输出到 stderr
 - `--home <path>` / `-H <path>`：覆盖默认数据目录
 
-无消息运行 `tasi` 会进入交互式对话，支持 `:new`、`:session <id>`、`:exit`。每次回复后都会显示当前 session id。命令行复用桌面端配置与本地数据；浏览器自动化工具通过外部 Chrome / Edge 的 CDP 模式运行。
+CLI 也支持管道输入：
+
+```powershell
+Get-Content .\prompt.md | tasi chat --plain
+```
+
+无消息运行 `tasi` 会进入交互式对话，支持 `:new`、`:session <id>`、`:exit`。每次回复后都会显示当前 session id。`tasi sessions` 会列出已保存会话并支持 `--json`；`tasi help` / `tasi --help` 可查看内置用法；`tasi version` / `tasi --version` 可输出打包版本。命令行复用桌面端配置与本地数据；浏览器自动化工具通过外部 Chrome / Edge 的 CDP 模式运行。
 
 ## 测试
 

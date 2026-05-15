@@ -137,6 +137,8 @@ tasi chat "summarize the current workspace"
 tasi chat --session xxx "continue this session"
 tasi chat -s xxx -e sandbox "continue this session"
 tasi chat --execution sandbox --knowledge "answer with my personal knowledge base"
+tasi chat --no-memory --no-skills --tools none "answer without memory, skills, or tools"
+tasi chat --skill deep-search --tools browser_open,browser_extract "research this topic"
 tasi sessions
 ```
 
@@ -149,9 +151,32 @@ On macOS, after installing the app in `/Applications`, the bundled bash launcher
 ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.local/bin/tasi"
 ```
 
-Running `tasi` with no message starts an interactive chat. `chat` creates a new session when `--session/-s` is omitted, and appends to an existing session when `--session xxx` or `-s xxx` is provided; `xxx` is the full session id and does not need a fixed prefix. Each reply prints the current session id. The CLI shares the desktop app's `~/.tasi-harness/config.json`, sessions, memory, skills, and personal knowledge base. Browser automation runs through external Chrome / Edge CDP mode.
+Running `tasi` with no message starts an interactive chat. `chat` creates a new session when `--session/-s` is omitted, and appends to an existing session when `--session xxx` or `-s xxx` is provided; `xxx` is the full session id and does not need a fixed prefix. `tasi sessions` lists saved sessions; add `--json` when scripts need structured session data. Each reply prints the current session id. The CLI shares the desktop app's `~/.tasi-harness/config.json`, sessions, memory, skills, and personal knowledge base. Browser automation runs through external Chrome / Edge CDP mode.
 
-With `--stream` enabled by default, the CLI first prints raw output as it arrives, then replaces it with a terminal-rendered Markdown version with `marked-terminal` when the answer completes. Add `--plain` or `-p` when you only want the raw Markdown stream for copying, or `--json` / `-j` to print the full result object, including `sessionId`, `finalResponse`, `messages`, `toolEvents`, `usage`, and `execution`.
+Common chat options:
+
+- `--execution workspace|sandbox` / `-e workspace|sandbox`: choose whether tools run directly in the configured workspace or in a copied sandbox.
+- `--knowledge` / `-k`: include the personal knowledge base.
+- `--no-memory`: disable persistent memory for this run.
+- `--memory-domains <list>`: use comma-separated memory domains instead of auto inference. Valid domains include `finance`, `daily_life`, `work`, `travel`, `reading`, `education`, `health`, and `other`.
+- `--no-skills`: omit the skill index from the prompt.
+- `--skill <name>`: enable one named skill. Can be repeated.
+- `--skills <list>`: enable comma-separated skills.
+- `--tools <list>`: use comma-separated tools instead of the configured defaults. Use `--tools none` to disable tools.
+- `--stream` / `--no-stream`: stream output by default, or wait for the full response before printing.
+- `--plain` / `-p`: print raw Markdown instead of terminal-rendered Markdown.
+- `--json` / `-j`: print the full run result object, including `sessionId`, `finalResponse`, `messages`, `toolEvents`, `usage`, and `execution`.
+- `--log-probs` and `--top-logprobs <0-5>`: in `--json` mode, request token log probabilities and optional top alternatives.
+- `--verbose` / `-V`: print tool events to stderr.
+- `--home <path>` / `-H <path>`: override `TASI_HARNESS_HOME`.
+
+The CLI also accepts piped input:
+
+```powershell
+Get-Content .\prompt.md | tasi chat --plain
+```
+
+Interactive commands are `:new`, `:session <id>`, and `:exit`. Use `tasi help` or `tasi --help` for built-in usage, and `tasi version` or `tasi --version` to print the packaged app version.
 
 ### Scheduled tasks and notifications
 
