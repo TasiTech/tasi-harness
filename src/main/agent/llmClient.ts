@@ -350,6 +350,7 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
       completionTokens: json.usage?.completion_tokens,
       totalTokens: json.usage?.total_tokens
     },
+    log_probs: choice?.logprobs,
     raw: json
   };
 }
@@ -722,6 +723,8 @@ class ModelClient implements LlmClient {
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
+      logprobs: request.logProbs === true ? true : undefined,
+      top_logprobs: request.logProbs === true ? request.topLogProbs : undefined,
       stream: false
     };
     const json = await this.postJson(endpoint, headers, body, request);

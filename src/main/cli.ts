@@ -28,6 +28,8 @@ export interface CliOptions {
   useSkills: boolean;
   enabledSkillNames?: string[];
   enabledToolNames?: string[];
+  logProbs: boolean;
+  topLogProbs?: number;
   json: boolean;
   plain: boolean;
   verbose: boolean;
@@ -57,6 +59,8 @@ function printUsage(): void {
       '      --skill <name>      Enable a named skill in the prompt index. Can be repeated.',
       '      --skills <list>     Enable comma-separated skills in the prompt index.',
       '      --tools <list>      Use comma-separated tools instead of config defaults. Use "none" for no tools.',
+      '      --log-probs        In --json mode, request token log probabilities and include log_probs in JSON output.',
+      '      --top-logprobs <n> In --json mode, include top token alternatives per output token.',
       '  -j, --json               Print the run result as JSON.',
       '  -p, --plain              Print raw Markdown instead of terminal-rendered output.',
       '      --stream             Stream raw output first, then render Markdown when complete (default).',
@@ -98,6 +102,14 @@ function splitList(value: string): string[] {
     .filter(Boolean);
 }
 
+function parseTopLogProbs(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 5) {
+    throw new Error(`Invalid top_logprobs: ${value}. Expected an integer from 0 to 5.`);
+  }
+  return parsed;
+}
+
 export function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     command: 'chat',
@@ -105,6 +117,7 @@ export function parseArgs(argv: string[]): CliOptions {
     usePersonalKnowledgeBase: false,
     useMemory: true,
     useSkills: true,
+    logProbs: false,
     json: false,
     plain: false,
     verbose: false,
@@ -175,6 +188,17 @@ export function parseArgs(argv: string[]): CliOptions {
       const value = args[++index];
       if (value === undefined) throw new Error(`${arg} requires a comma-separated tool list.`);
       options.enabledToolNames = splitList(value);
+      continue;
+    }
+    if (arg === '--log-probs' || arg === '--log_probs') {
+      options.logProbs = true;
+      continue;
+    }
+    if (arg === '--top-logprobs' || arg === '--top_logprobs') {
+      const value = args[++index];
+      if (!value) throw new Error(`${arg} requires an integer from 0 to 5.`);
+      options.logProbs = true;
+      options.topLogProbs = parseTopLogProbs(value);
       continue;
     }
     if (arg === '--json' || arg === '-j') {
@@ -367,6 +391,8 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
         useSkills: options.useSkills,
         enabledSkillNames: options.enabledSkillNames,
         enabledToolNames: options.enabledToolNames,
+        logProbs: options.json && options.logProbs,
+        topLogProbs: options.json ? options.topLogProbs : undefined,
         stream: options.stream
       },
       {

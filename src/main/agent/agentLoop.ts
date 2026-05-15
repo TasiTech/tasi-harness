@@ -120,6 +120,7 @@ export class AgentLoop {
       const tools = this.deps.toolRegistry.definitions(enabledToolNames);
       const toolEvents: ToolEvent[] = [];
       let usage = undefined as AgentRunResult['usage'];
+      let log_probs: AgentRunResult['log_probs'];
       let finalResponse = '';
       let iterations = 0;
       let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
@@ -200,7 +201,14 @@ export class AgentLoop {
                 persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
               }
             })
-          : await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
+          : await client.complete({
+              messages,
+              tools,
+              temperature: cfg.temperature,
+              logProbs: options.logProbs,
+              topLogProbs: options.topLogProbs,
+              signal: options.signal
+            });
         const toolCalls = completion.message.tool_calls ?? [];
         const assistant = {
           ...completion.message,
@@ -215,6 +223,7 @@ export class AgentLoop {
           assistant.reasoning_parts = currentParts.length > 0 ? currentParts : undefined;
         }
         usage = completion.usage ?? usage;
+        log_probs = completion.log_probs ?? log_probs;
         messages.push(assistant);
         persistMessages([assistant]);
 
@@ -324,6 +333,7 @@ export class AgentLoop {
         messages: updatedSession.messages,
         toolEvents,
         usage,
+        log_probs,
         iterations: iterations + 1,
         execution
       };

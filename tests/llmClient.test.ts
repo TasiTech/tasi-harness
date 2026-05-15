@@ -162,6 +162,53 @@ describe('llmClient', () => {
     expect(result.message.content).toBe('vLLM response.');
   });
 
+  it('requests and returns OpenAI-compatible log probabilities', async () => {
+    const logprobs = {
+      content: [
+        {
+          token: 'Hello',
+          logprob: -0.12,
+          bytes: [72, 101, 108, 108, 111],
+          top_logprobs: []
+        }
+      ]
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'Hello' },
+              logprobs
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-model'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'hello' }],
+      logProbs: true,
+      topLogProbs: 3
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.logprobs).toBe(true);
+    expect(body.top_logprobs).toBe(3);
+    expect(result.log_probs).toEqual(logprobs);
+  });
+
   it('returns sanitized HTML error details instead of raw HTML', async () => {
     const fetchMock = vi.fn().mockImplementation(() =>
       Promise.resolve(

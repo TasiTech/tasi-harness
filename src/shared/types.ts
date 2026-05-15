@@ -146,6 +146,7 @@ export interface LlmUsage {
 export interface LlmCompletion {
   message: AgentMessage;
   usage?: LlmUsage;
+  log_probs?: unknown;
   raw?: unknown;
 }
 
@@ -154,6 +155,8 @@ export interface LlmRequest {
   tools?: ToolDefinition[];
   temperature?: number;
   maxTokens?: number;
+  logProbs?: boolean;
+  topLogProbs?: number;
   signal?: AbortSignal;
 }
 
@@ -323,6 +326,8 @@ export interface AgentRunOptions {
   useSkills?: boolean;
   enabledSkillNames?: string[];
   enabledToolNames?: string[];
+  logProbs?: boolean;
+  topLogProbs?: number;
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
   stream?: boolean;
@@ -336,6 +341,7 @@ export interface AgentRunResult {
   followUpQuestions?: string[];
   usage?: LlmUsage;
   totalUsage?: LlmUsage;
+  log_probs?: unknown;
   iterations: number;
   execution: AgentExecutionDetails;
 }
