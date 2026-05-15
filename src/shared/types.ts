@@ -1,6 +1,7 @@
 export type ProviderKind =
   | 'openai'
   | 'openai-compatible'
+  | 'vllm'
   | 'deepseek'
   | 'qwen-bailian'
   | 'minimax'

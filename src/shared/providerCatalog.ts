@@ -77,6 +77,15 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     requiresApiKey: true
   },
   {
+    kind: 'vllm',
+    label: 'vLLM',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'http://127.0.0.1:8000/v1',
+    defaultModel: 'local-model',
+    models: ['local-model', 'Qwen/Qwen3-8B', 'meta-llama/Llama-3.1-8B-Instruct', 'mistralai/Mistral-7B-Instruct-v0.3'],
+    requiresApiKey: false
+  },
+  {
     kind: 'ollama',
     label: 'Ollama',
     apiStyle: 'ollama',

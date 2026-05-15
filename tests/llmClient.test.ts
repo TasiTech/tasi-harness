@@ -125,6 +125,43 @@ describe('llmClient', () => {
     expect(result.message.content).toBe('Recovered after retry.');
   });
 
+  it('uses OpenAI-compatible chat completions for vLLM without requiring an API key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'vLLM response.' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-model'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [endpoint, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(endpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+    const body = JSON.parse(String(init.body));
+    expect(body.model).toBe('served-model');
+    expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
+    expect(result.message.content).toBe('vLLM response.');
+  });
+
   it('returns sanitized HTML error details instead of raw HTML', async () => {
     const fetchMock = vi.fn().mockImplementation(() =>
       Promise.resolve(
