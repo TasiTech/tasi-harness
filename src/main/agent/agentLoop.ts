@@ -5,6 +5,8 @@ import { ToolRegistry } from '../tools/toolRegistry.js';
 import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
 
+const REPEATED_TOOL_RESULT_LIMIT = 3;
+
 function parseToolArgs(raw: string): unknown {
   if (!raw.trim()) return {};
   try {
@@ -12,6 +14,26 @@ function parseToolArgs(raw: string): unknown {
   } catch {
     return { raw };
   }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(',')}}`;
+}
+
+function repeatedToolDiagnostic(toolName: string, args: unknown, ok: boolean, content: string, limit: number): string {
+  const resultLabel = ok ? 'ok' : 'fail';
+  return [
+    `Stopped because the same tool call repeated ${limit} times with the same result.`,
+    `Tool: ${toolName}`,
+    `Args: ${stableStringify(args)}`,
+    `Result: ${resultLabel} - ${content || '(empty)'}`
+  ].join('\n');
 }
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
@@ -97,6 +119,8 @@ export class AgentLoop {
       const accumulatedReasoningParts: string[] = [];
       let lastStreamPersistedAt = 0;
       let lastStreamPersistedLength = 0;
+      let lastToolResultSignature = '';
+      let repeatedToolResultCount = 0;
 
       const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
       const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
@@ -236,7 +260,41 @@ export class AgentLoop {
           };
           messages.push(toolMessage);
           persistMessages([toolMessage], [event]);
+
+          const toolResultSignature = stableStringify({
+            toolName: call.function.name,
+            args,
+            ok: result.ok,
+            content: result.content
+          });
+          repeatedToolResultCount = toolResultSignature === lastToolResultSignature ? repeatedToolResultCount + 1 : 1;
+          lastToolResultSignature = toolResultSignature;
+          if (repeatedToolResultCount >= REPEATED_TOOL_RESULT_LIMIT) {
+            finalResponse = repeatedToolDiagnostic(call.function.name, args, result.ok, result.content, REPEATED_TOOL_RESULT_LIMIT);
+            const diagnosticMessage: AgentMessage = {
+              id: createId('msg'),
+              role: 'assistant',
+              content: finalResponse,
+              createdAt: nowIso()
+            };
+            messages.push(diagnosticMessage);
+            persistMessages([diagnosticMessage]);
+            if (canStream) {
+              options.onMessageDelta?.(session.id, {
+                sessionId: session.id,
+                messageId: visibleAssistantId,
+                role: 'assistant',
+                type: 'done',
+                content: finalResponse,
+                reasoning_content: accumulatedReasoning || undefined,
+                reasoning_parts: accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined,
+                createdAt: visibleAssistantCreatedAt
+              });
+            }
+            break;
+          }
         }
+        if (finalResponse) break;
       }
 
       if (!finalResponse) {

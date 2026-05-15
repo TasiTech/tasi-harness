@@ -252,4 +252,81 @@ describe('AgentLoop', () => {
     expect(finalAssistant?.reasoning_content).toBe('Need to inspect the workspace.\nNeed to write the file.');
     expect(finalAssistant?.reasoning_parts).toEqual(['Need to inspect the workspace.', 'Need to write the file.']);
   });
+
+  it('stops when the same tool call returns the same result repeatedly', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 10 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      safety: 'read-only',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'repeat_probe',
+          description: 'Returns the same result for repeat-loop tests.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }
+            }
+          }
+        }
+      },
+      async execute() {
+        return { ok: false, content: 'fetch failed' };
+      }
+    });
+    const repeatedCompletion = () => ({
+      message: {
+        role: 'assistant' as const,
+        content: 'Trying again.',
+        tool_calls: [{
+          id: createMockToolCallId(),
+          type: 'function' as const,
+          function: { name: 'repeat_probe', arguments: JSON.stringify({ path: 'token-hub-v2.png' }) }
+        }]
+      }
+    });
+    const mock = new MockLlmClient(Array.from({ length: 10 }, repeatedCompletion));
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'keep probing' });
+
+    expect(result.toolEvents).toHaveLength(3);
+    expect(result.iterations).toBe(3);
+    expect(result.finalResponse).toContain('Stopped because the same tool call repeated 3 times with the same result.');
+    expect(result.finalResponse).toContain('Tool: repeat_probe');
+    expect(result.finalResponse).toContain('Result: fail - fetch failed');
+    expect(result.finalResponse).not.toContain('Reached iteration limit');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
 });
+
+let mockToolCallCounter = 0;
+
+function createMockToolCallId(): string {
+  mockToolCallCounter += 1;
+  return `call_repeat_${mockToolCallCounter}`;
+}
