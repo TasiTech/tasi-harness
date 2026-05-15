@@ -85,10 +85,12 @@ export class AgentLoop {
   async run(options: AgentLoopRuntimeOptions): Promise<AgentRunResult> {
     throwIfAborted(options.signal);
     const cfg = this.deps.getConfig();
+    const memoryEnabled = options.useMemory !== false;
+    const skillsEnabled = options.useSkills !== false;
     const requestId = createId('run');
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
     const session = options.sessionId ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create() : this.deps.sessions.create();
-    this.deps.beginDeferredMemory(session.id);
+    if (memoryEnabled) this.deps.beginDeferredMemory(session.id);
     const userMessage: AgentMessage = {
       id: createId('msg'),
       role: 'user',
@@ -101,12 +103,21 @@ export class AgentLoop {
       const prompt = await this.deps.promptBuilder.build(cfg, {
         sessionId: session.id,
         userInput: options.userInput,
-        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase
+        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase,
+        useMemory: options.useMemory,
+        memoryDomains: options.memoryDomains,
+        useSkills: options.useSkills,
+        enabledSkillNames: options.enabledSkillNames
       });
       this.deps.sessions.setSystemPrompt(session.id, prompt);
       const messages: AgentMessage[] = [{ role: 'system', content: prompt }, ...history];
       const client = this.deps.createClient();
-      const tools = this.deps.toolRegistry.definitions(cfg.enabledToolNames);
+      const enabledToolNames = (options.enabledToolNames ?? cfg.enabledToolNames).filter((name) => {
+        if (!memoryEnabled && name === 'memory') return false;
+        if (!skillsEnabled && (name === 'skill_view' || name === 'skill_manage')) return false;
+        return true;
+      });
+      const tools = this.deps.toolRegistry.definitions(enabledToolNames);
       const toolEvents: ToolEvent[] = [];
       let usage = undefined as AgentRunResult['usage'];
       let finalResponse = '';
@@ -303,8 +314,10 @@ export class AgentLoop {
         persistMessages([limitMessage]);
       }
 
-      this.deps.commitDeferredMemory(session.id);
-      this.deps.syncSessionMemory(updatedSession);
+      if (memoryEnabled) {
+        this.deps.commitDeferredMemory(session.id);
+        this.deps.syncSessionMemory(updatedSession);
+      }
       return {
         sessionId: session.id,
         finalResponse,
@@ -315,7 +328,7 @@ export class AgentLoop {
         execution
       };
     } catch (error) {
-      this.deps.discardDeferredMemory(session.id);
+      if (memoryEnabled) this.deps.discardDeferredMemory(session.id);
       throw error;
     }
   }

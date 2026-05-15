@@ -317,6 +317,11 @@ export interface AgentRunOptions {
   attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
   usePersonalKnowledgeBase?: boolean;
+  useMemory?: boolean;
+  memoryDomains?: MemoryDomain[];
+  useSkills?: boolean;
+  enabledSkillNames?: string[];
+  enabledToolNames?: string[];
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
   stream?: boolean;

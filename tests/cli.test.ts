@@ -51,6 +51,37 @@ describe('CLI argument parsing', () => {
     });
   });
 
+  it('parses runtime memory, skill, and tool controls', () => {
+    expect(parseArgs([
+      'chat',
+      '--no-memory',
+      '--memory-domains',
+      'work,travel',
+      '--no-skills',
+      '--skill',
+      'docx',
+      '--skills',
+      'tasi-travel,deep-search',
+      '--tools',
+      'file_read,browser_open',
+      'hello'
+    ])).toMatchObject({
+      message: 'hello',
+      useMemory: false,
+      memoryDomains: ['work', 'travel'],
+      useSkills: false,
+      enabledSkillNames: ['docx', 'tasi-travel', 'deep-search'],
+      enabledToolNames: ['file_read', 'browser_open']
+    });
+  });
+
+  it('supports disabling all tools from the CLI', () => {
+    expect(parseArgs(['chat', '--tools', 'none', 'hello'])).toMatchObject({
+      message: 'hello',
+      enabledToolNames: []
+    });
+  });
+
   it('renders headings without markdown prefixes and de-indents markdown list items', () => {
     const rendered = renderMarkdownForTerminal(['## Current weather', '', '    * **Temperature**: 21 C'].join('\n'));
 

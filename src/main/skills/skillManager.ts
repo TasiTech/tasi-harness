@@ -226,9 +226,12 @@ export class SkillManager {
     return true;
   }
 
-  renderPromptIndex(): string {
-    const skills = this.list();
-    if (skills.length === 0) return 'No skills are installed.';
+  renderPromptIndex(enabledNames?: string[]): string {
+    const enabled = enabledNames && enabledNames.length > 0 ? new Set(enabledNames.map((name) => slugifyName(name))) : null;
+    const skills = enabled
+      ? this.list().filter((skill) => enabled.has(slugifyName(skill.name)) || enabled.has(slugifyName(basename(dirname(skill.path)))))
+      : this.list();
+    if (skills.length === 0) return enabled ? 'No matching skills are enabled for this run.' : 'No skills are installed.';
     return skills
       .map((skill) => {
         const skillDir = dirname(skill.path);

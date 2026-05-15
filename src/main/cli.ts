@@ -7,7 +7,8 @@ import { stdin as input, stdout as output } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
-import type { ExecutionMode, ToolApprovalDecision, ToolApprovalRequest } from '../shared/types.js';
+import type { ExecutionMode, MemoryDomain, ToolApprovalDecision, ToolApprovalRequest } from '../shared/types.js';
+import { normalizeMemoryDomain } from '../shared/memoryDomains.js';
 import { CliContext } from './cliContext.js';
 
 marked.use(
@@ -22,6 +23,11 @@ export interface CliOptions {
   sessionId?: string;
   executionMode?: ExecutionMode;
   usePersonalKnowledgeBase: boolean;
+  useMemory: boolean;
+  memoryDomains?: MemoryDomain[];
+  useSkills: boolean;
+  enabledSkillNames?: string[];
+  enabledToolNames?: string[];
   json: boolean;
   plain: boolean;
   verbose: boolean;
@@ -44,6 +50,13 @@ function printUsage(): void {
       '  -s, --session <id>       Continue an existing session.',
       '  -e, --execution <mode>   workspace or sandbox.',
       '  -k, --knowledge          Use the personal knowledge base.',
+      '      --no-memory         Disable persistent memory for this run.',
+      '      --memory-domains <domains>',
+      '                          Use comma-separated memory domains instead of auto inference.',
+      '      --no-skills         Disable skills for this run.',
+      '      --skill <name>      Enable a named skill in the prompt index. Can be repeated.',
+      '      --skills <list>     Enable comma-separated skills in the prompt index.',
+      '      --tools <list>      Use comma-separated tools instead of config defaults. Use "none" for no tools.',
       '  -j, --json               Print the run result as JSON.',
       '  -p, --plain              Print raw Markdown instead of terminal-rendered output.',
       '      --stream             Stream raw output first, then render Markdown when complete (default).',
@@ -77,11 +90,21 @@ function normalizeExecutionMode(value: string): ExecutionMode {
   throw new Error(`Invalid execution mode: ${value}. Expected workspace or sandbox.`);
 }
 
+function splitList(value: string): string[] {
+  if (value.trim().toLowerCase() === 'none') return [];
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     command: 'chat',
     message: '',
     usePersonalKnowledgeBase: false,
+    useMemory: true,
+    useSkills: true,
     json: false,
     plain: false,
     verbose: false,
@@ -120,6 +143,38 @@ export function parseArgs(argv: string[]): CliOptions {
     }
     if (arg === '--knowledge' || arg === '-k') {
       options.usePersonalKnowledgeBase = true;
+      continue;
+    }
+    if (arg === '--no-memory') {
+      options.useMemory = false;
+      continue;
+    }
+    if (arg === '--memory-domains') {
+      const value = args[++index];
+      if (!value) throw new Error(`${arg} requires a comma-separated domain list.`);
+      options.memoryDomains = splitList(value).map((domain) => normalizeMemoryDomain(domain));
+      continue;
+    }
+    if (arg === '--no-skills') {
+      options.useSkills = false;
+      continue;
+    }
+    if (arg === '--skill') {
+      const value = args[++index];
+      if (!value) throw new Error(`${arg} requires a skill name.`);
+      options.enabledSkillNames = [...(options.enabledSkillNames ?? []), value];
+      continue;
+    }
+    if (arg === '--skills') {
+      const value = args[++index];
+      if (!value) throw new Error(`${arg} requires a comma-separated skill list.`);
+      options.enabledSkillNames = [...(options.enabledSkillNames ?? []), ...splitList(value)];
+      continue;
+    }
+    if (arg === '--tools') {
+      const value = args[++index];
+      if (value === undefined) throw new Error(`${arg} requires a comma-separated tool list.`);
+      options.enabledToolNames = splitList(value);
       continue;
     }
     if (arg === '--json' || arg === '-j') {
@@ -307,6 +362,11 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
         sessionId: options.sessionId,
         executionMode: options.executionMode,
         usePersonalKnowledgeBase: options.usePersonalKnowledgeBase,
+        useMemory: options.useMemory,
+        memoryDomains: options.memoryDomains,
+        useSkills: options.useSkills,
+        enabledSkillNames: options.enabledSkillNames,
+        enabledToolNames: options.enabledToolNames,
         stream: options.stream
       },
       {
