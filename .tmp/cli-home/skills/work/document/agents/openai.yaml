@@ -1,7 +1,0 @@
-interface:
-  display_name: "Document"
-  short_description: "Draft document text with planned figures and charts."
-  default_prompt: "Use $document to draft a structured proposal with assumptions, recommendations, risks, next steps, and any useful diagram or data chart placeholders."
-
-policy:
-  allow_implicit_invocation: true
