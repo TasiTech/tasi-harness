@@ -6,7 +6,7 @@ import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SessionStore } from '../storage/sessionStore.js';
 import { safeJoin } from '../storage/pathUtils.js';
 import type { SkillManager } from '../skills/skillManager.js';
-import type { BrowserAutomation, BrowserBinaryResult, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
+import type { BrowserAutomation, BrowserBinaryResult, BrowserClickResult, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
 import { booleanArg, isPathInside, objectArgs, resolveToolPath, stringArg } from './toolRegistry.js';
 import { runTerminalCommand } from './terminalRunner.js';
 
@@ -79,6 +79,33 @@ function renderBrowserJsonTool(tool: string, state: BrowserPageState, payload: u
       browser_preview_url: state.url,
       ...state,
       payload
+    },
+    null,
+    2
+  );
+}
+
+function renderBrowserClickResult(result: BrowserClickResult): string {
+  const observation = result.observation;
+  const recommendedNextTools = observation?.currentPageNavigationDetected
+    ? ['browser_snapshot', 'browser_extract']
+    : (observation?.newTargets?.length || observation?.windowOpenCalls?.length)
+      ? ['browser_state', 'browser_snapshot', 'browser_console']
+      : ['browser_snapshot', 'browser_extract', 'browser_console', 'browser_network'];
+  return JSON.stringify(
+    {
+      tool: 'browser_click',
+      browser_preview_url: result.url,
+      url: result.url,
+      title: result.title,
+      action: result.action || 'dispatched_click_events',
+      selector: result.selector,
+      index: result.index,
+      element: result.element,
+      before: result.before,
+      after: result.after ?? { url: result.url, title: result.title },
+      observation,
+      recommended_next_tools: recommendedNextTools
     },
     null,
     2
@@ -536,7 +563,8 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             selector: { type: 'string', description: 'CSS selector for the target element.' },
             index: { type: 'number', description: 'Zero-based index when selector matches multiple elements.' },
             wait_for_navigation: { type: 'boolean', description: 'Wait for page navigation after clicking.' },
-            timeout_ms: { type: 'number', description: 'Navigation wait timeout in milliseconds.' }
+            timeout_ms: { type: 'number', description: 'Navigation wait timeout in milliseconds.' },
+            observe_ms: { type: 'number', description: 'Short post-click observation window for DOM changes or new targets. Defaults to 500 ms.' }
           },
           required: ['selector']
         }
@@ -551,9 +579,10 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const state = await access.browser.click(selector, {
         index: numberArg(obj, 'index', 0),
         waitForNavigation: booleanArg(obj, 'wait_for_navigation', false),
-        timeoutMs: numberArg(obj, 'timeout_ms', 20000)
+        timeoutMs: numberArg(obj, 'timeout_ms', 20000),
+        observeMs: numberArg(obj, 'observe_ms', 500)
       });
-      return { ok: true, content: withBrowserPreview(`Clicked selector: ${selector}`, state), data: state };
+      return { ok: true, content: renderBrowserClickResult(state), data: state };
     }
   };
 

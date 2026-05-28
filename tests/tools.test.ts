@@ -612,6 +612,20 @@ describe('builtin tools', () => {
     expect(open.ok).toBe(true);
     expect(open.content).toContain('browser_preview_url: https://example.com');
 
+    const click = await registry.execute(
+      'browser_click',
+      { selector: '#demo' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(click.ok).toBe(true);
+    expect(JSON.parse(click.content)).toMatchObject({
+      tool: 'browser_click',
+      browser_preview_url: 'https://example.com',
+      url: 'https://example.com',
+      action: 'dispatched_click_events',
+      recommended_next_tools: ['browser_snapshot', 'browser_extract', 'browser_console', 'browser_network']
+    });
+
     const extract = await registry.execute(
       'browser_extract',
       { max_chars: 2000 },

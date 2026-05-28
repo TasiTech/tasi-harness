@@ -2,6 +2,7 @@ import { app, BrowserWindow, type WebContents } from 'electron';
 import type {
   BrowserAutomation,
   BrowserBinaryResult,
+  BrowserClickResult,
   BrowserCookieResult,
   BrowserDiagnosticsResult,
   BrowserExtractResult,
@@ -56,6 +57,19 @@ interface NetworkEntry {
   decodedBodySize?: number;
 }
 
+interface ClickPageSnapshot {
+  textLength: number;
+  textDigest: string;
+  element?: BrowserClickResult['element'];
+}
+
+interface ClickDispatchResult {
+  ok: boolean;
+  error?: string;
+  element?: BrowserClickResult['element'];
+  windowOpenCalls?: Array<{ url: string; target?: string }>;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -78,6 +92,16 @@ function clipWithMarker(value: string, maxChars: number): string {
   const marker = '... [truncated]';
   if (maxChars <= marker.length) return value.slice(0, maxChars);
   return `${value.slice(0, maxChars - marker.length)}${marker}`;
+}
+
+function clickObservationNote(result: BrowserClickResult): string {
+  const observation = result.observation;
+  if (!observation) return 'Click events were dispatched.';
+  if (observation.currentPageNavigationDetected) return 'Click events were dispatched and current-page navigation was detected.';
+  if ((observation.newTargets?.length ?? 0) > 0) return 'Click events were dispatched and a new browser target/window was detected.';
+  if ((observation.windowOpenCalls?.length ?? 0) > 0) return 'Click events were dispatched and window.open was called.';
+  if (observation.domTextChanged) return 'Click events were dispatched; URL/title stayed the same, but visible page text changed.';
+  return 'Click events were dispatched, but no current-page navigation or visible text change was detected.';
 }
 
 function serializeBrowserExtractJson(payload: BrowserExtractJsonPayload, maxChars: number): string {
@@ -274,6 +298,10 @@ export function pageHelpers(): string {
         if (href) {
           try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
         }
+        const target = el.getAttribute("target");
+        if (target) item.target = target;
+        const onclick = el.getAttribute("onclick");
+        if (onclick) item.onclick = clip(onclick, 500);
         if ("value" in el && typeof el.value !== "undefined") item.value = clip(String(el.value || ""), 240);
         const placeholder = el.getAttribute("placeholder");
         if (placeholder) item.placeholder = placeholder;
@@ -426,23 +454,21 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return this.stateFrom(wc);
   }
 
-  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number }): Promise<BrowserPageState> {
+  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number; observeMs?: number }): Promise<BrowserClickResult> {
     const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000);
+    const observeMs = clampInt(Number(options?.observeMs), options?.waitForNavigation ? 150 : 500, 0, 5000);
     const index = clampInt(Number(options?.index), 0, 0, 9999);
     const sel = selector.trim();
     if (!sel) throw new Error('selector is required.');
-    const result = await this.evalInPage<{ ok: boolean; error?: string }>(
-      `(function () {
-        ${pageHelpers()}
-        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
-        if (!found.ok) return found;
-        TasiBrowser.activate(found.el);
-        return { ok: true };
-      })();`
-    );
+    const before = await this.state();
+    const beforeSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    const result = await this.dispatchClick(sel, index);
     if (!result.ok) throw new Error(result.error || `Failed to click selector: ${sel}`);
     if (options?.waitForNavigation) await this.waitForIdle(timeoutMs, this.getTargetWebContents());
-    return this.state();
+    else if (observeMs > 0) await sleep(observeMs);
+    const after = await this.state();
+    const afterSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    return this.buildClickResult(sel, index, before, after, beforeSnapshot, afterSnapshot, result);
   }
 
   async type(selector: string, text: string, options?: { clear?: boolean; submit?: boolean }): Promise<BrowserPageState> {
@@ -1077,6 +1103,84 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     }
     this.window.close();
     this.window = null;
+  }
+
+  private async captureClickPageSnapshot(selector: string, index: number): Promise<ClickPageSnapshot> {
+    return this.evalInPage<ClickPageSnapshot>(
+      `(function () {
+        ${pageHelpers()}
+        const text = TasiBrowser.normalizeText((document.body && document.body.innerText) || (document.documentElement && document.documentElement.textContent) || "");
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        return {
+          textLength: text.length,
+          textDigest: String(hash),
+          element: found.ok ? TasiBrowser.describe(found.el) : undefined
+        };
+      })();`
+    );
+  }
+
+  private async dispatchClick(selector: string, index: number): Promise<ClickDispatchResult> {
+    return this.evalInPage<ClickDispatchResult>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) return found;
+        const calls = [];
+        const originalOpen = window.open;
+        window.open = function (url, target, features) {
+          calls.push({ url: String(url || ""), target: target == null ? undefined : String(target) });
+          return originalOpen.apply(window, arguments);
+        };
+        try {
+          TasiBrowser.activate(found.el);
+          return { ok: true, element: TasiBrowser.describe(found.el), windowOpenCalls: calls };
+        } finally {
+          window.open = originalOpen;
+        }
+      })();`
+    );
+  }
+
+  private buildClickResult(
+    selector: string,
+    index: number,
+    before: BrowserPageState,
+    after: BrowserPageState,
+    beforeSnapshot: ClickPageSnapshot | null,
+    afterSnapshot: ClickPageSnapshot | null,
+    dispatch: ClickDispatchResult
+  ): BrowserClickResult {
+    const urlChanged = before.url !== after.url;
+    const titleChanged = before.title !== after.title;
+    const domTextChanged = beforeSnapshot && afterSnapshot
+      ? beforeSnapshot.textDigest !== afterSnapshot.textDigest || beforeSnapshot.textLength !== afterSnapshot.textLength
+      : undefined;
+    const result: BrowserClickResult = {
+      ...after,
+      action: 'dispatched_click_events',
+      selector,
+      index,
+      element: dispatch.element || beforeSnapshot?.element,
+      before,
+      after,
+      observation: {
+        urlChanged,
+        titleChanged,
+        currentPageNavigationDetected: urlChanged || titleChanged,
+        domTextChanged,
+        beforeTextLength: beforeSnapshot?.textLength,
+        afterTextLength: afterSnapshot?.textLength,
+        windowOpenCalls: dispatch.windowOpenCalls?.slice(0, 5),
+        note: ''
+      }
+    };
+    result.observation!.note = clickObservationNote(result);
+    return result;
   }
 
   private ensureWindow(): BrowserWindow {
