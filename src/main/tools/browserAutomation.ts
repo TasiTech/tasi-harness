@@ -3,6 +3,12 @@ export interface BrowserPageState {
   title: string;
 }
 
+export interface BrowserUploadFileResult extends BrowserPageState {
+  selector: string;
+  files: string[];
+  multiple?: boolean;
+}
+
 export interface BrowserClickElementSnapshot {
   tag: string;
   text: string;
@@ -125,6 +131,8 @@ export interface BrowserAutomation {
     state?: 'attached' | 'visible' | 'hidden' | 'detached';
     loadState?: 'load' | 'domcontentloaded' | 'networkidle';
     function?: string;
+    untilChanged?: boolean;
+    untilLoggedIn?: boolean;
     timeoutMs?: number;
   }): Promise<BrowserPageState>;
   extract(options?: { selector?: string; format?: 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult>;
@@ -134,6 +142,7 @@ export interface BrowserAutomation {
   select(selector: string, value: string, options?: { index?: number }): Promise<BrowserPageState>;
   check(selector: string, checked: boolean, options?: { index?: number }): Promise<BrowserPageState>;
   press(key: string, options?: { selector?: string; text?: string }): Promise<BrowserPageState>;
+  uploadFile(selector: string, files: string[], options?: { index?: number }): Promise<BrowserUploadFileResult>;
   screenshot(options?: { fullPage?: boolean }): Promise<BrowserBinaryResult>;
   pdf(): Promise<BrowserBinaryResult>;
   storage(options?: { area?: 'local' | 'session'; action?: 'get' | 'set' | 'clear'; key?: string; value?: string }): Promise<BrowserStorageResult>;

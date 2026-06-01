@@ -36,6 +36,29 @@ function repeatedToolDiagnostic(toolName: string, args: unknown, ok: boolean, co
   ].join('\n');
 }
 
+function compactToolText(content: string, maxLength = 160): string {
+  const text = content.replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
+}
+
+function iterationLimitResponse(maxIterations: number, toolEvents: ToolEvent[]): string {
+  const recentEvents = toolEvents.slice(-5);
+  const lines = [
+    `本轮已达到最大执行步数（${maxIterations}），我先停在这里，避免继续消耗无效步骤。`
+  ];
+  if (recentEvents.length > 0) {
+    lines.push('', '最近完成的操作：');
+    for (const event of recentEvents) {
+      const status = event.ok ? '成功' : '失败';
+      const detail = compactToolText(event.content);
+      lines.push(`- ${event.toolName}：${status}${detail ? `，${detail}` : ''}`);
+    }
+  }
+  lines.push('', '当前页面和会话状态已保留，可以继续让我从当前状态接着做。');
+  return lines.join('\n');
+}
+
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
   onMessageDelta?: (sessionId: string, event: AgentMessageDeltaStream) => void;
@@ -318,7 +341,7 @@ export class AgentLoop {
       }
 
       if (!finalResponse) {
-        finalResponse = `Reached iteration limit (${cfg.maxIterations}). Last tool events: ${toolEvents.map((e) => `${e.toolName}:${e.ok ? 'ok' : 'fail'}`).join(', ')}`;
+        finalResponse = iterationLimitResponse(cfg.maxIterations, toolEvents);
         const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
         persistMessages([limitMessage]);
       }

@@ -4,6 +4,7 @@ export type ProviderKind =
   | 'vllm'
   | 'deepseek'
   | 'qwen-bailian'
+  | 'soildapi'
   | 'minimax'
   | 'kimi'
   | 'anthropic'
@@ -31,8 +32,12 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  contentOmitted?: boolean;
+  contentLength?: number;
   attachments?: AgentMessageAttachment[];
   reasoning_content?: string;
+  reasoningOmitted?: boolean;
+  reasoningLength?: number;
   reasoning_parts?: string[];
   name?: string;
   tool_call_id?: string;
@@ -259,8 +264,10 @@ export interface MemoryState {
 
 export interface SkillMetadata {
   name: string;
+  displayName?: string;
   description: string;
   category: string;
+  displayCategory?: string;
   path: string;
   readonly: boolean;
   source: 'bundled' | 'local';
@@ -299,6 +306,41 @@ export interface SessionRecord extends SessionSummary {
   lastExecution?: AgentExecutionDetails;
   lastUsage?: LlmUsage;
   totalUsage?: LlmUsage;
+}
+
+export interface SessionOptimizationContextRequest {
+  sessionIds: string[];
+  maxCharsPerSession?: number;
+  maxTotalChars?: number;
+}
+
+export interface SessionOptimizationContextResult {
+  sessionIds: string[];
+  missingIds: string[];
+  context: string;
+  truncated: boolean;
+  totalChars: number;
+}
+
+export interface SessionMessageContentRequest {
+  sessionId: string;
+  messageId: string;
+}
+
+export interface SessionMessageContentResult {
+  content: string;
+  reasoning_content?: string;
+  attachments?: AgentMessageAttachment[];
+}
+
+export interface SessionToolEventContentRequest {
+  sessionId: string;
+  toolEventId: string;
+}
+
+export interface SessionToolEventContentResult {
+  content: string;
+  args: unknown;
 }
 
 export interface SessionUpdateEvent {
@@ -346,12 +388,22 @@ export interface AgentRunResult {
   execution: AgentExecutionDetails;
 }
 
+export interface SkillOptimizationRunRequest {
+  prompt: string;
+  sessionIds: string[];
+  executionMode?: ExecutionMode;
+}
+
 export interface ToolEvent {
   id: string;
   toolName: string;
   args: unknown;
+  argsOmitted?: boolean;
+  argsLength?: number;
   ok: boolean;
   content: string;
+  contentOmitted?: boolean;
+  contentLength?: number;
   approval?: ToolApprovalRecord;
   createdAt: string;
 }
@@ -571,6 +623,8 @@ export interface SkillWriteRequest {
   name: string;
   content: string;
   category?: string;
+  displayName?: string;
+  displayCategory?: string;
   overwrite?: boolean;
 }
 
@@ -585,6 +639,8 @@ export interface SkillArchiveUploadRequest {
   contentBase64: string;
   name?: string;
   category?: string;
+  displayName?: string;
+  displayCategory?: string;
   overwrite?: boolean;
 }
 
@@ -623,12 +679,31 @@ export interface BrowserCoachGenerateSkillRequest {
   name: string;
   category: string;
   description?: string;
+  userGuidance?: string;
+  overwrite?: boolean;
+  recording?: BrowserCoachRecording;
+  displayName?: string;
+  displayCategory?: string;
 }
 
 export interface BrowserCoachGenerateSkillResult {
   skill: SkillDocument;
   recording: BrowserCoachRecording;
   recordingReferencePath: string;
+}
+
+export interface BrowserCoachStoredRecording {
+  id: string;
+  source: 'recording' | 'skill';
+  skillName: string;
+  displayName?: string;
+  category: string;
+  displayCategory?: string;
+  path: string;
+  startUrl: string;
+  startedAt?: string;
+  updatedAt?: string;
+  eventCount: number;
 }
 
 export interface PersonalKnowledgeUploadRequest {

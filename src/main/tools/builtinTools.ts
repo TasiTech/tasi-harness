@@ -6,9 +6,13 @@ import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SessionStore } from '../storage/sessionStore.js';
 import { safeJoin } from '../storage/pathUtils.js';
 import type { SkillManager } from '../skills/skillManager.js';
-import type { BrowserAutomation, BrowserBinaryResult, BrowserClickResult, BrowserExtractResult, BrowserPageState } from './browserAutomation.js';
+import type { BrowserAutomation, BrowserBinaryResult, BrowserClickResult, BrowserExtractResult, BrowserPageState, BrowserSnapshotResult } from './browserAutomation.js';
 import { booleanArg, isPathInside, objectArgs, resolveToolPath, stringArg } from './toolRegistry.js';
 import { runTerminalCommand } from './terminalRunner.js';
+
+const BROWSER_DEFAULT_TIMEOUT_MS = 60000;
+const BROWSER_MANUAL_LOGIN_TIMEOUT_MS = 300000;
+const BROWSER_REDACTION_MASK = 'xxxx';
 
 export interface BuiltinToolDeps {
   getConfig: () => AppConfig;
@@ -16,6 +20,7 @@ export interface BuiltinToolDeps {
   sessionStore: SessionStore;
   skillManager: SkillManager;
   browserAutomation?: BrowserAutomation;
+  setBrowserClosePolicy?: (sessionId: string, policy: 'auto_close' | 'keep_open', reason?: string) => void;
 }
 
 function numberArg(args: Record<string, unknown>, name: string, fallback: number): number {
@@ -83,6 +88,128 @@ function renderBrowserJsonTool(tool: string, state: BrowserPageState, payload: u
     null,
     2
   );
+}
+
+function filterTerms(input: string): string[] {
+  return input
+    .split(/[,，|]/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+    .slice(0, 12);
+}
+
+function textMatchesTerms(value: unknown, terms: string[]): boolean {
+  if (terms.length === 0) return true;
+  const text = typeof value === 'string' ? value : JSON.stringify(value ?? '');
+  const lowered = text.toLowerCase();
+  return terms.some((term) => lowered.includes(term));
+}
+
+function redactSensitiveUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    const sensitiveKeys = /^(access_token|auth|authorization|code|data|key|password|pwd|s|secret|session|sid|ticket|token)$/i;
+    for (const key of [...url.searchParams.keys()]) {
+      if (sensitiveKeys.test(key)) url.searchParams.set(key, BROWSER_REDACTION_MASK);
+    }
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function redactSensitiveText(value: string): string {
+  return redactSensitiveUrl(value)
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, BROWSER_REDACTION_MASK)
+    .replace(/(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/g, BROWSER_REDACTION_MASK)
+    .replace(/(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)/g, BROWSER_REDACTION_MASK)
+    .replace(/((?:银行卡|卡号|账号|账户|account|card)[^\n\r\d]{0,12})\d{6,19}/gi, `$1${BROWSER_REDACTION_MASK}`)
+    .replace(/\[redacted(?:-[^\]]+)?\]/gi, BROWSER_REDACTION_MASK);
+}
+
+function redactSensitiveObject(value: unknown, options: { includeValues: boolean }): unknown {
+  if (typeof value === 'string') return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map((item) => redactSensitiveObject(item, options));
+  if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  const fieldHints = ['selector', 'name', 'placeholder', 'label', 'text', 'role', 'tag']
+    .map((key) => typeof record[key] === 'string' ? record[key] : '')
+    .join(' ');
+  const isSensitiveBrowserField =
+    /(password|passwd|pwd|secret|token|cookie|authorization|session|access[-_]?key|api[-_]?key|ticket|finger|captcha|otp|mfa|username|user[-_ ]?name|account|login|i_user|i_pass|i_code|sm2pass|用户|用户名|账号|账户|学号|工号|密码|验证码|身份)/i.test(fieldHints);
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(record)) {
+    if (key === 'value' && (!options.includeValues || isSensitiveBrowserField)) {
+      out[key] = raw ? BROWSER_REDACTION_MASK : raw;
+      continue;
+    }
+    if (/password|passwd|pwd|secret|token|cookie|authorization|session|access[-_]?key|api[-_]?key|ticket|finger/i.test(key)) {
+      out[key] = raw ? BROWSER_REDACTION_MASK : raw;
+      continue;
+    }
+    out[key] = redactSensitiveObject(raw, options);
+  }
+  return out;
+}
+
+function filterTextByTerms(value: string, terms: string[]): string {
+  if (terms.length === 0) return value;
+  const parts = value.includes('\n')
+    ? value.split(/\r?\n/)
+    : value.split(/(?<=[。！？.!?])\s*/);
+  const kept = parts.filter((part) => textMatchesTerms(part, terms));
+  return kept.length > 0 ? kept.join('\n') : '';
+}
+
+function processBrowserExtractResult(
+  result: BrowserExtractResult,
+  options: { terms: string[]; redact: boolean; includeValues: boolean; maxChars: number }
+): BrowserExtractResult {
+  let content = result.content;
+  if (result.format === 'json') {
+    try {
+      const parsed = JSON.parse(content) as Record<string, unknown>;
+      if (typeof parsed.text === 'string') parsed.text = filterTextByTerms(parsed.text, options.terms);
+      if (Array.isArray(parsed.headings)) parsed.headings = parsed.headings.filter((item) => textMatchesTerms(item, options.terms));
+      if (Array.isArray(parsed.links)) parsed.links = parsed.links.filter((item) => textMatchesTerms(item, options.terms));
+      const processed = options.redact ? redactSensitiveObject(parsed, { includeValues: options.includeValues }) : parsed;
+      content = JSON.stringify(processed, null, 2);
+    } catch {
+      content = filterTextByTerms(content, options.terms);
+      if (options.redact) content = redactSensitiveText(content);
+    }
+  } else {
+    content = filterTextByTerms(content, options.terms);
+    if (options.redact) content = redactSensitiveText(content);
+  }
+  return { ...result, content: content.slice(0, options.maxChars) };
+}
+
+function processBrowserSnapshotResult(
+  result: BrowserSnapshotResult,
+  options: { terms: string[]; redact: boolean; includeValues: boolean; maxChars: number }
+): BrowserSnapshotResult {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(result.content) as Record<string, unknown>;
+  } catch {
+    const content = options.redact ? redactSensitiveText(filterTextByTerms(result.content, options.terms)) : filterTextByTerms(result.content, options.terms);
+    return { ...result, content: content.slice(0, options.maxChars), truncated: result.truncated || content.length > options.maxChars };
+  }
+  const keep = (item: unknown) => textMatchesTerms(item, options.terms);
+  if (options.terms.length > 0) {
+    if (typeof parsed.snapshot === 'string') parsed.snapshot = filterTextByTerms(parsed.snapshot, options.terms);
+    for (const key of ['elements', 'headings', 'links', 'images', 'tree']) {
+      if (Array.isArray(parsed[key])) parsed[key] = parsed[key].filter(keep);
+    }
+  }
+  const processed = options.redact ? redactSensitiveObject(parsed, { includeValues: options.includeValues }) : parsed;
+  const content = JSON.stringify(processed, null, 2);
+  return {
+    ...result,
+    content: content.slice(0, options.maxChars),
+    truncated: result.truncated || content.length > options.maxChars
+  };
 }
 
 function renderBrowserClickResult(result: BrowserClickResult): string {
@@ -515,7 +642,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
           type: 'object',
           properties: {
             url: { type: 'string', description: 'Target URL. Accepts full URL or hostname.' },
-            timeout_ms: { type: 'number', description: 'Optional load timeout in milliseconds.' }
+            timeout_ms: { type: 'number', description: 'Optional load timeout in milliseconds. Use up to 300000 when the user may need to complete login, captcha, or MFA in the browser.' }
           },
           required: ['url']
         }
@@ -527,7 +654,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const obj = objectArgs(args);
       const url = stringArg(obj, 'url').trim();
       if (!url) return { ok: false, content: 'url is required.' };
-      const state = await access.browser.open(url, { timeoutMs: numberArg(obj, 'timeout_ms', 20000) });
+      const state = await access.browser.open(url, { timeoutMs: numberArg(obj, 'timeout_ms', BROWSER_DEFAULT_TIMEOUT_MS) });
       return { ok: true, content: withBrowserPreview(`Opened ${state.url}.`, state), data: state };
     }
   };
@@ -563,7 +690,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             selector: { type: 'string', description: 'CSS selector for the target element.' },
             index: { type: 'number', description: 'Zero-based index when selector matches multiple elements.' },
             wait_for_navigation: { type: 'boolean', description: 'Wait for page navigation after clicking.' },
-            timeout_ms: { type: 'number', description: 'Navigation wait timeout in milliseconds.' },
+            timeout_ms: { type: 'number', description: 'Navigation wait timeout in milliseconds. Use a longer timeout when a click leads to login, captcha, or MFA.' },
             observe_ms: { type: 'number', description: 'Short post-click observation window for DOM changes or new targets. Defaults to 500 ms.' }
           },
           required: ['selector']
@@ -579,7 +706,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const state = await access.browser.click(selector, {
         index: numberArg(obj, 'index', 0),
         waitForNavigation: booleanArg(obj, 'wait_for_navigation', false),
-        timeoutMs: numberArg(obj, 'timeout_ms', 20000),
+        timeoutMs: numberArg(obj, 'timeout_ms', BROWSER_DEFAULT_TIMEOUT_MS),
         observeMs: numberArg(obj, 'observe_ms', 500)
       });
       return { ok: true, content: renderBrowserClickResult(state), data: state };
@@ -664,19 +791,22 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         parameters: {
           type: 'object',
           properties: {
-            ms: { type: 'number', description: 'Milliseconds to wait.' },
+            ms: { type: 'number', description: 'Milliseconds to wait. Long waits without other conditions return early when the page changes.' },
             selector: { type: 'string', description: 'Wait until this selector condition is satisfied.' },
             text: { type: 'string', description: 'Wait until this text appears in the page body.' },
             url: { type: 'string', description: 'Wait until the current URL contains this text or matches a * glob.' },
             state: { type: 'string', enum: ['attached', 'visible', 'hidden', 'detached'], description: 'Selector state to wait for.' },
             load_state: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle'], description: 'Wait for page load settling.' },
             function: { type: 'string', description: 'JavaScript boolean expression to poll, such as window.ready === true.' },
-            timeout_ms: { type: 'number', description: 'Timeout for selector waiting.' }
+            until_changed: { type: 'boolean', description: 'Return as soon as URL, title, or visible page text changes. Useful after asking the user to complete login.' },
+            until_logged_in: { type: 'boolean', description: 'Return as soon as the page appears past credential entry, such as an SSO confirmation/authorization page or non-login destination.' },
+            wait_for_user: { type: 'boolean', description: 'Use when the browser is waiting for the user to type credentials, captcha, or MFA. Keeps the browser open and returns the current page instead of failing if the user has not finished before timeout.' },
+            timeout_ms: { type: 'number', description: 'Timeout for selector/text/URL waiting. For manual login, captcha, or MFA, use up to 300000 ms.' }
           }
         }
       }
     },
-    async execute(args) {
+    async execute(args, context) {
       const access = requireBrowserAutomation();
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
@@ -688,18 +818,42 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const stateRaw = stringArg(obj, 'state', '').trim();
       const selectorState = stateRaw === 'visible' || stateRaw === 'hidden' || stateRaw === 'detached' ? stateRaw : 'attached';
       const fn = stringArg(obj, 'function', '').trim() || undefined;
+      const hasCondition = Boolean(selector || text || url || loadState || fn);
       const ms = numberArg(obj, 'ms', selector || text || url || loadState || fn ? 0 : 250);
-      const pageState = await access.browser.wait({
-        ms,
+      const timeoutMs = numberArg(obj, 'timeout_ms', BROWSER_MANUAL_LOGIN_TIMEOUT_MS);
+      const untilChanged = booleanArg(obj, 'until_changed', (!hasCondition && ms >= 5000) || timeoutMs > BROWSER_DEFAULT_TIMEOUT_MS);
+      const untilLoggedIn = booleanArg(obj, 'until_logged_in', timeoutMs > BROWSER_DEFAULT_TIMEOUT_MS);
+      const explicitUntilLoggedIn = Object.prototype.hasOwnProperty.call(obj, 'until_logged_in') && untilLoggedIn;
+      const waitForUser = booleanArg(obj, 'wait_for_user', false);
+      const manualUserWait = waitForUser || explicitUntilLoggedIn || (!hasCondition && ms >= 5000);
+      if (manualUserWait) {
+        deps.setBrowserClosePolicy?.(context.sessionId, 'keep_open', 'waiting for user login, captcha, or MFA in browser');
+      }
+      const waitOptions: Parameters<BrowserAutomation['wait']>[0] = {
+        ms: untilChanged ? 0 : ms,
         selector,
         text,
         url,
         state: selectorState,
         loadState,
         function: fn,
-        timeoutMs: numberArg(obj, 'timeout_ms', 20000)
-      });
-      return { ok: true, content: withBrowserPreview(`Wait completed.${selector ? ` selector=${selector}` : ''}`, pageState), data: pageState };
+        untilChanged,
+        untilLoggedIn,
+        timeoutMs: untilChanged && ms > 0 ? ms : timeoutMs
+      };
+      let pageState: BrowserPageState;
+      let stillWaitingForUser = false;
+      try {
+        pageState = await access.browser.wait(waitOptions);
+      } catch (error) {
+        if (!manualUserWait || !/timed out waiting/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        stillWaitingForUser = true;
+        pageState = await access.browser.state();
+      }
+      const message = stillWaitingForUser
+        ? 'Waiting for user input in the browser. The browser is kept open; ask the user to enter credentials/captcha/MFA and continue in this same session.'
+        : `Wait completed.${selector ? ` selector=${selector}` : ''}`;
+      return { ok: true, content: withBrowserPreview(message, pageState), data: pageState };
     }
   };
 
@@ -715,7 +869,10 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
           properties: {
             selector: { type: 'string', description: 'Optional CSS selector to scope extraction.' },
             format: { type: 'string', enum: ['html', 'json'] },
-            max_chars: { type: 'number', description: 'Maximum characters to return.' }
+            max_chars: { type: 'number', description: 'Maximum characters to return.' },
+            filter_text: { type: 'string', description: 'Optional comma-separated keywords. When set, return only matching page text/headings/links to reduce token use.' },
+            redact_sensitive: { type: 'boolean', description: 'Redact common sensitive data such as emails, phone numbers, ID numbers, auth tokens, cookies, and secrets. Defaults to true.' },
+            include_values: { type: 'boolean', description: 'Include non-sensitive form/control value fields in output. Defaults to false; sensitive fields are always masked as xxxx.' }
           }
         }
       }
@@ -726,6 +883,9 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const obj = objectArgs(args);
       const selector = stringArg(obj, 'selector', '').trim() || undefined;
       const maxChars = numberArg(obj, 'max_chars', 8000);
+      const terms = filterTerms(stringArg(obj, 'filter_text', ''));
+      const redact = booleanArg(obj, 'redact_sensitive', true);
+      const includeValues = booleanArg(obj, 'include_values', false);
       const formatRaw = stringArg(obj, 'format', 'json').toLowerCase();
       const format = formatRaw === 'html' ? 'html' : 'json';
       let extracted = await access.browser.extract({
@@ -744,6 +904,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
           });
         }
       }
+      extracted = processBrowserExtractResult(extracted, { terms, redact, includeValues, maxChars });
       return { ok: true, content: renderBrowserExtractResult(extracted), data: extracted };
     }
   };
@@ -760,7 +921,10 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
           properties: {
             selector: { type: 'string', description: 'Optional CSS selector or @e ref to scope the snapshot.' },
             max_elements: { type: 'number', description: 'Maximum elements to include. Omit to include all discovered elements.' },
-            max_chars: { type: 'number', description: 'Maximum characters to return. Defaults to a large snapshot budget.' }
+            max_chars: { type: 'number', description: 'Maximum characters to return. Defaults to a large snapshot budget.' },
+            filter_text: { type: 'string', description: 'Optional comma-separated keywords. When set, keep only matching elements/headings/links/images/tree lines to reduce token use.' },
+            redact_sensitive: { type: 'boolean', description: 'Redact common sensitive data such as emails, phone numbers, ID numbers, auth tokens, cookies, and secrets. Defaults to true.' },
+            include_values: { type: 'boolean', description: 'Include non-sensitive form/control value fields in output. Defaults to false; sensitive fields are always masked as xxxx.' }
           }
         }
       }
@@ -770,12 +934,19 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       if (!access.ok) return access.result;
       const obj = objectArgs(args);
       const hasMaxElements = Object.prototype.hasOwnProperty.call(obj, 'max_elements');
+      const maxChars = numberArg(obj, 'max_chars', 100000);
       const result = await access.browser.snapshot({
         selector: stringArg(obj, 'selector', '').trim() || undefined,
         maxElements: hasMaxElements ? numberArg(obj, 'max_elements', 0) : undefined,
-        maxChars: numberArg(obj, 'max_chars', 100000)
+        maxChars
       });
-      return { ok: true, content: result.content, data: result };
+      const processed = processBrowserSnapshotResult(result, {
+        terms: filterTerms(stringArg(obj, 'filter_text', '')),
+        redact: booleanArg(obj, 'redact_sensitive', true),
+        includeValues: booleanArg(obj, 'include_values', false),
+        maxChars
+      });
+      return { ok: true, content: processed.content, data: processed };
     }
   };
 
@@ -797,7 +968,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             exact: { type: 'boolean', description: 'Use exact text matching.' },
             index: { type: 'number', description: 'Zero-based match index.' },
             wait_for_navigation: { type: 'boolean', description: 'Wait after click-like actions.' },
-            timeout_ms: { type: 'number', description: 'Navigation wait timeout.' }
+            timeout_ms: { type: 'number', description: 'Navigation wait timeout. Use a longer timeout when the action leads to login, captcha, or MFA.' }
           },
           required: ['by', 'value']
         }
@@ -840,7 +1011,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         exact: booleanArg(obj, 'exact', false),
         index: numberArg(obj, 'index', 0),
         waitForNavigation: booleanArg(obj, 'wait_for_navigation', false),
-        timeoutMs: numberArg(obj, 'timeout_ms', 20000)
+        timeoutMs: numberArg(obj, 'timeout_ms', BROWSER_DEFAULT_TIMEOUT_MS)
       });
       return {
         ok: true,
@@ -966,6 +1137,49 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
         text: typeof obj.text === 'string' ? obj.text : undefined
       });
       return { ok: true, content: withBrowserPreview(`Pressed key: ${key}`, state), data: state };
+    }
+  };
+
+  const browserUploadFile: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_upload_file',
+        description: 'Set one or more local files on an input[type=file] element in the browser automation session, including hidden file inputs. Use this for webpage uploads such as invoices or reimbursement attachments. Do not use browser_eval/JavaScript to simulate local file selection.',
+        parameters: {
+          type: 'object',
+          properties: {
+            selector: { type: 'string', description: 'CSS selector or @e ref for the target input[type=file]. Defaults to input[type=file]. Use browser_snapshot or browser_find first when multiple inputs exist.' },
+            path: { type: 'string', description: 'Workspace-relative or absolute local file path to upload.' },
+            paths: { type: 'array', items: { type: 'string' }, description: 'Optional multiple file paths. Use only when the file input supports multiple files.' },
+            index: { type: 'number', description: 'Zero-based index when selector matches multiple file inputs.' }
+          }
+        }
+      }
+    },
+    async execute(args) {
+      const access = requireBrowserAutomation();
+      if (!access.ok) return access.result;
+      const cfg = deps.getConfig();
+      const obj = objectArgs(args);
+      const selector = stringArg(obj, 'selector', 'input[type=file]').trim() || 'input[type=file]';
+      const rawPaths = Array.isArray(obj.paths)
+        ? obj.paths.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        : [stringArg(obj, 'path')].filter(Boolean);
+      if (rawPaths.length === 0) return { ok: false, content: 'path or paths is required.' };
+      const files = rawPaths.map((item) => resolveToolPath(cfg.workspaceDir, item));
+      for (const file of files) {
+        if (!existsSync(file)) return { ok: false, content: `Upload file not found: ${file}` };
+        if (!statSync(file).isFile()) return { ok: false, content: `Upload path is not a file: ${file}` };
+      }
+      const state = await access.browser.uploadFile(selector, files, { index: numberArg(obj, 'index', 0) });
+      const labels = files.map((file) => isPathInside(cfg.workspaceDir, file) ? relative(cfg.workspaceDir, file) : file);
+      return {
+        ok: true,
+        content: withBrowserPreview(`Uploaded ${labels.length} file(s) to ${selector}: ${labels.join(', ')}`, state),
+        data: state
+      };
     }
   };
 
@@ -1230,6 +1444,36 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     }
   };
 
+  const browserClosePolicy: RegisteredTool = {
+    safety: 'stateful',
+    definition: {
+      type: 'function',
+      function: {
+        name: 'browser_close_policy',
+        description: 'Set whether the current browser should auto-close when this run finishes. Use keep_open for form filling, submissions, approvals, account changes, or any workflow where the user may need to review the final browser state. Use auto_close for read-only data lookup/extraction tasks.',
+        parameters: {
+          type: 'object',
+          properties: {
+            policy: { type: 'string', enum: ['auto_close', 'keep_open'], description: 'Browser close behavior for the current run.' },
+            reason: { type: 'string', description: 'Short reason for the policy.' }
+          },
+          required: ['policy']
+        }
+      }
+    },
+    async execute(args, context) {
+      const obj = objectArgs(args);
+      const rawPolicy = stringArg(obj, 'policy', 'auto_close');
+      const policy = rawPolicy === 'keep_open' ? 'keep_open' : 'auto_close';
+      const reason = stringArg(obj, 'reason', '').trim() || undefined;
+      deps.setBrowserClosePolicy?.(context.sessionId, policy, reason);
+      return {
+        ok: true,
+        content: `Browser close policy set to ${policy}${reason ? `: ${reason}` : '.'}`
+      };
+    }
+  };
+
   const terminal: RegisteredTool = {
     safety: 'executes-command',
     definition: {
@@ -1315,6 +1559,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     browserSelect,
     browserCheck,
     browserPress,
+    browserUploadFile,
     browserScreenshot,
     browserPdf,
     browserStorage,
@@ -1323,6 +1568,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
     browserNetwork,
     browserEval,
     browserViewport,
+    browserClosePolicy,
     browserClose,
     terminal,
     diagnostics

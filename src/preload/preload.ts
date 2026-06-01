@@ -8,6 +8,7 @@ import type {
   BrowserCoachGenerateSkillResult,
   BrowserCoachRecording,
   BrowserCoachStartRequest,
+  BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -17,6 +18,9 @@ import type {
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
   SessionDocumentUploadRequest,
+  SessionMessageContentRequest,
+  SessionToolEventContentRequest,
+  SkillOptimizationRunRequest,
   SessionUpdateEvent,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
@@ -40,6 +44,7 @@ const api = {
   agent: {
     chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]) =>
       ipcRenderer.invoke('agent:chat', input, sessionId, executionMode, usePersonalKnowledgeBase, attachments),
+    optimizeSkills: (req: SkillOptimizationRunRequest) => ipcRenderer.invoke('agent:optimizeSkills', req),
     stop: () => ipcRenderer.invoke('agent:stop'),
     onToolEvent: (listener: (payload: AgentToolEventStream) => void) => {
       const channel = 'agent:tool-event';
@@ -66,6 +71,9 @@ const api = {
   sessions: {
     list: () => ipcRenderer.invoke('sessions:list'),
     read: (id: string) => ipcRenderer.invoke('sessions:read', id),
+    readForDisplay: (id: string) => ipcRenderer.invoke('sessions:readForDisplay', id),
+    readMessageContent: (req: SessionMessageContentRequest) => ipcRenderer.invoke('sessions:readMessageContent', req),
+    readToolEventContent: (req: SessionToolEventContentRequest) => ipcRenderer.invoke('sessions:readToolEventContent', req),
     delete: (id: string) => ipcRenderer.invoke('sessions:delete', id),
     rename: (id: string, title: string) => ipcRenderer.invoke('sessions:rename', id, title),
     search: (query: string) => ipcRenderer.invoke('sessions:search', query),
@@ -109,6 +117,9 @@ const api = {
     stop: () => ipcRenderer.invoke('browser-coach:stop') as Promise<BrowserCoachRecording>,
     status: () => ipcRenderer.invoke('browser-coach:status') as Promise<BrowserCoachRecording>,
     clear: () => ipcRenderer.invoke('browser-coach:clear') as Promise<BrowserCoachRecording>,
+    listRecordings: () => ipcRenderer.invoke('browser-coach:listRecordings') as Promise<BrowserCoachStoredRecording[]>,
+    loadRecording: (skillName: string) => ipcRenderer.invoke('browser-coach:loadRecording', skillName) as Promise<BrowserCoachRecording | null>,
+    deleteRecording: (recordingId: string) => ipcRenderer.invoke('browser-coach:deleteRecording', recordingId) as Promise<boolean>,
     generateSkill: (req: BrowserCoachGenerateSkillRequest) => ipcRenderer.invoke('browser-coach:generateSkill', req) as Promise<BrowserCoachGenerateSkillResult>
   },
   tasks: {

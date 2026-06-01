@@ -11,12 +11,14 @@ import type {
   BrowserPageState,
   BrowserSnapshotElement,
   BrowserSnapshotResult,
-  BrowserStorageResult
+  BrowserStorageResult,
+  BrowserUploadFileResult
 } from '../tools/browserAutomation.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../../shared/browserConstants.js';
 import { resolveAppWindowIconPath } from '../appIcon.js';
 
-const DEFAULT_TIMEOUT_MS = 20000;
+const DEFAULT_TIMEOUT_MS = 60000;
+const MAX_TIMEOUT_MS = 300000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
 const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
 const DEFAULT_SNAPSHOT_MAX_CHARS = 100000;
@@ -302,7 +304,10 @@ export function pageHelpers(): string {
         if (target) item.target = target;
         const onclick = el.getAttribute("onclick");
         if (onclick) item.onclick = clip(onclick, 500);
-        if ("value" in el && typeof el.value !== "undefined") item.value = clip(String(el.value || ""), 240);
+        if ("value" in el && typeof el.value !== "undefined") {
+          const type = String(el.getAttribute("type") || "").toLowerCase();
+          item.value = type === "password" ? (el.value ? "[password filled]" : "") : clip(String(el.value || ""), 240);
+        }
         const placeholder = el.getAttribute("placeholder");
         if (placeholder) item.placeholder = placeholder;
         const label = labelFor(el);
@@ -440,7 +445,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
   }
 
   async open(url: string, options?: { timeoutMs?: number }): Promise<BrowserPageState> {
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000);
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS);
     const target = normalizeUrl(url);
     const wc = this.getTargetWebContents();
     await Promise.race([
@@ -455,7 +460,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
   }
 
   async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number; observeMs?: number }): Promise<BrowserClickResult> {
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000);
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS);
     const observeMs = clampInt(Number(options?.observeMs), options?.waitForNavigation ? 150 : 500, 0, 5000);
     const index = clampInt(Number(options?.index), 0, 0, 9999);
     const sel = selector.trim();
@@ -556,21 +561,27 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     state?: 'attached' | 'visible' | 'hidden' | 'detached';
     loadState?: 'load' | 'domcontentloaded' | 'networkidle';
     function?: string;
+    untilChanged?: boolean;
+    untilLoggedIn?: boolean;
     timeoutMs?: number;
   }): Promise<BrowserPageState> {
-    const ms = clampInt(Number(options?.ms), 0, 0, 60000);
+    const ms = clampInt(Number(options?.ms), 0, 0, MAX_TIMEOUT_MS);
     const selector = options?.selector?.trim() ?? '';
     const text = options?.text?.trim() ?? '';
     const url = options?.url?.trim() ?? '';
     const state = options?.state ?? 'attached';
     const loadState = options?.loadState;
     const fn = options?.function?.trim() ?? '';
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, 120000);
-    if (!selector && !text && !url && !loadState && !fn && ms <= 0) throw new Error('Provide ms, selector, text, url, load_state, or function.');
+    const untilChanged = options?.untilChanged === true;
+    const untilLoggedIn = options?.untilLoggedIn === true;
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, MAX_TIMEOUT_MS);
+    if (!selector && !text && !url && !loadState && !fn && !untilChanged && !untilLoggedIn && ms <= 0) throw new Error('Provide ms, selector, text, url, load_state, function, until_changed, or until_logged_in.');
+    const initialSignature = untilChanged ? await this.pageChangeSignature().catch(() => '') : '';
     if (ms > 0) await sleep(ms);
     if (loadState) await this.waitForIdle(timeoutMs, this.getTargetWebContents());
-    if (!selector && !text && !url && !fn) return this.state();
+    if (!selector && !text && !url && !fn && !untilChanged && !untilLoggedIn) return this.state();
 
+    const hasPredicate = Boolean(selector || text || url || fn);
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       const ok = await this.evalInPage<boolean>(
@@ -616,7 +627,12 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
           return true;
         })();`
       );
-      if (ok) return this.state();
+      if (hasPredicate && ok) return this.state();
+      if (untilChanged) {
+        const currentSignature = await this.pageChangeSignature().catch(() => '');
+        if (currentSignature && currentSignature !== initialSignature) return this.state();
+      }
+      if (untilLoggedIn && await this.loginCompletionDetected().catch(() => false)) return this.state();
       await sleep(150);
     }
     throw new Error(`Timed out waiting for browser condition after ${timeoutMs} ms.`);
@@ -765,7 +781,10 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
             if (ref) item.ref = ref;
             if ("checked" in node) item.state = node.checked ? "checked" : "unchecked";
             if (node.getAttribute("aria-expanded")) item.state = "expanded=" + node.getAttribute("aria-expanded");
-            if ("value" in node && node.value) item.value = String(node.value).slice(0, 160);
+            if ("value" in node && node.value) {
+              const type = String(node.getAttribute("type") || "").toLowerCase();
+              item.value = type === "password" ? "[password filled]" : String(node.value).slice(0, 160);
+            }
             const href = node.getAttribute("href");
             if (href) {
               try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
@@ -861,7 +880,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
       })();`
     );
     if (!result.ok) throw new Error(result.error || 'Find failed.');
-    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000), this.getTargetWebContents());
+    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS), this.getTargetWebContents());
     return { ...(await this.state()), ref: result.ref, selector: result.selector, text: result.text, element: result.element };
   }
 
@@ -947,6 +966,28 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     wc.sendInputEvent({ type: 'keyDown', keyCode: normalized.keyCode, modifiers: normalized.modifiers });
     wc.sendInputEvent({ type: 'keyUp', keyCode: normalized.keyCode, modifiers: normalized.modifiers });
     return this.state();
+  }
+
+  async uploadFile(selector: string, files: string[], options?: { index?: number }): Promise<BrowserUploadFileResult> {
+    const sel = selector.trim();
+    if (!sel) throw new Error('selector is required.');
+    if (files.length === 0) throw new Error('At least one file path is required.');
+    const index = clampInt(Number(options?.index), 0, 0, 9999);
+    const wc = this.getTargetWebContents();
+    const objectId = await this.resolveElementObjectId(wc, sel, index);
+    await this.sendDebuggerCommand(wc, 'DOM.setFileInputFiles', { objectId, files });
+    const result = await this.evalInPage<{ multiple: boolean }>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return { multiple: Boolean(el.multiple) };
+      })();`
+    );
+    return { ...(await this.state()), selector: sel, files, multiple: result.multiple };
   }
 
   async screenshot(): Promise<BrowserBinaryResult> {
@@ -1254,6 +1295,44 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return wc.executeJavaScript(script, true) as Promise<T>;
   }
 
+  private async resolveElementObjectId(wc: WebContents, selector: string, index: number): Promise<string> {
+    const result = await this.sendDebuggerCommand(wc, 'Runtime.evaluate', {
+      expression: `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        if (!(el instanceof HTMLInputElement) || String(el.type || "").toLowerCase() !== "file") throw new Error("Target is not a file input.");
+        if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        return el;
+      })();`,
+      awaitPromise: true,
+      returnByValue: false
+    }) as { result?: { objectId?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'Runtime.evaluate failed.');
+    }
+    const objectId = result.result?.objectId;
+    if (!objectId) throw new Error(`Could not resolve file input for selector: ${selector}`);
+    return objectId;
+  }
+
+  private async sendDebuggerCommand(wc: WebContents, method: string, params: Record<string, unknown>): Promise<unknown> {
+    const wasAttached = wc.debugger.isAttached();
+    if (!wasAttached) wc.debugger.attach('1.3');
+    try {
+      return await wc.debugger.sendCommand(method, params);
+    } finally {
+      if (!wasAttached && wc.debugger.isAttached()) {
+        try {
+          wc.debugger.detach();
+        } catch {
+          // Ignore detach races when the page closes.
+        }
+      }
+    }
+  }
+
   private async installPageErrorCapture(): Promise<void> {
     await this.evalInPage(
       `(function () {
@@ -1291,5 +1370,44 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
       await sleep(100);
     }
     throw new Error(`Page did not finish loading within ${timeoutMs} ms.`);
+  }
+
+  private async pageChangeSignature(): Promise<string> {
+    return this.evalInPage<string>(
+      `(function () {
+        const text = String((document.body && (document.body.innerText || document.body.textContent)) || "")
+          .replace(/\\s+/g, " ")
+          .trim();
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        return [location.href, document.title || "", text.length, hash].join("\\n");
+      })();`
+    );
+  }
+
+  private async loginCompletionDetected(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const visiblePasswords = Array.from(document.querySelectorAll('input[type="password"]')).filter(visible);
+        const filledPassword = visiblePasswords.some((el) => String(el.value || "").length > 0);
+        const filledAccount = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter(visible)
+          .some((el) => String(el.value || "").trim().length > 0);
+        if (filledPassword && (filledAccount || visiblePasswords.length === 1)) return true;
+        if (visiblePasswords.length > 0) return false;
+        const text = TasiBrowser.normalizeText((document.body && (document.body.innerText || document.body.textContent)) || "");
+        const loweredUrl = location.href.toLowerCase();
+        const loweredTitle = String(document.title || "").toLowerCase();
+        const looksLikeLoginUrl = /\\/login\\b|\\/auth\\b|sso|cas|oauth|signin|logon/.test(loweredUrl);
+        const continuation = /(即将登录|确认登录|继续登录|授权|允许访问|同意授权|继续|进入系统|进入门户|continue|authorize|allow access|consent)/i.test(text);
+        const signedIn = /(退出登录|注销|个人中心|用户中心|我的|控制台|工作台|首页|信息门户|dashboard|portal|logout|sign out|my account)/i.test(text + " " + loweredTitle);
+        if (continuation || signedIn) return true;
+        return !looksLikeLoginUrl && text.length > 0;
+      })();`
+    );
   }
 }

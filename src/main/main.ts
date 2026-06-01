@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -13,7 +13,9 @@ import type {
   AssistantMessageExportRequest,
   AppConfig,
   BrowserCoachGenerateSkillRequest,
+  BrowserCoachRecording,
   BrowserCoachStartRequest,
+  BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   ToolEvent,
@@ -29,6 +31,7 @@ import type {
   SessionUpdateEvent,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
+  SkillOptimizationRunRequest,
   SkillPatchRequest,
   SkillWriteRequest,
   ToolRunRequest,
@@ -47,7 +50,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 let mainWindow: BrowserWindow | null = null;
 let devToolsWindow: BrowserWindow | null = null;
 const context = new AppContext();
-const browserCoachRecorder = new BrowserCoachRecorder(join(__dirname, '..', 'preload', 'browserCoachPreload.js'));
+const browserCoachRecorder = new BrowserCoachRecorder(
+  join(__dirname, '..', 'preload', 'browserCoachPreload.js'),
+  (recording) => {
+    saveStoppedBrowserCoachRecording(recording);
+  }
+);
 let embeddedPreviewWebContentsId: number | null = null;
 let isAppQuitting = false;
 let lastExternalBrowserOpen: { url: string; at: number } | null = null;
@@ -396,6 +404,90 @@ function listFilesRecursively(rootDir: string): string[] {
     }
   }
   return files;
+}
+
+function browserCoachRecordingsDir(): string {
+  const dir = join(context.harnessHome, 'coach records');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function safeRecordingFilePart(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'recording';
+}
+
+function normalizeBrowserCoachStartUrl(input: string | undefined): string {
+  const trimmed = input?.trim() || 'https://www.baidu.com';
+  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:/.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
+function parseBrowserCoachRecording(raw: string): BrowserCoachRecording | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<BrowserCoachRecording>;
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.events)) return null;
+    return {
+      id: typeof parsed.id === 'string' ? parsed.id : '',
+      startUrl: typeof parsed.startUrl === 'string' ? parsed.startUrl : '',
+      startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '',
+      endedAt: typeof parsed.endedAt === 'string' ? parsed.endedAt : undefined,
+      active: Boolean(parsed.active),
+      events: parsed.events
+    } as BrowserCoachRecording;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoppedBrowserCoachRecording(recording: BrowserCoachRecording): string | null {
+  if (recording.events.length === 0) return null;
+  const stamp = safeRecordingFilePart(recording.startedAt || nowIso());
+  const id = safeRecordingFilePart(recording.id || createId('browser_coach'));
+  const file = join(browserCoachRecordingsDir(), `${stamp}-${id}.json`);
+  writeFileSync(file, `${JSON.stringify({ ...recording, active: false }, null, 2)}\n`, 'utf8');
+  return file;
+}
+
+function standaloneBrowserCoachRecordingSummary(file: string): BrowserCoachStoredRecording | null {
+  const recording = parseBrowserCoachRecording(readFileSync(file, 'utf8'));
+  if (!recording) return null;
+  const stat = statSync(file);
+  const fileId = basename(file, '.json');
+  return {
+    id: `recording:${fileId}`,
+    source: 'recording',
+    skillName: fileId,
+    displayName: `Recorded trace ${recording.startedAt || fileId}`,
+    category: 'browser',
+    displayCategory: 'Browser',
+    path: file,
+    startUrl: recording.startUrl,
+    startedAt: recording.startedAt,
+    updatedAt: stat.mtime.toISOString(),
+    eventCount: recording.events.length
+  };
+}
+
+function listStandaloneBrowserCoachRecordings(): BrowserCoachStoredRecording[] {
+  return readdirSync(browserCoachRecordingsDir())
+    .filter((name) => name.toLowerCase().endsWith('.json'))
+    .map((name) => standaloneBrowserCoachRecordingSummary(join(browserCoachRecordingsDir(), name)))
+    .filter((item): item is BrowserCoachStoredRecording => Boolean(item));
+}
+
+function readStandaloneBrowserCoachRecording(recordingId: string): BrowserCoachRecording | null {
+  const fileId = safeRecordingFilePart(recordingId.replace(/^recording:/, ''));
+  const file = join(browserCoachRecordingsDir(), `${fileId}.json`);
+  if (!existsSync(file)) return null;
+  return parseBrowserCoachRecording(readFileSync(file, 'utf8'));
+}
+
+function deleteStandaloneBrowserCoachRecording(recordingId: string): boolean {
+  const fileId = safeRecordingFilePart(recordingId.replace(/^recording:/, ''));
+  const file = join(browserCoachRecordingsDir(), `${fileId}.json`);
+  if (!existsSync(file)) return false;
+  rmSync(file, { force: true });
+  return true;
 }
 
 async function importKnowledgeBuffer(
@@ -1484,6 +1576,85 @@ function latestWebPreviewUrlFromEvents(events: ToolEvent[], fallbackOnly = false
   return latest;
 }
 
+function eventArgsObject(event: ToolEvent): Record<string, unknown> {
+  return typeof event.args === 'object' && event.args !== null && !Array.isArray(event.args)
+    ? event.args as Record<string, unknown>
+    : {};
+}
+
+function browserPolicyFromToolEvents(events: ToolEvent[]): 'auto_close' | 'keep_open' | undefined {
+  for (const event of [...events].reverse()) {
+    if (event.toolName !== 'browser_close_policy' || !event.ok) continue;
+    const policy = eventArgsObject(event).policy;
+    return policy === 'keep_open' ? 'keep_open' : 'auto_close';
+  }
+  return undefined;
+}
+
+function isBrowserFormMutationEvent(event: ToolEvent): boolean {
+  if (!event.ok) return false;
+  if (['browser_type', 'browser_select', 'browser_check'].includes(event.toolName)) return true;
+  if (event.toolName === 'browser_find') {
+    const action = String(eventArgsObject(event).action ?? '').toLowerCase();
+    if (['type', 'fill', 'select', 'check', 'uncheck'].includes(action)) return true;
+  }
+  if (event.toolName === 'browser_click' || event.toolName === 'browser_find') {
+    const combined = previewSourceText(event.toolName, event.args, event.content);
+    return /\b(submit|sign in|login|log in|confirm|continue|authorize|approve|save|apply|send|next)\b|提交|登录|确认|继续|授权|保存|申请|发送|下一步/.test(combined);
+  }
+  return false;
+}
+
+function isBrowserManualUserWaitEvent(event: ToolEvent): boolean {
+  if (!event.ok || event.toolName !== 'browser_wait') return false;
+  const args = eventArgsObject(event);
+  if (args.wait_for_user === true || args.until_logged_in === true) return true;
+  return /waiting for user input|credentials|captcha|mfa/i.test(event.content);
+}
+
+function isBrowserCredentialPromptEvent(event: ToolEvent): boolean {
+  if (!event.ok || !isWebPreviewEvent(event)) return false;
+  const combined = previewSourceText(event.toolName, event.args, event.content);
+  const hasCredentialInput = /\b(password|passwd|pwd|captcha|mfa|otp)\b|input\[type=["']?password|#?i_pass\b|#?i_code\b/i.test(combined);
+  const hasLoginContext = /\b(login|log in|sign in|signin|auth|sso|cas|oauth|account|username|user)\b|id\.tsinghua|#?i_user\b/i.test(combined);
+  return hasCredentialInput && hasLoginContext;
+}
+
+function isBrowserDataExtractionEvent(event: ToolEvent): boolean {
+  return event.ok && ['browser_extract', 'browser_pdf', 'browser_screenshot'].includes(event.toolName);
+}
+
+function inferKeepBrowserOpenFromEvents(events: ToolEvent[]): boolean {
+  let lastMutationIndex = -1;
+  let lastCredentialPromptIndex = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    if (isBrowserFormMutationEvent(events[index])) lastMutationIndex = index;
+    if (isBrowserManualUserWaitEvent(events[index]) || isBrowserCredentialPromptEvent(events[index])) {
+      lastCredentialPromptIndex = index;
+    }
+  }
+  if (lastCredentialPromptIndex >= 0) return true;
+  if (lastMutationIndex < 0) return false;
+  const extractedAfterMutation = events.slice(lastMutationIndex + 1).some(isBrowserDataExtractionEvent);
+  return !extractedAfterMutation;
+}
+
+function shouldKeepExternalBrowserOpen(sessionId: string | undefined, events: ToolEvent[]): boolean {
+  const explicit = browserPolicyFromToolEvents(events);
+  const stored = sessionId ? context.consumeBrowserClosePolicy(sessionId) : undefined;
+  if (explicit) return explicit === 'keep_open';
+  if (stored) return stored.policy === 'keep_open';
+  return inferKeepBrowserOpenFromEvents(events);
+}
+
+async function closeExternalBrowserPreviewAfterRun(sessionId: string | undefined, events: ToolEvent[]): Promise<ToolExecutionResult> {
+  if (shouldKeepExternalBrowserOpen(sessionId, events)) {
+    lastExternalBrowserOpen = null;
+    return { ok: true, content: 'External browser kept open for form/submission workflow.' };
+  }
+  return closeExternalBrowserPreview();
+}
+
 async function maybeOpenExternalBrowser(url?: string): Promise<ToolExecutionResult> {
   if (!url) return { ok: false, content: 'No preview URL available to open.' };
   const config = context.getConfig();
@@ -1790,6 +1961,8 @@ function registerIpc(): void {
     if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
     const controller = new AbortController();
     activeChatControllers.set(senderId, controller);
+    let completedSessionId: string | undefined;
+    let completedToolEvents: ToolEvent[] = [];
     try {
       const result = await context.agentLoop.run({
         userInput: input,
@@ -1815,6 +1988,8 @@ function registerIpc(): void {
           });
         }
       });
+      completedSessionId = result.sessionId;
+      completedToolEvents = result.toolEvents;
       const followUpQuestions = await generateFollowUpQuestions(
         () => createLlmClient(context.getConfig()),
         context.getConfig(),
@@ -1840,7 +2015,82 @@ function registerIpc(): void {
     } finally {
       const active = activeChatControllers.get(senderId);
       if (active === controller) activeChatControllers.delete(senderId);
-      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreviewAfterRun(completedSessionId, completedToolEvents);
+    }
+  });
+
+  ipcMain.handle('agent:optimizeSkills', async (_event, req: SkillOptimizationRunRequest) => {
+    const prompt = req?.prompt?.trim();
+    const sessionIds = Array.isArray(req?.sessionIds) ? req.sessionIds.map((id) => id.trim()).filter(Boolean) : [];
+    if (!prompt) throw new Error('Message cannot be empty.');
+    if (sessionIds.length === 0) throw new Error('Select at least one session to optimize from.');
+    const senderId = _event.sender.id;
+    if (activeChatControllers.has(senderId)) throw new Error('A chat session is already running.');
+    const controller = new AbortController();
+    activeChatControllers.set(senderId, controller);
+    let completedSessionId: string | undefined;
+    let completedToolEvents: ToolEvent[] = [];
+    const selectedContext = context.sessionStore.buildOptimizationContext({ sessionIds });
+    const input = [
+      prompt,
+      'Selected session context:',
+      selectedContext.context,
+      [
+        'Skill optimization scope rules:',
+        `- Only use the selected sessions listed above: ${selectedContext.sessionIds.join(', ')}.`,
+        '- Do not search the whole session directory.',
+        '- The session_search tool is disabled for this optimization run to prevent unrelated or recursive session history from entering the model request.',
+        '- If the compact context is not enough, make a narrow skill improvement from the visible failure signals instead of broadening the session scope.'
+      ].join('\n')
+    ].join('\n\n');
+    try {
+      const cfg = context.getConfig();
+      const enabledToolNames = cfg.enabledToolNames.filter((name) => name !== 'session_search');
+      const result = await context.agentLoop.run({
+        userInput: input,
+        executionMode: req.executionMode,
+        usePersonalKnowledgeBase: false,
+        origin: 'chat',
+        signal: controller.signal,
+        enabledToolNames,
+        requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
+        onToolEvent: (eventSessionId, toolEvent) => {
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+          _event.sender.send('agent:tool-event', payload);
+        },
+        onMessageDelta: (_eventSessionId, messageDelta) => {
+          _event.sender.send('agent:message-delta', messageDelta);
+        },
+        onSessionUpdated: (record) => {
+          broadcastSessionUpdated({
+            sessionId: record.id,
+            source: 'chat',
+            updatedAt: record.updatedAt
+          });
+        }
+      });
+      completedSessionId = result.sessionId;
+      completedToolEvents = result.toolEvents;
+      const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
+      broadcastSessionUpdated({
+        sessionId: result.sessionId,
+        source: 'chat',
+        updatedAt: new Date().toISOString()
+      });
+      return { ...result, totalUsage: usageRecord.totalUsage };
+    } catch (error) {
+      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      logAgentChatError({
+        error,
+        input,
+        executionMode: req.executionMode,
+        attachments: []
+      });
+      throw new Error(error instanceof Error ? error.message : String(error));
+    } finally {
+      const active = activeChatControllers.get(senderId);
+      if (active === controller) activeChatControllers.delete(senderId);
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreviewAfterRun(completedSessionId, completedToolEvents);
     }
   });
 
@@ -1888,6 +2138,17 @@ function registerIpc(): void {
 
   ipcMain.handle('sessions:list', () => context.sessionStore.list());
   ipcMain.handle('sessions:read', (_event, id: string) => context.sessionStore.read(id));
+  ipcMain.handle('sessions:readForDisplay', (_event, id: string) => context.sessionStore.readForDisplay(id));
+  ipcMain.handle('sessions:readMessageContent', (_event, req: { sessionId: string; messageId: string }) => {
+    const result = context.sessionStore.readMessageContent(req.sessionId, req.messageId);
+    if (!result) throw new Error(`Message not found: ${req.messageId}`);
+    return result;
+  });
+  ipcMain.handle('sessions:readToolEventContent', (_event, req: { sessionId: string; toolEventId: string }) => {
+    const result = context.sessionStore.readToolEventContent(req.sessionId, req.toolEventId);
+    if (!result) throw new Error(`Tool event not found: ${req.toolEventId}`);
+    return result;
+  });
   ipcMain.handle('sessions:delete', (_event, id: string) => context.sessionStore.delete(id));
   ipcMain.handle('sessions:rename', (_event, id: string, title: string) => context.sessionStore.rename(id, title));
   ipcMain.handle('sessions:search', (_event, query: string) => context.sessionStore.search(query).map((r) => r.item));
@@ -1980,10 +2241,34 @@ function registerIpc(): void {
   ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));
   ipcMain.handle('skills:market:uninstall', (_event, name: string) => context.marketplaceManager.uninstall(name));
-  ipcMain.handle('browser-coach:start', (_event, req?: BrowserCoachStartRequest) => browserCoachRecorder.start(req));
-  ipcMain.handle('browser-coach:stop', () => browserCoachRecorder.stop());
+  ipcMain.handle('browser-coach:start', async (_event, req?: BrowserCoachStartRequest) => {
+    const config = context.getConfig();
+    if (config.browserMode === 'external') {
+      const url = normalizeBrowserCoachStartUrl(req?.url);
+      const result = await context.externalBrowserBridge.open(url, { ...config, externalBrowserEngine: 'cdp' });
+      if (!result.ok) throw new Error(result.content);
+      return browserCoachRecorder.startExternalCdp(req, {
+        endpoint: context.externalBrowserBridge.cdpEndpointHint(config),
+        targetId: context.externalBrowserBridge.activeCdpTargetId()
+      });
+    }
+    return browserCoachRecorder.start(req);
+  });
+  ipcMain.handle('browser-coach:stop', () => {
+    const recording = browserCoachRecorder.stop();
+    return recording;
+  });
   ipcMain.handle('browser-coach:status', () => browserCoachRecorder.status());
   ipcMain.handle('browser-coach:clear', () => browserCoachRecorder.clear());
+  ipcMain.handle('browser-coach:listRecordings', () => [
+    ...listStandaloneBrowserCoachRecordings()
+  ].sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')));
+  ipcMain.handle('browser-coach:loadRecording', (_event, recordingId: string) => (
+    readStandaloneBrowserCoachRecording(recordingId)
+  ));
+  ipcMain.handle('browser-coach:deleteRecording', (_event, recordingId: string) => (
+    deleteStandaloneBrowserCoachRecording(recordingId)
+  ));
   ipcMain.handle('browser-coach:generateSkill', async (_event, req: BrowserCoachGenerateSkillRequest) => browserCoachRecorder.generateSkill(
     req,
     context.skillManager,
@@ -2003,6 +2288,8 @@ function registerIpc(): void {
     const task = context.scheduledTaskStore.list().find((item) => item.id === id);
     if (!task) throw new Error(`Task not found: ${id}`);
     context.scheduledTaskStore.setRunning(id, true);
+    let completedSessionId: string | undefined;
+    let completedToolEvents: ToolEvent[] = [];
     try {
       const result = await context.agentLoop.run({
         userInput: task.prompt,
@@ -2011,6 +2298,8 @@ function registerIpc(): void {
         origin: 'scheduled',
         scheduledTaskId: task.id
       });
+      completedSessionId = result.sessionId;
+      completedToolEvents = result.toolEvents;
       const usageRecord = context.sessionStore.recordUsage(result.sessionId, result.usage);
       const updated = context.scheduledTaskStore.markRun(id, {
         sessionId: result.sessionId,
@@ -2060,7 +2349,7 @@ function registerIpc(): void {
       });
       throw error;
     } finally {
-      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreview();
+      if (context.getConfig().browserMode === 'external') await closeExternalBrowserPreviewAfterRun(completedSessionId, completedToolEvents);
     }
   });
 

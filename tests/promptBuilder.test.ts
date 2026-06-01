@@ -26,6 +26,8 @@ describe('PromptBuilder', () => {
 
     expect(prompt).toContain('Browser mode is external.');
     expect(prompt).toContain('In external browser mode, use browser_* tools as the default workflow');
+    expect(prompt).toContain('browser_close_policy');
+    expect(prompt).toContain('keep_open');
     expect(prompt).toContain('engine=auto');
     expect(prompt).toContain('shell.openExternal fallback');
   });

@@ -69,11 +69,17 @@ export class PromptBuilder {
         : ['- Skill execution is disabled for this run; do not call skill_view or skill_manage.']),
       `- Browser mode is ${config.browserMode}.`,
       skillsEnabled
-        ? '- When users ask to open/search/read/interact with webpages, consult skill_view("tasi-browser-automation") before planning web steps.'
+        ? '- When users ask to open/search/read/interact with webpages, consult the relevant browser automation skill from the installed skills index before planning web steps.'
         : '- When users ask to open/search/read/interact with webpages, use available browser_* tools directly when they are enabled.',
       config.browserMode === 'embedded'
         ? '- In embedded browser mode, use browser_* tools as the default web workflow and rely on the built-in preview.'
         : '- In external browser mode, use browser_* tools as the default workflow and let the harness surface pages in the system browser when needed.',
+      '- For webpage file uploads, locate the target `input[type=file]` with `browser_snapshot` or `browser_find`, then use `browser_upload_file` with a workspace-relative path. Hidden file inputs are valid upload targets. Do not use browser_eval/JavaScript, visible-input hacks, or a native file picker unless `browser_upload_file` is unavailable or the file path is unknown.',
+      '- For privacy and token efficiency, use `max_elements`/`max_chars` for the first page exploration and usually do not use `filter_text` yet, because narrow keywords can hide needed controls.',
+      '- After learning the page structure, prefer local reads with `selector` plus a broader `filter_text` on `browser_snapshot`/`browser_extract`; if the target is missing, remove `filter_text` or expand the keywords.',
+      '- For forms and dialogs, include generic action words in `filter_text`, such as `上传,搜索,选择,确定,取消,保存,提交,下一步`, and leave `redact_sensitive` enabled. Browser snapshots/extracts mask sensitive data as `xxxx`; do not request unredacted credential or account values.',
+      '- If a page asks for username/password, captcha, MFA, SSO approval, or other private credentials, do not ask the user to send the secret in chat. Tell the user to complete it in the visible browser and call `browser_wait` with `wait_for_user: true`, `until_logged_in: true`, `until_changed: true`, and `timeout_ms: 300000`. If the user has not finished before the wait times out, report that the browser is still open and continue in the same session when they return.',
+      '- Browser close policy: for form-filling, submissions, approvals, account changes, or workflows where the user should review the final browser state, call `browser_close_policy` with `policy: "keep_open"` before the final answer. For read-only data lookup, extraction, summarization, and report tasks, leave the default auto-close behavior or set `policy: "auto_close"`.',
       bridgeGuide,
       '- When a final answer relies on browser/search/webpage evidence, cite each supported claim with numbered inline Markdown links in this exact style: `2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。`',
       '- Assign web citation numbers in first-use order, reuse the same number for the same URL, and cite only pages that were opened/inspected or otherwise provided as trusted source material.',

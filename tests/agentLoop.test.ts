@@ -372,6 +372,70 @@ describe('AgentLoop', () => {
     const storedSession = sessions.read(result.sessionId);
     expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
   });
+
+  it('returns a user-facing handoff when the iteration limit is reached', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 2 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      safety: 'read-only',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'step_probe',
+          description: 'Probe a step.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      async execute() {
+        return { ok: true, content: 'still working' };
+      }
+    });
+    const repeatedCompletion = () => ({
+      message: {
+        role: 'assistant' as const,
+        content: 'Continuing.',
+        tool_calls: [{
+          id: createMockToolCallId(),
+          type: 'function' as const,
+          function: { name: 'step_probe', arguments: '{}' }
+        }]
+      }
+    });
+    const mock = new MockLlmClient(Array.from({ length: 5 }, repeatedCompletion));
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'keep going' });
+
+    expect(result.finalResponse).toContain('本轮已达到最大执行步数（2）');
+    expect(result.finalResponse).toContain('最近完成的操作');
+    expect(result.finalResponse).toContain('step_probe：成功');
+    expect(result.finalResponse).not.toContain('Reached iteration limit');
+    expect(result.finalResponse).not.toContain('Last tool events');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
 });
 
 let mockToolCallCounter = 0;

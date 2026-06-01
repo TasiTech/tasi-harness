@@ -29,6 +29,8 @@ import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtr
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
 import type { BrowserAutomation } from './tools/browserAutomation.js';
 
+export type BrowserClosePolicy = 'auto_close' | 'keep_open';
+
 function findBundledSkillsRoot(): string | undefined {
   const here = fileURLToPath(new URL('.', import.meta.url));
   const candidates = [
@@ -98,6 +100,7 @@ export class AppContext {
   readonly browserExecutionLogger: BrowserExecutionLogger;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
+  private readonly browserClosePolicies = new Map<string, { policy: BrowserClosePolicy; reason?: string; updatedAt: string }>();
 
   constructor(home = process.env.TASI_HARNESS_HOME || DEFAULT_HOME) {
     this.harnessHome = ensureDir(home);
@@ -170,6 +173,20 @@ export class AppContext {
     return this.configStore.get();
   }
 
+  setBrowserClosePolicy(sessionId: string, policy: BrowserClosePolicy, reason?: string): void {
+    const cleanSessionId = sessionId.trim();
+    if (!cleanSessionId) return;
+    this.browserClosePolicies.set(cleanSessionId, { policy, reason, updatedAt: new Date().toISOString() });
+  }
+
+  consumeBrowserClosePolicy(sessionId: string): { policy: BrowserClosePolicy; reason?: string; updatedAt: string } | undefined {
+    const cleanSessionId = sessionId.trim();
+    if (!cleanSessionId) return undefined;
+    const policy = this.browserClosePolicies.get(cleanSessionId);
+    this.browserClosePolicies.delete(cleanSessionId);
+    return policy;
+  }
+
   private syncMemoryFromExistingSessions(): void {
     const records = this.sessionStore
       .list()
@@ -198,7 +215,8 @@ export class AppContext {
       memoryStore: this.memoryStore,
       sessionStore: this.sessionStore,
       skillManager: this.skillManager,
-      browserAutomation: this.browserAutomation
+      browserAutomation: this.browserAutomation,
+      setBrowserClosePolicy: (sessionId, policy, reason) => this.setBrowserClosePolicy(sessionId, policy, reason)
     });
   }
 }

@@ -5,7 +5,8 @@ import type { LlmRequest } from '../src/shared/types.js';
 import {
   buildBrowserCoachSkillContent,
   buildBrowserCoachSkillContentWithModel,
-  browserCoachEventToInstruction
+  browserCoachEventToInstruction,
+  normalizeBrowserCoachSkillRequest
 } from '../src/main/browser/browserCoachSkill.js';
 
 function sampleRecording(): BrowserCoachRecording {
@@ -58,7 +59,12 @@ describe('browser coach skill generation', () => {
 
   it('builds a valid SKILL.md body with recording reference', () => {
     const content = buildBrowserCoachSkillContent(
-      { name: 'Example Search Coach', category: 'browser', description: 'Repeat example.com search workflow.' },
+      {
+        name: 'Example Search Coach',
+        category: 'browser',
+        description: 'Repeat example.com search workflow.',
+        userGuidance: 'Prefer semantic fields and keep the workflow in Chinese.'
+      },
       sampleRecording()
     );
 
@@ -72,7 +78,27 @@ describe('browser coach skill generation', () => {
     expect(content).toContain('Search = `invoice 123`');
     expect(content).toContain('Browser Reliability Rules');
     expect(content).toContain('Do not guess provider result URLs');
+    expect(content).toContain('User Guidance');
+    expect(content).toContain('Prefer semantic fields and keep the workflow in Chinese.');
     expect(content).toContain('./references/recording.json');
+  });
+
+  it('uses a safe browser workflow name when the requested name has no ASCII slug', () => {
+    const normalized = normalizeBrowserCoachSkillRequest(
+      { name: '携程旅行', category: '浏览器', description: 'Repeat the recorded workflow.' },
+      sampleRecording()
+    );
+    const content = buildBrowserCoachSkillContent(
+      { name: '携程旅行', category: '浏览器', description: 'Repeat the recorded workflow.' },
+      sampleRecording()
+    );
+
+    expect(normalized.name).toBe('example.com-browser-workflow');
+    expect(normalized.category).toBe('browser');
+    expect(normalized.displayName).toBe('携程旅行');
+    expect(content).toContain('name: example.com-browser-workflow');
+    expect(content).toContain('display_name: 携程旅行');
+    expect(content).toContain('category: browser');
   });
 
   it('uses the built-in skill creator guide when generating with a model', async () => {
@@ -111,7 +137,12 @@ describe('browser coach skill generation', () => {
     };
 
     const content = await buildBrowserCoachSkillContentWithModel(
-      { name: 'Example Search Coach', category: 'browser', description: 'Repeat example.com search workflow.' },
+      {
+        name: 'Example Search Coach',
+        category: 'browser',
+        description: 'Repeat example.com search workflow.',
+        userGuidance: 'Always ask the user for the invoice id before searching.'
+      },
       sampleRecording(),
       client,
       'SKILL CREATOR GUIDE\nCore Principles\nUse concise reusable workflows.'
@@ -123,6 +154,8 @@ describe('browser coach skill generation', () => {
     expect(prompt).toContain('prevent the my-travel failure pattern');
     expect(prompt).toContain('mark live-data failures as degraded');
     expect(prompt).toContain('Recorded Links And Parameters');
+    expect(prompt).toContain('User-provided guidance to preserve and follow');
+    expect(prompt).toContain('Always ask the user for the invoice id before searching.');
     expect(prompt).toContain('linksAndParams');
     expect(prompt).toContain('"channel"');
     expect(prompt).toContain('Recorded workflow summary JSON');
@@ -132,6 +165,8 @@ describe('browser coach skill generation', () => {
     expect(content).toContain('Recorded Links And Parameters');
     expect(content).toContain('channel=web');
     expect(content).toContain('Browser Reliability Rules');
+    expect(content).toContain('User Guidance');
+    expect(content).toContain('Always ask the user for the invoice id before searching.');
     expect(content).toContain('Do not guess provider result URLs');
     expect(content).toContain('./references/recording.json');
   });

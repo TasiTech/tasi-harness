@@ -41,6 +41,15 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     requiresApiKey: true
   },
   {
+    kind: 'soildapi',
+    label: 'SoildAPI',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'https://soildapi.com/v1',
+    defaultModel: 'qwen3.6-plus',
+    models: ['qwen3.6-plus', 'qwen3.6-flash', 'qwen3.5-plus', 'qwen3.5-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+    requiresApiKey: true
+  },
+  {
     kind: 'minimax',
     label: 'MiniMax',
     apiStyle: 'openai',
