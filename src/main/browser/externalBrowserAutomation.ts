@@ -330,7 +330,7 @@ function pageHelpers(): string {
         if (onclick) item.onclick = clip(onclick, 500);
         if ("value" in el && typeof el.value !== "undefined") {
           const type = String(el.getAttribute("type") || "").toLowerCase();
-          item.value = type === "password" ? (el.value ? "[password filled]" : "") : clip(String(el.value || ""), 240);
+          item.value = el.value ? "xxxx" : "";
         }
         const placeholder = el.getAttribute("placeholder");
         if (placeholder) item.placeholder = placeholder;
@@ -564,6 +564,8 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     if (!selector && !text && !url && !fn && !untilChanged && !untilLoggedIn) return this.state();
     const hasPredicate = Boolean(selector || text || url || fn);
     const started = Date.now();
+    let lastAutoLoginSubmitAt = 0;
+    let autoLoginSubmitAttempts = 0;
     while (Date.now() - started < timeoutMs) {
       const ok = await this.evalInPage<boolean>(
         `(function () {
@@ -597,6 +599,14 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       if (untilChanged) {
         const currentSignature = await this.pageChangeSignature().catch(() => '');
         if (currentSignature && currentSignature !== initialSignature) return this.state();
+      }
+      if (untilLoggedIn && autoLoginSubmitAttempts < 3 && Date.now() - lastAutoLoginSubmitAt > 5000) {
+        lastAutoLoginSubmitAt = Date.now();
+        const submitted = await this.autoSubmitFilledLoginForm().catch(() => false);
+        if (submitted) {
+          autoLoginSubmitAttempts += 1;
+          await sleep(500);
+        }
       }
       if (untilLoggedIn && await this.loginCompletionDetected().catch(() => false)) return this.state();
       await sleep(150);
@@ -1276,7 +1286,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         const filledAccount = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
           .filter(visible)
           .some((el) => String(el.value || "").trim().length > 0);
-        if (filledPassword && (filledAccount || visiblePasswords.length === 1)) return true;
+        if (filledPassword && (filledAccount || visiblePasswords.length === 1)) return false;
         if (visiblePasswords.length > 0) return false;
         const text = TasiBrowser.normalizeText((document.body && (document.body.innerText || document.body.textContent)) || "");
         const loweredUrl = location.href.toLowerCase();
@@ -1286,6 +1296,55 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
         const signedIn = /(退出登录|注销|个人中心|用户中心|我的|控制台|工作台|首页|信息门户|dashboard|portal|logout|sign out|my account)/i.test(text + " " + loweredTitle);
         if (continuation || signedIn) return true;
         return !looksLikeLoginUrl && text.length > 0;
+      })();`
+    );
+  }
+
+  private async autoSubmitFilledLoginForm(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const enabled = (el) => !el.disabled && el.getAttribute("aria-disabled") !== "true";
+        const textOf = (el) => TasiBrowser.normalizeText([
+          el.innerText,
+          el.textContent,
+          el.getAttribute("value"),
+          el.getAttribute("aria-label"),
+          el.getAttribute("title"),
+          el.getAttribute("name"),
+          el.id,
+          el.className
+        ].filter(Boolean).join(" "));
+        const passwords = Array.from(document.querySelectorAll('input[type="password"]')).filter((el) => visible(el) && enabled(el));
+        const filledPassword = passwords.find((el) => String(el.value || "").length > 0);
+        if (!filledPassword) return false;
+        const textInputs = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter((el) => visible(el) && enabled(el));
+        const challengePattern = /(captcha|otp|mfa|totp|2fa|verification|verify|sms|code|验证码|校验码|动态码|短信码|认证码)/i;
+        const emptyChallenge = textInputs.some((el) => challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && !String(el.value || "").trim());
+        if (emptyChallenge) return false;
+        const filledAccount = textInputs.some((el) => !challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && String(el.value || "").trim().length > 0);
+        if (!filledAccount && passwords.length !== 1) return false;
+        const form = filledPassword.closest("form");
+        const scopeCandidates = (root) => Array.from((root || document).querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]'));
+        const loginPattern = /\\b(log\\s*in|login|sign\\s*in|signin|submit|continue|next)\\b|登录|登陆|提交|继续|下一步|确认|进入/i;
+        const rejectPattern = /\\b(register|sign\\s*up|forgot|reset|cancel|back)\\b|注册|忘记|找回|重置|取消|返回/i;
+        const buttons = [...scopeCandidates(form), ...scopeCandidates(document)]
+          .filter((el, index, list) => list.indexOf(el) === index)
+          .filter((el) => visible(el) && enabled(el))
+          .map((el) => ({ el, label: textOf(el), type: String(el.getAttribute("type") || "").toLowerCase() }))
+          .filter((item) => !rejectPattern.test(item.label) && (loginPattern.test(item.label) || item.type === "submit"));
+        const target = buttons.sort((left, right) => (right.type === "submit" ? 1 : 0) - (left.type === "submit" ? 1 : 0))[0]?.el;
+        if (target) {
+          TasiBrowser.activate(target);
+          return true;
+        }
+        if (form && typeof form.requestSubmit === "function") {
+          form.requestSubmit();
+          return true;
+        }
+        return false;
       })();`
     );
   }

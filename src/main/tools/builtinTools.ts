@@ -6,13 +6,13 @@ import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SessionStore } from '../storage/sessionStore.js';
 import { safeJoin } from '../storage/pathUtils.js';
 import type { SkillManager } from '../skills/skillManager.js';
+import { BROWSER_REDACTION_MASK, redactSensitiveObject, redactSensitiveText } from '../privacy/sensitiveRedaction.js';
 import type { BrowserAutomation, BrowserBinaryResult, BrowserClickResult, BrowserExtractResult, BrowserPageState, BrowserSnapshotResult } from './browserAutomation.js';
 import { booleanArg, isPathInside, objectArgs, resolveToolPath, stringArg } from './toolRegistry.js';
 import { runTerminalCommand } from './terminalRunner.js';
 
 const BROWSER_DEFAULT_TIMEOUT_MS = 60000;
 const BROWSER_MANUAL_LOGIN_TIMEOUT_MS = 300000;
-const BROWSER_REDACTION_MASK = 'xxxx';
 
 export interface BuiltinToolDeps {
   getConfig: () => AppConfig;
@@ -105,53 +105,6 @@ function textMatchesTerms(value: unknown, terms: string[]): boolean {
   return terms.some((term) => lowered.includes(term));
 }
 
-function redactSensitiveUrl(value: string): string {
-  try {
-    const url = new URL(value);
-    const sensitiveKeys = /^(access_token|auth|authorization|code|data|key|password|pwd|s|secret|session|sid|ticket|token)$/i;
-    for (const key of [...url.searchParams.keys()]) {
-      if (sensitiveKeys.test(key)) url.searchParams.set(key, BROWSER_REDACTION_MASK);
-    }
-    return url.toString();
-  } catch {
-    return value;
-  }
-}
-
-function redactSensitiveText(value: string): string {
-  return redactSensitiveUrl(value)
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, BROWSER_REDACTION_MASK)
-    .replace(/(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/g, BROWSER_REDACTION_MASK)
-    .replace(/(?<!\d)\d{6}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx](?!\d)/g, BROWSER_REDACTION_MASK)
-    .replace(/((?:银行卡|卡号|账号|账户|account|card)[^\n\r\d]{0,12})\d{6,19}/gi, `$1${BROWSER_REDACTION_MASK}`)
-    .replace(/\[redacted(?:-[^\]]+)?\]/gi, BROWSER_REDACTION_MASK);
-}
-
-function redactSensitiveObject(value: unknown, options: { includeValues: boolean }): unknown {
-  if (typeof value === 'string') return redactSensitiveText(value);
-  if (Array.isArray(value)) return value.map((item) => redactSensitiveObject(item, options));
-  if (!value || typeof value !== 'object') return value;
-  const record = value as Record<string, unknown>;
-  const fieldHints = ['selector', 'name', 'placeholder', 'label', 'text', 'role', 'tag']
-    .map((key) => typeof record[key] === 'string' ? record[key] : '')
-    .join(' ');
-  const isSensitiveBrowserField =
-    /(password|passwd|pwd|secret|token|cookie|authorization|session|access[-_]?key|api[-_]?key|ticket|finger|captcha|otp|mfa|username|user[-_ ]?name|account|login|i_user|i_pass|i_code|sm2pass|用户|用户名|账号|账户|学号|工号|密码|验证码|身份)/i.test(fieldHints);
-  const out: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(record)) {
-    if (key === 'value' && (!options.includeValues || isSensitiveBrowserField)) {
-      out[key] = raw ? BROWSER_REDACTION_MASK : raw;
-      continue;
-    }
-    if (/password|passwd|pwd|secret|token|cookie|authorization|session|access[-_]?key|api[-_]?key|ticket|finger/i.test(key)) {
-      out[key] = raw ? BROWSER_REDACTION_MASK : raw;
-      continue;
-    }
-    out[key] = redactSensitiveObject(raw, options);
-  }
-  return out;
-}
-
 function filterTextByTerms(value: string, terms: string[]): string {
   if (terms.length === 0) return value;
   const parts = value.includes('\n')
@@ -182,7 +135,8 @@ function processBrowserExtractResult(
     content = filterTextByTerms(content, options.terms);
     if (options.redact) content = redactSensitiveText(content);
   }
-  return { ...result, content: content.slice(0, options.maxChars) };
+  const next = { ...result, content: content.slice(0, options.maxChars) };
+  return options.redact ? redactSensitiveObject(next, { includeValues: options.includeValues }) as BrowserExtractResult : next;
 }
 
 function processBrowserSnapshotResult(
@@ -205,11 +159,12 @@ function processBrowserSnapshotResult(
   }
   const processed = options.redact ? redactSensitiveObject(parsed, { includeValues: options.includeValues }) : parsed;
   const content = JSON.stringify(processed, null, 2);
-  return {
+  const next = {
     ...result,
     content: content.slice(0, options.maxChars),
     truncated: result.truncated || content.length > options.maxChars
   };
+  return options.redact ? redactSensitiveObject(next, { includeValues: options.includeValues }) as BrowserSnapshotResult : next;
 }
 
 function renderBrowserClickResult(result: BrowserClickResult): string {
@@ -872,7 +827,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             max_chars: { type: 'number', description: 'Maximum characters to return.' },
             filter_text: { type: 'string', description: 'Optional comma-separated keywords. When set, return only matching page text/headings/links to reduce token use.' },
             redact_sensitive: { type: 'boolean', description: 'Redact common sensitive data such as emails, phone numbers, ID numbers, auth tokens, cookies, and secrets. Defaults to true.' },
-            include_values: { type: 'boolean', description: 'Include non-sensitive form/control value fields in output. Defaults to false; sensitive fields are always masked as xxxx.' }
+            include_values: { type: 'boolean', description: 'Include non-sensitive non-form value fields in output. Defaults to false; form/control values and sensitive fields are always masked as xxxx.' }
           }
         }
       }
@@ -924,7 +879,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
             max_chars: { type: 'number', description: 'Maximum characters to return. Defaults to a large snapshot budget.' },
             filter_text: { type: 'string', description: 'Optional comma-separated keywords. When set, keep only matching elements/headings/links/images/tree lines to reduce token use.' },
             redact_sensitive: { type: 'boolean', description: 'Redact common sensitive data such as emails, phone numbers, ID numbers, auth tokens, cookies, and secrets. Defaults to true.' },
-            include_values: { type: 'boolean', description: 'Include non-sensitive form/control value fields in output. Defaults to false; sensitive fields are always masked as xxxx.' }
+            include_values: { type: 'boolean', description: 'Include non-sensitive non-form value fields in output. Defaults to false; form/control values and sensitive fields are always masked as xxxx.' }
           }
         }
       }

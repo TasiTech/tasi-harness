@@ -552,8 +552,15 @@ describe('builtin tools', () => {
             url: 'https://example.com/?ticket=secret-ticket',
             elements: [
               { ref: '@e1', tag: 'input', role: 'textbox', name: 'Phone', text: 'Phone 13812345678', selector: '#phone', value: '13812345678', visible: true, enabled: true },
-              { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '2022620869', visible: true, enabled: true },
+              { ref: '@e5', tag: 'input', role: 'textbox', name: 'Search', text: '', selector: '#search', value: 'weather in beijing', visible: true, enabled: true },
+              { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '1234567890', visible: true, enabled: true },
+              { ref: '@e4', tag: 'input', role: 'textbox', name: '姓名', text: '', selector: '#person_name', value: '张三', visible: true, enabled: true },
               { ref: '@e2', tag: 'div', role: 'div', name: 'Weather', text: 'Weather sunny', selector: '#weather', visible: true, enabled: true }
+            ],
+            snapshot: '- textbox "Username" [@e3] value="1234567890"\n- textbox "姓名" [@e4] value="李四"\n- div "Weather"',
+            tree: [
+              { depth: 0, role: 'textbox', name: 'Username', ref: '@e3', value: '1234567890' },
+              { depth: 0, role: 'textbox', name: '姓名', ref: '@e4', value: '王五' }
             ],
             headings: [{ level: 1, text: 'Phone profile' }],
             links: [{ text: 'Auth link', href: 'https://example.com/callback?token=abc123' }],
@@ -561,7 +568,9 @@ describe('builtin tools', () => {
           }),
           elements: [
             { ref: '@e1', tag: 'input', role: 'textbox', name: 'Phone', text: 'Phone 13812345678', selector: '#phone', value: '13812345678', visible: true, enabled: true },
-            { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '2022620869', visible: true, enabled: true },
+            { ref: '@e5', tag: 'input', role: 'textbox', name: 'Search', text: '', selector: '#search', value: 'weather in shanghai', visible: true, enabled: true },
+            { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '9876543210', visible: true, enabled: true },
+            { ref: '@e4', tag: 'input', role: 'textbox', name: '姓名', text: '', selector: '#person_name', value: '赵六', visible: true, enabled: true },
             { ref: '@e2', tag: 'div', role: 'div', name: 'Weather', text: 'Weather sunny', selector: '#weather', visible: true, enabled: true }
           ],
           headings: [{ level: 1, text: 'Phone profile' }],
@@ -684,7 +693,30 @@ describe('builtin tools', () => {
     );
     expect(sensitiveSnapshot.ok).toBe(true);
     expect(sensitiveSnapshot.content).toContain('xxxx');
-    expect(sensitiveSnapshot.content).not.toContain('2022620869');
+    expect(sensitiveSnapshot.content).not.toContain('1234567890');
+    expect(JSON.stringify(sensitiveSnapshot.data)).not.toContain('9876543210');
+
+    const formValueSnapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: 'Search', include_values: true, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(formValueSnapshot.ok).toBe(true);
+    expect(formValueSnapshot.content).toContain('xxxx');
+    expect(formValueSnapshot.content).not.toContain('weather in beijing');
+    expect(JSON.stringify(formValueSnapshot.data)).not.toContain('weather in shanghai');
+
+    const personSnapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: '姓名', include_values: true, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(personSnapshot.ok).toBe(true);
+    expect(personSnapshot.content).toContain('xxxx');
+    for (const fakeName of ['张三', '李四', '王五', '赵六']) {
+      expect(personSnapshot.content).not.toContain(fakeName);
+      expect(JSON.stringify(personSnapshot.data)).not.toContain(fakeName);
+    }
 
     mockBrowser.extract = async (options) => ({
       url: 'https://example.com',

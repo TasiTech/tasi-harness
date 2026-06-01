@@ -15,6 +15,7 @@ import type {
 } from '../../shared/types.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { inferMemoryDomains, normalizeMemoryDomain } from '../../shared/memoryDomains.js';
+import { redactSensitiveObject } from '../privacy/sensitiveRedaction.js';
 import { ensureDir, safeJoin } from './pathUtils.js';
 
 const SEARCH_HIGHLIGHT_CHARS = 1200;
@@ -273,10 +274,11 @@ export class SessionStore {
 
   private write(record: SessionRecord): void {
     ensureDir(this.dir);
-    const history = this.buildSystemPromptHistory(record);
+    const redactedRecord = redactSensitiveObject(record, { includeValues: false }) as SessionRecord;
+    const history = this.buildSystemPromptHistory(redactedRecord);
     const persisted: Record<string, unknown> = {
-      ...record,
-      messages: (record.messages ?? []).map((message) => this.persistableMessage(message)),
+      ...redactedRecord,
+      messages: (redactedRecord.messages ?? []).map((message) => this.persistableMessage(message)),
       systemPromptHistory: history
     };
     delete persisted.systemPrompt;
