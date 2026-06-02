@@ -725,6 +725,7 @@ class ModelClient implements LlmClient {
       max_tokens: request.maxTokens,
       logprobs: request.logProbs === true ? true : undefined,
       top_logprobs: request.logProbs === true ? request.topLogProbs : undefined,
+      metadata: request.metadata,
       stream: false
     };
     const json = await this.postJson(endpoint, headers, body, request);
@@ -741,6 +742,7 @@ class ModelClient implements LlmClient {
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
+      metadata: request.metadata,
       stream: true
     };
 
@@ -802,7 +804,8 @@ class ModelClient implements LlmClient {
       messages: toAnthropicMessages(request.messages),
       system: toAnthropicSystem(request.messages),
       tools: toAnthropicTools(request.tools),
-      temperature: request.temperature ?? this.config.temperature
+      temperature: request.temperature ?? this.config.temperature,
+      metadata: request.metadata
     };
     const json = await this.postJson(endpoint, headers, body, request);
     return parseAnthropicCompletion(json);
@@ -822,6 +825,7 @@ class ModelClient implements LlmClient {
       system: toAnthropicSystem(request.messages),
       tools: toAnthropicTools(request.tools),
       temperature: request.temperature ?? this.config.temperature,
+      metadata: request.metadata,
       stream: true
     };
 
@@ -909,7 +913,8 @@ class ModelClient implements LlmClient {
         images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
       })),
       stream: false,
-      options: { temperature: request.temperature ?? this.config.temperature }
+      options: { temperature: request.temperature ?? this.config.temperature },
+      metadata: request.metadata
     };
     const json = await this.postJson(endpoint, headers, body, request);
     return {
@@ -933,7 +938,8 @@ class ModelClient implements LlmClient {
         images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
       })),
       stream: true,
-      options: { temperature: request.temperature ?? this.config.temperature }
+      options: { temperature: request.temperature ?? this.config.temperature },
+      metadata: request.metadata
     };
 
     let content = '';
