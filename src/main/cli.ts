@@ -30,6 +30,8 @@ export interface CliOptions {
   enabledToolNames?: string[];
   logProbs: boolean;
   topLogProbs?: number;
+  turnType?: string;
+  sessionDone?: boolean;
   json: boolean;
   plain: boolean;
   verbose: boolean;
@@ -61,6 +63,10 @@ function printUsage(): void {
       '      --tools <list>      Use comma-separated tools instead of config defaults. Use "none" for no tools.',
       '      --log-probs        In --json mode, request token log probabilities and include log_probs in JSON output.',
       '      --top-logprobs <n> In --json mode, include top token alternatives per output token.',
+      '      --turn-type <type>  Tag the turn type; sent to the provider in request metadata.',
+      '      --session-done [bool]',
+      '                          Mark the session as done (true/false; bare flag means true).',
+      '                          Sent to the provider in request metadata.',
       '  -j, --json               Print the run result as JSON.',
       '  -p, --plain              Print raw Markdown instead of terminal-rendered output.',
       '      --stream             Stream raw output first, then render Markdown when complete (default).',
@@ -199,6 +205,23 @@ export function parseArgs(argv: string[]): CliOptions {
       if (!value) throw new Error(`${arg} requires an integer from 0 to 5.`);
       options.logProbs = true;
       options.topLogProbs = parseTopLogProbs(value);
+      continue;
+    }
+    if (arg === '--turn-type' || arg === '--turn_type') {
+      const value = args[++index];
+      if (!value) throw new Error(`${arg} requires a turn type.`);
+      options.turnType = value;
+      continue;
+    }
+    if (arg === '--session-done' || arg === '--session_done') {
+      const next = args[index + 1];
+      const lowered = next?.trim().toLowerCase();
+      if (lowered === 'true' || lowered === 'false') {
+        options.sessionDone = lowered === 'true';
+        index += 1;
+      } else {
+        options.sessionDone = true;
+      }
       continue;
     }
     if (arg === '--json' || arg === '-j') {
@@ -393,6 +416,8 @@ async function runSingleMessage(context: CliContext, options: CliOptions, rl: In
         enabledToolNames: options.enabledToolNames,
         logProbs: options.json && options.logProbs,
         topLogProbs: options.json ? options.topLogProbs : undefined,
+        turnType: options.turnType,
+        sessionDone: options.sessionDone,
         stream: options.stream
       },
       {

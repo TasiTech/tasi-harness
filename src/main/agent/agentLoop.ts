@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
@@ -112,7 +112,9 @@ export class AgentLoop {
     const skillsEnabled = options.useSkills !== false;
     const requestId = createId('run');
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
-    const session = options.sessionId ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create() : this.deps.sessions.create();
+    const session = options.sessionId
+      ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create('New session', options.sessionId)
+      : this.deps.sessions.create();
     if (memoryEnabled) this.deps.beginDeferredMemory(session.id);
     const userMessage: AgentMessage = {
       id: createId('msg'),
@@ -134,6 +136,9 @@ export class AgentLoop {
       });
       this.deps.sessions.setSystemPrompt(session.id, prompt);
       const messages: AgentMessage[] = [{ role: 'system', content: prompt }, ...history];
+      const requestMetadata: LlmRequestMetadata = { session: session.id };
+      if (options.turnType !== undefined) requestMetadata.turn_type = options.turnType;
+      if (options.sessionDone !== undefined) requestMetadata.session_done = options.sessionDone;
       const client = this.deps.createClient();
       const enabledToolNames = (options.enabledToolNames ?? cfg.enabledToolNames).filter((name) => {
         if (!memoryEnabled && name === 'memory') return false;
@@ -190,7 +195,7 @@ export class AgentLoop {
         const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
         const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
         const completion = canStream
-          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, signal: options.signal }, (delta) => {
+          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, metadata: requestMetadata, signal: options.signal }, (delta) => {
               if (delta.reasoning_content) {
                 streamedReasoning += delta.reasoning_content;
                 const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
@@ -230,6 +235,7 @@ export class AgentLoop {
               temperature: cfg.temperature,
               logProbs: options.logProbs,
               topLogProbs: options.topLogProbs,
+              metadata: requestMetadata,
               signal: options.signal
             });
         const toolCalls = completion.message.tool_calls ?? [];

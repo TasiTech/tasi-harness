@@ -38,10 +38,10 @@ export class SessionStore {
     ensureDir(this.dir);
   }
 
-  create(title = 'New session'): SessionRecord {
+  create(title = 'New session', id?: string): SessionRecord {
     const ts = nowIso();
     const record: SessionRecord = {
-      id: createId('session'),
+      id: id !== undefined ? this.ensureValidProvidedId(id) : createId('session'),
       title,
       createdAt: ts,
       updatedAt: ts,
@@ -446,6 +446,14 @@ export class SessionStore {
     const next = { ...message };
     delete next.reasoning_parts;
     return next;
+  }
+
+  private ensureValidProvidedId(id: string): string {
+    const trimmed = id.trim();
+    if (!trimmed || /[^a-zA-Z0-9_.-]/.test(trimmed)) {
+      throw new Error(`Invalid session id: ${id}. Use only letters, numbers, '.', '_' or '-'.`);
+    }
+    return trimmed;
   }
 
   private fileFor(id: string): string {
