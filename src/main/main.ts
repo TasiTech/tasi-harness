@@ -1,6 +1,7 @@
-import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents, type Rectangle, type WebContents } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, Rectangle, WebContents } from 'electron';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
@@ -47,8 +48,11 @@ import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSk
 import { isPathInside, objectArgs, resolveToolPath, stringArg } from './tools/toolRegistry.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-let mainWindow: BrowserWindow | null = null;
-let devToolsWindow: BrowserWindow | null = null;
+const electronRequire = createRequire(import.meta.url);
+const { app, BrowserWindow, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
+const { shell } = electronRequire('electron/common') as typeof import('electron/common');
+let mainWindow: ElectronBrowserWindow | null = null;
+let devToolsWindow: ElectronBrowserWindow | null = null;
 const context = new AppContext();
 const browserCoachRecorder = new BrowserCoachRecorder(
   join(__dirname, '..', 'preload', 'browserCoachPreload.js'),
@@ -1368,7 +1372,7 @@ async function fetchWechatChannelQrCode(fallbackBindUrl: string): Promise<Wechat
   }
 }
 
-function getDevToolsWindowMetrics(parent: BrowserWindow): { bounds: Rectangle; minWidth: number; minHeight: number } {
+function getDevToolsWindowMetrics(parent: ElectronBrowserWindow): { bounds: Rectangle; minWidth: number; minHeight: number } {
   const parentBounds = parent.getBounds();
   const workArea = screen.getDisplayMatching(parentBounds).workArea;
   const horizontalMargin = 24;
@@ -1397,7 +1401,7 @@ function getDevToolsWindowMetrics(parent: BrowserWindow): { bounds: Rectangle; m
   };
 }
 
-function ensureDevToolsWindow(parent: BrowserWindow): BrowserWindow {
+function ensureDevToolsWindow(parent: ElectronBrowserWindow): ElectronBrowserWindow {
   const layout = getDevToolsWindowMetrics(parent);
   const appIconPath = resolveAppWindowIconPath();
 
@@ -1434,7 +1438,7 @@ function ensureDevToolsWindow(parent: BrowserWindow): BrowserWindow {
   return win;
 }
 
-function openMainWindowDevTools(win: BrowserWindow): void {
+function openMainWindowDevTools(win: ElectronBrowserWindow): void {
   const devtools = ensureDevToolsWindow(win);
   win.webContents.setDevToolsWebContents(devtools.webContents);
   win.webContents.on('devtools-opened', () => {

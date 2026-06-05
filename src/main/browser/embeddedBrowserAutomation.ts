@@ -1,4 +1,5 @@
-import { app, BrowserWindow, type WebContents } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, WebContents } from 'electron';
+import { createRequire } from 'node:module';
 import type {
   BrowserAutomation,
   BrowserBinaryResult,
@@ -16,6 +17,9 @@ import type {
 } from '../tools/browserAutomation.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../../shared/browserConstants.js';
 import { resolveAppWindowIconPath } from '../appIcon.js';
+
+const electronRequire = createRequire(import.meta.url);
+const { app, BrowserWindow } = electronRequire('electron/main') as typeof import('electron/main');
 
 const DEFAULT_TIMEOUT_MS = 60000;
 const MAX_TIMEOUT_MS = 300000;
@@ -434,7 +438,7 @@ function formatSnapshotTree(nodes: unknown[]): string {
 }
 
 export class EmbeddedBrowserAutomation implements BrowserAutomation {
-  private window: BrowserWindow | null = null;
+  private window: ElectronBrowserWindow | null = null;
   private readonly partition = EMBEDDED_BROWSER_PARTITION;
   private sharedWebContentsResolver?: () => WebContents | null;
   private readonly consoleEntries: ConsoleEntry[] = [];
@@ -1234,7 +1238,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return result;
   }
 
-  private ensureWindow(): BrowserWindow {
+  private ensureWindow(): ElectronBrowserWindow {
     if (!app.isReady()) throw new Error('Electron app is not ready yet.');
     if (this.window && !this.window.isDestroyed()) return this.window;
     const appIconPath = resolveAppWindowIconPath();

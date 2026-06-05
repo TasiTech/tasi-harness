@@ -1,4 +1,5 @@
-import { BrowserWindow, type IpcMainEvent } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, IpcMainEvent } from 'electron';
+import { createRequire } from 'node:module';
 import type {
   BrowserCoachGenerateSkillRequest,
   BrowserCoachGenerateSkillResult,
@@ -9,6 +10,9 @@ import type {
 import { createId } from '../../shared/types.js';
 import type { SkillManager } from '../skills/skillManager.js';
 import { buildBrowserCoachSkillContent, normalizeBrowserCoachSkillRequest } from './browserCoachSkill.js';
+
+const electronRequire = createRequire(import.meta.url);
+const { BrowserWindow } = electronRequire('electron/main') as typeof import('electron/main');
 
 type BrowserCoachIncomingEvent = Omit<BrowserCoachRecordedEvent, 'id' | 'index' | 'createdAt'>;
 
@@ -183,7 +187,7 @@ function externalCoachInjectionScript(): string {
 }
 
 export class BrowserCoachRecorder {
-  private window: BrowserWindow | null = null;
+  private window: ElectronBrowserWindow | null = null;
   private recording: BrowserCoachRecording | null = null;
   private externalSocket: WebSocket | null = null;
   private cdpMessageId = 0;

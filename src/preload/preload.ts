@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { createRequire } from 'node:module';
 import type {
   AgentToolEventStream,
   AgentMessageDeltaStream,
@@ -32,6 +32,9 @@ import type {
   WechatChannelLoginStatusPayload,
   ToolRunRequest
 } from '../shared/types.js';
+
+const electronRequire = createRequire(import.meta.url);
+const { contextBridge, ipcRenderer } = electronRequire('electron/renderer') as typeof import('electron/renderer');
 
 const api = {
   config: {

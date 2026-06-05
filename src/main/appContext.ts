@@ -1,5 +1,5 @@
-import { app } from 'electron';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AppConfig, RegisteredTool } from '../shared/types.js';
@@ -28,6 +28,9 @@ import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
 import type { BrowserAutomation } from './tools/browserAutomation.js';
+
+const electronRequire = createRequire(import.meta.url);
+const { app } = electronRequire('electron/main') as typeof import('electron/main');
 
 export type BrowserClosePolicy = 'auto_close' | 'keep_open';
 
