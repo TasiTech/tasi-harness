@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -11,6 +11,7 @@ const argv = new Set(process.argv.slice(2));
 const builderRetryCount = Math.max(1, Number(process.env.TASI_BUILDER_RETRIES ?? '3') || 3);
 const builderRetryDelayMs = Math.max(0, Number(process.env.TASI_BUILDER_RETRY_DELAY_MS ?? '2000') || 2000);
 const windowsExecutablePath = join(releaseDir, 'win-unpacked', 'Tasi Harness.exe');
+const linuxUnpackedPath = join(releaseDir, 'linux-unpacked');
 const packageMetadata = JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8'));
 const macCliScripts = [join(rootDir, 'build', 'cli', 'mac', 'tasi'), join(rootDir, 'build', 'cli', 'mac', 'tasi-harness')];
 const expectedWindowsMetadata = {
@@ -24,13 +25,20 @@ function printUsage() {
       'Usage:',
       '  node scripts/package-installers.mjs --win',
       '  node scripts/package-installers.mjs --mac',
+      '  node scripts/package-installers.mjs --ubuntu',
+      '  node scripts/package-installers.mjs --ubuntu-deb',
       '  node scripts/package-installers.mjs --win --mac',
       '',
       'Options:',
       '  --win              Build the Windows NSIS installer.',
       '  --mac              Build the macOS DMG installer.',
+      '  --ubuntu           Build the Ubuntu/Linux executable .bin installer.',
+      '  --ubuntu-bin       Alias for --ubuntu.',
+      '  --ubuntu-deb       Build the Ubuntu Debian package.',
       '  --skip-build       Skip `npm run build` before packaging.',
       '  --allow-cross-mac  Skip the macOS host check.',
+      '  --allow-cross-ubuntu',
+      '                     Skip the Ubuntu/Linux host check.',
       '',
       'Environment:',
       '  TASI_BUILDER_RETRIES          Retry count for electron-builder (default: 3).',
@@ -268,24 +276,216 @@ function packageInstallers(command, args, targets) {
   throw lastError ?? new Error('Packaging failed for an unknown reason.');
 }
 
+function shellSingleQuote(value) {
+  return String(value).replace(/'/g, "'\"'\"'");
+}
+
+function createLinuxBinInstallerStub(metadata) {
+  return `#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME='${shellSingleQuote(metadata.productName)}'
+APP_ID='${shellSingleQuote(metadata.appId)}'
+APP_VERSION='${shellSingleQuote(metadata.version)}'
+DEFAULT_INSTALL_DIR="/opt/$APP_ID"
+DEFAULT_BIN_DIR="/usr/local/bin"
+PAYLOAD_LINE=__PAYLOAD_LINE__
+
+show_usage() {
+  cat <<EOF
+$APP_NAME $APP_VERSION installer
+
+Usage:
+  sudo ./$(basename "$0")
+  ./$(basename "$0") --prefix "\$HOME/.local/opt/$APP_ID" --bin-dir "\$HOME/.local/bin"
+
+Options:
+  --prefix <dir>       Install directory. Default: $DEFAULT_INSTALL_DIR
+  --bin-dir <dir>      Directory for the command-line launcher. Default: $DEFAULT_BIN_DIR
+  --no-bin-link        Do not create the command-line launcher.
+  --help               Show this help message.
+EOF
+}
+
+INSTALL_DIR="\${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+BIN_DIR="\${BIN_DIR:-$DEFAULT_BIN_DIR}"
+CREATE_BIN_LINK=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --prefix)
+      INSTALL_DIR="\${2:-}"
+      if [[ -z "$INSTALL_DIR" ]]; then
+        echo "--prefix requires a directory." >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --bin-dir)
+      BIN_DIR="\${2:-}"
+      if [[ -z "$BIN_DIR" ]]; then
+        echo "--bin-dir requires a directory." >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --no-bin-link)
+      CREATE_BIN_LINK=0
+      shift
+      ;;
+    --help|-h)
+      show_usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      show_usage
+      exit 1
+      ;;
+  esac
+done
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+choose_sudo() {
+  local parent
+  parent="$(dirname "$INSTALL_DIR")"
+  if [[ "$EUID" -eq 0 ]]; then
+    return
+  fi
+  if [[ ! -d "$parent" || ! -w "$parent" ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "Installing to $INSTALL_DIR requires elevated permissions, but sudo was not found." >&2
+      exit 1
+    fi
+    SUDO=(sudo)
+    return
+  fi
+  if [[ "$CREATE_BIN_LINK" -eq 1 && (! -d "$BIN_DIR" || ! -w "$BIN_DIR") ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      echo "Creating launcher in $BIN_DIR requires elevated permissions, but sudo was not found." >&2
+      exit 1
+    fi
+    SUDO=(sudo)
+  fi
+}
+
+find_app_executable() {
+  local candidate
+  for candidate in "$INSTALL_DIR/$APP_ID" "$INSTALL_DIR/$APP_NAME" "$INSTALL_DIR/tasi-harness" "$INSTALL_DIR/Tasi Harness"; do
+    if [[ -x "$candidate" && ! -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  find "$INSTALL_DIR" -maxdepth 1 -type f -perm -111 | head -n 1
+}
+
+require_command tail
+require_command tar
+require_command mktemp
+
+SUDO=()
+choose_sudo
+
+WORK_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+
+PAYLOAD_START=$((PAYLOAD_LINE + 1))
+tail -n +"$PAYLOAD_START" "$0" | tar -xzf - -C "$WORK_DIR"
+
+APP_SOURCE="$WORK_DIR/linux-unpacked"
+if [[ ! -d "$APP_SOURCE" ]]; then
+  echo "Installer payload is missing linux-unpacked." >&2
+  exit 1
+fi
+
+echo "Installing $APP_NAME $APP_VERSION to $INSTALL_DIR"
+"\${SUDO[@]}" rm -rf "$INSTALL_DIR"
+"\${SUDO[@]}" mkdir -p "$INSTALL_DIR"
+"\${SUDO[@]}" cp -R "$APP_SOURCE/." "$INSTALL_DIR/"
+
+APP_EXECUTABLE="$(find_app_executable)"
+if [[ -z "$APP_EXECUTABLE" ]]; then
+  echo "Installed app executable was not found in $INSTALL_DIR." >&2
+  exit 1
+fi
+
+if [[ "$CREATE_BIN_LINK" -eq 1 ]]; then
+  "\${SUDO[@]}" mkdir -p "$BIN_DIR"
+  "\${SUDO[@]}" ln -sfn "$APP_EXECUTABLE" "$BIN_DIR/$APP_ID"
+  echo "Command-line launcher: $BIN_DIR/$APP_ID"
+fi
+
+echo "Installation completed."
+`;
+}
+
+function archLabel() {
+  if (process.arch === 'x64') return 'x64';
+  if (process.arch === 'arm64') return 'arm64';
+  return process.arch;
+}
+
+function artifactSafeName(value) {
+  return String(value).trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'app';
+}
+
+function createLinuxBinInstaller(targets) {
+  if (!targets.ubuntuBin) return;
+  if (!existsSync(linuxUnpackedPath)) {
+    throw new Error(`Expected Linux unpacked app was not produced: ${linuxUnpackedPath}`);
+  }
+
+  const productName = String(packageMetadata.build?.productName ?? packageMetadata.productName ?? packageMetadata.name ?? 'Tasi Harness');
+  const appId = 'tasi-harness';
+  const version = String(packageMetadata.version ?? '0.0.0');
+  const artifactName = `${artifactSafeName(productName)}-${version}-${archLabel()}.bin`;
+  const installerPath = join(releaseDir, artifactName);
+  const payloadPath = join(releaseDir, '.tasi-harness-linux-bin-payload.tar.gz');
+  ensureSuccess(run('tar', ['-czf', payloadPath, '-C', releaseDir, 'linux-unpacked'], 'Creating Ubuntu/Linux .bin payload'), 'Creating Ubuntu/Linux .bin payload');
+
+  const stub = createLinuxBinInstallerStub({ productName, appId, version });
+  const payloadLine = (stub.match(/\n/g) ?? []).length;
+  const installerStub = stub.replace('__PAYLOAD_LINE__', String(payloadLine));
+  writeFileSync(installerPath, installerStub, 'utf8');
+  appendFileSync(installerPath, readFileSync(payloadPath));
+  chmodSync(installerPath, 0o755);
+  rmSync(payloadPath, { force: true });
+  console.log(`Created Ubuntu/Linux executable installer: ${installerPath}`);
+}
+
 if (argv.has('--help')) {
   printUsage();
   process.exit(0);
 }
 
-const explicitTarget = argv.has('--win') || argv.has('--mac');
+const wantsUbuntuBin = argv.has('--ubuntu') || argv.has('--ubuntu-bin') || argv.has('--linux-bin');
+const wantsUbuntuDeb = argv.has('--ubuntu-deb') || argv.has('--linux-deb');
+const explicitTarget = argv.has('--win') || argv.has('--mac') || wantsUbuntuBin || wantsUbuntuDeb || argv.has('--linux');
 const targets = {
   win: argv.has('--win'),
-  mac: argv.has('--mac')
+  mac: argv.has('--mac'),
+  ubuntuBin: wantsUbuntuBin || (argv.has('--linux') && !wantsUbuntuDeb),
+  ubuntuDeb: wantsUbuntuDeb
 };
 
 if (!explicitTarget) {
   if (process.platform === 'win32') targets.win = true;
   else if (process.platform === 'darwin') targets.mac = true;
+  else if (process.platform === 'linux') targets.ubuntuBin = true;
 }
 
-if (!targets.win && !targets.mac) {
-  console.error('No packaging target selected. Use --win and/or --mac.');
+if (!targets.win && !targets.mac && !targets.ubuntuBin && !targets.ubuntuDeb) {
+  console.error('No packaging target selected. Use --win, --mac, --ubuntu, and/or --ubuntu-deb.');
   printUsage();
   process.exit(1);
 }
@@ -294,6 +494,14 @@ const allowCrossMac = argv.has('--allow-cross-mac') || process.env.TASI_ALLOW_CR
 if (targets.mac && process.platform !== 'darwin' && !allowCrossMac) {
   console.error(
     'macOS DMG packaging should normally run on a macOS host. Re-run this command on macOS, or pass --allow-cross-mac if you have a custom cross-build environment.'
+  );
+  process.exit(1);
+}
+
+const allowCrossUbuntu = argv.has('--allow-cross-ubuntu') || process.env.TASI_ALLOW_CROSS_UBUNTU === '1';
+if ((targets.ubuntuBin || targets.ubuntuDeb) && process.platform !== 'linux' && !allowCrossUbuntu) {
+  console.error(
+    'Ubuntu/Linux packaging should normally run on a Linux/Ubuntu host. Re-run this command on Ubuntu, or pass --allow-cross-ubuntu if you have a custom cross-build environment.'
   );
   process.exit(1);
 }
@@ -308,7 +516,12 @@ if (!argv.has('--skip-build')) {
 const builderArgs = ['exec', 'electron-builder', '--', '--publish', 'never'];
 if (targets.win) builderArgs.push('--win', 'nsis');
 if (targets.mac) builderArgs.push('--mac', 'dmg');
+const linuxTargets = [];
+if (targets.ubuntuBin) linuxTargets.push('dir');
+if (targets.ubuntuDeb) linuxTargets.push('deb');
+if (linuxTargets.length > 0) builderArgs.push('--linux', ...linuxTargets);
 packageInstallers(npm, builderArgs, targets);
+createLinuxBinInstaller(targets);
 
 let artifacts = [];
 try {

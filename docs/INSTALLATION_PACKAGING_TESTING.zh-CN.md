@@ -112,9 +112,12 @@ npm run pack
 npm run dist
 npm run dist:win
 npm run dist:mac
+npm run dist:ubuntu
+npm run dist:ubuntu-deb
 npm run dist:installers
 powershell -ExecutionPolicy Bypass -File scripts/package-win-installer.ps1
 bash scripts/package-macos-installer.sh
+bash scripts/package-ubuntu-installer.sh
 ```
 
 打包产物输出到 `release/`。
@@ -123,11 +126,28 @@ bash scripts/package-macos-installer.sh
 
 - `npm run dist:win` 生成 Windows `NSIS` 安装包
 - `npm run dist:mac` 生成 macOS `DMG`
-- `npm run dist:installers` 一次触发双平台目标
+- `npm run dist:ubuntu` 生成 Ubuntu/Linux 可执行 `.bin` 安装包
+- `npm run dist:ubuntu-deb` 生成 Ubuntu `.deb` 安装包
+- `npm run dist:installers` 一次触发 Windows 和 macOS 目标
 - `scripts/package-win-installer.ps1` 为 Windows 打包脚本
 - `scripts/package-macos-installer.sh` 为 macOS 打包脚本
+- `scripts/package-ubuntu-installer.sh` 为 Ubuntu/Linux 打包脚本
 - macOS 打包通常应在 macOS 主机执行
-- 安装包会包含命令行启动器：Windows 为安装目录下的 `tasi.cmd` / `tasi-harness.cmd`，macOS 为应用包内的 `Contents/Resources/bin/tasi` / `tasi-harness`
+- Ubuntu/Linux 打包通常应在 Ubuntu/Linux 主机执行
+- 生成 `.bin` 后可在命令行安装：
+
+```bash
+chmod +x release/Tasi-Harness-*-*.bin
+sudo ./release/Tasi-Harness-*-*.bin
+```
+
+- 如需免 `sudo` 安装到用户目录：
+
+```bash
+./release/Tasi-Harness-*-*.bin --prefix "$HOME/.local/opt/tasi-harness" --bin-dir "$HOME/.local/bin"
+```
+
+- Windows 和 macOS 安装包会包含命令行启动器：Windows 为安装目录下的 `tasi.cmd` / `tasi-harness.cmd`，macOS 为应用包内的 `Contents/Resources/bin/tasi` / `tasi-harness`
 - Windows 安装器会在写入新文件前清理旧的程序安装目录；用户数据目录 `~/.tasi-harness` 不会被清理。启动时，安装包内置技能会同步到 `~/.tasi-harness/skills` 的对应内置副本，其他用户安装的技能保持不变。
 
 ## 命令行使用

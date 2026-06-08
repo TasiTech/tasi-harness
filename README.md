@@ -53,6 +53,8 @@ Quick commands:
 - Test: `npm test`
 - Package (Windows): `npm run dist:win`
 - Package (macOS): `npm run dist:mac`
+- Package (Ubuntu): `npm run dist:ubuntu`
+- Package (Ubuntu .deb): `npm run dist:ubuntu-deb`
 
 ## Quick Start
 

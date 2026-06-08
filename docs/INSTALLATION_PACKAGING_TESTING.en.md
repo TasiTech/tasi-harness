@@ -112,9 +112,12 @@ npm run pack
 npm run dist
 npm run dist:win
 npm run dist:mac
+npm run dist:ubuntu
+npm run dist:ubuntu-deb
 npm run dist:installers
 powershell -ExecutionPolicy Bypass -File scripts/package-win-installer.ps1
 bash scripts/package-macos-installer.sh
+bash scripts/package-ubuntu-installer.sh
 ```
 
 Artifacts are written to `release/`.
@@ -123,11 +126,28 @@ Notes:
 
 - `npm run dist:win` builds a Windows `NSIS` installer.
 - `npm run dist:mac` builds a macOS `DMG` installer.
-- `npm run dist:installers` builds both targets.
+- `npm run dist:ubuntu` builds an Ubuntu/Linux executable `.bin` installer.
+- `npm run dist:ubuntu-deb` builds an Ubuntu `.deb` package.
+- `npm run dist:installers` builds the Windows and macOS targets.
 - `scripts/package-win-installer.ps1` is Windows-focused.
 - `scripts/package-macos-installer.sh` is macOS-focused.
+- `scripts/package-ubuntu-installer.sh` is Ubuntu/Linux-focused.
 - macOS packaging should normally run on a macOS host.
-- Installers include command-line launchers: `tasi.cmd` / `tasi-harness.cmd` in the Windows install directory, and `Contents/Resources/bin/tasi` / `tasi-harness` inside the macOS app bundle.
+- Ubuntu/Linux packaging should normally run on an Ubuntu/Linux host.
+- Install the generated `.bin` package from a terminal:
+
+```bash
+chmod +x release/Tasi-Harness-*-*.bin
+sudo ./release/Tasi-Harness-*-*.bin
+```
+
+- To install without `sudo`, choose user-writable directories:
+
+```bash
+./release/Tasi-Harness-*-*.bin --prefix "$HOME/.local/opt/tasi-harness" --bin-dir "$HOME/.local/bin"
+```
+
+- Windows and macOS installers include command-line launchers: `tasi.cmd` / `tasi-harness.cmd` in the Windows install directory, and `Contents/Resources/bin/tasi` / `tasi-harness` inside the macOS app bundle.
 - The Windows installer cleans the old application install directory before writing new files; the user data directory `~/.tasi-harness` is left intact. On startup, bundled skills from the installer are synced into the matching bundled-skill copies under `~/.tasi-harness/skills`, while other user-installed skills are left unchanged.
 
 ## Command-Line Usage

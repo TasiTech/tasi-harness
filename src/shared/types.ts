@@ -155,6 +155,12 @@ export interface LlmCompletion {
   raw?: unknown;
 }
 
+export interface LlmRequestMetadata {
+  session?: string;
+  turn_type?: string;
+  session_done?: boolean;
+}
+
 export interface LlmRequest {
   messages: AgentMessage[];
   tools?: ToolDefinition[];
@@ -162,6 +168,7 @@ export interface LlmRequest {
   maxTokens?: number;
   logProbs?: boolean;
   topLogProbs?: number;
+  metadata?: LlmRequestMetadata;
   signal?: AbortSignal;
 }
 
@@ -370,6 +377,8 @@ export interface AgentRunOptions {
   enabledToolNames?: string[];
   logProbs?: boolean;
   topLogProbs?: number;
+  turnType?: string;
+  sessionDone?: boolean;
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
   stream?: boolean;
