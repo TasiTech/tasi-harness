@@ -1,6 +1,7 @@
 import type {
   BrowserAutomation,
   BrowserBinaryResult,
+  BrowserClickResult,
   BrowserCookieResult,
   BrowserDiagnosticsResult,
   BrowserExtractResult,
@@ -9,13 +10,15 @@ import type {
   BrowserPageState,
   BrowserSnapshotElement,
   BrowserSnapshotResult,
-  BrowserStorageResult
+  BrowserStorageResult,
+  BrowserUploadFileResult
 } from '../tools/browserAutomation.js';
 import type { AppConfig } from '../../shared/types.js';
 import { ExternalBrowserBridge } from './externalBrowserBridge.js';
 import type { BrowserExecutionLogger } from './browserExecutionLogger.js';
 
-const DEFAULT_TIMEOUT_MS = 20000;
+const DEFAULT_TIMEOUT_MS = 60000;
+const MAX_TIMEOUT_MS = 300000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
 const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
 const DEFAULT_SNAPSHOT_MAX_CHARS = 100000;
@@ -31,6 +34,7 @@ interface CdpTargetInfo {
 interface CdpEvaluateResult {
   result?: {
     type?: string;
+    objectId?: string;
     value?: unknown;
     unserializableValue?: string;
     description?: string;
@@ -59,9 +63,24 @@ interface CdpSession {
   target: CdpTargetInfo;
 }
 
+type CdpCommandSender = (method: string, params: Record<string, unknown>) => Promise<Record<string, any>>;
+
 interface BrowserExtractJsonLink {
   text: string;
   href: string;
+}
+
+interface ClickPageSnapshot {
+  textLength: number;
+  textDigest: string;
+  element?: BrowserClickResult['element'];
+}
+
+interface ClickDispatchResult {
+  ok: boolean;
+  error?: string;
+  element?: BrowserClickResult['element'];
+  windowOpenCalls?: Array<{ url: string; target?: string }>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -98,6 +117,16 @@ function clipWithMarker(value: string, maxChars: number): string {
   const marker = '... [truncated]';
   if (maxChars <= marker.length) return value.slice(0, maxChars);
   return `${value.slice(0, maxChars - marker.length)}${marker}`;
+}
+
+function clickObservationNote(result: BrowserClickResult): string {
+  const observation = result.observation;
+  if (!observation) return 'Click events were dispatched.';
+  if (observation.currentPageNavigationDetected) return 'Click events were dispatched and current-page navigation was detected.';
+  if ((observation.newTargets?.length ?? 0) > 0) return 'Click events were dispatched and a new browser target/window was detected.';
+  if ((observation.windowOpenCalls?.length ?? 0) > 0) return 'Click events were dispatched and window.open was called.';
+  if (observation.domTextChanged) return 'Click events were dispatched; URL/title stayed the same, but visible page text changed.';
+  return 'Click events were dispatched, but no current-page navigation or visible text change was detected.';
 }
 
 async function readMessageData(data: unknown): Promise<string> {
@@ -295,7 +324,14 @@ function pageHelpers(): string {
         if (href) {
           try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
         }
-        if ("value" in el && typeof el.value !== "undefined") item.value = clip(String(el.value || ""), 240);
+        const target = el.getAttribute("target");
+        if (target) item.target = target;
+        const onclick = el.getAttribute("onclick");
+        if (onclick) item.onclick = clip(onclick, 500);
+        if ("value" in el && typeof el.value !== "undefined") {
+          const type = String(el.getAttribute("type") || "").toLowerCase();
+          item.value = el.value ? "xxxx" : "";
+        }
         const placeholder = el.getAttribute("placeholder");
         if (placeholder) item.placeholder = placeholder;
         const label = labelFor(el);
@@ -408,7 +444,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     });
     const result = await this.bridge.open(target, config);
     if (!result.ok) throw new Error(result.content);
-    await this.waitForIdle(clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000));
+    await this.waitForIdle(clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS));
     await this.installPageErrorCapture().catch(() => {});
     const state = await this.state();
     await this.logStorageDiagnostics(state.url);
@@ -416,22 +452,22 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     return state;
   }
 
-  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number }): Promise<BrowserPageState> {
+  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number; observeMs?: number }): Promise<BrowserClickResult> {
+    const observeMs = clampInt(Number(options?.observeMs), options?.waitForNavigation ? 150 : 500, 0, 5000);
     const index = clampInt(Number(options?.index), 0, 0, 9999);
     const sel = selector.trim();
     if (!sel) throw new Error('selector is required.');
-    const result = await this.evalInPage<{ ok: boolean; error?: string }>(
-      `(function () {
-        ${pageHelpers()}
-        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
-        if (!found.ok) return found;
-        TasiBrowser.activate(found.el);
-        return { ok: true };
-      })();`
-    );
+    const before = await this.state();
+    const beforeTargets = await this.listPageTargets().catch(() => []);
+    const beforeSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    const result = await this.dispatchClick(sel, index);
     if (!result.ok) throw new Error(result.error || `Failed to click selector: ${sel}`);
-    if (options?.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000));
-    return this.state();
+    if (options?.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS));
+    else if (observeMs > 0) await sleep(observeMs);
+    const after = await this.state();
+    const afterTargets = await this.listPageTargets().catch(() => []);
+    const afterSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    return this.buildClickResult(sel, index, before, after, beforeSnapshot, afterSnapshot, result, beforeTargets, afterTargets);
   }
 
   async type(selector: string, text: string, options?: { clear?: boolean; submit?: boolean }): Promise<BrowserPageState> {
@@ -509,19 +545,27 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     state?: 'attached' | 'visible' | 'hidden' | 'detached';
     loadState?: 'load' | 'domcontentloaded' | 'networkidle';
     function?: string;
+    untilChanged?: boolean;
+    untilLoggedIn?: boolean;
     timeoutMs?: number;
   }): Promise<BrowserPageState> {
-    const ms = clampInt(Number(options?.ms), 0, 0, 60000);
-    if (ms > 0) await sleep(ms);
-    if (options?.loadState) await this.waitForIdle(clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, 120000));
+    const ms = clampInt(Number(options?.ms), 0, 0, MAX_TIMEOUT_MS);
     const selector = options?.selector?.trim() ?? '';
     const text = options?.text?.trim() ?? '';
     const url = options?.url?.trim() ?? '';
     const fn = options?.function?.trim() ?? '';
-    if (!selector && !text && !url && !fn) return this.state();
+    const untilChanged = options?.untilChanged === true;
+    const untilLoggedIn = options?.untilLoggedIn === true;
     const wantedState = options?.state ?? 'attached';
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, 120000);
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, MAX_TIMEOUT_MS);
+    const initialSignature = untilChanged ? await this.pageChangeSignature().catch(() => '') : '';
+    if (ms > 0) await sleep(ms);
+    if (options?.loadState) await this.waitForIdle(timeoutMs);
+    if (!selector && !text && !url && !fn && !untilChanged && !untilLoggedIn) return this.state();
+    const hasPredicate = Boolean(selector || text || url || fn);
     const started = Date.now();
+    let lastAutoLoginSubmitAt = 0;
+    let autoLoginSubmitAttempts = 0;
     while (Date.now() - started < timeoutMs) {
       const ok = await this.evalInPage<boolean>(
         `(function () {
@@ -551,7 +595,20 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
           return true;
         })();`
       );
-      if (ok) return this.state();
+      if (hasPredicate && ok) return this.state();
+      if (untilChanged) {
+        const currentSignature = await this.pageChangeSignature().catch(() => '');
+        if (currentSignature && currentSignature !== initialSignature) return this.state();
+      }
+      if (untilLoggedIn && autoLoginSubmitAttempts < 3 && Date.now() - lastAutoLoginSubmitAt > 5000) {
+        lastAutoLoginSubmitAt = Date.now();
+        const submitted = await this.autoSubmitFilledLoginForm().catch(() => false);
+        if (submitted) {
+          autoLoginSubmitAttempts += 1;
+          await sleep(500);
+        }
+      }
+      if (untilLoggedIn && await this.loginCompletionDetected().catch(() => false)) return this.state();
       await sleep(150);
     }
     throw new Error(`Timed out waiting for browser condition after ${timeoutMs} ms.`);
@@ -744,7 +801,7 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       })();`
     );
     if (!result.ok) throw new Error(result.error || 'Find failed.');
-    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000));
+    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS));
     return { ...(await this.state()), ref: result.ref, selector: result.selector, text: result.text, element: result.element };
   }
 
@@ -812,6 +869,31 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyDown', key: normalized.key, code: normalized.code, modifiers: normalized.modifiers });
     await this.cdpCommand('Input.dispatchKeyEvent', { type: 'keyUp', key: normalized.key, code: normalized.code, modifiers: normalized.modifiers });
     return this.state();
+  }
+
+  async uploadFile(selector: string, files: string[], options?: { index?: number }): Promise<BrowserUploadFileResult> {
+    const sel = selector.trim();
+    if (!sel) throw new Error('selector is required.');
+    if (files.length === 0) throw new Error('At least one file path is required.');
+    const index = clampInt(Number(options?.index), 0, 0, 9999);
+    const session = await this.resolveSession();
+    if (!session.target.webSocketDebuggerUrl) throw new Error(`External browser target has no CDP websocket URL: ${session.target.id}`);
+    await this.withCdpConnection(session.target.webSocketDebuggerUrl, async (send) => {
+      const objectId = await this.resolveElementObjectIdWithCdp(send, sel, index, 'HTMLInputElement', 'file input');
+      await send('DOM.setFileInputFiles', { objectId, files });
+    });
+    const result = await this.evalInPage<{ multiple: boolean }>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return { multiple: Boolean(el.multiple) };
+      })();`
+    );
+    return { ...(await this.state()), selector: sel, files, multiple: result.multiple };
   }
 
   async screenshot(): Promise<BrowserBinaryResult> {
@@ -966,6 +1048,93 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     await this.bridge.close();
   }
 
+  private async captureClickPageSnapshot(selector: string, index: number): Promise<ClickPageSnapshot> {
+    return this.evalInPage<ClickPageSnapshot>(
+      `(function () {
+        ${pageHelpers()}
+        const text = TasiBrowser.normalizeText((document.body && document.body.innerText) || (document.documentElement && document.documentElement.textContent) || "");
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        return {
+          textLength: text.length,
+          textDigest: String(hash),
+          element: found.ok ? TasiBrowser.describe(found.el) : undefined
+        };
+      })();`
+    );
+  }
+
+  private async dispatchClick(selector: string, index: number): Promise<ClickDispatchResult> {
+    return this.evalInPage<ClickDispatchResult>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) return found;
+        const calls = [];
+        const originalOpen = window.open;
+        window.open = function (url, target, features) {
+          calls.push({ url: String(url || ""), target: target == null ? undefined : String(target) });
+          return originalOpen.apply(window, arguments);
+        };
+        try {
+          TasiBrowser.activate(found.el);
+          return { ok: true, element: TasiBrowser.describe(found.el), windowOpenCalls: calls };
+        } finally {
+          window.open = originalOpen;
+        }
+      })();`
+    );
+  }
+
+  private buildClickResult(
+    selector: string,
+    index: number,
+    before: BrowserPageState,
+    after: BrowserPageState,
+    beforeSnapshot: ClickPageSnapshot | null,
+    afterSnapshot: ClickPageSnapshot | null,
+    dispatch: ClickDispatchResult,
+    beforeTargets: CdpTargetInfo[],
+    afterTargets: CdpTargetInfo[]
+  ): BrowserClickResult {
+    const urlChanged = before.url !== after.url;
+    const titleChanged = before.title !== after.title;
+    const domTextChanged = beforeSnapshot && afterSnapshot
+      ? beforeSnapshot.textDigest !== afterSnapshot.textDigest || beforeSnapshot.textLength !== afterSnapshot.textLength
+      : undefined;
+    const beforeTargetIds = new Set(beforeTargets.map((target) => target.id));
+    const newTargets = afterTargets
+      .filter((target) => !beforeTargetIds.has(target.id))
+      .filter((target) => target.url && target.url !== 'about:blank')
+      .slice(0, 5)
+      .map((target) => ({ id: target.id, url: target.url, title: target.title || '' }));
+    const result: BrowserClickResult = {
+      ...after,
+      action: 'dispatched_click_events',
+      selector,
+      index,
+      element: dispatch.element || beforeSnapshot?.element,
+      before,
+      after,
+      observation: {
+        urlChanged,
+        titleChanged,
+        currentPageNavigationDetected: urlChanged || titleChanged,
+        domTextChanged,
+        beforeTextLength: beforeSnapshot?.textLength,
+        afterTextLength: afterSnapshot?.textLength,
+        windowOpenCalls: dispatch.windowOpenCalls?.slice(0, 5),
+        newTargets,
+        note: ''
+      }
+    };
+    result.observation!.note = clickObservationNote(result);
+    return result;
+  }
+
   private async installPageErrorCapture(): Promise<void> {
     await this.evalInPage(
       `(function () {
@@ -1046,9 +1215,10 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
       const meaningful = depth === 0 || name || value || stateParts.length > 0 || !['generic', 'none', 'ignored'].includes(role.toLowerCase());
       if (meaningful) {
         const item: Record<string, unknown> = { depth, role };
-        if (name) item.name = clipWithMarker(name, 240);
-        if (value) item.value = clipWithMarker(value, 240);
         const ref = findRef(role, name);
+        const matchedElement = ref ? elements.find((element) => element.ref === ref) : undefined;
+        if (name) item.name = clipWithMarker(name, 240);
+        if (value) item.value = matchedElement?.value === '[password filled]' ? '[password filled]' : clipWithMarker(value, 240);
         if (ref) item.ref = ref;
         if (stateParts.length > 0) item.state = stateParts.join(',');
         out.push(item);
@@ -1091,6 +1261,94 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     throw new Error(`External browser page did not finish loading within ${timeoutMs} ms.`);
   }
 
+  private async pageChangeSignature(): Promise<string> {
+    return this.evalInPage<string>(
+      `(function () {
+        const text = String((document.body && (document.body.innerText || document.body.textContent)) || "")
+          .replace(/\\s+/g, " ")
+          .trim();
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        return [location.href, document.title || "", text.length, hash].join("\\n");
+      })();`
+    );
+  }
+
+  private async loginCompletionDetected(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const visiblePasswords = Array.from(document.querySelectorAll('input[type="password"]')).filter(visible);
+        const filledPassword = visiblePasswords.some((el) => String(el.value || "").length > 0);
+        const filledAccount = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter(visible)
+          .some((el) => String(el.value || "").trim().length > 0);
+        if (filledPassword && (filledAccount || visiblePasswords.length === 1)) return false;
+        if (visiblePasswords.length > 0) return false;
+        const text = TasiBrowser.normalizeText((document.body && (document.body.innerText || document.body.textContent)) || "");
+        const loweredUrl = location.href.toLowerCase();
+        const loweredTitle = String(document.title || "").toLowerCase();
+        const looksLikeLoginUrl = /\\/login\\b|\\/auth\\b|sso|cas|oauth|signin|logon/.test(loweredUrl);
+        const continuation = /(即将登录|确认登录|继续登录|授权|允许访问|同意授权|继续|进入系统|进入门户|continue|authorize|allow access|consent)/i.test(text);
+        const signedIn = /(退出登录|注销|个人中心|用户中心|我的|控制台|工作台|首页|信息门户|dashboard|portal|logout|sign out|my account)/i.test(text + " " + loweredTitle);
+        if (continuation || signedIn) return true;
+        return !looksLikeLoginUrl && text.length > 0;
+      })();`
+    );
+  }
+
+  private async autoSubmitFilledLoginForm(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const enabled = (el) => !el.disabled && el.getAttribute("aria-disabled") !== "true";
+        const textOf = (el) => TasiBrowser.normalizeText([
+          el.innerText,
+          el.textContent,
+          el.getAttribute("value"),
+          el.getAttribute("aria-label"),
+          el.getAttribute("title"),
+          el.getAttribute("name"),
+          el.id,
+          el.className
+        ].filter(Boolean).join(" "));
+        const passwords = Array.from(document.querySelectorAll('input[type="password"]')).filter((el) => visible(el) && enabled(el));
+        const filledPassword = passwords.find((el) => String(el.value || "").length > 0);
+        if (!filledPassword) return false;
+        const textInputs = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter((el) => visible(el) && enabled(el));
+        const challengePattern = /(captcha|otp|mfa|totp|2fa|verification|verify|sms|code|验证码|校验码|动态码|短信码|认证码)/i;
+        const emptyChallenge = textInputs.some((el) => challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && !String(el.value || "").trim());
+        if (emptyChallenge) return false;
+        const filledAccount = textInputs.some((el) => !challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && String(el.value || "").trim().length > 0);
+        if (!filledAccount && passwords.length !== 1) return false;
+        const form = filledPassword.closest("form");
+        const scopeCandidates = (root) => Array.from((root || document).querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]'));
+        const loginPattern = /\\b(log\\s*in|login|sign\\s*in|signin|submit|continue|next)\\b|登录|登陆|提交|继续|下一步|确认|进入/i;
+        const rejectPattern = /\\b(register|sign\\s*up|forgot|reset|cancel|back)\\b|注册|忘记|找回|重置|取消|返回/i;
+        const buttons = [...scopeCandidates(form), ...scopeCandidates(document)]
+          .filter((el, index, list) => list.indexOf(el) === index)
+          .filter((el) => visible(el) && enabled(el))
+          .map((el) => ({ el, label: textOf(el), type: String(el.getAttribute("type") || "").toLowerCase() }))
+          .filter((item) => !rejectPattern.test(item.label) && (loginPattern.test(item.label) || item.type === "submit"));
+        const target = buttons.sort((left, right) => (right.type === "submit" ? 1 : 0) - (left.type === "submit" ? 1 : 0))[0]?.el;
+        if (target) {
+          TasiBrowser.activate(target);
+          return true;
+        }
+        if (form && typeof form.requestSubmit === "function") {
+          form.requestSubmit();
+          return true;
+        }
+        return false;
+      })();`
+    );
+  }
+
   private async evalInPage<T>(expression: string): Promise<T> {
     const result = await this.cdpCommand('Runtime.evaluate', {
       expression,
@@ -1105,6 +1363,53 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     return (result.result?.value ?? result.result?.unserializableValue ?? result.result?.description ?? null) as T;
   }
 
+  private async resolveElementObjectId(selector: string, index: number, expectedConstructor: string, label: string): Promise<string> {
+    const result = await this.cdpCommand('Runtime.evaluate', {
+      expression: this.elementObjectExpression(selector, index, expectedConstructor, label),
+      awaitPromise: true,
+      returnByValue: false
+    }) as CdpEvaluateResult;
+    return this.objectIdFromEvaluateResult(result, selector, label);
+  }
+
+  private async resolveElementObjectIdWithCdp(
+    send: CdpCommandSender,
+    selector: string,
+    index: number,
+    expectedConstructor: string,
+    label: string
+  ): Promise<string> {
+    const result = await send('Runtime.evaluate', {
+      expression: this.elementObjectExpression(selector, index, expectedConstructor, label),
+      awaitPromise: true,
+      returnByValue: false
+    }) as CdpEvaluateResult;
+    return this.objectIdFromEvaluateResult(result, selector, label);
+  }
+
+  private elementObjectExpression(selector: string, index: number, expectedConstructor: string, label: string): string {
+    return `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        if (!(el instanceof ${expectedConstructor})) throw new Error("Target is not a ${label}.");
+        if (${JSON.stringify(label)} === "file input" && String(el.type || "").toLowerCase() !== "file") throw new Error("Target is not a file input.");
+        if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        return el;
+      })();`;
+  }
+
+  private objectIdFromEvaluateResult(result: CdpEvaluateResult, selector: string, label: string): string {
+    if (result.exceptionDetails) {
+      const message = result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'Runtime.evaluate failed.';
+      throw new Error(message);
+    }
+    const objectId = result.result?.objectId;
+    if (!objectId) throw new Error(`Could not resolve ${label} for selector: ${selector}`);
+    return objectId;
+  }
+
   private async cdpCommand(method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
     const session = await this.resolveSession();
     if (!session.target.webSocketDebuggerUrl) throw new Error(`External browser target has no CDP websocket URL: ${session.target.id}`);
@@ -1117,13 +1422,124 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     return this.sendCdpCommand(session.target.webSocketDebuggerUrl, method, params);
   }
 
+  private async withCdpConnection<T>(wsUrl: string, action: (send: CdpCommandSender) => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const ws = new WebSocket(withScheme(wsUrl, 'ws'));
+      const pending = new Map<number, {
+        method: string;
+        started: number;
+        timeout: ReturnType<typeof setTimeout>;
+        resolve: (result: Record<string, any>) => void;
+        reject: (error: Error) => void;
+      }>();
+      let closed = false;
+      let openedResolve: (() => void) | undefined;
+      let openedReject: ((error: Error) => void) | undefined;
+      const opened = new Promise<void>((ok, fail) => {
+        openedResolve = ok;
+        openedReject = fail;
+      });
+
+      const close = () => {
+        try {
+          ws.close();
+        } catch {
+          // Ignore socket close errors.
+        }
+      };
+      const failAll = (message: string) => {
+        if (closed) return;
+        closed = true;
+        openedReject?.(new Error(message));
+        for (const [id, item] of pending) {
+          clearTimeout(item.timeout);
+          this.log('automation.cdp.send.done', { id, method: item.method, ok: false, durationMs: Date.now() - item.started, message });
+          item.reject(new Error(message));
+        }
+        pending.clear();
+        close();
+      };
+      const send: CdpCommandSender = async (method, params) => {
+        await opened;
+        if (closed) throw new Error(`CDP socket is closed before ${method}.`);
+        return new Promise<Record<string, any>>((ok, fail) => {
+          const id = ++this.messageId;
+          const started = Date.now();
+          this.log('automation.cdp.send.start', { id, method });
+          const timeout = setTimeout(() => {
+            pending.delete(id);
+            const message = `CDP timeout for ${method} on ${wsUrl}`;
+            this.log('automation.cdp.send.done', { id, method, ok: false, durationMs: Date.now() - started, message });
+            fail(new Error(message));
+          }, 8000);
+          pending.set(id, { method, started, timeout, resolve: ok, reject: fail });
+          try {
+            ws.send(JSON.stringify({ id, method, params }));
+          } catch (error) {
+            clearTimeout(timeout);
+            pending.delete(id);
+            const message = error instanceof Error ? error.message : String(error);
+            this.log('automation.cdp.send.done', { id, method, ok: false, durationMs: Date.now() - started, message });
+            fail(error instanceof Error ? error : new Error(message));
+          }
+        });
+      };
+
+      ws.addEventListener('open', () => openedResolve?.());
+      ws.addEventListener('error', (event) => {
+        failAll(`CDP socket error: ${String((event as unknown as { message?: string }).message || 'unknown')}`);
+      });
+      ws.addEventListener('message', (event) => {
+        void (async () => {
+          const text = await readMessageData((event as MessageEvent).data);
+          let payload: Record<string, any>;
+          try {
+            payload = JSON.parse(text) as Record<string, any>;
+          } catch {
+            return;
+          }
+          if (typeof payload.id !== 'number') return;
+          const item = pending.get(payload.id);
+          if (!item) return;
+          pending.delete(payload.id);
+          clearTimeout(item.timeout);
+          if (payload.error) {
+            const error = payload.error as { message?: string } | undefined;
+            const message = error?.message ? `CDP ${item.method} failed: ${error.message}` : `CDP ${item.method} failed.`;
+            this.log('automation.cdp.send.done', { id: payload.id, method: item.method, ok: false, durationMs: Date.now() - item.started, message });
+            item.reject(new Error(message));
+            return;
+          }
+          this.log('automation.cdp.send.done', { id: payload.id, method: item.method, ok: true, durationMs: Date.now() - item.started });
+          item.resolve((payload.result as Record<string, any>) || {});
+        })();
+      });
+      ws.addEventListener('close', () => {
+        if (pending.size > 0) failAll('CDP socket closed before response.');
+        closed = true;
+      });
+
+      void (async () => {
+        try {
+          const result = await action(send);
+          resolve(result);
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error(String(error)));
+        } finally {
+          close();
+        }
+      })();
+    });
+  }
+
+  private async sendCdpCommand(wsUrl: string, method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
+    return this.withCdpConnection(wsUrl, (send) => send(method, params));
+  }
+
   private async resolveSession(): Promise<CdpSession> {
     const endpoint = endpointRoot(this.bridge.cdpEndpointHint(this.getConfig()));
     this.log('automation.resolveSession.start', { endpoint });
-    const response = await fetch(`${endpoint}/json/list`, { method: 'GET' });
-    if (!response.ok) throw new Error(`CDP target list unavailable (${response.status}) at ${endpoint}/json/list`);
-    const targets = (await response.json()) as CdpTargetInfo[];
-    const pages = targets.filter((target) => target.type === 'page' && target.webSocketDebuggerUrl);
+    const pages = await this.listPageTargets(endpoint);
     if (pages.length === 0) throw new Error('No attachable CDP page target is available.');
     const activeId = this.bridge.activeCdpTargetId();
     const target = (activeId ? pages.find((item) => item.id === activeId) : undefined)
@@ -1140,72 +1556,11 @@ export class ExternalBrowserAutomation implements BrowserAutomation {
     return { target };
   }
 
-  private async sendCdpCommand(wsUrl: string, method: string, params: Record<string, unknown>): Promise<Record<string, any>> {
-    return new Promise<Record<string, any>>((resolve, reject) => {
-      const id = ++this.messageId;
-      const started = Date.now();
-      this.log('automation.cdp.send.start', { id, method });
-      let settled = false;
-      const ws = new WebSocket(withScheme(wsUrl, 'ws'));
-      const fail = (message: string) => {
-        if (settled) return;
-        settled = true;
-        try {
-          ws.close();
-        } catch {
-          // Ignore socket close errors.
-        }
-        this.log('automation.cdp.send.done', { id, method, ok: false, durationMs: Date.now() - started, message });
-        reject(new Error(message));
-      };
-      const done = (result: Record<string, any>) => {
-        if (settled) return;
-        settled = true;
-        try {
-          ws.close();
-        } catch {
-          // Ignore socket close errors.
-        }
-        this.log('automation.cdp.send.done', { id, method, ok: true, durationMs: Date.now() - started });
-        resolve(result);
-      };
-      const timeout = setTimeout(() => fail(`CDP timeout for ${method} on ${wsUrl}`), 8000);
-      ws.addEventListener('open', () => {
-        try {
-          ws.send(JSON.stringify({ id, method, params }));
-        } catch (error) {
-          clearTimeout(timeout);
-          fail(error instanceof Error ? error.message : String(error));
-        }
-      });
-      ws.addEventListener('error', (event) => {
-        clearTimeout(timeout);
-        fail(`CDP socket error: ${String((event as unknown as { message?: string }).message || 'unknown')}`);
-      });
-      ws.addEventListener('message', (event) => {
-        void (async () => {
-          const text = await readMessageData((event as MessageEvent).data);
-          let payload: Record<string, any>;
-          try {
-            payload = JSON.parse(text) as Record<string, any>;
-          } catch {
-            return;
-          }
-          if (payload.id !== id) return;
-          clearTimeout(timeout);
-          if (payload.error) {
-            const error = payload.error as { message?: string } | undefined;
-            fail(error?.message ? `CDP ${method} failed: ${error.message}` : `CDP ${method} failed.`);
-            return;
-          }
-          done((payload.result as Record<string, any>) || {});
-        })();
-      });
-      ws.addEventListener('close', () => {
-        clearTimeout(timeout);
-        if (!settled) fail(`CDP socket closed before response for ${method}.`);
-      });
-    });
+  private async listPageTargets(endpoint = endpointRoot(this.bridge.cdpEndpointHint(this.getConfig()))): Promise<CdpTargetInfo[]> {
+    const response = await fetch(`${endpoint}/json/list`, { method: 'GET' });
+    if (!response.ok) throw new Error(`CDP target list unavailable (${response.status}) at ${endpoint}/json/list`);
+    const targets = (await response.json()) as CdpTargetInfo[];
+    return targets.filter((target) => target.type === 'page' && target.webSocketDebuggerUrl);
   }
 
   private log(event: string, details: Record<string, unknown> = {}): void {

@@ -1,9 +1,12 @@
-import { app, nativeImage } from 'electron';
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const electronRequire = createRequire(import.meta.url);
+const { app } = electronRequire('electron/main') as typeof import('electron/main');
+const { nativeImage } = electronRequire('electron/common') as typeof import('electron/common');
 const WINDOWS_APP_USER_MODEL_ID = 'com.tasiharness.desktop';
 
 function assetCandidates(fileName: string): string[] {

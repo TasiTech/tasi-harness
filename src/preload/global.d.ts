@@ -9,6 +9,7 @@ import type {
   BrowserCoachGenerateSkillResult,
   BrowserCoachRecording,
   BrowserCoachStartRequest,
+  BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
@@ -26,13 +27,18 @@ import type {
   SessionDocumentContext,
   SessionDocumentUploadRequest,
   SessionDocumentUploadResult,
+  SessionMessageContentRequest,
+  SessionMessageContentResult,
   SkillArchiveUploadRequest,
   SkillInstallRequest,
   SessionRecord,
   SessionSummary,
+  SessionToolEventContentRequest,
+  SessionToolEventContentResult,
   SessionUpdateEvent,
   SkillDocument,
   SkillMetadata,
+  SkillOptimizationRunRequest,
   SkillPatchRequest,
   ToolApprovalDecision,
   ToolApprovalRequest,
@@ -56,6 +62,7 @@ declare global {
       };
       agent: {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]): Promise<AgentRunResult>;
+        optimizeSkills(req: SkillOptimizationRunRequest): Promise<AgentRunResult>;
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
         onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;
@@ -67,6 +74,9 @@ declare global {
       sessions: {
         list(): Promise<SessionSummary[]>;
         read(id: string): Promise<SessionRecord | null>;
+        readForDisplay(id: string): Promise<SessionRecord | null>;
+        readMessageContent(req: SessionMessageContentRequest): Promise<SessionMessageContentResult>;
+        readToolEventContent(req: SessionToolEventContentRequest): Promise<SessionToolEventContentResult>;
         delete(id: string): Promise<boolean>;
         rename(id: string, title: string): Promise<SessionSummary>;
         search(query: string): Promise<SessionSummary[]>;
@@ -105,6 +115,9 @@ declare global {
         stop(): Promise<BrowserCoachRecording>;
         status(): Promise<BrowserCoachRecording>;
         clear(): Promise<BrowserCoachRecording>;
+        listRecordings(): Promise<BrowserCoachStoredRecording[]>;
+        loadRecording(skillName: string): Promise<BrowserCoachRecording | null>;
+        deleteRecording(recordingId: string): Promise<boolean>;
         generateSkill(req: BrowserCoachGenerateSkillRequest): Promise<BrowserCoachGenerateSkillResult>;
       };
       tasks: {

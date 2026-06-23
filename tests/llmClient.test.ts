@@ -125,6 +125,90 @@ describe('llmClient', () => {
     expect(result.message.content).toBe('Recovered after retry.');
   });
 
+  it('uses OpenAI-compatible chat completions for vLLM without requiring an API key', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'vLLM response.' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-model'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'hello' }]
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [endpoint, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(endpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect((init.headers as Record<string, string>).Authorization).toBeUndefined();
+    const body = JSON.parse(String(init.body));
+    expect(body.model).toBe('served-model');
+    expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
+    expect(result.message.content).toBe('vLLM response.');
+  });
+
+  it('requests and returns OpenAI-compatible log probabilities', async () => {
+    const logprobs = {
+      content: [
+        {
+          token: 'Hello',
+          logprob: -0.12,
+          bytes: [72, 101, 108, 108, 111],
+          top_logprobs: []
+        }
+      ]
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'Hello' },
+              logprobs
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-model'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'hello' }],
+      logProbs: true,
+      topLogProbs: 3
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.logprobs).toBe(true);
+    expect(body.top_logprobs).toBe(3);
+    expect(result.log_probs).toEqual(logprobs);
+  });
+
   it('returns sanitized HTML error details instead of raw HTML', async () => {
     const fetchMock = vi.fn().mockImplementation(() =>
       Promise.resolve(
@@ -288,6 +372,55 @@ describe('llmClient', () => {
       { type: 'video_url', video_url: { url: 'data:video/mp4;base64,dmlkZW8=' } },
       { type: 'input_audio', input_audio: { data: 'data:audio/mpeg;base64,YXVkaW8=', format: 'mp3' } }
     ]);
+  });
+
+  it('normalizes historical tool call arguments to JSON for qwen-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.6-plus'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'user', content: 'open example.com' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'call_bad_args',
+              type: 'function',
+              function: { name: 'browser_open', arguments: 'url=https://example.com' }
+            }
+          ]
+        },
+        { role: 'tool', tool_call_id: 'call_bad_args', content: 'opened' },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages[1].tool_calls[0].function.arguments).toBe('{"raw":"url=https://example.com"}');
+    expect(() => JSON.parse(body.messages[1].tool_calls[0].function.arguments)).not.toThrow();
   });
 
   it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {

@@ -123,6 +123,8 @@ tasi chat "帮我总结当前工作区"
 tasi chat --session xxx "继续这个会话"
 tasi chat -s xxx -e sandbox "继续这个会话"
 tasi chat --execution sandbox --knowledge "根据个人知识库回答"
+tasi chat --no-memory --no-skills --tools none "不使用记忆、技能或工具回答"
+tasi chat --skill deep-search --tools browser_open,browser_extract "调研这个主题"
 tasi sessions
 ```
 
@@ -135,9 +137,32 @@ macOS 安装到 `/Applications` 后，可在 bash 中使用应用内置命令：
 ln -sf "/Applications/Tasi Harness.app/Contents/Resources/bin/tasi" "$HOME/.local/bin/tasi"
 ```
 
-无参数运行 `tasi` 会进入交互式对话。`chat` 不传 `--session/-s` 会新建会话，传入 `--session xxx` 或 `-s xxx` 会追加到该会话，`xxx` 就是完整 session id，不需要固定前缀；每次回复后都会显示当前 session id。命令行复用桌面应用的 `~/.tasi-harness/config.json`、会话、记忆、技能与个人知识库；浏览器自动化会通过外部 Chrome / Edge 的 CDP 模式运行。
+无参数运行 `tasi` 会进入交互式对话。`chat` 不传 `--session/-s` 会新建会话，传入 `--session xxx` 或 `-s xxx` 会追加到该会话，`xxx` 就是完整 session id，不需要固定前缀。`tasi sessions` 会列出已保存会话；脚本需要结构化会话列表时可加 `--json`。每次回复后都会显示当前 session id。命令行复用桌面应用的 `~/.tasi-harness/config.json`、会话、记忆、技能与个人知识库；浏览器自动化会通过外部 Chrome / Edge 的 CDP 模式运行。
 
-默认启用 `--stream` 时，CLI 会先按原文实时输出模型回复；回复完成后，会清掉这段原文并用 `marked-terminal` 替换成终端渲染版 Markdown。需要只保留 Markdown 原文流时可加 `--plain` 或 `-p`；需要脚本处理结果时可加 `--json` 或 `-j`，输出会包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage` 与 `execution` 等完整字段。
+常用对话选项：
+
+- `--execution workspace|sandbox` / `-e workspace|sandbox`：选择工具直接在工作区运行，或在复制出的沙箱中运行。
+- `--knowledge` / `-k`：启用个人知识库上下文。
+- `--no-memory`：本次运行禁用持久记忆。
+- `--memory-domains <list>`：用逗号分隔的记忆域替代自动推断。可用域包括 `finance`、`daily_life`、`work`、`travel`、`reading`、`education`、`health`、`other`。
+- `--no-skills`：不把技能索引注入提示词。
+- `--skill <name>`：启用一个指定技能，可重复传入。
+- `--skills <list>`：启用逗号分隔的多个技能。
+- `--tools <list>`：用逗号分隔的工具列表替代配置默认值；`--tools none` 表示禁用工具。
+- `--stream` / `--no-stream`：默认流式输出；也可等待完整回复后再输出。
+- `--plain` / `-p`：输出 Markdown 原文，而不是终端渲染版 Markdown。
+- `--json` / `-j`：输出完整运行结果对象，包含 `sessionId`、`finalResponse`、`messages`、`toolEvents`、`usage` 与 `execution` 等字段。
+- `--log-probs` 与 `--top-logprobs <0-5>`：在 `--json` 模式下请求 token log probabilities 和可选候选 token。
+- `--verbose` / `-V`：将工具事件输出到 stderr。
+- `--home <path>` / `-H <path>`：覆盖 `TASI_HARNESS_HOME`。
+
+CLI 也支持管道输入：
+
+```powershell
+Get-Content .\prompt.md | tasi chat --plain
+```
+
+交互式命令包括 `:new`、`:session <id>`、`:exit`。可用 `tasi help` 或 `tasi --help` 查看内置用法，用 `tasi version` 或 `tasi --version` 输出打包版本。
 
 ### 定时任务与通知
 

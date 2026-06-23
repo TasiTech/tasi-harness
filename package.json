@@ -1,6 +1,6 @@
 {
   "name": "tasi-harness",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Tasi Harness - TypeScript Electron desktop agent inspired by Hermes Agent architecture.",
   "main": "dist/main/main.js",
   "author": "Tasi Harness",
@@ -9,7 +9,7 @@
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "build:icons": "powershell -ExecutionPolicy Bypass -File scripts/generate-th-icons.ps1",
-    "dev": "concurrently -k \"tsc -p tsconfig.node.json --watch\" \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 dist/main/main.js && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "dev": "concurrently -k \"tsc -p tsconfig.node.json --watch\" \"vite --host 127.0.0.1 --port 5187 --strictPort\" \"wait-on dist/main/main.js && node scripts/start-electron-dev.mjs\"",
     "build:main": "tsc -p tsconfig.node.json",
     "build:renderer": "vite build",
     "build": "npm run clean && npm run typecheck && npm run build:main && npm run build:renderer",
@@ -17,6 +17,9 @@
     "dist": "npm run build && electron-builder",
     "dist:win": "node scripts/package-installers.mjs --win",
     "dist:mac": "node scripts/package-installers.mjs --mac",
+    "dist:ubuntu": "node scripts/package-installers.mjs --ubuntu",
+    "dist:ubuntu-bin": "node scripts/package-installers.mjs --ubuntu-bin",
+    "dist:ubuntu-deb": "node scripts/package-installers.mjs --ubuntu-deb",
     "dist:installers": "node scripts/package-installers.mjs --win --mac",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -25,7 +28,6 @@
   },
   "dependencies": {
     "@types/qrcode": "^1.5.6",
-    "@vitejs/plugin-react": "latest",
     "jszip": "^3.10.1",
     "katex": "^0.16.46",
     "marked": "^15.0.12",
@@ -41,12 +43,13 @@
     "@types/nodemailer": "^8.0.0",
     "@types/react": "latest",
     "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "^5.2.0",
     "concurrently": "latest",
     "cross-env": "latest",
     "electron": "latest",
     "electron-builder": "latest",
     "typescript": "latest",
-    "vite": "latest",
+    "vite": "^7.3.5",
     "vitest": "latest",
     "wait-on": "latest"
   },
@@ -111,7 +114,11 @@
       "include": "build/nsis/cli-path.nsh"
     },
     "linux": {
-      "target": "AppImage",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility",
       "icon": "build/icons"
     }
   }

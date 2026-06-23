@@ -1,8 +1,10 @@
 export type ProviderKind =
   | 'openai'
   | 'openai-compatible'
+  | 'vllm'
   | 'deepseek'
   | 'qwen-bailian'
+  | 'soildapi'
   | 'minimax'
   | 'kimi'
   | 'anthropic'
@@ -30,8 +32,12 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  contentOmitted?: boolean;
+  contentLength?: number;
   attachments?: AgentMessageAttachment[];
   reasoning_content?: string;
+  reasoningOmitted?: boolean;
+  reasoningLength?: number;
   reasoning_parts?: string[];
   name?: string;
   tool_call_id?: string;
@@ -145,7 +151,14 @@ export interface LlmUsage {
 export interface LlmCompletion {
   message: AgentMessage;
   usage?: LlmUsage;
+  log_probs?: unknown;
   raw?: unknown;
+}
+
+export interface LlmRequestMetadata {
+  session?: string;
+  turn_type?: string;
+  session_done?: boolean;
 }
 
 export interface LlmRequest {
@@ -153,6 +166,9 @@ export interface LlmRequest {
   tools?: ToolDefinition[];
   temperature?: number;
   maxTokens?: number;
+  logProbs?: boolean;
+  topLogProbs?: number;
+  metadata?: LlmRequestMetadata;
   signal?: AbortSignal;
 }
 
@@ -255,8 +271,10 @@ export interface MemoryState {
 
 export interface SkillMetadata {
   name: string;
+  displayName?: string;
   description: string;
   category: string;
+  displayCategory?: string;
   path: string;
   readonly: boolean;
   source: 'bundled' | 'local';
@@ -297,6 +315,41 @@ export interface SessionRecord extends SessionSummary {
   totalUsage?: LlmUsage;
 }
 
+export interface SessionOptimizationContextRequest {
+  sessionIds: string[];
+  maxCharsPerSession?: number;
+  maxTotalChars?: number;
+}
+
+export interface SessionOptimizationContextResult {
+  sessionIds: string[];
+  missingIds: string[];
+  context: string;
+  truncated: boolean;
+  totalChars: number;
+}
+
+export interface SessionMessageContentRequest {
+  sessionId: string;
+  messageId: string;
+}
+
+export interface SessionMessageContentResult {
+  content: string;
+  reasoning_content?: string;
+  attachments?: AgentMessageAttachment[];
+}
+
+export interface SessionToolEventContentRequest {
+  sessionId: string;
+  toolEventId: string;
+}
+
+export interface SessionToolEventContentResult {
+  content: string;
+  args: unknown;
+}
+
 export interface SessionUpdateEvent {
   sessionId: string;
   source: 'chat' | 'scheduled' | 'external';
@@ -317,6 +370,15 @@ export interface AgentRunOptions {
   attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
   usePersonalKnowledgeBase?: boolean;
+  useMemory?: boolean;
+  memoryDomains?: MemoryDomain[];
+  useSkills?: boolean;
+  enabledSkillNames?: string[];
+  enabledToolNames?: string[];
+  logProbs?: boolean;
+  topLogProbs?: number;
+  turnType?: string;
+  sessionDone?: boolean;
   origin?: 'chat' | 'scheduled';
   scheduledTaskId?: string;
   stream?: boolean;
@@ -330,16 +392,27 @@ export interface AgentRunResult {
   followUpQuestions?: string[];
   usage?: LlmUsage;
   totalUsage?: LlmUsage;
+  log_probs?: unknown;
   iterations: number;
   execution: AgentExecutionDetails;
+}
+
+export interface SkillOptimizationRunRequest {
+  prompt: string;
+  sessionIds: string[];
+  executionMode?: ExecutionMode;
 }
 
 export interface ToolEvent {
   id: string;
   toolName: string;
   args: unknown;
+  argsOmitted?: boolean;
+  argsLength?: number;
   ok: boolean;
   content: string;
+  contentOmitted?: boolean;
+  contentLength?: number;
   approval?: ToolApprovalRecord;
   createdAt: string;
 }
@@ -559,6 +632,8 @@ export interface SkillWriteRequest {
   name: string;
   content: string;
   category?: string;
+  displayName?: string;
+  displayCategory?: string;
   overwrite?: boolean;
 }
 
@@ -573,6 +648,8 @@ export interface SkillArchiveUploadRequest {
   contentBase64: string;
   name?: string;
   category?: string;
+  displayName?: string;
+  displayCategory?: string;
   overwrite?: boolean;
 }
 
@@ -611,12 +688,31 @@ export interface BrowserCoachGenerateSkillRequest {
   name: string;
   category: string;
   description?: string;
+  userGuidance?: string;
+  overwrite?: boolean;
+  recording?: BrowserCoachRecording;
+  displayName?: string;
+  displayCategory?: string;
 }
 
 export interface BrowserCoachGenerateSkillResult {
   skill: SkillDocument;
   recording: BrowserCoachRecording;
   recordingReferencePath: string;
+}
+
+export interface BrowserCoachStoredRecording {
+  id: string;
+  source: 'recording' | 'skill';
+  skillName: string;
+  displayName?: string;
+  category: string;
+  displayCategory?: string;
+  path: string;
+  startUrl: string;
+  startedAt?: string;
+  updatedAt?: string;
+  eventCount: number;
 }
 
 export interface PersonalKnowledgeUploadRequest {

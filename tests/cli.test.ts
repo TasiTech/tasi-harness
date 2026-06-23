@@ -51,6 +51,66 @@ describe('CLI argument parsing', () => {
     });
   });
 
+  it('parses runtime memory, skill, and tool controls', () => {
+    expect(parseArgs([
+      'chat',
+      '--no-memory',
+      '--memory-domains',
+      'work,travel',
+      '--no-skills',
+      '--skill',
+      'docx',
+      '--skills',
+      'tasi-travel,deep-search',
+      '--tools',
+      'file_read,browser_open',
+      'hello'
+    ])).toMatchObject({
+      message: 'hello',
+      useMemory: false,
+      memoryDomains: ['work', 'travel'],
+      useSkills: false,
+      enabledSkillNames: ['docx', 'tasi-travel', 'deep-search'],
+      enabledToolNames: ['file_read', 'browser_open']
+    });
+  });
+
+  it('supports disabling all tools from the CLI', () => {
+    expect(parseArgs(['chat', '--tools', 'none', 'hello'])).toMatchObject({
+      message: 'hello',
+      enabledToolNames: []
+    });
+  });
+
+  it('parses log probs request flags', () => {
+    expect(parseArgs(['chat', '--json', '--log-probs', 'hello'])).toMatchObject({
+      message: 'hello',
+      json: true,
+      logProbs: true
+    });
+    expect(parseArgs(['chat', '--json', '--log_probs', 'hello'])).toMatchObject({
+      message: 'hello',
+      json: true,
+      logProbs: true
+    });
+  });
+
+  it('parses top logprobs and implies log probs', () => {
+    expect(parseArgs(['chat', '--json', '--top-logprobs', '3', 'hello'])).toMatchObject({
+      message: 'hello',
+      json: true,
+      logProbs: true,
+      topLogProbs: 3
+    });
+    expect(parseArgs(['chat', '--json', '--top_logprobs', '1', 'hello'])).toMatchObject({
+      message: 'hello',
+      json: true,
+      logProbs: true,
+      topLogProbs: 1
+    });
+    expect(() => parseArgs(['chat', '--top-logprobs', '6', 'hello'])).toThrow(/Expected an integer from 0 to 5/);
+  });
+
   it('renders headings without markdown prefixes and de-indents markdown list items', () => {
     const rendered = renderMarkdownForTerminal(['## Current weather', '', '    * **Temperature**: 21 C'].join('\n'));
 

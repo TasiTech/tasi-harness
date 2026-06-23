@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { join } from 'node:path';
 import { existsSync, readFileSync } from 'node:fs';
 import { AgentLoop } from '../src/main/agent/agentLoop.js';
-import { MockLlmClient } from '../src/main/agent/llmClient.js';
+import { MockLlmClient, type LlmClient } from '../src/main/agent/llmClient.js';
 import { PromptBuilder } from '../src/main/agent/promptBuilder.js';
 import { PersonalKnowledgeBase } from '../src/main/knowledge/personalKnowledgeBase.js';
 import { MemoryStore } from '../src/main/storage/memoryStore.js';
@@ -11,6 +11,7 @@ import { SkillManager } from '../src/main/skills/skillManager.js';
 import { defaultConfig, ensureDir } from '../src/main/storage/pathUtils.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
+import type { LlmCompletion, LlmRequest } from '../src/shared/types.js';
 import { tempHome } from './helpers.js';
 
 let cleanup = () => {};
@@ -128,6 +129,55 @@ describe('AgentLoop', () => {
 
     expect(result.finalResponse).toBe('Streamed answer.');
     expect(deltas).toEqual(['r:Brief reasoning.', 'c:Streamed answer.', 'done:Streamed answer.']);
+  });
+
+  it('returns log probabilities from the final completion when requested', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const log_probs = { content: [{ token: 'Done', logprob: -0.1 }] };
+    let capturedRequest: LlmRequest | undefined;
+    const mock: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        capturedRequest = request;
+        return {
+          message: {
+            role: 'assistant',
+            content: 'Done.'
+          },
+          log_probs
+        };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'hello', logProbs: true, topLogProbs: 2, stream: false });
+
+    expect(result.finalResponse).toBe('Done.');
+    expect(result.log_probs).toEqual(log_probs);
+    expect(capturedRequest?.logProbs).toBe(true);
+    expect(capturedRequest?.topLogProbs).toBe(2);
   });
 
   it('persists user and streamed assistant messages before the run finishes', async () => {
@@ -252,4 +302,145 @@ describe('AgentLoop', () => {
     expect(finalAssistant?.reasoning_content).toBe('Need to inspect the workspace.\nNeed to write the file.');
     expect(finalAssistant?.reasoning_parts).toEqual(['Need to inspect the workspace.', 'Need to write the file.']);
   });
+
+  it('stops when the same tool call returns the same result repeatedly', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 10 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      safety: 'read-only',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'repeat_probe',
+          description: 'Returns the same result for repeat-loop tests.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }
+            }
+          }
+        }
+      },
+      async execute() {
+        return { ok: false, content: 'fetch failed' };
+      }
+    });
+    const repeatedCompletion = () => ({
+      message: {
+        role: 'assistant' as const,
+        content: 'Trying again.',
+        tool_calls: [{
+          id: createMockToolCallId(),
+          type: 'function' as const,
+          function: { name: 'repeat_probe', arguments: JSON.stringify({ path: 'token-hub-v2.png' }) }
+        }]
+      }
+    });
+    const mock = new MockLlmClient(Array.from({ length: 10 }, repeatedCompletion));
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'keep probing' });
+
+    expect(result.toolEvents).toHaveLength(3);
+    expect(result.iterations).toBe(3);
+    expect(result.finalResponse).toContain('Stopped because the same tool call repeated 3 times with the same result.');
+    expect(result.finalResponse).toContain('Tool: repeat_probe');
+    expect(result.finalResponse).toContain('Result: fail - fetch failed');
+    expect(result.finalResponse).not.toContain('Reached iteration limit');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
+
+  it('returns a user-facing handoff when the iteration limit is reached', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 2 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      safety: 'read-only',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'step_probe',
+          description: 'Probe a step.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      async execute() {
+        return { ok: true, content: 'still working' };
+      }
+    });
+    const repeatedCompletion = () => ({
+      message: {
+        role: 'assistant' as const,
+        content: 'Continuing.',
+        tool_calls: [{
+          id: createMockToolCallId(),
+          type: 'function' as const,
+          function: { name: 'step_probe', arguments: '{}' }
+        }]
+      }
+    });
+    const mock = new MockLlmClient(Array.from({ length: 5 }, repeatedCompletion));
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'keep going' });
+
+    expect(result.finalResponse).toContain('本轮已达到最大执行步数（2）');
+    expect(result.finalResponse).toContain('最近完成的操作');
+    expect(result.finalResponse).toContain('step_probe：成功');
+    expect(result.finalResponse).not.toContain('Reached iteration limit');
+    expect(result.finalResponse).not.toContain('Last tool events');
+    const storedSession = sessions.read(result.sessionId);
+    expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
 });
+
+let mockToolCallCounter = 0;
+
+function createMockToolCallId(): string {
+  mockToolCallCounter += 1;
+  return `call_repeat_${mockToolCallCounter}`;
+}

@@ -60,6 +60,10 @@ export class BrowserAutomationRouter implements BrowserAutomation {
     return this.current().press(...args);
   }
 
+  uploadFile(...args: Parameters<BrowserAutomation['uploadFile']>): ReturnType<BrowserAutomation['uploadFile']> {
+    return this.current().uploadFile(...args);
+  }
+
   screenshot(...args: Parameters<BrowserAutomation['screenshot']>): ReturnType<BrowserAutomation['screenshot']> {
     return this.current().screenshot(...args);
   }

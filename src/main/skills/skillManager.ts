@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import JSZip from 'jszip';
-import type { SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
+import type { BrowserCoachRecording, BrowserCoachStoredRecording, SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
 import { ensureDir, safeJoin, slugifyName } from '../storage/pathUtils.js';
 
 type FrontmatterValue = string | string[] | boolean | number;
@@ -95,6 +95,24 @@ export class SkillManager {
     return this.documentFromFile(file, file.startsWith(this.localRoot), file.startsWith(this.localRoot) ? 'local' : 'bundled');
   }
 
+  listBrowserCoachRecordings(): BrowserCoachStoredRecording[] {
+    return this.findSkillFiles(this.localRoot)
+      .map((file) => this.browserCoachRecordingSummary(file))
+      .filter((item): item is BrowserCoachStoredRecording => Boolean(item))
+      .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '') || a.skillName.localeCompare(b.skillName));
+  }
+
+  readBrowserCoachRecording(skillName: string): BrowserCoachRecording | null {
+    const file = this.localSkillFile(skillName);
+    const recordingPath = join(dirname(file), 'references', 'recording.json');
+    if (!existsSync(recordingPath)) return null;
+    return this.parseBrowserCoachRecording(readFileSync(recordingPath, 'utf8'));
+  }
+
+  deleteBrowserCoachRecording(skillName: string): boolean {
+    return this.removeSupportingFile(skillName, 'references/recording.json');
+  }
+
   readBundled(name: string): SkillDocument | null {
     if (!this.bundledRoot || !existsSync(this.bundledRoot)) return null;
     const slug = slugifyName(name);
@@ -119,11 +137,25 @@ export class SkillManager {
       name: String(frontmatter.name ?? slug),
       description: String(frontmatter.description ?? `Skill: ${slug}`),
       category,
-      ...frontmatter
+      ...frontmatter,
+      ...(req.displayName?.trim() ? { display_name: req.displayName.trim() } : {}),
+      ...(req.displayCategory?.trim() ? { display_category: req.displayCategory.trim() } : {})
     };
     const content = stringifySkill(finalFrontmatter, body || req.content);
     writeFileSync(join(dir, 'SKILL.md'), content, 'utf8');
     return this.documentFromFile(join(dir, 'SKILL.md'), true, 'local');
+  }
+
+  nextAvailableName(name: string, category = 'local'): string {
+    const base = slugifyName(name);
+    const categorySlug = slugifyName(category || 'local');
+    let candidate = base;
+    let suffix = 2;
+    while (existsSync(safeJoin(this.localRoot, join(categorySlug, candidate)))) {
+      candidate = `${base}-${suffix}`;
+      suffix += 1;
+    }
+    return candidate;
   }
 
   patch(req: SkillPatchRequest): SkillDocument {
@@ -165,6 +197,8 @@ export class SkillManager {
       ...Object.fromEntries(Object.entries(frontmatterOverrides).filter((entry): entry is [string, FrontmatterValue] => entry[1] !== undefined)),
       name: skillName,
       category: skillCategory || 'local',
+      ...(req.displayName?.trim() ? { display_name: req.displayName.trim() } : {}),
+      ...(req.displayCategory?.trim() ? { display_category: req.displayCategory.trim() } : {}),
       description: parsed.frontmatter.description ?? `Skill: ${skillName}`
     };
     const content = stringifySkill(frontmatter, parsed.body);
@@ -226,13 +260,18 @@ export class SkillManager {
     return true;
   }
 
-  renderPromptIndex(): string {
-    const skills = this.list();
-    if (skills.length === 0) return 'No skills are installed.';
+  renderPromptIndex(enabledNames?: string[]): string {
+    const enabled = enabledNames && enabledNames.length > 0 ? new Set(enabledNames.map((name) => slugifyName(name))) : null;
+    const skills = enabled
+      ? this.list().filter((skill) => enabled.has(slugifyName(skill.name)) || enabled.has(slugifyName(basename(dirname(skill.path)))))
+      : this.list();
+    if (skills.length === 0) return enabled ? 'No matching skills are enabled for this run.' : 'No skills are installed.';
     return skills
       .map((skill) => {
         const skillDir = dirname(skill.path);
-        return `- ${skill.name} [${skill.category}]: ${skill.description} | skill_file=${skill.path} | skill_dir=${skillDir}`;
+        const display = skill.displayName && skill.displayName !== skill.name ? `${skill.displayName} (${skill.name})` : skill.name;
+        const category = skill.displayCategory && skill.displayCategory !== skill.category ? `${skill.displayCategory} (${skill.category})` : skill.category;
+        return `- ${display} [${category}]: ${skill.description} | skill_file=${skill.path} | skill_dir=${skillDir}`;
       })
       .join('\n');
   }
@@ -281,8 +320,10 @@ export class SkillManager {
     const stat = statSync(file);
     return {
       name: String(frontmatter.name ?? folder),
+      displayName: typeof frontmatter.display_name === 'string' ? frontmatter.display_name : undefined,
       description: String(frontmatter.description ?? 'No description.'),
       category: String(frontmatter.category ?? basename(dirname(dirname(file))) ?? 'local'),
+      displayCategory: typeof frontmatter.display_category === 'string' ? frontmatter.display_category : undefined,
       path: file,
       readonly,
       source,
@@ -298,6 +339,45 @@ export class SkillManager {
     const { frontmatter } = parseSkillMarkdown(content);
     const meta = this.metadataFromFile(file, readonly, source);
     return { ...meta, content, frontmatter };
+  }
+
+  private browserCoachRecordingSummary(skillFile: string): BrowserCoachStoredRecording | null {
+    const recordingPath = join(dirname(skillFile), 'references', 'recording.json');
+    if (!existsSync(recordingPath)) return null;
+    const recording = this.parseBrowserCoachRecording(readFileSync(recordingPath, 'utf8'));
+    if (!recording) return null;
+    const metadata = this.metadataFromFile(skillFile, false, 'local');
+    const stat = statSync(recordingPath);
+    return {
+      id: `skill:${metadata.name}`,
+      source: 'skill',
+      skillName: metadata.name,
+      displayName: metadata.displayName,
+      category: metadata.category,
+      displayCategory: metadata.displayCategory,
+      path: recordingPath,
+      startUrl: recording.startUrl,
+      startedAt: recording.startedAt,
+      updatedAt: stat.mtime.toISOString(),
+      eventCount: recording.events.length
+    };
+  }
+
+  private parseBrowserCoachRecording(raw: string): BrowserCoachRecording | null {
+    try {
+      const parsed = JSON.parse(raw) as Partial<BrowserCoachRecording>;
+      if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.events)) return null;
+      return {
+        id: typeof parsed.id === 'string' ? parsed.id : '',
+        startUrl: typeof parsed.startUrl === 'string' ? parsed.startUrl : '',
+        startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : '',
+        endedAt: typeof parsed.endedAt === 'string' ? parsed.endedAt : undefined,
+        active: Boolean(parsed.active),
+        events: parsed.events
+      } as BrowserCoachRecording;
+    } catch {
+      return null;
+    }
   }
 
   private resolveSkillFile(name: string): string | null {

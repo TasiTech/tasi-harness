@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
@@ -23,6 +23,7 @@ describe('builtin tools', () => {
     expect(cfg.externalBrowserProfileMode).toBe('system');
     expect(cfg.browserHeadless).toBe(false);
     expect(cfg.browserExecutionLoggingEnabled).toBe(false);
+    expect(cfg.enabledToolNames).toContain('browser_close_policy');
   });
 
   it('writes inside workspace without approval and outside workspace with approval', async () => {
@@ -501,8 +502,10 @@ describe('builtin tools', () => {
     const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
     ensureDir(cfg.workspaceDir);
     const registry = new ToolRegistry();
+    const browserCalls: Array<{ tool: string; options?: unknown }> = [];
     const mockBrowser: BrowserAutomation = {
-      async open(url: string) {
+      async open(url: string, options?: { timeoutMs?: number }) {
+        browserCalls.push({ tool: 'open', options });
         return { url: url.startsWith('http') ? url : `https://${url}`, title: 'Example' };
       },
       async click() {
@@ -514,23 +517,24 @@ describe('builtin tools', () => {
       async scroll() {
         return { url: 'https://example.com', title: 'Example' };
       },
-      async wait() {
+      async wait(options) {
+        browserCalls.push({ tool: 'wait', options });
         return { url: 'https://example.com', title: 'Example' };
       },
       async extract() {
         return {
-          url: 'https://example.com',
+          url: 'https://example.com/?ticket=secret-ticket',
           title: 'Example',
           content: JSON.stringify(
             {
               tool: 'browser_extract',
               format: 'json',
-              browser_preview_url: 'https://example.com',
-              url: 'https://example.com',
+              browser_preview_url: 'https://example.com/?ticket=secret-ticket',
+              url: 'https://example.com/?ticket=secret-ticket',
               title: 'Example',
-              text: 'Hello world',
-              headings: [],
-              links: []
+              text: 'Hello world\nPhone 13812345678\nWeather sunny',
+              headings: ['Hello world', 'Weather'],
+              links: [{ text: 'Auth link', href: 'https://example.com/callback?token=abc123' }]
             },
             null,
             2
@@ -540,12 +544,37 @@ describe('builtin tools', () => {
       },
       async snapshot() {
         return {
-          url: 'https://example.com',
+          url: 'https://example.com/?ticket=secret-ticket',
           title: 'Example',
-          content: JSON.stringify({ tool: 'browser_snapshot', browser_preview_url: 'https://example.com', elements: [] }),
-          elements: [],
-          headings: [],
-          links: [],
+          content: JSON.stringify({
+            tool: 'browser_snapshot',
+            browser_preview_url: 'https://example.com/?ticket=secret-ticket',
+            url: 'https://example.com/?ticket=secret-ticket',
+            elements: [
+              { ref: '@e1', tag: 'input', role: 'textbox', name: 'Phone', text: 'Phone 13812345678', selector: '#phone', value: '13812345678', visible: true, enabled: true },
+              { ref: '@e5', tag: 'input', role: 'textbox', name: 'Search', text: '', selector: '#search', value: 'weather in beijing', visible: true, enabled: true },
+              { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '1234567890', visible: true, enabled: true },
+              { ref: '@e4', tag: 'input', role: 'textbox', name: '姓名', text: '', selector: '#person_name', value: '张三', visible: true, enabled: true },
+              { ref: '@e2', tag: 'div', role: 'div', name: 'Weather', text: 'Weather sunny', selector: '#weather', visible: true, enabled: true }
+            ],
+            snapshot: '- textbox "Username" [@e3] value="1234567890"\n- textbox "姓名" [@e4] value="李四"\n- div "Weather"',
+            tree: [
+              { depth: 0, role: 'textbox', name: 'Username', ref: '@e3', value: '1234567890' },
+              { depth: 0, role: 'textbox', name: '姓名', ref: '@e4', value: '王五' }
+            ],
+            headings: [{ level: 1, text: 'Phone profile' }],
+            links: [{ text: 'Auth link', href: 'https://example.com/callback?token=abc123' }],
+            images: []
+          }),
+          elements: [
+            { ref: '@e1', tag: 'input', role: 'textbox', name: 'Phone', text: 'Phone 13812345678', selector: '#phone', value: '13812345678', visible: true, enabled: true },
+            { ref: '@e5', tag: 'input', role: 'textbox', name: 'Search', text: '', selector: '#search', value: 'weather in shanghai', visible: true, enabled: true },
+            { ref: '@e3', tag: 'input', role: 'textbox', name: 'Username', text: '', selector: '#i_user', value: '9876543210', visible: true, enabled: true },
+            { ref: '@e4', tag: 'input', role: 'textbox', name: '姓名', text: '', selector: '#person_name', value: '赵六', visible: true, enabled: true },
+            { ref: '@e2', tag: 'div', role: 'div', name: 'Weather', text: 'Weather sunny', selector: '#weather', visible: true, enabled: true }
+          ],
+          headings: [{ level: 1, text: 'Phone profile' }],
+          links: [{ text: 'Auth link', href: 'https://example.com/callback?token=abc123' }],
           images: [],
           viewport: { width: 1280, height: 720, scrollX: 0, scrollY: 0 }
         };
@@ -564,6 +593,10 @@ describe('builtin tools', () => {
       },
       async press() {
         return { url: 'https://example.com', title: 'Example' };
+      },
+      async uploadFile(selector: string, files: string[]) {
+        browserCalls.push({ tool: 'uploadFile', options: { selector, files } });
+        return { url: 'https://example.com', title: 'Example', selector, files };
       },
       async screenshot() {
         return { url: 'https://example.com', title: 'Example', data: Buffer.from('png'), mimeType: 'image/png', extension: 'png' };
@@ -611,18 +644,79 @@ describe('builtin tools', () => {
     );
     expect(open.ok).toBe(true);
     expect(open.content).toContain('browser_preview_url: https://example.com');
+    expect(browserCalls.find((call) => call.tool === 'open')?.options).toMatchObject({ timeoutMs: 60000 });
+
+    const click = await registry.execute(
+      'browser_click',
+      { selector: '#demo' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(click.ok).toBe(true);
+    expect(JSON.parse(click.content)).toMatchObject({
+      tool: 'browser_click',
+      browser_preview_url: 'https://example.com',
+      url: 'https://example.com',
+      action: 'dispatched_click_events',
+      recommended_next_tools: ['browser_snapshot', 'browser_extract', 'browser_console', 'browser_network']
+    });
 
     const extract = await registry.execute(
       'browser_extract',
-      { max_chars: 2000 },
+      { max_chars: 2000, filter_text: 'Hello' },
       { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
     );
     expect(extract.ok).toBe(true);
     expect(JSON.parse(extract.content)).toMatchObject({
       format: 'json',
       text: 'Hello world',
-      url: 'https://example.com'
+      url: 'https://example.com/?ticket=xxxx'
     });
+    expect(extract.content).not.toContain('13812345678');
+    expect(extract.content).not.toContain('abc123');
+
+    const snapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: 'Phone', include_values: false, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(snapshot.ok).toBe(true);
+    expect(snapshot.content).toContain('xxxx');
+    expect(snapshot.content).not.toContain('[redacted');
+    expect(snapshot.content).toContain('Phone');
+    expect(snapshot.content).not.toContain('Weather sunny');
+    expect(snapshot.content).not.toContain('abc123');
+
+    const sensitiveSnapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: 'Username', include_values: true, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(sensitiveSnapshot.ok).toBe(true);
+    expect(sensitiveSnapshot.content).toContain('xxxx');
+    expect(sensitiveSnapshot.content).not.toContain('1234567890');
+    expect(JSON.stringify(sensitiveSnapshot.data)).not.toContain('9876543210');
+
+    const formValueSnapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: 'Search', include_values: true, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(formValueSnapshot.ok).toBe(true);
+    expect(formValueSnapshot.content).toContain('xxxx');
+    expect(formValueSnapshot.content).not.toContain('weather in beijing');
+    expect(JSON.stringify(formValueSnapshot.data)).not.toContain('weather in shanghai');
+
+    const personSnapshot = await registry.execute(
+      'browser_snapshot',
+      { filter_text: '姓名', include_values: true, max_chars: 10000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(personSnapshot.ok).toBe(true);
+    expect(personSnapshot.content).toContain('xxxx');
+    for (const fakeName of ['张三', '李四', '王五', '赵六']) {
+      expect(personSnapshot.content).not.toContain(fakeName);
+      expect(JSON.stringify(personSnapshot.data)).not.toContain(fakeName);
+    }
 
     mockBrowser.extract = async (options) => ({
       url: 'https://example.com',
@@ -642,5 +736,112 @@ describe('builtin tools', () => {
     expect(extractJson.ok).toBe(true);
     expect(extractJson.content).toContain('browser_extract format=html');
     expect(extractJson.content).toContain('fallback html');
+
+    const policies: Array<{ sessionId: string; policy: string; reason?: string }> = [];
+    const policyRegistry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home),
+      setBrowserClosePolicy: (sessionId, policy, reason) => policies.push({ sessionId, policy, reason })
+    })) policyRegistry.register(tool);
+    const policy = await policyRegistry.execute(
+      'browser_close_policy',
+      { policy: 'keep_open', reason: 'form submitted for user review' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(policy.ok).toBe(true);
+    expect(policy.content).toContain('keep_open');
+    expect(policies).toEqual([{ sessionId: 's', policy: 'keep_open', reason: 'form submitted for user review' }]);
+
+    const wait = await registry.execute(
+      'browser_wait',
+      { url: 'dashboard' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(wait.ok).toBe(true);
+    expect([...browserCalls].reverse().find((call) => call.tool === 'wait')?.options).toMatchObject({
+      url: 'dashboard',
+      untilChanged: true,
+      untilLoggedIn: true,
+      timeoutMs: 300000
+    });
+
+    const longConditionalWait = await registry.execute(
+      'browser_wait',
+      { url: 'dashboard', timeout_ms: 300000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(longConditionalWait.ok).toBe(true);
+    expect([...browserCalls].reverse().find((call) => call.tool === 'wait')?.options).toMatchObject({
+      url: 'dashboard',
+      untilChanged: true,
+      untilLoggedIn: true,
+      timeoutMs: 300000
+    });
+
+    const manualWait = await registry.execute(
+      'browser_wait',
+      { ms: 300000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(manualWait.ok).toBe(true);
+    expect([...browserCalls].reverse().find((call) => call.tool === 'wait')?.options).toMatchObject({
+      ms: 0,
+      untilChanged: true,
+      untilLoggedIn: true,
+      timeoutMs: 300000
+    });
+
+    const originalWait = mockBrowser.wait;
+    const waitPolicies: Array<{ sessionId: string; policy: string; reason?: string }> = [];
+    mockBrowser.wait = async (options) => {
+      browserCalls.push({ tool: 'wait', options });
+      throw new Error('Timed out waiting for browser condition after 300000 ms.');
+    };
+    const manualLoginWaitRegistry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home),
+      browserAutomation: mockBrowser,
+      setBrowserClosePolicy: (sessionId, policy, reason) => waitPolicies.push({ sessionId, policy, reason })
+    })) manualLoginWaitRegistry.register(tool);
+    const pendingManualLogin = await manualLoginWaitRegistry.execute(
+      'browser_wait',
+      { wait_for_user: true, until_logged_in: true, until_changed: true, timeout_ms: 300000 },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(pendingManualLogin.ok).toBe(true);
+    expect(pendingManualLogin.content).toContain('Waiting for user input');
+    expect(waitPolicies).toEqual([{ sessionId: 's', policy: 'keep_open', reason: 'waiting for user login, captcha, or MFA in browser' }]);
+    mockBrowser.wait = originalWait;
+
+    writeFileSync(join(cfg.workspaceDir, 'invoice.pdf'), 'pdf');
+    const upload = await registry.execute(
+      'browser_upload_file',
+      { selector: 'input[type=file]', path: 'invoice.pdf' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(upload.ok).toBe(true);
+    expect(upload.content).toContain('Uploaded 1 file');
+    expect(browserCalls.find((call) => call.tool === 'uploadFile')?.options).toMatchObject({
+      selector: 'input[type=file]',
+      files: [join(cfg.workspaceDir, 'invoice.pdf')]
+    });
+
+    browserCalls.length = 0;
+    const uploadDefaultSelector = await registry.execute(
+      'browser_upload_file',
+      { path: 'invoice.pdf' },
+      { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r' }
+    );
+    expect(uploadDefaultSelector.ok).toBe(true);
+    expect(browserCalls.find((call) => call.tool === 'uploadFile')?.options).toMatchObject({
+      selector: 'input[type=file]',
+      files: [join(cfg.workspaceDir, 'invoice.pdf')]
+    });
   });
 });

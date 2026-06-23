@@ -3,6 +3,47 @@ export interface BrowserPageState {
   title: string;
 }
 
+export interface BrowserUploadFileResult extends BrowserPageState {
+  selector: string;
+  files: string[];
+  multiple?: boolean;
+}
+
+export interface BrowserClickElementSnapshot {
+  tag: string;
+  text: string;
+  href?: string;
+  target?: string;
+  onclick?: string;
+  role?: string;
+  name?: string;
+  visible?: boolean;
+  enabled?: boolean;
+  box?: { x: number; y: number; width: number; height: number };
+}
+
+export interface BrowserClickObservation {
+  urlChanged: boolean;
+  titleChanged: boolean;
+  currentPageNavigationDetected: boolean;
+  domTextChanged?: boolean;
+  beforeTextLength?: number;
+  afterTextLength?: number;
+  windowOpenCalls?: Array<{ url: string; target?: string }>;
+  newTargets?: Array<{ id?: string; url: string; title: string }>;
+  note: string;
+}
+
+export interface BrowserClickResult extends BrowserPageState {
+  action?: 'dispatched_click_events';
+  selector?: string;
+  index?: number;
+  element?: BrowserClickElementSnapshot;
+  before?: BrowserPageState;
+  after?: BrowserPageState;
+  observation?: BrowserClickObservation;
+}
+
 export interface BrowserExtractResult extends BrowserPageState {
   content: string;
   format: 'html' | 'json';
@@ -79,7 +120,7 @@ export interface BrowserDiagnosticsResult extends BrowserPageState {
 
 export interface BrowserAutomation {
   open(url: string, options?: { timeoutMs?: number }): Promise<BrowserPageState>;
-  click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number }): Promise<BrowserPageState>;
+  click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number; observeMs?: number }): Promise<BrowserClickResult>;
   type(selector: string, text: string, options?: { clear?: boolean; submit?: boolean }): Promise<BrowserPageState>;
   scroll(options?: { direction?: 'up' | 'down' | 'left' | 'right' | 'top' | 'bottom'; amount?: number; selector?: string }): Promise<BrowserPageState>;
   wait(options?: {
@@ -90,6 +131,8 @@ export interface BrowserAutomation {
     state?: 'attached' | 'visible' | 'hidden' | 'detached';
     loadState?: 'load' | 'domcontentloaded' | 'networkidle';
     function?: string;
+    untilChanged?: boolean;
+    untilLoggedIn?: boolean;
     timeoutMs?: number;
   }): Promise<BrowserPageState>;
   extract(options?: { selector?: string; format?: 'html' | 'json'; maxChars?: number }): Promise<BrowserExtractResult>;
@@ -99,6 +142,7 @@ export interface BrowserAutomation {
   select(selector: string, value: string, options?: { index?: number }): Promise<BrowserPageState>;
   check(selector: string, checked: boolean, options?: { index?: number }): Promise<BrowserPageState>;
   press(key: string, options?: { selector?: string; text?: string }): Promise<BrowserPageState>;
+  uploadFile(selector: string, files: string[], options?: { index?: number }): Promise<BrowserUploadFileResult>;
   screenshot(options?: { fullPage?: boolean }): Promise<BrowserBinaryResult>;
   pdf(): Promise<BrowserBinaryResult>;
   storage(options?: { area?: 'local' | 'session'; action?: 'get' | 'set' | 'clear'; key?: string; value?: string }): Promise<BrowserStorageResult>;

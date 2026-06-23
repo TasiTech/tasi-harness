@@ -1,4 +1,4 @@
-import type { AppConfig } from '../../shared/types.js';
+import type { AppConfig, MemoryDomain } from '../../shared/types.js';
 import type { MemoryStore } from '../storage/memoryStore.js';
 import type { SkillManager } from '../skills/skillManager.js';
 import type { PersonalKnowledgeBase } from '../knowledge/personalKnowledgeBase.js';
@@ -13,9 +13,23 @@ export class PromptBuilder {
     private readonly sessionDocumentContextStore?: SessionDocumentContextStore
   ) {}
 
-  async build(config: AppConfig, context?: { sessionId?: string; userInput?: string; usePersonalKnowledgeBase?: boolean }): Promise<string> {
+  async build(
+    config: AppConfig,
+    context?: {
+      sessionId?: string;
+      userInput?: string;
+      usePersonalKnowledgeBase?: boolean;
+      useMemory?: boolean;
+      memoryDomains?: MemoryDomain[];
+      useSkills?: boolean;
+      enabledSkillNames?: string[];
+    }
+  ): Promise<string> {
     const date = new Date().toISOString();
-    const inferredDomains = context?.userInput ? this.memoryStore.inferDomains(context.userInput) : [];
+    const memoryEnabled = context?.useMemory !== false;
+    const skillsEnabled = context?.useSkills !== false;
+    const explicitMemoryDomains = [...new Set(context?.memoryDomains ?? [])];
+    const inferredDomains = explicitMemoryDomains.length > 0 ? explicitMemoryDomains : (context?.userInput ? this.memoryStore.inferDomains(context.userInput) : []);
     const bridgeGuide = this.externalBrowserBridgeGuide?.(config).trim() ?? '';
     const personalKnowledgeBlock =
       context?.usePersonalKnowledgeBase && context.userInput
@@ -32,28 +46,40 @@ export class PromptBuilder {
       '- You are a local desktop harness inspired by Hermes Agent: plan, use tools, observe results, and iterate until the task is done.',
       '- Use tools when they materially improve correctness. Keep tool arguments precise and bounded.',
       '- Prefer workspace-relative file paths. Do not attempt to access files outside the configured workspace.',
-      '- For skill execution, if a skill entry includes skill_file or skill_dir, treat them as absolute paths and do not guess relative paths.',
-      '- If an installed skill is relevant to the user request, treat that skill as an execution workflow, not optional background reading.',
-      '- When a relevant skill exists, enter skill execution mode and stay in that mode until the skill is satisfied or you explicitly report a blocked/degraded outcome.',
-      '- If a relevant skill can be identified from the installed skills index, your first substantive step should be to call skill_view for that skill before drafting the answer.',
-      '- When a relevant skill exists, consult it before producing the final answer, then follow its instructions, routing rules, and completion criteria.',
-      '- Skill requirements are mandatory by default: if the skill says to gather evidence, call providers, verify results, ask for missing critical inputs, or mark degraded output, you must do that before finalizing.',
-      '- Reading skill_view only loads instructions; it does not count as completing the skill, gathering evidence, or satisfying provider/tool steps.',
-      '- The content returned by skill_view is workflow guidance, not evidence. Do not paraphrase it as if it were tool-backed findings about the user request.',
-      '- After calling skill_view for a relevant skill, do not skip straight to a general-knowledge answer if the skill requires evidence gathering, tool use, verification, or explicit degradation handling.',
-      '- If SKILL.md lists references/*.md files, load the references relevant to the planned provider/tool path via skill_view(name + ref_path) before issuing provider-specific or browser/tool calls.',
-      '- Prioritize reading the most relevant provider reference first (for example, browser flows should read the browser/provider reference first), then issue tool calls according to that reference.',
-      '- If the only tool you have called for a skill-driven request is skill_view, you are usually not ready to give a final answer yet.',
-      '- If a skill requires live data, provider lookup, or page inspection, prefer an assistant turn with tool calls immediately after reading the skill rather than a narrative response.',
-      '- After reading a relevant skill, the next substantive action must be one of: required tool calls, a concise follow-up for missing critical inputs, or an explicit blocked/degraded explanation. Do not output a polished final answer before completing one of those paths.',
-      '- A final answer that skips required skill steps is incorrect, even if the answer sounds plausible.',
-      '- Before producing a final answer for a skill-driven request, check that you can name the relevant skill, the mandatory steps you completed, and the evidence or blocked reason behind the answer. If you cannot, keep working instead of finalizing.',
-      '- If a relevant skill requires tool-backed evidence and the tools are unavailable, blocked, or fail, say that explicitly and return a degraded answer rather than presenting an unverified answer as complete.',
+      ...(skillsEnabled
+        ? [
+            '- For skill execution, if a skill entry includes skill_file or skill_dir, treat them as absolute paths and do not guess relative paths.',
+            '- If an installed skill is relevant to the user request, treat that skill as an execution workflow, not optional background reading.',
+            '- When a relevant skill exists, enter skill execution mode and stay in that mode until the skill is satisfied or you explicitly report a blocked/degraded outcome.',
+            '- If a relevant skill can be identified from the installed skills index, your first substantive step should be to call skill_view for that skill before drafting the answer.',
+            '- When a relevant skill exists, consult it before producing the final answer, then follow its instructions, routing rules, and completion criteria.',
+            '- Skill requirements are mandatory by default: if the skill says to gather evidence, call providers, verify results, ask for missing critical inputs, or mark degraded output, you must do that before finalizing.',
+            '- Reading skill_view only loads instructions; it does not count as completing the skill, gathering evidence, or satisfying provider/tool steps.',
+            '- The content returned by skill_view is workflow guidance, not evidence. Do not paraphrase it as if it were tool-backed findings about the user request.',
+            '- After calling skill_view for a relevant skill, do not skip straight to a general-knowledge answer if the skill requires evidence gathering, tool use, verification, or explicit degradation handling.',
+            '- If SKILL.md lists references/*.md files, load the references relevant to the planned provider/tool path via skill_view(name + ref_path) before issuing provider-specific or browser/tool calls.',
+            '- Prioritize reading the most relevant provider reference first (for example, browser flows should read the browser/provider reference first), then issue tool calls according to that reference.',
+            '- If the only tool you have called for a skill-driven request is skill_view, you are usually not ready to give a final answer yet.',
+            '- If a skill requires live data, provider lookup, or page inspection, prefer an assistant turn with tool calls immediately after reading the skill rather than a narrative response.',
+            '- After reading a relevant skill, the next substantive action must be one of: required tool calls, a concise follow-up for missing critical inputs, or an explicit blocked/degraded explanation. Do not output a polished final answer before completing one of those paths.',
+            '- A final answer that skips required skill steps is incorrect, even if the answer sounds plausible.',
+            '- Before producing a final answer for a skill-driven request, check that you can name the relevant skill, the mandatory steps you completed, and the evidence or blocked reason behind the answer. If you cannot, keep working instead of finalizing.',
+            '- If a relevant skill requires tool-backed evidence and the tools are unavailable, blocked, or fail, say that explicitly and return a degraded answer rather than presenting an unverified answer as complete.'
+          ]
+        : ['- Skill execution is disabled for this run; do not call skill_view or skill_manage.']),
       `- Browser mode is ${config.browserMode}.`,
-      '- When users ask to open/search/read/interact with webpages, consult skill_view("tasi-browser-automation") before planning web steps.',
+      skillsEnabled
+        ? '- When users ask to open/search/read/interact with webpages, consult the relevant browser automation skill from the installed skills index before planning web steps.'
+        : '- When users ask to open/search/read/interact with webpages, use available browser_* tools directly when they are enabled.',
       config.browserMode === 'embedded'
         ? '- In embedded browser mode, use browser_* tools as the default web workflow and rely on the built-in preview.'
         : '- In external browser mode, use browser_* tools as the default workflow and let the harness surface pages in the system browser when needed.',
+      '- For webpage file uploads, locate the target `input[type=file]` with `browser_snapshot` or `browser_find`, then use `browser_upload_file` with a workspace-relative path. Hidden file inputs are valid upload targets. Do not use browser_eval/JavaScript, visible-input hacks, or a native file picker unless `browser_upload_file` is unavailable or the file path is unknown.',
+      '- For privacy and token efficiency, use `max_elements`/`max_chars` for the first page exploration and usually do not use `filter_text` yet, because narrow keywords can hide needed controls.',
+      '- After learning the page structure, prefer local reads with `selector` plus a broader `filter_text` on `browser_snapshot`/`browser_extract`; if the target is missing, remove `filter_text` or expand the keywords.',
+      '- For forms and dialogs, include generic action words in `filter_text`, such as `上传,搜索,选择,确定,取消,保存,提交,下一步`, and leave `redact_sensitive` enabled. Browser snapshots/extracts mask sensitive data as `xxxx`; do not request unredacted credential or account values.',
+      '- If a page asks for username/password, captcha, MFA, SSO approval, or other private credentials, do not ask the user to send the secret in chat. If username/password fields are already filled, use browser tools to click the visible login/sign-in/submit button yourself and wait with `until_logged_in: true`. Only tell the user to complete it in the visible browser when credentials, captcha, MFA, or approval are still missing; then call `browser_wait` with `wait_for_user: true`, `until_logged_in: true`, `until_changed: true`, and `timeout_ms: 300000`. If the user has not finished before the wait times out, report that the browser is still open and continue in this same session when they return.',
+      '- Browser close policy: for form-filling, submissions, approvals, account changes, or workflows where the user should review the final browser state, call `browser_close_policy` with `policy: "keep_open"` before the final answer. For read-only data lookup, extraction, summarization, and report tasks, leave the default auto-close behavior or set `policy: "auto_close"`.',
       bridgeGuide,
       '- When a final answer relies on browser/search/webpage evidence, cite each supported claim with numbered inline Markdown links in this exact style: `2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。`',
       '- Assign web citation numbers in first-use order, reuse the same number for the same URL, and cite only pages that were opened/inspected or otherwise provided as trusted source material.',
@@ -69,21 +95,23 @@ export class PromptBuilder {
       '- If a value is estimated, inferred, generated from parameters, or not directly visible in a source, label it as [estimated], [inferred], or [unverified] instead of presenting it as sourced fact.',
       '- Before finalizing a web-backed answer, check that every numeric citation link is clickable Markdown and can be detected as `[number](https://...)`: use complete URLs, URL-encode spaces and unsafe characters, and do not leave raw spaces inside link destinations.',
       '- Terminal access may be disabled; when disabled, explain the required command instead of pretending it ran.',
-      '- Save durable facts via the memory tool: user preferences, project conventions, environment facts, and stable workflow lessons.',
-      '- If you discover a repeatable non-trivial workflow, consider creating or patching a skill using skill_manage.',
+      memoryEnabled
+        ? '- Save durable facts via the memory tool: user preferences, project conventions, environment facts, and stable workflow lessons.'
+        : '- Persistent memory is disabled for this run; do not call the memory tool or rely on stored memory snapshots.',
+      skillsEnabled ? '- If you discover a repeatable non-trivial workflow, consider creating or patching a skill using skill_manage.' : '',
       '- Use session_search when previous conversations are likely relevant.',
       '- When a "Personal knowledge snapshot" section is present, treat it as user-provided source material. If it is relevant, use it before general knowledge and cite the filename in square brackets.',
       '',
       `Current timestamp: ${date}`,
       context?.sessionId ? `Current session id: ${context.sessionId}` : '',
-      inferredDomains.length > 0 ? `Inferred intent domains: ${inferredDomains.join(', ')}` : '',
+      explicitMemoryDomains.length > 0
+        ? `Requested memory domains: ${explicitMemoryDomains.join(', ')}`
+        : (inferredDomains.length > 0 ? `Inferred intent domains: ${inferredDomains.join(', ')}` : ''),
       '',
       '## Persistent memory snapshot',
-      this.memoryStore.renderPromptBlock({
-        sessionId: context?.sessionId,
-        intent: context?.userInput,
-        includeGlobal: true
-      }),
+      memoryEnabled
+        ? this.renderMemoryPromptBlock(context?.sessionId, context?.userInput, explicitMemoryDomains)
+        : '(memory disabled for this run)',
       context?.usePersonalKnowledgeBase
         ? [
             '',
@@ -102,7 +130,25 @@ export class PromptBuilder {
         : '',
       '',
       '## Installed skills index',
-      this.skillManager.renderPromptIndex()
+      skillsEnabled ? this.skillManager.renderPromptIndex(context?.enabledSkillNames) : 'Skills disabled for this run.'
     ].join('\n');
+  }
+
+  private renderMemoryPromptBlock(sessionId?: string, intent?: string, domains: MemoryDomain[] = []): string {
+    if (domains.length === 0) {
+      return this.memoryStore.renderPromptBlock({
+        sessionId,
+        intent,
+        includeGlobal: true
+      });
+    }
+    return domains
+      .map((domain) => this.memoryStore.renderPromptBlock({
+        sessionId,
+        intent,
+        domain,
+        includeGlobal: true
+      }))
+      .join('\n\n');
   }
 }

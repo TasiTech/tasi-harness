@@ -26,6 +26,8 @@ describe('PromptBuilder', () => {
 
     expect(prompt).toContain('Browser mode is external.');
     expect(prompt).toContain('In external browser mode, use browser_* tools as the default workflow');
+    expect(prompt).toContain('browser_close_policy');
+    expect(prompt).toContain('keep_open');
     expect(prompt).toContain('engine=auto');
     expect(prompt).toContain('shell.openExternal fallback');
   });
@@ -73,6 +75,40 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('Keep evidence links separate from action links');
     expect(prompt).toContain('label it as [estimated], [inferred], or [unverified]');
     expect(prompt).toContain('URL-encode spaces and unsafe characters');
+  });
+
+  it('can disable memory and skills for a single run', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home)
+    );
+
+    const prompt = await builder.build(defaultConfig(), { userInput: 'hello', useMemory: false, useSkills: false });
+
+    expect(prompt).toContain('Persistent memory is disabled for this run');
+    expect(prompt).toContain('(memory disabled for this run)');
+    expect(prompt).toContain('Skill execution is disabled for this run');
+    expect(prompt).toContain('Skills disabled for this run.');
+    expect(prompt).not.toContain('your first substantive step should be to call skill_view');
+  });
+
+  it('uses explicit memory domains when provided', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home)
+    );
+
+    const prompt = await builder.build(defaultConfig(), { userInput: 'plan a trip', memoryDomains: ['work', 'travel'] });
+
+    expect(prompt).toContain('Requested memory domains: work, travel');
+    expect(prompt).toContain('context: domain=work');
+    expect(prompt).toContain('context: domain=travel');
   });
 
   it('injects uploaded session document XML into the system prompt', async () => {

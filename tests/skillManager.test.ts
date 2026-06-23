@@ -32,6 +32,66 @@ describe('SkillManager', () => {
     expect(manager.list().map((s) => s.name)).toContain('repo-review');
   });
 
+  it('preserves Chinese display names separately from stable slugs', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const manager = new SkillManager(env.home);
+    const doc = manager.create({
+      name: 'ctrip-travel',
+      displayName: '携程旅行',
+      category: 'travel',
+      displayCategory: '旅行',
+      content: '---\nname: ctrip-travel\ndescription: Travel workflow\ncategory: travel\n---\n\nUse travel workflow.'
+    });
+
+    expect(doc.name).toBe('ctrip-travel');
+    expect(doc.displayName).toBe('携程旅行');
+    expect(doc.category).toBe('travel');
+    expect(doc.displayCategory).toBe('旅行');
+    expect(doc.content).toContain('display_name: 携程旅行');
+    expect(doc.content).toContain('display_category: 旅行');
+    expect(manager.renderPromptIndex()).toContain('携程旅行 (ctrip-travel)');
+    expect(manager.renderPromptIndex()).toContain('旅行 (travel)');
+  });
+
+  it('lists and reads saved browser coach recordings', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const manager = new SkillManager(env.home);
+    const doc = manager.create({
+      name: 'Recorded Flow',
+      category: 'browser',
+      content: '---\nname: recorded-flow\ndescription: Recorded flow\ncategory: browser\n---\n\nUse the recording.'
+    });
+    manager.writeSupportingFile(doc.name, 'references/recording.json', JSON.stringify({
+      id: 'rec_1',
+      startUrl: 'https://example.com',
+      startedAt: '2026-05-28T00:00:00.000Z',
+      active: false,
+      events: [
+        {
+          id: 'evt_1',
+          index: 1,
+          type: 'navigation',
+          url: 'https://example.com',
+          createdAt: '2026-05-28T00:00:01.000Z'
+        }
+      ]
+    }));
+
+    const summaries = manager.listBrowserCoachRecordings();
+    const recording = manager.readBrowserCoachRecording('recorded-flow');
+
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]).toMatchObject({
+      skillName: 'recorded-flow',
+      category: 'browser',
+      startUrl: 'https://example.com',
+      eventCount: 1
+    });
+    expect(recording?.events[0]?.url).toBe('https://example.com');
+  });
+
   it('skips duplicate patches when the replacement is already present', () => {
     const env = tempHome();
     cleanup = env.cleanup;

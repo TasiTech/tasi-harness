@@ -1,9 +1,11 @@
-import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
 import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
+
+const REPEATED_TOOL_RESULT_LIMIT = 3;
 
 function parseToolArgs(raw: string): unknown {
   if (!raw.trim()) return {};
@@ -12,6 +14,49 @@ function parseToolArgs(raw: string): unknown {
   } catch {
     return { raw };
   }
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(',')}}`;
+}
+
+function repeatedToolDiagnostic(toolName: string, args: unknown, ok: boolean, content: string, limit: number): string {
+  const resultLabel = ok ? 'ok' : 'fail';
+  return [
+    `Stopped because the same tool call repeated ${limit} times with the same result.`,
+    `Tool: ${toolName}`,
+    `Args: ${stableStringify(args)}`,
+    `Result: ${resultLabel} - ${content || '(empty)'}`
+  ].join('\n');
+}
+
+function compactToolText(content: string, maxLength = 160): string {
+  const text = content.replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}...` : text;
+}
+
+function iterationLimitResponse(maxIterations: number, toolEvents: ToolEvent[]): string {
+  const recentEvents = toolEvents.slice(-5);
+  const lines = [
+    `本轮已达到最大执行步数（${maxIterations}），我先停在这里，避免继续消耗无效步骤。`
+  ];
+  if (recentEvents.length > 0) {
+    lines.push('', '最近完成的操作：');
+    for (const event of recentEvents) {
+      const status = event.ok ? '成功' : '失败';
+      const detail = compactToolText(event.content);
+      lines.push(`- ${event.toolName}：${status}${detail ? `，${detail}` : ''}`);
+    }
+  }
+  lines.push('', '当前页面和会话状态已保留，可以继续让我从当前状态接着做。');
+  return lines.join('\n');
 }
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
@@ -63,10 +108,14 @@ export class AgentLoop {
   async run(options: AgentLoopRuntimeOptions): Promise<AgentRunResult> {
     throwIfAborted(options.signal);
     const cfg = this.deps.getConfig();
+    const memoryEnabled = options.useMemory !== false;
+    const skillsEnabled = options.useSkills !== false;
     const requestId = createId('run');
     const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
-    const session = options.sessionId ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create() : this.deps.sessions.create();
-    this.deps.beginDeferredMemory(session.id);
+    const session = options.sessionId
+      ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create('New session', options.sessionId)
+      : this.deps.sessions.create();
+    if (memoryEnabled) this.deps.beginDeferredMemory(session.id);
     const userMessage: AgentMessage = {
       id: createId('msg'),
       role: 'user',
@@ -79,14 +128,27 @@ export class AgentLoop {
       const prompt = await this.deps.promptBuilder.build(cfg, {
         sessionId: session.id,
         userInput: options.userInput,
-        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase
+        usePersonalKnowledgeBase: options.usePersonalKnowledgeBase,
+        useMemory: options.useMemory,
+        memoryDomains: options.memoryDomains,
+        useSkills: options.useSkills,
+        enabledSkillNames: options.enabledSkillNames
       });
       this.deps.sessions.setSystemPrompt(session.id, prompt);
       const messages: AgentMessage[] = [{ role: 'system', content: prompt }, ...history];
+      const requestMetadata: LlmRequestMetadata = { session: session.id };
+      if (options.turnType !== undefined) requestMetadata.turn_type = options.turnType;
+      if (options.sessionDone !== undefined) requestMetadata.session_done = options.sessionDone;
       const client = this.deps.createClient();
-      const tools = this.deps.toolRegistry.definitions(cfg.enabledToolNames);
+      const enabledToolNames = (options.enabledToolNames ?? cfg.enabledToolNames).filter((name) => {
+        if (!memoryEnabled && name === 'memory') return false;
+        if (!skillsEnabled && (name === 'skill_view' || name === 'skill_manage')) return false;
+        return true;
+      });
+      const tools = this.deps.toolRegistry.definitions(enabledToolNames);
       const toolEvents: ToolEvent[] = [];
       let usage = undefined as AgentRunResult['usage'];
+      let log_probs: AgentRunResult['log_probs'];
       let finalResponse = '';
       let iterations = 0;
       let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
@@ -97,6 +159,8 @@ export class AgentLoop {
       const accumulatedReasoningParts: string[] = [];
       let lastStreamPersistedAt = 0;
       let lastStreamPersistedLength = 0;
+      let lastToolResultSignature = '';
+      let repeatedToolResultCount = 0;
 
       const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
       const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
@@ -131,7 +195,7 @@ export class AgentLoop {
         const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
         const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
         const completion = canStream
-          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, signal: options.signal }, (delta) => {
+          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, metadata: requestMetadata, signal: options.signal }, (delta) => {
               if (delta.reasoning_content) {
                 streamedReasoning += delta.reasoning_content;
                 const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
@@ -165,7 +229,15 @@ export class AgentLoop {
                 persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
               }
             })
-          : await client.complete({ messages, tools, temperature: cfg.temperature, signal: options.signal });
+          : await client.complete({
+              messages,
+              tools,
+              temperature: cfg.temperature,
+              logProbs: options.logProbs,
+              topLogProbs: options.topLogProbs,
+              metadata: requestMetadata,
+              signal: options.signal
+            });
         const toolCalls = completion.message.tool_calls ?? [];
         const assistant = {
           ...completion.message,
@@ -180,6 +252,7 @@ export class AgentLoop {
           assistant.reasoning_parts = currentParts.length > 0 ? currentParts : undefined;
         }
         usage = completion.usage ?? usage;
+        log_probs = completion.log_probs ?? log_probs;
         messages.push(assistant);
         persistMessages([assistant]);
 
@@ -236,28 +309,65 @@ export class AgentLoop {
           };
           messages.push(toolMessage);
           persistMessages([toolMessage], [event]);
+
+          const toolResultSignature = stableStringify({
+            toolName: call.function.name,
+            args,
+            ok: result.ok,
+            content: result.content
+          });
+          repeatedToolResultCount = toolResultSignature === lastToolResultSignature ? repeatedToolResultCount + 1 : 1;
+          lastToolResultSignature = toolResultSignature;
+          if (repeatedToolResultCount >= REPEATED_TOOL_RESULT_LIMIT) {
+            finalResponse = repeatedToolDiagnostic(call.function.name, args, result.ok, result.content, REPEATED_TOOL_RESULT_LIMIT);
+            const diagnosticMessage: AgentMessage = {
+              id: createId('msg'),
+              role: 'assistant',
+              content: finalResponse,
+              createdAt: nowIso()
+            };
+            messages.push(diagnosticMessage);
+            persistMessages([diagnosticMessage]);
+            if (canStream) {
+              options.onMessageDelta?.(session.id, {
+                sessionId: session.id,
+                messageId: visibleAssistantId,
+                role: 'assistant',
+                type: 'done',
+                content: finalResponse,
+                reasoning_content: accumulatedReasoning || undefined,
+                reasoning_parts: accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined,
+                createdAt: visibleAssistantCreatedAt
+              });
+            }
+            break;
+          }
         }
+        if (finalResponse) break;
       }
 
       if (!finalResponse) {
-        finalResponse = `Reached iteration limit (${cfg.maxIterations}). Last tool events: ${toolEvents.map((e) => `${e.toolName}:${e.ok ? 'ok' : 'fail'}`).join(', ')}`;
+        finalResponse = iterationLimitResponse(cfg.maxIterations, toolEvents);
         const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
         persistMessages([limitMessage]);
       }
 
-      this.deps.commitDeferredMemory(session.id);
-      this.deps.syncSessionMemory(updatedSession);
+      if (memoryEnabled) {
+        this.deps.commitDeferredMemory(session.id);
+        this.deps.syncSessionMemory(updatedSession);
+      }
       return {
         sessionId: session.id,
         finalResponse,
         messages: updatedSession.messages,
         toolEvents,
         usage,
+        log_probs,
         iterations: iterations + 1,
         execution
       };
     } catch (error) {
-      this.deps.discardDeferredMemory(session.id);
+      if (memoryEnabled) this.deps.discardDeferredMemory(session.id);
       throw error;
     }
   }

@@ -5,6 +5,7 @@ import type {
   AppInfo,
   BrowserCoachRecordedEvent,
   BrowserCoachRecording,
+  BrowserCoachStoredRecording,
   LlmUsage,
   MarketplaceBrowseResult,
   MarketplaceSkill,
@@ -40,13 +41,55 @@ type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 
 type UiLanguage = 'zh' | 'en';
 type TranslateFn = (en: string, zh: string) => string;
 
+const SKILL_CATEGORIES = [
+  { value: 'local', en: 'Local', zh: '本地' },
+  { value: 'browser', en: 'Browser', zh: '浏览器' },
+  { value: 'travel', en: 'Travel', zh: '旅行' },
+  { value: 'shopping', en: 'Shopping', zh: '购物' },
+  { value: 'work', en: 'Work', zh: '工作' },
+  { value: 'documents', en: 'Documents', zh: '文档' },
+  { value: 'finance', en: 'Finance', zh: '财务' },
+  { value: 'education', en: 'Education', zh: '学习' },
+  { value: 'other', en: 'Other', zh: '其他' }
+];
+
+const CATEGORY_ALIASES: Record<string, string> = {
+  浏览器: 'browser',
+  浏览: 'browser',
+  browser: 'browser',
+  旅行: 'travel',
+  旅游: 'travel',
+  出行: 'travel',
+  travel: 'travel',
+  购物: 'shopping',
+  电商: 'shopping',
+  shopping: 'shopping',
+  工作: 'work',
+  办公: 'work',
+  work: 'work',
+  文档: 'documents',
+  文件: 'documents',
+  document: 'documents',
+  documents: 'documents',
+  财务: 'finance',
+  金融: 'finance',
+  finance: 'finance',
+  学习: 'education',
+  教育: 'education',
+  education: 'education',
+  本地: 'local',
+  local: 'local',
+  其他: 'other',
+  other: 'other'
+};
+
 const defaultConfig: PublicAppConfig = {
   provider: 'openai',
   baseUrl: providerDefaultBaseUrl('openai'),
   apiKeyConfigured: false,
   model: providerDefaultModel('openai'),
   temperature: 0.3,
-  maxIterations: 100,
+  maxIterations: 200,
   sessionDocumentMaxDocs: 10,
   workspaceDir: '',
   allowShellTools: true,
@@ -560,7 +603,7 @@ export function App(): ReactElement {
       void refreshSessions();
       if (chatBusy && payload.source === 'chat') return;
       if (!sessionId || payload.sessionId !== sessionId) return;
-      void window.tasiHarness.sessions.read(payload.sessionId).then((record) => {
+      void window.tasiHarness.sessions.readForDisplay(payload.sessionId).then((record) => {
         if (!record) return;
         setMessages(record.messages);
         setLastUsage(record.lastUsage);
@@ -593,11 +636,27 @@ export function App(): ReactElement {
     }
   }
 
-  async function startSkillOptimization(target: SessionSummary): Promise<void> {
+  async function startSkillOptimization(targets: SessionSummary[], userGuidance?: string): Promise<void> {
     if (chatBusy) return;
+    if (targets.length === 0) return;
+    const extraGuidance = userGuidance?.trim();
+    const sessionList = targets
+      .map((target, index) => `${index + 1}. ${target.id} (${target.title || 'Untitled'}, updated ${target.updatedAt}, messages ${target.messageCount})`)
+      .join('\n');
+    const sessionIds = targets.map((target) => target.id).join(', ');
     const prompt = tr(
-      `Use skill-creator to inspect session ${target.id} for failed work, identify all related skills, and optimize each affected skill separately. Apply three guards: keep each optimization narrowly scoped, do not whitelist or downgrade failure signals as routine, and do not put domain-specific rules into unrelated skills. Start by reading the session failure signals, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.`,
-      `使用 skill-creator，检查 session ${target.id} 中的失败问题，识别所有相关技能，并分别优化每个受影响的技能。应用三项防护：每次优化保持窄范围，不要把失败信号白名单化或降级为 routine，不要把领域规则写进无关技能。先读取该 session 的失败信号，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。`
+      [
+        `Use skill-creator to jointly inspect these sessions for failed work and recurring failure patterns, identify all related skills, and optimize each affected skill separately. Session ids: ${sessionIds}.`,
+        sessionList,
+        'Apply three guards: keep each optimization narrowly scoped, do not whitelist or downgrade failure signals as routine, and do not put domain-specific rules into unrelated skills. Use only the selected-session context supplied by the app, then patch the relevant SKILL.md files or scripts, verify the changes, and report what was changed.',
+        extraGuidance ? `User guidance for this optimization:\n---\n${extraGuidance}\n---\nFollow this guidance when it does not conflict with the guards above.` : ''
+      ].filter(Boolean).join('\n\n'),
+      [
+        `使用 skill-creator，联合检查这些 session 中的失败问题和重复失败模式，识别所有相关技能，并分别优化每个受影响的技能。Session ids: ${sessionIds}。`,
+        sessionList,
+        '应用三项防护：每次优化保持窄范围，不要把失败信号白名单化或降级为 routine，不要把领域规则写进无关技能。只使用应用提供的选中 session 上下文，再修改相关 SKILL.md 或脚本，完成校验后汇报改动内容。',
+        extraGuidance ? `本次优化的用户指导提示词：\n---\n${extraGuidance}\n---\n在不违背上述防护规则时遵循这些指导。` : ''
+      ].filter(Boolean).join('\n\n')
     );
     const userMessage: AgentMessage = {
       role: 'user',
@@ -612,7 +671,11 @@ export function App(): ReactElement {
     setMessages([userMessage]);
     setLastUsage(undefined);
     try {
-      const result = await window.tasiHarness.agent.chat(prompt, undefined, executionMode, false);
+      const result = await window.tasiHarness.agent.optimizeSkills({
+        prompt,
+        sessionIds: targets.map((target) => target.id),
+        executionMode
+      });
       setSessionId(result.sessionId);
       setMessages(result.messages.filter((m) => m.role !== 'system'));
       setLastUsage(result.usage);
@@ -735,7 +798,7 @@ export function App(): ReactElement {
             sessions={sessions}
             wechatSessionId={activeWechatSessionId}
             onOpen={async (id) => {
-              const record = await window.tasiHarness.sessions.read(id);
+              const record = await window.tasiHarness.sessions.readForDisplay(id);
               if (record) {
                 setSessionId(record.id);
                 setMessages(record.messages);
@@ -936,6 +999,7 @@ function ChatPage(props: {
   const [previewCanGoForward, setPreviewCanGoForward] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const toolPanelBodyRef = useRef<HTMLDivElement | null>(null);
   const chatContentGridRef = useRef<HTMLDivElement | null>(null);
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
@@ -1139,6 +1203,12 @@ function ChatPage(props: {
   }, [webPreviewExpanded]);
 
   useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, runBusy]);
+  useEffect(() => {
+    if (toolPanelCollapsed || toolPanelTab !== 'tools') return;
+    const panel = toolPanelBodyRef.current;
+    if (!panel) return;
+    panel.scrollTo({ top: panel.scrollHeight, behavior: 'smooth' });
+  }, [props.toolEvents, toolPanelCollapsed, toolPanelTab]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onToolEvent((payload) => {
       if (props.sessionId && payload.sessionId !== props.sessionId) return;
@@ -1557,13 +1627,6 @@ function ChatPage(props: {
         setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
-      if (props.config.browserMode === 'external') {
-        try {
-          await window.tasiHarness.app.closeExternalPreview();
-        } catch {
-          // Ignore cleanup errors when closing external preview window.
-        }
-      }
       props.setStopping(false);
       props.setBusy(false);
     }
@@ -1899,7 +1962,7 @@ function ChatPage(props: {
               <div className="empty-desc">{props.tr('Main chat only shows your messages and the final assistant replies. Tool calls and tool outputs now stream in the side panel.', '主聊天区仅展示你的消息和助手最终回复，工具调用与输出会显示在右侧面板。')}</div>
             </div>
           )}
-          {visibleMessages.map((m, idx) => <MessageBubble key={`${m.id ?? idx}-${idx}`} message={m} tr={props.tr} />)}
+          {visibleMessages.map((m, idx) => <MessageBubble key={`${m.id ?? idx}-${idx}`} message={m} sessionId={props.sessionId} tr={props.tr} />)}
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
           {followUpQuestions.length > 0 && !runBusy && (
             <div className="follow-up-panel">
@@ -1958,7 +2021,7 @@ function ChatPage(props: {
               </button>
             </div>
           </div>
-          <div className="tool-panel-body">
+          <div className="tool-panel-body" ref={toolPanelBodyRef}>
             {toolPanelTab === 'sources' ? (
               referencedPages.length === 0 ? (
                 <div className="tool-empty">{props.tr('Referenced webpages from the latest answer will appear here.', '最新回复中的引用网页会显示在这里。')}</div>
@@ -1989,14 +2052,7 @@ function ChatPage(props: {
               <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
             ) : (
               props.toolEvents.map((event) => (
-                <div key={event.id} className={`tool-event-card ${event.ok ? 'ok' : 'fail'}`}>
-                  <div className="tool-event-top">
-                    <strong>{event.toolName}</strong>
-                    <span>{prettyDate(event.createdAt)}</span>
-                  </div>
-                  <pre className="code-block small">{JSON.stringify(event.args, null, 2)}</pre>
-                  <pre className="code-block small">{event.content}</pre>
-                </div>
+                <ToolEventCard key={event.id} event={event} sessionId={props.sessionId} tr={props.tr} />
               ))
             )}
           </div>
@@ -2267,6 +2323,48 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
+function ToolEventCard({ event, sessionId, tr }: { event: ToolEvent; sessionId?: string; tr: TranslateFn }): ReactElement {
+  const [fullContent, setFullContent] = useState<string | null>(null);
+  const [fullArgs, setFullArgs] = useState<unknown | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const content = fullContent ?? event.content;
+  const args = fullArgs ?? event.args;
+  const canLoadFull = Boolean(sessionId && event.id && (event.contentOmitted || event.argsOmitted) && fullContent === null);
+
+  async function loadFull(): Promise<void> {
+    if (!sessionId || !event.id || loading) return;
+    setLoading(true);
+    setError('');
+    try {
+      const result = await window.tasiHarness.sessions.readToolEventContent({ sessionId, toolEventId: event.id });
+      setFullContent(result.content);
+      setFullArgs(result.args);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className={`tool-event-card ${event.ok ? 'ok' : 'fail'}`}>
+      <div className="tool-event-top">
+        <strong>{event.toolName}</strong>
+        <span>{prettyDate(event.createdAt)}</span>
+      </div>
+      <pre className="code-block small">{JSON.stringify(args, null, 2)}</pre>
+      <pre className="code-block small">{content}</pre>
+      {canLoadFull && (
+        <button className="mini-button" disabled={loading} onClick={() => void loadFull()}>
+          {loading ? '...' : tr('Load full tool output', '加载完整工具输出')}
+        </button>
+      )}
+      {error && <div className="error-box">{error}</div>}
+    </div>
+  );
+}
+
 function reasoningItems(content: string, parts?: string[]): string[] {
   const explicitParts = parts?.map((part) => part.trim()).filter(Boolean) ?? [];
   if (explicitParts.length > 0) return explicitParts;
@@ -2284,12 +2382,18 @@ function reasoningItems(content: string, parts?: string[]): string[] {
 }
 
 function ReasoningList({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
+  const listRef = useRef<HTMLDivElement | null>(null);
   const items = reasoningItems(content, parts);
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' });
+  }, [content, parts, items.length]);
   if (items.length === 0) return null;
   return (
     <div className="msg-reasoning">
       <div className="msg-reasoning-title">{tr('Reasoning', '推理过程')}</div>
-      <div className="msg-reasoning-list">
+      <div className="msg-reasoning-list" ref={listRef}>
         {items.map((item, index) => (
           <details key={`${index}-${item.slice(0, 24)}`} className="msg-reasoning-item" open>
             <summary>{tr(`Step ${index + 1}`, `第 ${index + 1} 条`)}</summary>
@@ -2403,12 +2507,19 @@ function MessageAttachments({ attachments }: { attachments?: AgentMessageAttachm
   );
 }
 
-function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn }): ReactElement {
+function MessageBubble({ message, sessionId, tr }: { message: AgentMessage; sessionId?: string; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
-  const citations = message.role === 'assistant' ? extractCitationLinks(message.content) : [];
+  const [fullContent, setFullContent] = useState<string | null>(null);
+  const [fullReasoning, setFullReasoning] = useState<string | undefined>();
+  const [loadingFull, setLoadingFull] = useState(false);
+  const [loadError, setLoadError] = useState('');
+  const content = fullContent ?? message.content;
+  const reasoningContent = fullReasoning ?? message.reasoning_content;
+  const citations = message.role === 'assistant' ? extractCitationLinks(content) : [];
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
+  const canLoadFull = Boolean(sessionId && message.id && message.contentOmitted && fullContent === null);
 
   useEffect(() => {
     if (!copied) return;
@@ -2418,10 +2529,25 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
 
   async function handleCopy(): Promise<void> {
     try {
-      await copyTextToClipboard(message.content || '');
+      await copyTextToClipboard(content || '');
       setCopied(true);
     } catch {
       setCopied(false);
+    }
+  }
+
+  async function loadFullContent(): Promise<void> {
+    if (!sessionId || !message.id || loadingFull) return;
+    setLoadingFull(true);
+    setLoadError('');
+    try {
+      const result = await window.tasiHarness.sessions.readMessageContent({ sessionId, messageId: message.id });
+      setFullContent(result.content);
+      setFullReasoning(result.reasoning_content);
+    } catch (cause) {
+      setLoadError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setLoadingFull(false);
     }
   }
 
@@ -2434,11 +2560,11 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
     }
     setExportBusy(format);
     try {
-      const normalized = normalizeMarkdownForRender(message.content);
+      const normalized = normalizeMarkdownForRender(content);
       const html = renderMarkdownToHtml(normalized);
       const result = await exportAssistantMessage({
         format,
-        title: assistantExportTitle(message.content),
+        title: assistantExportTitle(content),
         content: normalized,
         html
       });
@@ -2464,10 +2590,16 @@ function MessageBubble({ message, tr }: { message: AgentMessage; tr: TranslateFn
             <>
               <CitationLinkStrip citations={citations} />
               <MessageAttachments attachments={message.attachments} />
-              {message.role === 'assistant' && message.reasoning_content?.trim()
-                ? <ReasoningList content={message.reasoning_content} parts={message.reasoning_parts} tr={tr} />
+              {message.role === 'assistant' && reasoningContent?.trim()
+                ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} tr={tr} />
                 : null}
-              {message.content.trim() ? renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`) : null}
+              {content.trim() ? renderMarkdownContent(content, `msg-${message.id ?? 'x'}`) : null}
+              {canLoadFull && (
+                <button className="mini-button" disabled={loadingFull} onClick={() => void loadFullContent()}>
+                  {loadingFull ? '...' : tr('Load full message', '加载完整消息')}
+                </button>
+              )}
+              {loadError && <div className="error-box">{loadError}</div>}
               <div className="msg-bubble-actions">
                 {message.role === 'assistant' && (
                   <>
@@ -2931,11 +3063,39 @@ function createSkillTemplate(name: string, category: string): string {
   ].join('\n');
 }
 
-function normalizeSkillContent(content: string, name: string, category: string): string {
+function slugifyUiName(name: string, fallback = 'my-workflow'): string {
+  const normalized = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-{2,}/g, '-');
+  if (normalized) return normalized;
+  let hash = 0;
+  for (const char of name.trim()) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+  return `${fallback}-${Math.abs(hash).toString(36).slice(0, 6)}`;
+}
+
+function normalizeSkillCategory(value: string, fallback = 'other'): string {
+  const trimmed = value.trim();
+  const alias = CATEGORY_ALIASES[trimmed] ?? CATEGORY_ALIASES[trimmed.toLowerCase()];
+  return alias || slugifyUiName(trimmed, fallback);
+}
+
+function skillCategoryLabel(value: string, tr: TranslateFn): string {
+  const option = SKILL_CATEGORIES.find((item) => item.value === value);
+  return option ? tr(option.en, option.zh) : value;
+}
+
+function normalizeSkillContent(content: string, name: string, category: string, displayName?: string, displayCategory?: string): string {
   const safeName = name.trim() || 'my-workflow';
   const safeCategory = category.trim() || 'local';
   const trimmed = content.trim();
   const frontmatterMatch = trimmed.match(/^---\n([\s\S]*?)\n---\n?/);
+  const displayLines = [
+    ...(displayName?.trim() && displayName.trim() !== safeName ? [`display_name: ${displayName.trim().replace(/\n/g, ' ')}`] : []),
+    ...(displayCategory?.trim() && displayCategory.trim() !== safeCategory ? [`display_category: ${displayCategory.trim().replace(/\n/g, ' ')}`] : [])
+  ];
   if (frontmatterMatch) {
     const existingLines = frontmatterMatch[1]
       .split('\n')
@@ -2943,17 +3103,17 @@ function normalizeSkillContent(content: string, name: string, category: string):
       .filter((line) => line.trim().length > 0);
     const keptLines = existingLines.filter((line) => {
       const key = line.split(':', 1)[0]?.trim().toLowerCase();
-      return key !== 'name' && key !== 'category';
+      return key !== 'name' && key !== 'category' && key !== 'display_name' && key !== 'display_category';
     });
     const hasDescription = keptLines.some((line) => line.split(':', 1)[0]?.trim().toLowerCase() === 'description');
     const body = trimmed.slice(frontmatterMatch[0].length).trim();
     const lines = ['---', `name: ${safeName}`];
     if (!hasDescription) lines.push(`description: Skill ${safeName}.`);
-    lines.push(`category: ${safeCategory}`, ...keptLines, '---', '', body, '');
+    lines.push(`category: ${safeCategory}`, ...displayLines, ...keptLines, '---', '', body, '');
     return lines.join('\n');
   }
-  const body = trimmed || `# ${safeName}\n\nDescribe what this skill does.`;
-  return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, '---', '', body, ''].join('\n');
+  const body = trimmed || `# ${displayName?.trim() || safeName}\n\nDescribe what this skill does.`;
+  return ['---', `name: ${safeName}`, `description: Skill ${safeName}.`, `category: ${safeCategory}`, ...displayLines, '---', '', body, ''].join('\n');
 }
 
 function parseSkillFrontmatter(content: string): Record<string, string> {
@@ -2998,6 +3158,55 @@ function formatCoachEvent(event: BrowserCoachRecordedEvent): string {
   return `${event.index}. ${event.type}${target ? ` | ${target}` : ''}${detail}`;
 }
 
+function reindexCoachEvents(events: BrowserCoachRecordedEvent[]): BrowserCoachRecordedEvent[] {
+  return events.map((event, index) => ({ ...event, index: index + 1 }));
+}
+
+type CoachEventDraft = {
+  type: BrowserCoachRecordedEvent['type'];
+  url: string;
+  title: string;
+  selector: string;
+  tag: string;
+  role: string;
+  name: string;
+  text: string;
+  value: string;
+  key: string;
+};
+
+function coachEventToDraft(event: BrowserCoachRecordedEvent): CoachEventDraft {
+  return {
+    type: event.type,
+    url: event.url,
+    title: event.title ?? '',
+    selector: event.selector ?? '',
+    tag: event.tag ?? '',
+    role: event.role ?? '',
+    name: event.name ?? '',
+    text: event.text ?? '',
+    value: event.value ?? '',
+    key: event.key ?? ''
+  };
+}
+
+function draftToCoachEvent(event: BrowserCoachRecordedEvent, draft: CoachEventDraft): BrowserCoachRecordedEvent {
+  const optional = (value: string): string | undefined => value.trim() || undefined;
+  return {
+    ...event,
+    type: draft.type,
+    url: draft.url.trim() || event.url,
+    title: optional(draft.title),
+    selector: optional(draft.selector),
+    tag: optional(draft.tag),
+    role: optional(draft.role),
+    name: optional(draft.name),
+    text: optional(draft.text),
+    value: optional(draft.value),
+    key: optional(draft.key)
+  };
+}
+
 function SkillsPage({
   tr,
   skills,
@@ -3013,7 +3222,7 @@ function SkillsPage({
   refreshSkills: () => Promise<void>;
   refreshSessions: () => Promise<void>;
   optimizeBusy: boolean;
-  onOptimizeSession: (session: SessionSummary) => Promise<void>;
+  onOptimizeSession: (sessions: SessionSummary[], userGuidance?: string) => Promise<void>;
 }): ReactElement {
   const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach' | 'optimize'>('installed');
   const [query, setQuery] = useState('');
@@ -3036,10 +3245,19 @@ function SkillsPage({
   const [coachSkillName, setCoachSkillName] = useState('recorded-browser-workflow');
   const [coachCategory, setCoachCategory] = useState('browser');
   const [coachDescription, setCoachDescription] = useState('');
+  const [coachUserGuidance, setCoachUserGuidance] = useState('');
   const [coachBusy, setCoachBusy] = useState(false);
   const [coachNotice, setCoachNotice] = useState('');
   const [coachError, setCoachError] = useState('');
-  const [optimizeSessionId, setOptimizeSessionId] = useState('');
+  const [coachTraceDirty, setCoachTraceDirty] = useState(false);
+  const [coachEditingEventId, setCoachEditingEventId] = useState<string | null>(null);
+  const [coachEventDraft, setCoachEventDraft] = useState<CoachEventDraft | null>(null);
+  const [coachRecordingSource, setCoachRecordingSource] = useState<'live' | 'stored'>('live');
+  const [coachStoredRecordings, setCoachStoredRecordings] = useState<BrowserCoachStoredRecording[]>([]);
+  const [coachSelectedStoredSkill, setCoachSelectedStoredSkill] = useState('');
+  const [coachStoredBusy, setCoachStoredBusy] = useState(false);
+  const [optimizeSessionIds, setOptimizeSessionIds] = useState<string[]>([]);
+  const [optimizeUserGuidance, setOptimizeUserGuidance] = useState('');
   const [optimizeError, setOptimizeError] = useState('');
   const [optimizeRefreshing, setOptimizeRefreshing] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -3052,6 +3270,7 @@ function SkillsPage({
   const [editorOriginalContent, setEditorOriginalContent] = useState('');
   const [editorError, setEditorError] = useState('');
   const [editorSaving, setEditorSaving] = useState(false);
+  const coachWasActiveRef = useRef(false);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setDebouncedQuery(query.trim()), 240);
@@ -3078,7 +3297,16 @@ function SkillsPage({
     const refresh = () => {
       void window.tasiHarness.browserCoach.status()
         .then((recording) => {
-          if (!canceled) setCoachRecording(recording);
+          if (!canceled) {
+            if (coachWasActiveRef.current && !recording.active && recording.events.length > 0) {
+              void refreshCoachStoredRecordings();
+            }
+            coachWasActiveRef.current = recording.active;
+            setCoachRecording((current) => {
+              if ((coachRecordingSource === 'stored' || coachTraceDirty) && !recording.active) return current;
+              return recording;
+            });
+          }
         })
         .catch((error) => {
           if (!canceled) setCoachError(error instanceof Error ? error.message : String(error));
@@ -3090,12 +3318,23 @@ function SkillsPage({
       canceled = true;
       window.clearInterval(timer);
     };
-  }, [activeTab]);
+  }, [activeTab, coachRecordingSource, coachTraceDirty]);
 
   useEffect(() => {
-    if (optimizeSessionId || sessions.length === 0) return;
-    setOptimizeSessionId(sessions[0]?.id ?? '');
-  }, [optimizeSessionId, sessions]);
+    if (activeTab !== 'coach') return;
+    void refreshCoachStoredRecordings();
+  }, [activeTab]);
+
+  const displayedCoachEvents = useMemo(() => coachRecording.events.slice(-120), [coachRecording.events]);
+
+  useEffect(() => {
+    setOptimizeSessionIds((current) => {
+      const available = new Set(sessions.map((session) => session.id));
+      const kept = current.filter((id) => available.has(id));
+      if (kept.length > 0 || sessions.length === 0) return kept;
+      return [sessions[0].id];
+    });
+  }, [sessions]);
 
   function closeEditor(): void {
     if (editorSaving) return;
@@ -3124,7 +3363,7 @@ function SkillsPage({
       return;
     }
     setEditorMode('edit');
-    setEditorName(doc.name);
+    setEditorName(doc.displayName || doc.name);
     setEditorCategory(doc.category);
     setEditorContent(doc.content);
     setEditorReadonly(doc.readonly);
@@ -3164,6 +3403,12 @@ function SkillsPage({
     return skills.find((skill) => normalizeSkillNameForCompare(skill.name) === target);
   }
 
+  function existingSkillForDisplayName(name: string, fallback = 'my-workflow'): SkillMetadata | undefined {
+    const trimmed = name.trim();
+    if (!trimmed) return undefined;
+    return existingSkillForName(slugifyUiName(trimmed, fallback));
+  }
+
   function marketplaceExistingSkill(skill: MarketplaceSkill): SkillMetadata | undefined {
     return [skill.installedSkillName, skill.name, skill.id]
       .filter((name): name is string => Boolean(name?.trim()))
@@ -3201,7 +3446,7 @@ function SkillsPage({
         setUploadName(metadata.name.trim());
         setUploadPackageSkillName(metadata.name.trim());
       }
-      if (metadata.category?.trim()) setUploadCategory(metadata.category.trim());
+      if (metadata.category?.trim()) setUploadCategory(normalizeSkillCategory(metadata.category.trim(), 'other'));
       setUploadOverwrite(false);
     } catch (error) {
       setUploadError(error instanceof Error ? error.message : String(error));
@@ -3209,9 +3454,11 @@ function SkillsPage({
   }
 
   async function saveEditor(): Promise<void> {
-    const name = editorName.trim();
-    const category = editorCategory.trim() || 'local';
-    if (!name) {
+    const displayName = editorName.trim();
+    const name = slugifyUiName(displayName, 'my-workflow');
+    const category = normalizeSkillCategory(editorCategory, 'other');
+    const displayCategory = skillCategoryLabel(category, tr);
+    if (!displayName) {
       setEditorError('Skill name is required.');
       return;
     }
@@ -3219,13 +3466,13 @@ function SkillsPage({
       setEditorError('Skill content cannot be empty.');
       return;
     }
-    const content = normalizeSkillContent(editorContent, name, category);
+    const content = normalizeSkillContent(editorContent, name, category, displayName, displayCategory);
     setEditorSaving(true);
     setEditorError('');
     try {
       if (editorMode === 'create') {
-        await window.tasiHarness.skills.create({ name, category, content });
-        setNotice(`Created ${name}.`);
+        await window.tasiHarness.skills.create({ name, category, content, displayName, displayCategory });
+        setNotice(`Created ${displayName}.`);
       } else {
         if (editorReadonly) throw new Error('This skill is read-only and cannot be edited.');
         if (!editorOriginalName) throw new Error('Missing original skill name.');
@@ -3237,7 +3484,7 @@ function SkillsPage({
           });
           setNotice(`Saved ${name}.`);
         } else {
-          await window.tasiHarness.skills.create({ name, category, content });
+          await window.tasiHarness.skills.create({ name, category, content, displayName, displayCategory });
           const removed = await window.tasiHarness.skills.delete(editorOriginalName);
           if (!removed) throw new Error(`Renamed ${name}, but failed to remove old skill ${editorOriginalName}.`);
           setNotice(`Renamed ${editorOriginalName} to ${name}.`);
@@ -3324,8 +3571,11 @@ function SkillsPage({
       setUploadError('Please choose a ZIP package first.');
       return;
     }
-    const skillName = uploadName.trim();
-    if (!skillName) {
+    const uploadDisplayName = uploadName.trim();
+    const skillName = slugifyUiName(uploadDisplayName, 'uploaded-skill');
+    const skillCategory = normalizeSkillCategory(uploadCategory, 'other');
+    const displayCategory = skillCategoryLabel(skillCategory, tr);
+    if (!uploadDisplayName) {
       setUploadError('Please fill in a skill name.');
       return;
     }
@@ -3345,7 +3595,9 @@ function SkillsPage({
         filename: uploadFile.name,
         contentBase64,
         name: skillName,
-        category: uploadCategory.trim() || 'local',
+        category: skillCategory,
+        displayName: uploadDisplayName,
+        displayCategory,
         overwrite
       });
       setUploadNotice(`Uploaded and installed ${created.name}.`);
@@ -3361,10 +3613,68 @@ function SkillsPage({
     }
   }
 
+  async function refreshCoachStoredRecordings(): Promise<BrowserCoachStoredRecording[]> {
+    setCoachStoredBusy(true);
+    try {
+      const listRecordings = window.tasiHarness.browserCoach.listRecordings;
+      if (!listRecordings) {
+        setCoachStoredRecordings([]);
+        setCoachSelectedStoredSkill('');
+        setCoachError(tr('Browser coach trace list API is not loaded yet. Restart the app to load the updated preload script.', '浏览器教练轨迹列表 API 尚未加载。请重启应用以加载更新后的 preload 脚本。'));
+        return [];
+      }
+      const recordings = await listRecordings();
+      setCoachStoredRecordings(recordings);
+      setCoachSelectedStoredSkill((current) => (
+        current && recordings.some((item) => item.id === current) ? current : recordings[0]?.id ?? ''
+      ));
+      return recordings;
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+      return [];
+    } finally {
+      setCoachStoredBusy(false);
+    }
+  }
+
+  async function loadCoachStoredRecording(recordingId: string): Promise<void> {
+    setCoachSelectedStoredSkill(recordingId);
+    if (!recordingId) return;
+    setCoachStoredBusy(true);
+    setCoachError('');
+    setCoachNotice('');
+    try {
+      const loadRecording = window.tasiHarness.browserCoach.loadRecording;
+      const summary = coachStoredRecordings.find((item) => item.id === recordingId);
+      const label = summary?.displayName || summary?.skillName || recordingId;
+      if (!loadRecording) {
+        throw new Error(tr('Browser coach trace loader API is not loaded yet. Restart the app to load the updated preload script.', '浏览器教练轨迹载入 API 尚未加载。请重启应用以加载更新后的 preload 脚本。'));
+      }
+      const recording = await loadRecording(recordingId);
+      if (!recording) throw new Error(tr(`No saved recording found for ${label}.`, `没有找到 ${label} 的已保存轨迹。`));
+      setCoachRecording({ ...recording, active: false, events: reindexCoachEvents(recording.events) });
+      setCoachRecordingSource('stored');
+      setCoachTraceDirty(false);
+      setCoachEditingEventId(null);
+      setCoachEventDraft(null);
+      setCoachSkillName(summary?.displayName || summary?.skillName || 'recorded-browser-workflow');
+      setCoachCategory(summary?.category || 'browser');
+      setCoachNotice(tr(`Loaded saved trace from ${label}.`, `已载入 ${label} 的保存轨迹。`));
+    } catch (error) {
+      setCoachError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCoachStoredBusy(false);
+    }
+  }
+
   async function startCoach(): Promise<void> {
     setCoachBusy(true);
     setCoachError('');
     setCoachNotice('');
+    setCoachTraceDirty(false);
+    setCoachEditingEventId(null);
+    setCoachEventDraft(null);
+    setCoachRecordingSource('live');
     try {
       const recording = await window.tasiHarness.browserCoach.start({ url: coachUrl });
       setCoachRecording(recording);
@@ -3380,8 +3690,20 @@ function SkillsPage({
     setCoachBusy(true);
     setCoachError('');
     try {
-      setCoachRecording(await window.tasiHarness.browserCoach.stop());
-      setCoachNotice(tr('Browser coach stopped.', '教练已停止。'));
+      const stopped = await window.tasiHarness.browserCoach.stop();
+      setCoachRecording(stopped);
+      const recordings = await refreshCoachStoredRecordings();
+      const saved = recordings.find((item) => item.source === 'recording' && item.startedAt === stopped.startedAt && item.eventCount === stopped.events.length);
+      if (saved) {
+        setCoachSelectedStoredSkill(saved.id);
+        setCoachRecordingSource('stored');
+      } else {
+        setCoachRecordingSource('live');
+      }
+      setCoachTraceDirty(false);
+      setCoachEditingEventId(null);
+      setCoachEventDraft(null);
+      setCoachNotice(tr('Browser coach stopped and saved as a trace.', '教练已停止，轨迹已保存。'));
     } catch (error) {
       setCoachError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3394,8 +3716,23 @@ function SkillsPage({
     setCoachError('');
     setCoachNotice('');
     try {
+      const selectedRecordingId = coachRecordingSource === 'stored' ? coachSelectedStoredSkill : '';
+      if (selectedRecordingId) {
+        const deleteRecording = window.tasiHarness.browserCoach.deleteRecording;
+        if (!deleteRecording) {
+          throw new Error(tr('Browser coach trace delete API is not loaded yet. Restart the app to load the updated preload script.', '浏览器教练轨迹删除 API 尚未加载。请重启应用以加载更新后的 preload 脚本。'));
+        }
+        await deleteRecording(selectedRecordingId);
+      }
       setCoachRecording(await window.tasiHarness.browserCoach.clear());
-      setCoachNotice(tr('Browser trace cleared.', '浏览器操作轨迹已清除。'));
+      setCoachRecordingSource('live');
+      setCoachTraceDirty(false);
+      setCoachEditingEventId(null);
+      setCoachEventDraft(null);
+      await refreshCoachStoredRecordings();
+      setCoachNotice(selectedRecordingId
+        ? tr('Browser trace cleared and saved trace file deleted.', '浏览器操作轨迹已清除，已保存轨迹文件已删除。')
+        : tr('Browser trace cleared.', '浏览器操作轨迹已清除。'));
     } catch (error) {
       setCoachError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -3404,9 +3741,11 @@ function SkillsPage({
   }
 
   async function generateCoachSkill(): Promise<void> {
-    const name = coachSkillName.trim();
-    const category = coachCategory.trim() || 'browser';
-    if (!name) {
+    const displayName = coachSkillName.trim();
+    const name = displayName;
+    const category = normalizeSkillCategory(coachCategory, 'browser');
+    const displayCategory = skillCategoryLabel(category, tr);
+    if (!displayName) {
       setCoachError(tr('Skill name is required.', '请填写技能名称。'));
       return;
     }
@@ -3421,8 +3760,14 @@ function SkillsPage({
       const result = await window.tasiHarness.browserCoach.generateSkill({
         name,
         category,
-        description: coachDescription.trim() || undefined
+        description: coachDescription.trim() || undefined,
+        userGuidance: coachUserGuidance.trim() || undefined,
+        recording: coachRecording,
+        displayName,
+        displayCategory
       });
+      setCoachTraceDirty(false);
+      await refreshCoachStoredRecordings();
       setNotice(tr(`Generated skill ${result.skill.name}.`, `已生成技能 ${result.skill.name}。`));
       setCoachNotice(tr(`Generated skill ${result.skill.name}; recording saved to ${result.recordingReferencePath}.`, `已生成技能 ${result.skill.name}；轨迹已保存到 ${result.recordingReferencePath}。`));
       await refreshSkills();
@@ -3432,6 +3777,44 @@ function SkillsPage({
     } finally {
       setCoachBusy(false);
     }
+  }
+
+  function beginEditCoachEvent(event: BrowserCoachRecordedEvent): void {
+    if (coachRecording.active) return;
+    setCoachEditingEventId(event.id);
+    setCoachEventDraft(coachEventToDraft(event));
+    setCoachError('');
+  }
+
+  function cancelEditCoachEvent(): void {
+    setCoachEditingEventId(null);
+    setCoachEventDraft(null);
+  }
+
+  function saveEditCoachEvent(eventId: string): void {
+    if (!coachEventDraft) return;
+    setCoachRecording((recording) => ({
+      ...recording,
+      events: recording.events.map((event) => event.id === eventId ? draftToCoachEvent(event, coachEventDraft) : event)
+    }));
+    setCoachTraceDirty(true);
+    setCoachEditingEventId(null);
+    setCoachEventDraft(null);
+    setCoachNotice(tr('Trace event updated. Generate the skill to use the edited trace.', '轨迹事件已修改。生成技能时会使用修改后的轨迹。'));
+  }
+
+  function deleteCoachEvent(eventId: string): void {
+    if (coachRecording.active) return;
+    setCoachRecording((recording) => ({
+      ...recording,
+      events: reindexCoachEvents(recording.events.filter((event) => event.id !== eventId))
+    }));
+    if (coachEditingEventId === eventId) {
+      setCoachEditingEventId(null);
+      setCoachEventDraft(null);
+    }
+    setCoachTraceDirty(true);
+    setCoachNotice(tr('Trace event deleted. Generate the skill to use the edited trace.', '轨迹事件已删除。生成技能时会使用修改后的轨迹。'));
   }
 
   async function installBundledVersion(skill: SkillMetadata): Promise<void> {
@@ -3471,17 +3854,29 @@ function SkillsPage({
   }
 
   async function optimizeSelectedSession(): Promise<void> {
-    const selected = sessions.find((item) => item.id === optimizeSessionId);
-    if (!selected) {
-      setOptimizeError(tr('Choose a session first.', '请先选择一个 session。'));
+    const selected = sessions.filter((item) => optimizeSessionIds.includes(item.id));
+    if (selected.length === 0) {
+      setOptimizeError(tr('Choose at least one session first.', '请先选择至少一个 session。'));
       return;
     }
     setOptimizeError('');
     try {
-      await onOptimizeSession(selected);
+      await onOptimizeSession(selected, optimizeUserGuidance);
     } catch (error) {
       setOptimizeError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function toggleOptimizeSession(sessionId: string): void {
+    setOptimizeSessionIds((current) => (
+      current.includes(sessionId)
+        ? current.filter((id) => id !== sessionId)
+        : [...current, sessionId]
+    ));
+  }
+
+  function setAllOptimizeSessions(selected: boolean): void {
+    setOptimizeSessionIds(selected ? sessions.map((session) => session.id) : []);
   }
 
   return (
@@ -3515,10 +3910,11 @@ function SkillsPage({
             <div className="skills-grid">
               {skills.map((skill) => (
                 <div key={`${skill.source}-${skill.name}`} className="skill-card">
-                  <div className="skill-card-top"><strong>{skill.name}</strong></div>
+                  <div className="skill-card-top"><strong>{skill.displayName || skill.name}</strong></div>
                   <p>{skill.description}</p>
                   <div className="skill-footer">
-                    <span>{skill.category}</span>
+                    <span>{skill.displayCategory || skill.category}</span>
+                    {skill.displayName && <span>{skill.name}</span>}
                     <span>{skill.marketplaceSourceId ?? skill.source}</span>
                   </div>
                   {skill.bundledPath && (
@@ -3641,11 +4037,15 @@ function SkillsPage({
               placeholder={tr('required, e.g. my-automation-skill', '必填，例如：my-automation-skill')}
             />
             <label>{tr('Category', '分类')}</label>
-            <input value={uploadCategory} onChange={(e) => setUploadCategory(e.target.value)} placeholder="local" />
-            {existingSkillForName(uploadName) && (
+            <select value={uploadCategory} onChange={(e) => setUploadCategory(e.target.value)}>
+              {SKILL_CATEGORIES.map((category) => (
+                <option key={category.value} value={category.value}>{tr(category.en, category.zh)}</option>
+              ))}
+            </select>
+            {existingSkillForDisplayName(uploadName, 'uploaded-skill') && (
               <label className="toggle-line overwrite-toggle">
                 <input type="checkbox" checked={uploadOverwrite} onChange={(event) => setUploadOverwrite(event.target.checked)} />
-                {tr(`Overwrite existing skill ${existingSkillForName(uploadName)?.name}`, `覆盖现有技能 ${existingSkillForName(uploadName)?.name}`)}
+                {tr(`Overwrite existing skill ${existingSkillForDisplayName(uploadName, 'uploaded-skill')?.name}`, `覆盖现有技能 ${existingSkillForDisplayName(uploadName, 'uploaded-skill')?.name}`)}
               </label>
             )}
             {uploadFile && (
@@ -3656,7 +4056,7 @@ function SkillsPage({
               </div>
             )}
             <div className="button-row">
-              <button className="primary-button" disabled={uploadBusy || Boolean(existingSkillForName(uploadName) && !uploadOverwrite)} onClick={() => void uploadArchive()}>
+              <button className="primary-button" disabled={uploadBusy || Boolean(existingSkillForDisplayName(uploadName, 'uploaded-skill') && !uploadOverwrite)} onClick={() => void uploadArchive()}>
                 {uploadBusy ? tr('Uploading...', '上传中...') : tr('Upload and Install', '上传并安装')}
               </button>
             </div>
@@ -3683,12 +4083,50 @@ function SkillsPage({
                   </span>
                   <span className="soft-badge">{tr('Events', '事件')}: {coachRecording.events.length}</span>
                 </div>
+                <label>{tr('Saved traces', '已有轨迹')}</label>
+                <div className="coach-saved-trace-row">
+                  <select
+                    value={coachSelectedStoredSkill}
+                    disabled={coachStoredBusy || coachStoredRecordings.length === 0}
+                    onChange={(event) => setCoachSelectedStoredSkill(event.target.value)}
+                  >
+                    {coachStoredRecordings.length === 0 ? (
+                      <option value="">{tr('No saved traces', '暂无已保存轨迹')}</option>
+                    ) : (
+                      coachStoredRecordings.map((recording) => (
+                        <option key={recording.id} value={recording.id}>
+                          {`${recording.displayName || recording.skillName} · ${recording.eventCount} ${tr('events', '条')}`}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                  <button
+                    className="ghost-button"
+                    disabled={coachStoredBusy || !coachSelectedStoredSkill}
+                    onClick={() => void loadCoachStoredRecording(coachSelectedStoredSkill)}
+                  >
+                    {coachStoredBusy ? tr('Loading...', '载入中...') : tr('Load', '载入')}
+                  </button>
+                  <button className="mini-button" disabled={coachStoredBusy} onClick={() => void refreshCoachStoredRecordings()}>
+                    {tr('Refresh', '刷新')}
+                  </button>
+                </div>
                 <label>{tr('Skill name', '技能名')}</label>
                 <input value={coachSkillName} onChange={(event) => setCoachSkillName(event.target.value)} placeholder="recorded-browser-workflow" />
                 <label>{tr('Category', '分类')}</label>
-                <input value={coachCategory} onChange={(event) => setCoachCategory(event.target.value)} placeholder="browser" />
+                <select value={coachCategory} onChange={(event) => setCoachCategory(event.target.value)}>
+                  {SKILL_CATEGORIES.map((category) => (
+                    <option key={category.value} value={category.value}>{tr(category.en, category.zh)}</option>
+                  ))}
+                </select>
                 <label>{tr('Description', '描述')}</label>
                 <input value={coachDescription} onChange={(event) => setCoachDescription(event.target.value)} placeholder={tr('optional skill trigger description', '可选，用于触发技能的描述')} />
+                <label>{tr('Guidance prompt', '指导提示词')}</label>
+                <textarea
+                  value={coachUserGuidance}
+                  onChange={(event) => setCoachUserGuidance(event.target.value)}
+                  placeholder={tr('Optional instructions for how this skill should be generated or used.', '可选：说明这个技能生成或使用时需要遵循的要求。')}
+                />
                 <div className="button-row">
                   <button className="primary-button" disabled={coachBusy || coachRecording.events.length === 0} onClick={() => void generateCoachSkill()}>
                     {coachBusy ? tr('Working...', '处理中...') : tr('Generate Skill', '生成技能')}
@@ -3697,7 +4135,14 @@ function SkillsPage({
               </div>
               <div className="coach-trace">
                 <div className="coach-trace-head">
-                  <strong>{tr('Recorded Browser Trace', '浏览器操作轨迹')}</strong>
+                  <div className="coach-trace-title">
+                    <strong>{tr('Recorded Browser Trace', '浏览器操作轨迹')}</strong>
+                    <span>
+                      {tr(`${coachRecording.events.length} events`, `${coachRecording.events.length} 个事件`)}
+                      {coachRecordingSource === 'stored' ? tr(' · saved trace', ' · 已保存轨迹') : ''}
+                      {coachTraceDirty ? tr(' · edited', ' · 已编辑') : ''}
+                    </span>
+                  </div>
                   <div className="coach-trace-head-actions">
                     {coachRecording.startedAt && <span>{prettyDate(coachRecording.startedAt)}</span>}
                     <button
@@ -3713,13 +4158,86 @@ function SkillsPage({
                   <div className="tool-empty">{tr('Click Start, operate in the browser window, and actions will appear here.', '点击开始，在弹出的浏览器中操作，轨迹会显示在这里。')}</div>
                 ) : (
                   <div className="coach-trace-list">
-                    {coachRecording.events.slice(-120).map((event) => (
+                    {displayedCoachEvents.map((event) => (
                       <div key={event.id || `${event.index}-${event.createdAt}`} className="coach-event">
-                        <div>
-                          <strong>{formatCoachEvent(event)}</strong>
-                          <span>{event.url}</span>
+                        <div className="coach-event-main">
+                          <div className="coach-event-summary">
+                            <strong>{formatCoachEvent(event)}</strong>
+                            <span>{event.url}</span>
+                          </div>
+                          {coachEditingEventId === event.id && coachEventDraft && (
+                            <div className="coach-event-editor">
+                              <label>{tr('Action', '动作')}</label>
+                              <select
+                                value={coachEventDraft.type}
+                                onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, type: changeEvent.target.value as BrowserCoachRecordedEvent['type'] } : draft)}
+                              >
+                                <option value="navigation">navigation</option>
+                                <option value="click">click</option>
+                                <option value="input">input</option>
+                                <option value="change">change</option>
+                                <option value="submit">submit</option>
+                                <option value="keydown">keydown</option>
+                                <option value="window_closed">window_closed</option>
+                              </select>
+                              <label>URL</label>
+                              <input value={coachEventDraft.url} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, url: changeEvent.target.value } : draft)} />
+                              <div className="coach-event-editor-grid">
+                                <div>
+                                  <label>{tr('Name', '名称')}</label>
+                                  <input value={coachEventDraft.name} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, name: changeEvent.target.value } : draft)} />
+                                </div>
+                                <div>
+                                  <label>{tr('Text', '文本')}</label>
+                                  <input value={coachEventDraft.text} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, text: changeEvent.target.value } : draft)} />
+                                </div>
+                              </div>
+                              <div className="coach-event-editor-grid">
+                                <div>
+                                  <label>{tr('Selector', '选择器')}</label>
+                                  <input value={coachEventDraft.selector} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, selector: changeEvent.target.value } : draft)} />
+                                </div>
+                                <div>
+                                  <label>{tr('Value', '值')}</label>
+                                  <input value={coachEventDraft.value} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, value: changeEvent.target.value } : draft)} />
+                                </div>
+                              </div>
+                              <div className="coach-event-editor-grid compact">
+                                <div>
+                                  <label>{tr('Title', '标题')}</label>
+                                  <input value={coachEventDraft.title} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, title: changeEvent.target.value } : draft)} />
+                                </div>
+                                <div>
+                                  <label>{tr('Tag', '标签')}</label>
+                                  <input value={coachEventDraft.tag} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, tag: changeEvent.target.value } : draft)} />
+                                </div>
+                                <div>
+                                  <label>{tr('Role', '角色')}</label>
+                                  <input value={coachEventDraft.role} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, role: changeEvent.target.value } : draft)} />
+                                </div>
+                                <div>
+                                  <label>{tr('Key', '按键')}</label>
+                                  <input value={coachEventDraft.key} onChange={(changeEvent) => setCoachEventDraft((draft) => draft ? { ...draft, key: changeEvent.target.value } : draft)} />
+                                </div>
+                              </div>
+                              <div className="button-row coach-event-editor-actions">
+                                <button className="primary-button" onClick={() => saveEditCoachEvent(event.id)}>{tr('Save', '保存')}</button>
+                                <button className="ghost-button" onClick={cancelEditCoachEvent}>{tr('Cancel', '取消')}</button>
+                              </div>
+                            </div>
+                          )}
                         </div>
-                        <time>{prettyDate(event.createdAt)}</time>
+                        <div className="coach-event-side">
+                          <time>{prettyDate(event.createdAt)}</time>
+                          <div className="coach-event-actions">
+                            <button className="mini-button" disabled={coachRecording.active} onClick={() => beginEditCoachEvent(event)}>
+                              {tr('Edit', '修改')}
+                            </button>
+                            <button className="mini-button danger-mini-button" disabled={coachRecording.active} onClick={() => deleteCoachEvent(event.id)}>
+                              {tr('Delete', '删除')}
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -3735,29 +4253,49 @@ function SkillsPage({
             <h2>{tr('Skill Optimization', '技能优化')}</h2>
             <p className="card-subtle">
               {tr(
-                'Choose a previous session. Tasi will start a new agent run that inspects its failures, maps them to one or more skills, and patches the affected skill instructions or scripts.',
-                '选择一个历史 session。系统会启动新的智能体任务，检查其中的失败问题，映射到一个或多个技能，并修改受影响的技能说明或脚本。'
+                'Choose one or more previous sessions. Tasi will start a new agent run that compares their failures, maps them to one or more skills, and patches the affected skill instructions or scripts.',
+                '选择一个或多个历史 session。系统会启动新的智能体任务，对比其中的失败问题，映射到一个或多个技能，并修改受影响的技能说明或脚本。'
               )}
             </p>
-            <label>{tr('Session', 'Session')}</label>
-            <select value={optimizeSessionId} onChange={(event) => setOptimizeSessionId(event.target.value)} disabled={optimizeBusy || optimizeRefreshing}>
-              {sessions.map((session) => (
-                <option key={session.id} value={session.id}>
-                  {`${prettyDate(session.updatedAt)} · ${session.title || session.id}`}
-                </option>
-              ))}
-            </select>
-            {optimizeSessionId && (
-              <div className="meta-row wrap upload-file-row">
-                <span className="soft-badge">{optimizeSessionId}</span>
-                <span className="soft-badge">
-                  {tr('Messages', '消息')}: {sessions.find((session) => session.id === optimizeSessionId)?.messageCount ?? 0}
-                </span>
+            <div className="coach-trace-head optimize-session-head">
+              <strong>{tr('Sessions', 'Session')}</strong>
+              <div className="coach-trace-head-actions">
+                <span className="soft-badge">{tr('Selected', '已选')}: {optimizeSessionIds.length}</span>
+                <button className="mini-button" disabled={optimizeBusy || optimizeRefreshing || sessions.length === 0} onClick={() => setAllOptimizeSessions(true)}>
+                  {tr('Select all', '全选')}
+                </button>
+                <button className="mini-button" disabled={optimizeBusy || optimizeRefreshing || optimizeSessionIds.length === 0} onClick={() => setAllOptimizeSessions(false)}>
+                  {tr('Clear', '清除')}
+                </button>
               </div>
-            )}
+            </div>
+            <div className="optimize-session-list">
+              {sessions.map((session) => (
+                <label key={session.id} className="optimize-session-item">
+                  <input
+                    type="checkbox"
+                    checked={optimizeSessionIds.includes(session.id)}
+                    disabled={optimizeBusy || optimizeRefreshing}
+                    onChange={() => toggleOptimizeSession(session.id)}
+                  />
+                  <span>
+                    <strong>{session.title || session.id}</strong>
+                    <span>{prettyDate(session.updatedAt)} · {session.messageCount} {tr('messages', '条消息')}</span>
+                    <code>{session.id}</code>
+                  </span>
+                </label>
+              ))}
+            </div>
+            <label>{tr('Guidance prompt', '指导提示词')}</label>
+            <textarea
+              value={optimizeUserGuidance}
+              onChange={(event) => setOptimizeUserGuidance(event.target.value)}
+              disabled={optimizeBusy || optimizeRefreshing}
+              placeholder={tr('Optional instructions for this optimization run.', '可选：本次技能优化需要遵循的要求。')}
+            />
             <div className="button-row">
-              <button className="primary-button" disabled={optimizeBusy || optimizeRefreshing || sessions.length === 0} onClick={() => void optimizeSelectedSession()}>
-                {optimizeBusy ? tr('Optimizing...', '优化中...') : tr('Optimize Skills From Session', '从 Session 优化技能')}
+              <button className="primary-button" disabled={optimizeBusy || optimizeRefreshing || optimizeSessionIds.length === 0} onClick={() => void optimizeSelectedSession()}>
+                {optimizeBusy ? tr('Optimizing...', '优化中...') : tr('Optimize Skills From Sessions', '从多个 Session 优化技能')}
               </button>
               <button className="ghost-button" disabled={optimizeBusy || optimizeRefreshing} onClick={() => void refreshOptimizationSessions()}>
                 {optimizeRefreshing ? tr('Refreshing...', '刷新中...') : tr('Refresh Sessions', '刷新 Session')}
@@ -3779,7 +4317,11 @@ function SkillsPage({
             <label>{tr('Skill name', '技能名')}</label>
             <input value={editorName} onChange={(e) => setEditorName(e.target.value)} disabled={editorReadonly || editorSaving} />
             <label>{tr('Category', '分类')}</label>
-            <input value={editorCategory} onChange={(e) => setEditorCategory(e.target.value)} disabled={editorReadonly || editorSaving} />
+            <select value={editorCategory} onChange={(e) => setEditorCategory(e.target.value)} disabled={editorReadonly || editorSaving}>
+              {SKILL_CATEGORIES.map((category) => (
+                <option key={category.value} value={category.value}>{tr(category.en, category.zh)}</option>
+              ))}
+            </select>
             <label>{tr('Skill content (SKILL.md)', '技能内容（SKILL.md）')}</label>
             <textarea
               className="skill-editor-textarea"
@@ -4338,7 +4880,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <label>{tr('Temperature', '温度')}</label>
           <input type="number" min="0" max="2" step="0.1" value={draft.temperature} onChange={(e) => setDraft((old) => ({ ...old, temperature: Number(e.target.value) }))} />
           <label>{tr('Max iterations', '最大迭代次数')}</label>
-          <input type="number" min="1" max="100" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
+          <input type="number" min="1" max="200" value={draft.maxIterations} onChange={(e) => setDraft((old) => ({ ...old, maxIterations: Number(e.target.value) }))} />
           <label>{tr('Session document max docs', '对话文档最大数量')}</label>
           <input
             type="number"

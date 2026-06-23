@@ -52,6 +52,20 @@ function shortPath(workspaceDir: string, target: string): string {
 
 function approvalFromFileTool(toolName: string, args: unknown, context: ToolExecutionContext): ApprovalCandidate | null {
   const obj = objectArgs(args);
+  if (toolName === 'browser_upload_file') {
+    const rawPaths = Array.isArray(obj.paths) ? obj.paths : [obj.path];
+    const targets = rawPaths
+      .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      .map((item) => resolveToolPath(context.workspaceDir, item));
+    const outside = targets.filter((target) => !isPathInside(context.workspaceDir, target) && !isPathInsideApprovalFreeTasiDir(target));
+    if (outside.length === 0) return null;
+    const labels = outside.map((target) => shortPath(context.workspaceDir, target)).join(', ');
+    return {
+      key: `outside:read:${outside.join('|')}`,
+      risk: 'outside-read',
+      summary: `Upload outside-workspace file(s) through browser: ${labels}`
+    };
+  }
   const pathArg = stringArg(obj, 'path');
   if (!pathArg && toolName !== 'file_list') return null;
   const target = resolveToolPath(context.workspaceDir, pathArg || '.');

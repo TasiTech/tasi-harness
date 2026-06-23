@@ -20,6 +20,58 @@ function uniqueHosts(recording: BrowserCoachRecording): string[] {
   return [...hosts].slice(0, 6);
 }
 
+function slugifyOrFallback(input: string | undefined, fallback: string): string {
+  for (const candidate of [input, fallback, 'recorded-browser-workflow']) {
+    try {
+      return slugifyName(candidate ?? '');
+    } catch {
+      // Try the next fallback.
+    }
+  }
+  return 'recorded-browser-workflow';
+}
+
+function fallbackSkillName(recording: BrowserCoachRecording): string {
+  const host = uniqueHosts(recording)[0];
+  return host ? `${host}-browser-workflow` : 'recorded-browser-workflow';
+}
+
+function displayValue(value: string | undefined): string | undefined {
+  const trimmed = value?.replace(/\s+/g, ' ').trim();
+  return trimmed || undefined;
+}
+
+function frontmatterLine(key: string, value: string | undefined): string[] {
+  return value ? [`${key}: ${value.replace(/\n/g, ' ')}`] : [];
+}
+
+function userGuidanceSection(guidance: string | undefined): string[] {
+  const trimmed = guidance?.trim();
+  if (!trimmed) return [];
+  return [
+    '## User Guidance',
+    '',
+    'Follow these user-provided instructions when they do not conflict with safety rules, tool reliability rules, or the recorded workflow evidence.',
+    '',
+    trimmed
+  ];
+}
+
+export function normalizeBrowserCoachSkillRequest(
+  req: BrowserCoachGenerateSkillRequest,
+  recording: BrowserCoachRecording
+): BrowserCoachGenerateSkillRequest {
+  const rawName = displayValue(req.displayName) ?? displayValue(req.name);
+  const rawCategory = displayValue(req.displayCategory);
+  return {
+    ...req,
+    name: slugifyOrFallback(req.name, fallbackSkillName(recording)),
+    category: slugifyOrFallback(req.category, 'browser'),
+    displayName: rawName,
+    displayCategory: rawCategory
+  };
+}
+
 function eventTargetLabel(event: BrowserCoachRecordedEvent): string {
   const primary = event.name
     ? `"${clip(event.name, 80)}"`
@@ -171,11 +223,20 @@ function ensureRecordedLinksAndParamsSection(content: string, recording: Browser
   return `${content.slice(0, referencesMatch.index).trim()}\n${section}${content.slice(referencesMatch.index)}`;
 }
 
+function ensureUserGuidanceSection(content: string, guidance: string | undefined): string {
+  if (!guidance?.trim() || /User Guidance/i.test(content)) return content;
+  const referencesMatch = content.match(/\n## References\s*\n/i);
+  const section = ['', ...userGuidanceSection(guidance), ''].join('\n');
+  if (!referencesMatch?.index) return `${content.trim()}\n${section}\n`;
+  return `${content.slice(0, referencesMatch.index).trim()}\n${section}${content.slice(referencesMatch.index)}`;
+}
+
 export function buildBrowserCoachSkillContent(req: BrowserCoachGenerateSkillRequest, recording: BrowserCoachRecording): string {
-  const name = slugifyName(req.name);
-  const category = slugifyName(req.category || 'browser');
+  const normalizedReq = normalizeBrowserCoachSkillRequest(req, recording);
+  const name = normalizedReq.name;
+  const category = normalizedReq.category;
   const hosts = uniqueHosts(recording);
-  const description = req.description?.trim() ||
+  const description = normalizedReq.description?.trim() ||
     `Use when the user asks to repeat the recorded browser workflow${hosts.length ? ` for ${hosts.join(', ')}` : ''}.`;
   const steps = relevantEvents(recording)
     .map((event, index) => `${index + 1}. ${browserCoachEventToInstruction(event)}`)
@@ -185,11 +246,13 @@ export function buildBrowserCoachSkillContent(req: BrowserCoachGenerateSkillRequ
   return [
     '---',
     `name: ${name}`,
+    ...frontmatterLine('display_name', normalizedReq.displayName),
     `description: ${description.replace(/\n/g, ' ')}`,
     `category: ${category}`,
+    ...frontmatterLine('display_category', normalizedReq.displayCategory),
     '---',
     '',
-    `# ${name}`,
+    `# ${normalizedReq.displayName || name}`,
     '',
     '## Workflow',
     '',
@@ -202,8 +265,13 @@ export function buildBrowserCoachSkillContent(req: BrowserCoachGenerateSkillRequ
     '- Treat recorded refs, CSS paths, and exact values as hints. If the page changed, locate the matching field or button semantically.',
     '- Replace private values, account-specific values, dates, search terms, order IDs, and filters with values supplied by the user.',
     '- After the workflow reaches the result page, use `browser_snapshot`, `browser_extract`, or `browser_find` to gather data and cite the current page URL.',
-    '- If login, captcha, MFA, or permission prompts appear, pause and ask the user to complete them in the browser.',
+    '- If login, captcha, MFA, or permission prompts appear, pause and ask the user to complete them in the browser, then use `browser_wait` with `until_logged_in: true`, `until_changed: true`, and `timeout_ms: 300000` before checking the page again. Avoid fixed long sleeps such as `ms: 300000`.',
+  '- If the login page already has saved credentials or the user has filled the username/password fields, do not ask for the password again. Click the visible login/sign-in button, then wait with `until_logged_in: true` and `timeout_ms: 300000`.',
+  '- If the page says the user is about to log in or authorize access after credentials were accepted, inspect the page and click the visible confirm/login/continue/authorize button instead of waiting for the final site indefinitely.',
+  '- If this workflow fills forms, submits requests, changes account state, or leaves a page for user review, call `browser_close_policy` with `policy: "keep_open"` before the final answer. If the workflow only extracts/read-only data, allow the default auto-close behavior.',
     '',
+    ...userGuidanceSection(normalizedReq.userGuidance),
+    ...(normalizedReq.userGuidance?.trim() ? [''] : []),
     ...recordedLinksAndParamsSection(recording),
     '',
     ...browserReliabilitySection(),
@@ -247,8 +315,8 @@ function stripCodeFence(input: string): string {
 }
 
 function ensureGeneratedSkillFrontmatter(content: string, req: BrowserCoachGenerateSkillRequest, fallbackDescription: string): string {
-  const name = slugifyName(req.name);
-  const category = slugifyName(req.category || 'browser');
+  const name = slugifyOrFallback(req.name, 'recorded-browser-workflow');
+  const category = slugifyOrFallback(req.category, 'browser');
   const cleaned = stripCodeFence(content);
   const body = cleaned.replace(/^---\n[\s\S]*?\n---\n?/, '').trim() || buildBrowserCoachSkillContent(req, {
     id: '',
@@ -261,13 +329,15 @@ function ensureGeneratedSkillFrontmatter(content: string, req: BrowserCoachGener
   const kept = (frontmatter?.[1] ?? '')
     .split('\n')
     .map((line) => line.trim())
-    .filter((line) => line && !/^(name|category|description)\s*:/i.test(line));
+    .filter((line) => line && !/^(name|display_name|category|display_category|description)\s*:/i.test(line));
   const description = frontmatter?.[1].match(/^description\s*:\s*(.+)$/im)?.[1]?.trim() || req.description?.trim() || fallbackDescription;
   return [
     '---',
     `name: ${name}`,
+    ...frontmatterLine('display_name', req.displayName),
     `description: ${description.replace(/\n/g, ' ')}`,
     `category: ${category}`,
+    ...frontmatterLine('display_category', req.displayCategory),
     ...kept,
     '---',
     '',
@@ -282,12 +352,13 @@ export async function buildBrowserCoachSkillContentWithModel(
   client: LlmClient,
   skillCreatorGuide?: string
 ): Promise<string> {
-  const name = slugifyName(req.name);
-  const category = slugifyName(req.category || 'browser');
+  const normalizedReq = normalizeBrowserCoachSkillRequest(req, recording);
+  const name = normalizedReq.name;
+  const category = normalizedReq.category;
   const hosts = uniqueHosts(recording);
-  const fallbackDescription = req.description?.trim() ||
+  const fallbackDescription = normalizedReq.description?.trim() ||
     `Use when the user asks to repeat the recorded browser workflow${hosts.length ? ` for ${hosts.join(', ')}` : ''}.`;
-  const fallback = buildBrowserCoachSkillContent(req, recording);
+  const fallback = buildBrowserCoachSkillContent(normalizedReq, recording);
   try {
     const completion = await client.complete({
       temperature: 0.2,
@@ -311,7 +382,18 @@ export async function buildBrowserCoachSkillContentWithModel(
           content: [
             `Required frontmatter name: ${name}`,
             `Required frontmatter category: ${category}`,
+            normalizedReq.displayName ? `Display name to preserve: ${normalizedReq.displayName}` : '',
+            normalizedReq.displayCategory ? `Display category to preserve: ${normalizedReq.displayCategory}` : '',
             `Suggested description: ${fallbackDescription}`,
+            normalizedReq.userGuidance?.trim()
+              ? [
+                  '',
+                  'User-provided guidance to preserve and follow:',
+                  '---',
+                  normalizedReq.userGuidance.trim(),
+                  '---'
+                ].join('\n')
+              : '',
             '',
             'Generate a high-quality skill for this browser workflow.',
             '',
@@ -327,6 +409,8 @@ export async function buildBrowserCoachSkillContentWithModel(
             '- Include a Recorded Links And Parameters section that preserves useful recorded URLs, query parameter names/values, route patterns, and input hints. Convert task-specific values into variables in the workflow, but keep the captured examples as hints.',
             '- Include Browser Reliability Rules that prevent the my-travel failure pattern: do not reuse brittle nth-of-type selectors, confirm autocomplete/dropdown selections, verify every critical state change, do not guess provider result URLs, and mark live-data failures as degraded.',
             '- For travel, booking, shopping, finance, or other live-provider workflows, require tool-backed evidence before reporting prices, schedules, inventory, availability, or ratings.',
+            '- Include browser close policy guidance: keep the browser open for form filling/submissions/account changes/user review, and allow auto-close for read-only data lookup/extraction.',
+            normalizedReq.userGuidance?.trim() ? '- Include a User Guidance section or weave the user-provided guidance into the relevant workflow sections.' : '',
             '',
             skillCreatorGuide?.trim()
               ? [
@@ -347,7 +431,10 @@ export async function buildBrowserCoachSkillContentWithModel(
     const generated = completion.message.content?.trim();
     if (!generated || !/^---\n[\s\S]*?\n---/.test(stripCodeFence(generated))) return fallback;
     const normalized = ensureBrowserReliabilitySection(
-      ensureRecordedLinksAndParamsSection(ensureGeneratedSkillFrontmatter(generated, req, fallbackDescription), recording)
+      ensureRecordedLinksAndParamsSection(
+        ensureUserGuidanceSection(ensureGeneratedSkillFrontmatter(generated, normalizedReq, fallbackDescription), normalizedReq.userGuidance),
+        recording
+      )
     );
     if (!normalized.includes('./references/recording.json')) {
       return `${normalized.trim()}\n\n## References\n\n- Raw browser recording: \`./references/recording.json\`\n`;

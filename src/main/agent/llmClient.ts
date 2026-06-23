@@ -193,6 +193,23 @@ function parseToolArguments(raw: string): unknown {
   }
 }
 
+function normalizeToolArgumentsForRequest(value: unknown): string {
+  if (typeof value === 'string') {
+    const raw = value.trim();
+    if (!raw) return '{}';
+    try {
+      return JSON.stringify(JSON.parse(raw));
+    } catch {
+      return JSON.stringify({ raw: value });
+    }
+  }
+  try {
+    return JSON.stringify(value ?? {});
+  } catch {
+    return '{}';
+  }
+}
+
 function anthropicTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text: text.trim() || ' ' };
 }
@@ -315,7 +332,7 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
         type: 'function',
         function: {
           name: String(tc.function?.name ?? tc.name ?? ''),
-          arguments: typeof tc.function?.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function?.arguments ?? {})
+          arguments: normalizeToolArgumentsForRequest(tc.function?.arguments)
         }
       }))
     : undefined;
@@ -333,6 +350,7 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
       completionTokens: json.usage?.completion_tokens,
       totalTokens: json.usage?.total_tokens
     },
+    log_probs: choice?.logprobs,
     raw: json
   };
 }
@@ -369,7 +387,7 @@ function finalizeStreamingToolCalls(acc: OpenAiStreamingToolCall[]): ToolCall[] 
       type: 'function' as const,
       function: {
         name: String(call.function.name ?? ''),
-        arguments: call.function.arguments || '{}'
+        arguments: normalizeToolArgumentsForRequest(call.function.arguments)
       }
     }))
     .filter((call) => call.function.name);
@@ -406,7 +424,7 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
           type: 'function' as const,
           function: {
             name: String(call.function?.name ?? ''),
-            arguments: typeof call.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call.function?.arguments ?? {})
+            arguments: normalizeToolArgumentsForRequest(call.function?.arguments)
           }
         }))
         .filter((call) => call.function.name);
@@ -705,6 +723,9 @@ class ModelClient implements LlmClient {
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
+      logprobs: request.logProbs === true ? true : undefined,
+      top_logprobs: request.logProbs === true ? request.topLogProbs : undefined,
+      metadata: request.metadata,
       stream: false
     };
     const json = await this.postJson(endpoint, headers, body, request);
@@ -721,6 +742,7 @@ class ModelClient implements LlmClient {
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
+      metadata: request.metadata,
       stream: true
     };
 
@@ -782,7 +804,8 @@ class ModelClient implements LlmClient {
       messages: toAnthropicMessages(request.messages),
       system: toAnthropicSystem(request.messages),
       tools: toAnthropicTools(request.tools),
-      temperature: request.temperature ?? this.config.temperature
+      temperature: request.temperature ?? this.config.temperature,
+      metadata: request.metadata
     };
     const json = await this.postJson(endpoint, headers, body, request);
     return parseAnthropicCompletion(json);
@@ -802,6 +825,7 @@ class ModelClient implements LlmClient {
       system: toAnthropicSystem(request.messages),
       tools: toAnthropicTools(request.tools),
       temperature: request.temperature ?? this.config.temperature,
+      metadata: request.metadata,
       stream: true
     };
 
@@ -889,7 +913,8 @@ class ModelClient implements LlmClient {
         images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
       })),
       stream: false,
-      options: { temperature: request.temperature ?? this.config.temperature }
+      options: { temperature: request.temperature ?? this.config.temperature },
+      metadata: request.metadata
     };
     const json = await this.postJson(endpoint, headers, body, request);
     return {
@@ -913,7 +938,8 @@ class ModelClient implements LlmClient {
         images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
       })),
       stream: true,
-      options: { temperature: request.temperature ?? this.config.temperature }
+      options: { temperature: request.temperature ?? this.config.temperature },
+      metadata: request.metadata
     };
 
     let content = '';

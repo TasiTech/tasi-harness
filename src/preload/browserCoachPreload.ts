@@ -1,4 +1,7 @@
-import { ipcRenderer } from 'electron';
+import { createRequire } from 'node:module';
+
+const electronRequire = createRequire(import.meta.url);
+const { ipcRenderer } = electronRequire('electron/renderer') as typeof import('electron/renderer');
 
 type CoachEventType = 'click' | 'input' | 'change' | 'submit' | 'keydown';
 

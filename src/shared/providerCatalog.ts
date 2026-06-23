@@ -41,6 +41,15 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     requiresApiKey: true
   },
   {
+    kind: 'soildapi',
+    label: 'SoildAPI',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'https://soildapi.com/v1',
+    defaultModel: 'qwen3.6-plus',
+    models: ['qwen3.6-plus', 'qwen3.6-flash', 'qwen3.5-plus', 'qwen3.5-flash', 'deepseek-v4-flash', 'deepseek-v4-pro'],
+    requiresApiKey: true
+  },
+  {
     kind: 'minimax',
     label: 'MiniMax',
     apiStyle: 'openai',
@@ -75,6 +84,15 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'gpt-5.4',
     models: ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-pro', 'gpt-5.3-codex', 'gpt-5.3-codex-spark'],
     requiresApiKey: true
+  },
+  {
+    kind: 'vllm',
+    label: 'vLLM',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'http://127.0.0.1:8000/v1',
+    defaultModel: 'local-model',
+    models: ['local-model', 'Qwen/Qwen3-8B', 'meta-llama/Llama-3.1-8B-Instruct', 'mistralai/Mistral-7B-Instruct-v0.3'],
+    requiresApiKey: false
   },
   {
     kind: 'ollama',

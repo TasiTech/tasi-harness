@@ -1,7 +1,9 @@
-import { app, BrowserWindow, type WebContents } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, WebContents } from 'electron';
+import { createRequire } from 'node:module';
 import type {
   BrowserAutomation,
   BrowserBinaryResult,
+  BrowserClickResult,
   BrowserCookieResult,
   BrowserDiagnosticsResult,
   BrowserExtractResult,
@@ -10,12 +12,17 @@ import type {
   BrowserPageState,
   BrowserSnapshotElement,
   BrowserSnapshotResult,
-  BrowserStorageResult
+  BrowserStorageResult,
+  BrowserUploadFileResult
 } from '../tools/browserAutomation.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../../shared/browserConstants.js';
 import { resolveAppWindowIconPath } from '../appIcon.js';
 
-const DEFAULT_TIMEOUT_MS = 20000;
+const electronRequire = createRequire(import.meta.url);
+const { app, BrowserWindow } = electronRequire('electron/main') as typeof import('electron/main');
+
+const DEFAULT_TIMEOUT_MS = 60000;
+const MAX_TIMEOUT_MS = 300000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
 const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
 const DEFAULT_SNAPSHOT_MAX_CHARS = 100000;
@@ -56,6 +63,19 @@ interface NetworkEntry {
   decodedBodySize?: number;
 }
 
+interface ClickPageSnapshot {
+  textLength: number;
+  textDigest: string;
+  element?: BrowserClickResult['element'];
+}
+
+interface ClickDispatchResult {
+  ok: boolean;
+  error?: string;
+  element?: BrowserClickResult['element'];
+  windowOpenCalls?: Array<{ url: string; target?: string }>;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -78,6 +98,16 @@ function clipWithMarker(value: string, maxChars: number): string {
   const marker = '... [truncated]';
   if (maxChars <= marker.length) return value.slice(0, maxChars);
   return `${value.slice(0, maxChars - marker.length)}${marker}`;
+}
+
+function clickObservationNote(result: BrowserClickResult): string {
+  const observation = result.observation;
+  if (!observation) return 'Click events were dispatched.';
+  if (observation.currentPageNavigationDetected) return 'Click events were dispatched and current-page navigation was detected.';
+  if ((observation.newTargets?.length ?? 0) > 0) return 'Click events were dispatched and a new browser target/window was detected.';
+  if ((observation.windowOpenCalls?.length ?? 0) > 0) return 'Click events were dispatched and window.open was called.';
+  if (observation.domTextChanged) return 'Click events were dispatched; URL/title stayed the same, but visible page text changed.';
+  return 'Click events were dispatched, but no current-page navigation or visible text change was detected.';
 }
 
 function serializeBrowserExtractJson(payload: BrowserExtractJsonPayload, maxChars: number): string {
@@ -274,7 +304,14 @@ export function pageHelpers(): string {
         if (href) {
           try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
         }
-        if ("value" in el && typeof el.value !== "undefined") item.value = clip(String(el.value || ""), 240);
+        const target = el.getAttribute("target");
+        if (target) item.target = target;
+        const onclick = el.getAttribute("onclick");
+        if (onclick) item.onclick = clip(onclick, 500);
+        if ("value" in el && typeof el.value !== "undefined") {
+          const type = String(el.getAttribute("type") || "").toLowerCase();
+          item.value = type === "password" ? (el.value ? "[password filled]" : "") : clip(String(el.value || ""), 240);
+        }
         const placeholder = el.getAttribute("placeholder");
         if (placeholder) item.placeholder = placeholder;
         const label = labelFor(el);
@@ -401,7 +438,7 @@ function formatSnapshotTree(nodes: unknown[]): string {
 }
 
 export class EmbeddedBrowserAutomation implements BrowserAutomation {
-  private window: BrowserWindow | null = null;
+  private window: ElectronBrowserWindow | null = null;
   private readonly partition = EMBEDDED_BROWSER_PARTITION;
   private sharedWebContentsResolver?: () => WebContents | null;
   private readonly consoleEntries: ConsoleEntry[] = [];
@@ -412,7 +449,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
   }
 
   async open(url: string, options?: { timeoutMs?: number }): Promise<BrowserPageState> {
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000);
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS);
     const target = normalizeUrl(url);
     const wc = this.getTargetWebContents();
     await Promise.race([
@@ -426,23 +463,21 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return this.stateFrom(wc);
   }
 
-  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number }): Promise<BrowserPageState> {
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000);
+  async click(selector: string, options?: { index?: number; waitForNavigation?: boolean; timeoutMs?: number; observeMs?: number }): Promise<BrowserClickResult> {
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS);
+    const observeMs = clampInt(Number(options?.observeMs), options?.waitForNavigation ? 150 : 500, 0, 5000);
     const index = clampInt(Number(options?.index), 0, 0, 9999);
     const sel = selector.trim();
     if (!sel) throw new Error('selector is required.');
-    const result = await this.evalInPage<{ ok: boolean; error?: string }>(
-      `(function () {
-        ${pageHelpers()}
-        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
-        if (!found.ok) return found;
-        TasiBrowser.activate(found.el);
-        return { ok: true };
-      })();`
-    );
+    const before = await this.state();
+    const beforeSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    const result = await this.dispatchClick(sel, index);
     if (!result.ok) throw new Error(result.error || `Failed to click selector: ${sel}`);
     if (options?.waitForNavigation) await this.waitForIdle(timeoutMs, this.getTargetWebContents());
-    return this.state();
+    else if (observeMs > 0) await sleep(observeMs);
+    const after = await this.state();
+    const afterSnapshot = await this.captureClickPageSnapshot(sel, index).catch(() => null);
+    return this.buildClickResult(sel, index, before, after, beforeSnapshot, afterSnapshot, result);
   }
 
   async type(selector: string, text: string, options?: { clear?: boolean; submit?: boolean }): Promise<BrowserPageState> {
@@ -530,22 +565,30 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     state?: 'attached' | 'visible' | 'hidden' | 'detached';
     loadState?: 'load' | 'domcontentloaded' | 'networkidle';
     function?: string;
+    untilChanged?: boolean;
+    untilLoggedIn?: boolean;
     timeoutMs?: number;
   }): Promise<BrowserPageState> {
-    const ms = clampInt(Number(options?.ms), 0, 0, 60000);
+    const ms = clampInt(Number(options?.ms), 0, 0, MAX_TIMEOUT_MS);
     const selector = options?.selector?.trim() ?? '';
     const text = options?.text?.trim() ?? '';
     const url = options?.url?.trim() ?? '';
     const state = options?.state ?? 'attached';
     const loadState = options?.loadState;
     const fn = options?.function?.trim() ?? '';
-    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, 120000);
-    if (!selector && !text && !url && !loadState && !fn && ms <= 0) throw new Error('Provide ms, selector, text, url, load_state, or function.');
+    const untilChanged = options?.untilChanged === true;
+    const untilLoggedIn = options?.untilLoggedIn === true;
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_TIMEOUT_MS, 250, MAX_TIMEOUT_MS);
+    if (!selector && !text && !url && !loadState && !fn && !untilChanged && !untilLoggedIn && ms <= 0) throw new Error('Provide ms, selector, text, url, load_state, function, until_changed, or until_logged_in.');
+    const initialSignature = untilChanged ? await this.pageChangeSignature().catch(() => '') : '';
     if (ms > 0) await sleep(ms);
     if (loadState) await this.waitForIdle(timeoutMs, this.getTargetWebContents());
-    if (!selector && !text && !url && !fn) return this.state();
+    if (!selector && !text && !url && !fn && !untilChanged && !untilLoggedIn) return this.state();
 
+    const hasPredicate = Boolean(selector || text || url || fn);
     const started = Date.now();
+    let lastAutoLoginSubmitAt = 0;
+    let autoLoginSubmitAttempts = 0;
     while (Date.now() - started < timeoutMs) {
       const ok = await this.evalInPage<boolean>(
         `(function () {
@@ -590,7 +633,20 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
           return true;
         })();`
       );
-      if (ok) return this.state();
+      if (hasPredicate && ok) return this.state();
+      if (untilChanged) {
+        const currentSignature = await this.pageChangeSignature().catch(() => '');
+        if (currentSignature && currentSignature !== initialSignature) return this.state();
+      }
+      if (untilLoggedIn && autoLoginSubmitAttempts < 3 && Date.now() - lastAutoLoginSubmitAt > 5000) {
+        lastAutoLoginSubmitAt = Date.now();
+        const submitted = await this.autoSubmitFilledLoginForm().catch(() => false);
+        if (submitted) {
+          autoLoginSubmitAttempts += 1;
+          await sleep(500);
+        }
+      }
+      if (untilLoggedIn && await this.loginCompletionDetected().catch(() => false)) return this.state();
       await sleep(150);
     }
     throw new Error(`Timed out waiting for browser condition after ${timeoutMs} ms.`);
@@ -739,7 +795,10 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
             if (ref) item.ref = ref;
             if ("checked" in node) item.state = node.checked ? "checked" : "unchecked";
             if (node.getAttribute("aria-expanded")) item.state = "expanded=" + node.getAttribute("aria-expanded");
-            if ("value" in node && node.value) item.value = String(node.value).slice(0, 160);
+            if ("value" in node && node.value) {
+              const type = String(node.getAttribute("type") || "").toLowerCase();
+              item.value = type === "password" ? "[password filled]" : String(node.value).slice(0, 160);
+            }
             const href = node.getAttribute("href");
             if (href) {
               try { item.href = new URL(href, location.href).toString(); } catch { item.href = href; }
@@ -835,7 +894,7 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
       })();`
     );
     if (!result.ok) throw new Error(result.error || 'Find failed.');
-    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, 120000), this.getTargetWebContents());
+    if (options.waitForNavigation) await this.waitForIdle(clampInt(Number(options.timeoutMs), DEFAULT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS), this.getTargetWebContents());
     return { ...(await this.state()), ref: result.ref, selector: result.selector, text: result.text, element: result.element };
   }
 
@@ -921,6 +980,28 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     wc.sendInputEvent({ type: 'keyDown', keyCode: normalized.keyCode, modifiers: normalized.modifiers });
     wc.sendInputEvent({ type: 'keyUp', keyCode: normalized.keyCode, modifiers: normalized.modifiers });
     return this.state();
+  }
+
+  async uploadFile(selector: string, files: string[], options?: { index?: number }): Promise<BrowserUploadFileResult> {
+    const sel = selector.trim();
+    if (!sel) throw new Error('selector is required.');
+    if (files.length === 0) throw new Error('At least one file path is required.');
+    const index = clampInt(Number(options?.index), 0, 0, 9999);
+    const wc = this.getTargetWebContents();
+    const objectId = await this.resolveElementObjectId(wc, sel, index);
+    await this.sendDebuggerCommand(wc, 'DOM.setFileInputFiles', { objectId, files });
+    const result = await this.evalInPage<{ multiple: boolean }>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(sel)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return { multiple: Boolean(el.multiple) };
+      })();`
+    );
+    return { ...(await this.state()), selector: sel, files, multiple: result.multiple };
   }
 
   async screenshot(): Promise<BrowserBinaryResult> {
@@ -1079,7 +1160,85 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     this.window = null;
   }
 
-  private ensureWindow(): BrowserWindow {
+  private async captureClickPageSnapshot(selector: string, index: number): Promise<ClickPageSnapshot> {
+    return this.evalInPage<ClickPageSnapshot>(
+      `(function () {
+        ${pageHelpers()}
+        const text = TasiBrowser.normalizeText((document.body && document.body.innerText) || (document.documentElement && document.documentElement.textContent) || "");
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        return {
+          textLength: text.length,
+          textDigest: String(hash),
+          element: found.ok ? TasiBrowser.describe(found.el) : undefined
+        };
+      })();`
+    );
+  }
+
+  private async dispatchClick(selector: string, index: number): Promise<ClickDispatchResult> {
+    return this.evalInPage<ClickDispatchResult>(
+      `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) return found;
+        const calls = [];
+        const originalOpen = window.open;
+        window.open = function (url, target, features) {
+          calls.push({ url: String(url || ""), target: target == null ? undefined : String(target) });
+          return originalOpen.apply(window, arguments);
+        };
+        try {
+          TasiBrowser.activate(found.el);
+          return { ok: true, element: TasiBrowser.describe(found.el), windowOpenCalls: calls };
+        } finally {
+          window.open = originalOpen;
+        }
+      })();`
+    );
+  }
+
+  private buildClickResult(
+    selector: string,
+    index: number,
+    before: BrowserPageState,
+    after: BrowserPageState,
+    beforeSnapshot: ClickPageSnapshot | null,
+    afterSnapshot: ClickPageSnapshot | null,
+    dispatch: ClickDispatchResult
+  ): BrowserClickResult {
+    const urlChanged = before.url !== after.url;
+    const titleChanged = before.title !== after.title;
+    const domTextChanged = beforeSnapshot && afterSnapshot
+      ? beforeSnapshot.textDigest !== afterSnapshot.textDigest || beforeSnapshot.textLength !== afterSnapshot.textLength
+      : undefined;
+    const result: BrowserClickResult = {
+      ...after,
+      action: 'dispatched_click_events',
+      selector,
+      index,
+      element: dispatch.element || beforeSnapshot?.element,
+      before,
+      after,
+      observation: {
+        urlChanged,
+        titleChanged,
+        currentPageNavigationDetected: urlChanged || titleChanged,
+        domTextChanged,
+        beforeTextLength: beforeSnapshot?.textLength,
+        afterTextLength: afterSnapshot?.textLength,
+        windowOpenCalls: dispatch.windowOpenCalls?.slice(0, 5),
+        note: ''
+      }
+    };
+    result.observation!.note = clickObservationNote(result);
+    return result;
+  }
+
+  private ensureWindow(): ElectronBrowserWindow {
     if (!app.isReady()) throw new Error('Electron app is not ready yet.');
     if (this.window && !this.window.isDestroyed()) return this.window;
     const appIconPath = resolveAppWindowIconPath();
@@ -1150,6 +1309,44 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     return wc.executeJavaScript(script, true) as Promise<T>;
   }
 
+  private async resolveElementObjectId(wc: WebContents, selector: string, index: number): Promise<string> {
+    const result = await this.sendDebuggerCommand(wc, 'Runtime.evaluate', {
+      expression: `(function () {
+        ${pageHelpers()}
+        const found = TasiBrowser.resolve(${JSON.stringify(selector)}, ${index});
+        if (!found.ok) throw new Error(found.error);
+        const el = found.el;
+        if (!(el instanceof HTMLInputElement) || String(el.type || "").toLowerCase() !== "file") throw new Error("Target is not a file input.");
+        if (typeof el.scrollIntoView === "function") el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        return el;
+      })();`,
+      awaitPromise: true,
+      returnByValue: false
+    }) as { result?: { objectId?: string }; exceptionDetails?: { text?: string; exception?: { description?: string } } };
+    if (result.exceptionDetails) {
+      throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text || 'Runtime.evaluate failed.');
+    }
+    const objectId = result.result?.objectId;
+    if (!objectId) throw new Error(`Could not resolve file input for selector: ${selector}`);
+    return objectId;
+  }
+
+  private async sendDebuggerCommand(wc: WebContents, method: string, params: Record<string, unknown>): Promise<unknown> {
+    const wasAttached = wc.debugger.isAttached();
+    if (!wasAttached) wc.debugger.attach('1.3');
+    try {
+      return await wc.debugger.sendCommand(method, params);
+    } finally {
+      if (!wasAttached && wc.debugger.isAttached()) {
+        try {
+          wc.debugger.detach();
+        } catch {
+          // Ignore detach races when the page closes.
+        }
+      }
+    }
+  }
+
   private async installPageErrorCapture(): Promise<void> {
     await this.evalInPage(
       `(function () {
@@ -1187,5 +1384,93 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
       await sleep(100);
     }
     throw new Error(`Page did not finish loading within ${timeoutMs} ms.`);
+  }
+
+  private async pageChangeSignature(): Promise<string> {
+    return this.evalInPage<string>(
+      `(function () {
+        const text = String((document.body && (document.body.innerText || document.body.textContent)) || "")
+          .replace(/\\s+/g, " ")
+          .trim();
+        let hash = 0;
+        for (let i = 0; i < Math.min(text.length, 50000); i += 1) {
+          hash = ((hash * 31) + text.charCodeAt(i)) >>> 0;
+        }
+        return [location.href, document.title || "", text.length, hash].join("\\n");
+      })();`
+    );
+  }
+
+  private async loginCompletionDetected(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const visiblePasswords = Array.from(document.querySelectorAll('input[type="password"]')).filter(visible);
+        const filledPassword = visiblePasswords.some((el) => String(el.value || "").length > 0);
+        const filledAccount = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter(visible)
+          .some((el) => String(el.value || "").trim().length > 0);
+        if (filledPassword && (filledAccount || visiblePasswords.length === 1)) return false;
+        if (visiblePasswords.length > 0) return false;
+        const text = TasiBrowser.normalizeText((document.body && (document.body.innerText || document.body.textContent)) || "");
+        const loweredUrl = location.href.toLowerCase();
+        const loweredTitle = String(document.title || "").toLowerCase();
+        const looksLikeLoginUrl = /\\/login\\b|\\/auth\\b|sso|cas|oauth|signin|logon/.test(loweredUrl);
+        const continuation = /(即将登录|确认登录|继续登录|授权|允许访问|同意授权|继续|进入系统|进入门户|continue|authorize|allow access|consent)/i.test(text);
+        const signedIn = /(退出登录|注销|个人中心|用户中心|我的|控制台|工作台|首页|信息门户|dashboard|portal|logout|sign out|my account)/i.test(text + " " + loweredTitle);
+        if (continuation || signedIn) return true;
+        return !looksLikeLoginUrl && text.length > 0;
+      })();`
+    );
+  }
+
+  private async autoSubmitFilledLoginForm(): Promise<boolean> {
+    return this.evalInPage<boolean>(
+      `(function () {
+        ${pageHelpers()}
+        const visible = (el) => el && TasiBrowser.isVisible(el);
+        const enabled = (el) => !el.disabled && el.getAttribute("aria-disabled") !== "true";
+        const textOf = (el) => TasiBrowser.normalizeText([
+          el.innerText,
+          el.textContent,
+          el.getAttribute("value"),
+          el.getAttribute("aria-label"),
+          el.getAttribute("title"),
+          el.getAttribute("name"),
+          el.id,
+          el.className
+        ].filter(Boolean).join(" "));
+        const passwords = Array.from(document.querySelectorAll('input[type="password"]')).filter((el) => visible(el) && enabled(el));
+        const filledPassword = passwords.find((el) => String(el.value || "").length > 0);
+        if (!filledPassword) return false;
+        const textInputs = Array.from(document.querySelectorAll('input:not([type]),input[type="text"],input[type="email"],input[type="tel"],input[type="number"]'))
+          .filter((el) => visible(el) && enabled(el));
+        const challengePattern = /(captcha|otp|mfa|totp|2fa|verification|verify|sms|code|验证码|校验码|动态码|短信码|认证码)/i;
+        const emptyChallenge = textInputs.some((el) => challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && !String(el.value || "").trim());
+        if (emptyChallenge) return false;
+        const filledAccount = textInputs.some((el) => !challengePattern.test(textOf(el) + " " + TasiBrowser.labelFor(el) + " " + (el.getAttribute("placeholder") || "")) && String(el.value || "").trim().length > 0);
+        if (!filledAccount && passwords.length !== 1) return false;
+        const form = filledPassword.closest("form");
+        const scopeCandidates = (root) => Array.from((root || document).querySelectorAll('button,input[type="submit"],input[type="button"],a,[role="button"]'));
+        const loginPattern = /\\b(log\\s*in|login|sign\\s*in|signin|submit|continue|next)\\b|登录|登陆|提交|继续|下一步|确认|进入/i;
+        const rejectPattern = /\\b(register|sign\\s*up|forgot|reset|cancel|back)\\b|注册|忘记|找回|重置|取消|返回/i;
+        const buttons = [...scopeCandidates(form), ...scopeCandidates(document)]
+          .filter((el, index, list) => list.indexOf(el) === index)
+          .filter((el) => visible(el) && enabled(el))
+          .map((el) => ({ el, label: textOf(el), type: String(el.getAttribute("type") || "").toLowerCase() }))
+          .filter((item) => !rejectPattern.test(item.label) && (loginPattern.test(item.label) || item.type === "submit"));
+        const target = buttons.sort((left, right) => (right.type === "submit" ? 1 : 0) - (left.type === "submit" ? 1 : 0))[0]?.el;
+        if (target) {
+          TasiBrowser.activate(target);
+          return true;
+        }
+        if (form && typeof form.requestSubmit === "function") {
+          form.requestSubmit();
+          return true;
+        }
+        return false;
+      })();`
+    );
   }
 }
