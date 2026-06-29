@@ -6,6 +6,7 @@ import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
 
 const REPEATED_TOOL_RESULT_LIMIT = 3;
+const ITERATION_LIMIT_MESSAGE_PATTERN = /^本轮已达到最大执行步数（\d+），我先停在这里，避免继续消耗无效步骤。/;
 
 function parseToolArgs(raw: string): unknown {
   if (!raw.trim()) return {};
@@ -57,6 +58,10 @@ function iterationLimitResponse(maxIterations: number, toolEvents: ToolEvent[]):
   }
   lines.push('', '当前页面和会话状态已保留，可以继续让我从当前状态接着做。');
   return lines.join('\n');
+}
+
+function isIterationLimitMessage(message: AgentMessage): boolean {
+  return message.role === 'assistant' && ITERATION_LIMIT_MESSAGE_PATTERN.test(message.content.trim());
 }
 
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
@@ -124,7 +129,7 @@ export class AgentLoop {
       createdAt: nowIso()
     };
     try {
-      const history = [...session.messages, userMessage];
+      const history = [...session.messages.filter((message) => !isIterationLimitMessage(message)), userMessage];
       const prompt = await this.deps.promptBuilder.build(cfg, {
         sessionId: session.id,
         userInput: options.userInput,
@@ -184,7 +189,8 @@ export class AgentLoop {
         }]);
       };
 
-      for (; iterations < cfg.maxIterations; iterations++) {
+      for (; iterations < cfg.maxIterations;) {
+        iterations += 1;
         throwIfAborted(options.signal);
         const streamPersistId = createId('msg');
         const streamPersistCreatedAt = nowIso();
@@ -363,7 +369,7 @@ export class AgentLoop {
         toolEvents,
         usage,
         log_probs,
-        iterations: iterations + 1,
+        iterations,
         execution
       };
     } catch (error) {

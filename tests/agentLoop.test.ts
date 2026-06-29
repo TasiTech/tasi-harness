@@ -436,6 +436,55 @@ describe('AgentLoop', () => {
     const storedSession = sessions.read(result.sessionId);
     expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
   });
+
+  it('does not send prior iteration-limit handoff messages back to the model', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 2 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const session = sessions.create('handoff history');
+    sessions.appendMessages(session.id, [
+      {
+        role: 'assistant',
+        content: '本轮已达到最大执行步数（200），我先停在这里，避免继续消耗无效步骤。\n\n最近完成的操作：\n- terminal：成功',
+        createdAt: new Date().toISOString()
+      }
+    ]);
+    let capturedRequest: LlmRequest | undefined;
+    const client: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        capturedRequest = request;
+        return { message: { role: 'assistant', content: 'Done.' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: new ToolRegistry(),
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (record) => {
+        void memory.syncSessionMemory(record);
+      }
+    });
+
+    const result = await loop.run({ sessionId: session.id, userInput: 'continue', stream: false });
+
+    expect(result.finalResponse).toBe('Done.');
+    expect(result.iterations).toBe(1);
+    expect(capturedRequest?.messages.some((message) => message.content.includes('本轮已达到最大执行步数'))).toBe(false);
+    expect(sessions.read(session.id)?.messages.some((message) => message.content.includes('本轮已达到最大执行步数'))).toBe(true);
+  });
 });
 
 let mockToolCallCounter = 0;
