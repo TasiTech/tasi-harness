@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useRef, useState, type Dispatch, type ReactElement, type SetStateAction } from 'react';
+﻿import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
 import type {
   AgentMessage,
   AgentMessageAttachment,
@@ -2303,7 +2303,7 @@ function ChatPage(props: {
 
 function renderMarkdownContent(content: string, keyPrefix: string): ReactElement {
   const normalized = normalizeMarkdownForRender(content);
-  const handleLinkClick = (event: React.MouseEvent<HTMLDivElement>): void => {
+  const handleLinkClick = (event: ReactMouseEvent<HTMLDivElement>): void => {
     const target = event.target as Element | null;
     const anchor = target?.closest('a[href]') as HTMLAnchorElement | null;
     if (!anchor) return;
@@ -2323,13 +2323,14 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
   );
 }
 
-function ToolEventCard({ event, sessionId, tr }: { event: ToolEvent; sessionId?: string; tr: TranslateFn }): ReactElement {
+function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; sessionId?: string; tr: TranslateFn }): ReactElement {
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullArgs, setFullArgs] = useState<unknown | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const content = fullContent ?? event.content;
   const args = fullArgs ?? event.args;
+  const argsPreview = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const canLoadFull = Boolean(sessionId && event.id && (event.contentOmitted || event.argsOmitted) && fullContent === null);
 
   async function loadFull(): Promise<void> {
@@ -2353,7 +2354,7 @@ function ToolEventCard({ event, sessionId, tr }: { event: ToolEvent; sessionId?:
         <strong>{event.toolName}</strong>
         <span>{prettyDate(event.createdAt)}</span>
       </div>
-      <pre className="code-block small">{JSON.stringify(args, null, 2)}</pre>
+      <pre className="code-block small">{argsPreview}</pre>
       <pre className="code-block small">{content}</pre>
       {canLoadFull && (
         <button className="mini-button" disabled={loading} onClick={() => void loadFull()}>
@@ -2364,6 +2365,8 @@ function ToolEventCard({ event, sessionId, tr }: { event: ToolEvent; sessionId?:
     </div>
   );
 }
+
+const ToolEventCard = memo(ToolEventCardComponent);
 
 function reasoningItems(content: string, parts?: string[]): string[] {
   const explicitParts = parts?.map((part) => part.trim()).filter(Boolean) ?? [];
@@ -2381,9 +2384,9 @@ function reasoningItems(content: string, parts?: string[]): string[] {
   return sentenceItems.length > 0 ? sentenceItems : [normalized];
 }
 
-function ReasoningList({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
+function ReasoningListComponent({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
   const listRef = useRef<HTMLDivElement | null>(null);
-  const items = reasoningItems(content, parts);
+  const items = useMemo(() => reasoningItems(content, parts), [content, parts]);
   useEffect(() => {
     const list = listRef.current;
     if (!list) return;
@@ -2405,7 +2408,9 @@ function ReasoningList({ content, parts, tr }: { content: string; parts?: string
   );
 }
 
-function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactElement | null {
+const ReasoningList = memo(ReasoningListComponent);
+
+function CitationLinkStripComponent({ citations }: { citations: CitationLink[] }): ReactElement | null {
   if (citations.length === 0) return null;
   return (
     <div className="msg-citation-strip" aria-label="Referenced webpages">
@@ -2431,6 +2436,8 @@ function CitationLinkStrip({ citations }: { citations: CitationLink[] }): ReactE
   );
 }
 
+const CitationLinkStrip = memo(CitationLinkStripComponent);
+
 function faviconCandidates(page: CitationLink): string[] {
   const candidates: string[] = [];
   try {
@@ -2447,7 +2454,7 @@ function faviconCandidates(page: CitationLink): string[] {
   return [...new Set(candidates)];
 }
 
-function ReferenceFavicon({ page, compact = false }: { page: CitationLink; compact?: boolean }): ReactElement {
+function ReferenceFaviconComponent({ page, compact = false }: { page: CitationLink; compact?: boolean }): ReactElement {
   const candidates = useMemo(() => faviconCandidates(page), [page]);
   const [index, setIndex] = useState(0);
   const src = candidates[index];
@@ -2471,6 +2478,8 @@ function ReferenceFavicon({ page, compact = false }: { page: CitationLink; compa
   );
 }
 
+const ReferenceFavicon = memo(ReferenceFaviconComponent);
+
 function assistantExportTitle(content: string): string {
   const lines = normalizeMarkdownForRender(content).split('\n');
   const heading = lines.find((line) => /^#{1,3}\s+\S/.test(line.trim()))?.replace(/^#{1,6}\s+/, '').trim();
@@ -2492,7 +2501,7 @@ function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactEleme
   );
 }
 
-function MessageAttachments({ attachments }: { attachments?: AgentMessageAttachment[] }): ReactElement | null {
+function MessageAttachmentsComponent({ attachments }: { attachments?: AgentMessageAttachment[] }): ReactElement | null {
   if (!attachments || attachments.length === 0) return null;
   return (
     <div className="msg-attachment-list">
@@ -2507,7 +2516,9 @@ function MessageAttachments({ attachments }: { attachments?: AgentMessageAttachm
   );
 }
 
-function MessageBubble({ message, sessionId, tr }: { message: AgentMessage; sessionId?: string; tr: TranslateFn }): ReactElement {
+const MessageAttachments = memo(MessageAttachmentsComponent);
+
+function MessageBubbleComponent({ message, sessionId, tr }: { message: AgentMessage; sessionId?: string; tr: TranslateFn }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
   const [fullContent, setFullContent] = useState<string | null>(null);
@@ -2516,7 +2527,11 @@ function MessageBubble({ message, sessionId, tr }: { message: AgentMessage; sess
   const [loadError, setLoadError] = useState('');
   const content = fullContent ?? message.content;
   const reasoningContent = fullReasoning ?? message.reasoning_content;
-  const citations = message.role === 'assistant' ? extractCitationLinks(content) : [];
+  const citations = useMemo(() => (message.role === 'assistant' ? extractCitationLinks(content) : []), [message.role, content]);
+  const renderedMarkdown = useMemo(
+    () => (content.trim() ? renderMarkdownContent(content, `msg-${message.id ?? 'x'}`) : null),
+    [content, message.id]
+  );
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
   const canLoadFull = Boolean(sessionId && message.id && message.contentOmitted && fullContent === null);
@@ -2593,7 +2608,7 @@ function MessageBubble({ message, sessionId, tr }: { message: AgentMessage; sess
               {message.role === 'assistant' && reasoningContent?.trim()
                 ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} tr={tr} />
                 : null}
-              {content.trim() ? renderMarkdownContent(content, `msg-${message.id ?? 'x'}`) : null}
+              {renderedMarkdown}
               {canLoadFull && (
                 <button className="mini-button" disabled={loadingFull} onClick={() => void loadFullContent()}>
                   {loadingFull ? '...' : tr('Load full message', '加载完整消息')}
@@ -2649,6 +2664,8 @@ function MessageBubble({ message, sessionId, tr }: { message: AgentMessage; sess
     </div>
   );
 }
+
+const MessageBubble = memo(MessageBubbleComponent);
 
 const MEMORY_DOMAINS: Array<{ value: MemoryDomain; labelEn: string; labelZh: string }> = [
   { value: 'finance', labelEn: 'Finance', labelZh: '财经' },
