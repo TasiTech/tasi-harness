@@ -13,6 +13,11 @@ export function ensureDir(path: string): string {
 
 export function defaultConfig(): AppConfig {
   return {
+    branding: {
+      productName: 'Tasi Harness',
+      logoPath: '',
+      logoInitials: 'TH'
+    },
     provider: 'openai',
     baseUrl: providerDefaultBaseUrl('openai'),
     apiKey: '',

@@ -133,6 +133,7 @@ declare global {
       };
       app: {
         info(): Promise<AppInfo>;
+        selectBrandLogo(): Promise<string>;
         exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult>;
         openPath(path: string): Promise<ToolExecutionResult>;
         openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;

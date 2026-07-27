@@ -41,7 +41,7 @@ import type {
 } from '../shared/types.js';
 import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
-import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
+import { applyBrandDockIcon, applyPlatformAppIdentity, resolveBrandWindowIconPath } from './appIcon.js';
 import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
 import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
 import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
@@ -1403,7 +1403,8 @@ function getDevToolsWindowMetrics(parent: ElectronBrowserWindow): { bounds: Rect
 
 function ensureDevToolsWindow(parent: ElectronBrowserWindow): ElectronBrowserWindow {
   const layout = getDevToolsWindowMetrics(parent);
-  const appIconPath = resolveAppWindowIconPath();
+  const cfg = context.getConfig();
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
 
   if (devToolsWindow && !devToolsWindow.isDestroyed()) {
     devToolsWindow.setMinimumSize(layout.minWidth, layout.minHeight);
@@ -1419,7 +1420,7 @@ function ensureDevToolsWindow(parent: ElectronBrowserWindow): ElectronBrowserWin
     minHeight: layout.minHeight,
     autoHideMenuBar: true,
     backgroundColor: '#111118',
-    title: 'Tasi Harness DevTools'
+    title: `${cfg.branding.productName} DevTools`
   });
 
   win.on('close', (event) => {
@@ -1458,7 +1459,7 @@ function openMainWindowDevTools(win: ElectronBrowserWindow): void {
     if (devToolsWindow && !devToolsWindow.isDestroyed()) devToolsWindow.destroy();
     devToolsWindow = null;
   });
-  win.webContents.openDevTools({ mode: 'detach', title: 'Tasi Harness DevTools' });
+  win.webContents.openDevTools({ mode: 'detach', title: `${context.getConfig().branding.productName} DevTools` });
 }
 
 function resetEmbeddedPreviewWebContentsState(target: WebContents): void {
@@ -1804,13 +1805,14 @@ async function exportAssistantMessage(req: AssistantMessageExportRequest): Promi
 }
 
 async function createWindow(): Promise<void> {
-  const appIconPath = resolveAppWindowIconPath();
+  const cfg = context.getConfig();
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 1040,
     minHeight: 680,
-    title: 'Tasi Harness',
+    title: cfg.branding.productName,
     backgroundColor: '#0a0a0f',
     ...(appIconPath ? { icon: appIconPath } : {}),
     webPreferences: {
@@ -1829,6 +1831,21 @@ async function createWindow(): Promise<void> {
     void mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
     void mainWindow.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
+  }
+}
+
+function applyMainWindowBranding(): void {
+  const cfg = context.getConfig();
+  app.setName(cfg.branding.productName);
+  applyBrandDockIcon(cfg.branding.logoPath);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setTitle(cfg.branding.productName);
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
+  if (!appIconPath) return;
+  try {
+    mainWindow.setIcon(appIconPath);
+  } catch {
+    // Some platforms ignore runtime icon updates.
   }
 }
 
@@ -1893,6 +1910,7 @@ function registerIpc(): void {
     const sanitized = { ...partial };
     if (typeof sanitized.apiKey !== 'string') delete sanitized.apiKey;
     const next = context.configStore.update(sanitized);
+    applyMainWindowBranding();
     startWechatPoller();
     if (next.browserMode !== 'external') await closeExternalBrowserPreview();
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
@@ -2315,7 +2333,7 @@ function registerIpc(): void {
       if (updated.notifyByEmail) {
         await context.emailNotifier.send(
           context.getConfig().emailNotifications,
-          `[Tasi Harness] ${updated.name}`,
+          `[${context.getConfig().branding.productName}] ${updated.name}`,
           [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
         );
       }
@@ -2376,8 +2394,19 @@ function registerIpc(): void {
     platform: process.platform,
     electron: process.versions.electron,
     node: process.versions.node,
-    harnessHome: context.harnessHome
+    harnessHome: context.harnessHome,
+    productName: context.getConfig().branding.productName
   }));
+  ipcMain.handle('app:selectBrandLogo', async () => {
+    const picked = await dialog.showOpenDialog({
+      title: 'Select brand logo',
+      properties: ['openFile'],
+      filters: [
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'ico'] }
+      ]
+    });
+    return picked.canceled || picked.filePaths.length === 0 ? '' : picked.filePaths[0];
+  });
   ipcMain.handle('app:exportAssistantMessage', async (_event, req: AssistantMessageExportRequest) => exportAssistantMessage(req));
   ipcMain.handle('app:openPath', async (_event, path: string) => {
     const err = await shell.openPath(path);
@@ -2431,7 +2460,8 @@ app.on('before-quit', () => {
 
 app.whenReady().then(() => {
   applyPlatformAppIdentity();
-  applyAppDockIcon();
+  app.setName(context.getConfig().branding.productName);
+  applyBrandDockIcon(context.getConfig().branding.logoPath);
   registerWechatTools();
   app.on('web-contents-created', (_event, contents) => {
     contents.once('destroyed', () => {

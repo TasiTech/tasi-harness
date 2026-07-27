@@ -172,7 +172,18 @@ export interface LlmRequest {
   signal?: AbortSignal;
 }
 
+export interface AppBrandingSettings {
+  productName: string;
+  logoPath: string;
+  logoInitials: string;
+}
+
+export interface PublicAppBrandingSettings extends AppBrandingSettings {
+  logoDataUrl?: string;
+}
+
 export interface AppConfig {
+  branding: AppBrandingSettings;
   provider: ProviderKind;
   baseUrl: string;
   apiKey: string;
@@ -204,7 +215,8 @@ export interface PublicEmailNotificationSettings extends Omit<EmailNotificationS
   password?: string;
 }
 
-export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifications'> {
+export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifications' | 'branding'> {
+  branding: PublicAppBrandingSettings;
   apiKeyConfigured: boolean;
   apiKey?: string;
   emailNotifications: PublicEmailNotificationSettings;
@@ -619,6 +631,7 @@ export interface AppInfo {
   electron: string;
   node: string;
   harnessHome: string;
+  productName: string;
 }
 
 export interface AssistantMessageExportRequest {

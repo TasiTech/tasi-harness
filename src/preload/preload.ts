@@ -138,6 +138,7 @@ const api = {
   },
   app: {
     info: () => ipcRenderer.invoke('app:info'),
+    selectBrandLogo: () => ipcRenderer.invoke('app:selectBrandLogo') as Promise<string>,
     exportAssistantMessage: (req: AssistantMessageExportRequest) => ipcRenderer.invoke('app:exportAssistantMessage', req),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
     openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),

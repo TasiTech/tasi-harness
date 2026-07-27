@@ -84,6 +84,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
   letter-spacing: 0.08em;
   box-shadow: 0 0 28px rgba(0, 212, 170, 0.18);
 }
+.brand-logo-image {
+  object-fit: contain;
+  padding: 4px;
+  background: var(--bg-tertiary);
+}
+.logo-icon { width: 42px; flex: 0 0 42px; }
 .logo-text { font-weight: 800; letter-spacing: -0.02em; }
 .logo-head { display: flex; align-items: center; gap: 8px; }
 .logo-copy { min-width: 0; flex: 1 1 auto; }
@@ -263,6 +269,9 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
 }
 .check-tile input { width: auto; margin: 0; }
 .button-row, .inline-form { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
+.input-row { display: flex; gap: 10px; align-items: center; }
+.input-row input { flex: 1 1 auto; min-width: 0; }
+.input-row button { flex: 0 0 auto; }
 .compact { margin: 0; }
 .primary-button, .ghost-button, .danger-button, .mini-button {
   border-radius: 10px;
@@ -1451,6 +1460,16 @@ progress::-webkit-progress-value { background: var(--accent); }
 .memory-entry-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 .tool-card h2 { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--accent); }
 .about-card { display: flex; align-items: center; gap: 22px; background: linear-gradient(135deg, var(--accent-dim), rgba(102, 126, 234, 0.08)); }
+.branding-settings-preview {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-tertiary);
+}
+.branding-settings-preview p { margin: 4px 0 0; }
 .about-logo { width: 80px; height: 80px; font-size: 36px; border-radius: 24px; }
 .wide-input { margin-bottom: 10px; }
 .modal-backdrop {

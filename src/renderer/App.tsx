@@ -84,6 +84,11 @@ const CATEGORY_ALIASES: Record<string, string> = {
 };
 
 const defaultConfig: PublicAppConfig = {
+  branding: {
+    productName: 'Tasi Harness',
+    logoPath: '',
+    logoInitials: 'TH'
+  },
   provider: 'openai',
   baseUrl: providerDefaultBaseUrl('openai'),
   apiKeyConfigured: false,
@@ -135,6 +140,26 @@ type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
   emailNotifications: PublicAppConfig['emailNotifications'] & { password?: string };
 };
+
+function brandInitials(branding?: PublicAppConfig['branding']): string {
+  const explicit = branding?.logoInitials?.trim();
+  if (explicit) return explicit.slice(0, 8);
+  const productName = branding?.productName?.trim() || 'Tasi Harness';
+  return productName
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join('')
+    .slice(0, 4)
+    .toUpperCase() || 'TH';
+}
+
+function BrandLogo({ branding, className }: { branding: PublicAppConfig['branding']; className: string }): ReactElement {
+  const label = branding.productName || 'Tasi Harness';
+  if (branding.logoDataUrl) {
+    return <img className={`${className} brand-logo-image`} src={branding.logoDataUrl} alt={label} />;
+  }
+  return <div className={className}>{brandInitials(branding)}</div>;
+}
 
 function prettyDate(iso?: string): string {
   if (!iso) return '';
@@ -584,6 +609,10 @@ export function App(): ReactElement {
   }, [config.theme]);
 
   useEffect(() => {
+    document.title = config.branding.productName || 'Tasi Harness';
+  }, [config.branding.productName]);
+
+  useEffect(() => {
     globalThis.localStorage?.setItem('tasi_harness_ui_language', language);
     document.documentElement.setAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
   }, [language]);
@@ -704,10 +733,10 @@ export function App(): ReactElement {
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
         <div className="sidebar-logo">
-          <div className="logo-icon">TH</div>
+          <BrandLogo branding={config.branding} className="logo-icon" />
           <div className="logo-copy">
             <div className="logo-head">
-              <div className="logo-text">Tasi Harness</div>
+              <div className="logo-text">{config.branding.productName || 'Tasi Harness'}</div>
               <button className="lang-toggle" onClick={() => setLanguage((current) => (current === 'zh' ? 'en' : 'zh'))}>
                 {language === 'zh' ? 'EN' : '中文'}
               </button>
@@ -815,12 +844,13 @@ export function App(): ReactElement {
           />
         )}
         {page === 'settings' && <SettingsPage tr={tr} config={config} setConfig={setConfig} />}
-        {page === 'about' && <AboutPage tr={tr} info={info} />}
+        {page === 'about' && <AboutPage tr={tr} info={info} branding={config.branding} />}
       </main>
       {approvalRequest && (
         <ToolApprovalModal
           tr={tr}
           request={approvalRequest}
+          productName={config.branding.productName || 'Tasi Harness'}
           onApprove={() => void resolveApproval(approvalRequest, true)}
           onApproveNever={() => void resolveApproval(approvalRequest, true, true)}
           onDeny={() => void resolveApproval(approvalRequest, false)}
@@ -830,7 +860,7 @@ export function App(): ReactElement {
   );
 }
 
-function ToolApprovalModal(props: { tr: TranslateFn; request: ToolApprovalRequest; onApprove: () => void; onApproveNever: () => void; onDeny: () => void }): ReactElement {
+function ToolApprovalModal(props: { tr: TranslateFn; request: ToolApprovalRequest; productName: string; onApprove: () => void; onApproveNever: () => void; onDeny: () => void }): ReactElement {
   const [remainingMs, setRemainingMs] = useState(props.request.timeoutMs);
   useEffect(() => {
     setRemainingMs(props.request.timeoutMs);
@@ -860,7 +890,7 @@ function ToolApprovalModal(props: { tr: TranslateFn; request: ToolApprovalReques
         <div className="modal-head">
           <div>
             <h2>{props.tr('Approval Required', '需要审批')}</h2>
-            <div className="card-subtle">{props.tr('Review this action before Tasi Harness continues.', '请在继续前确认此操作。')}</div>
+            <div className="card-subtle">{props.tr(`Review this action before ${props.productName} continues.`, `请在 ${props.productName} 继续前确认此操作。`)}</div>
           </div>
           <span className="soft-badge">{riskLabel}</span>
         </div>
@@ -1962,7 +1992,15 @@ function ChatPage(props: {
               <div className="empty-desc">{props.tr('Main chat only shows your messages and the final assistant replies. Tool calls and tool outputs now stream in the side panel.', '主聊天区仅展示你的消息和助手最终回复，工具调用与输出会显示在右侧面板。')}</div>
             </div>
           )}
-          {visibleMessages.map((m, idx) => <MessageBubble key={`${m.id ?? idx}-${idx}`} message={m} sessionId={props.sessionId} tr={props.tr} />)}
+          {visibleMessages.map((m, idx) => (
+            <MessageBubble
+              key={`${m.id ?? idx}-${idx}`}
+              message={m}
+              sessionId={props.sessionId}
+              tr={props.tr}
+              productName={props.config.branding.productName || 'Tasi Harness'}
+            />
+          ))}
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
           {followUpQuestions.length > 0 && !runBusy && (
             <div className="follow-up-panel">
@@ -2229,7 +2267,12 @@ function ChatPage(props: {
           <div className="chat-textarea-wrap">
             <textarea
               className="chat-textarea"
-              placeholder={connected ? props.tr('Message Tasi Harness. Enter sends, Shift+Enter line break.', '发送给 Tasi Harness，回车发送，Shift+Enter 换行。') : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
+              placeholder={connected
+                ? props.tr(
+                  `Message ${props.config.branding.productName || 'Tasi Harness'}. Enter sends, Shift+Enter line break.`,
+                  `发送给 ${props.config.branding.productName || 'Tasi Harness'}，回车发送，Shift+Enter 换行。`
+                )
+                : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
               value={input}
               disabled={runBusy || !connected}
               onChange={(e) => setInput(e.target.value)}
@@ -2518,7 +2561,7 @@ function MessageAttachmentsComponent({ attachments }: { attachments?: AgentMessa
 
 const MessageAttachments = memo(MessageAttachmentsComponent);
 
-function MessageBubbleComponent({ message, sessionId, tr }: { message: AgentMessage; sessionId?: string; tr: TranslateFn }): ReactElement {
+function MessageBubbleComponent({ message, sessionId, tr, productName }: { message: AgentMessage; sessionId?: string; tr: TranslateFn; productName: string }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
   const [fullContent, setFullContent] = useState<string | null>(null);
@@ -2570,7 +2613,10 @@ function MessageBubbleComponent({ message, sessionId, tr }: { message: AgentMess
     if (message.role !== 'assistant' || exportBusy) return;
     const exportAssistantMessage = window.tasiHarness.app.exportAssistantMessage;
     if (typeof exportAssistantMessage !== 'function') {
-      window.alert(tr('Export is not available in this window yet. Please restart Tasi Harness once so the updated preload API is loaded.', '当前窗口尚未加载导出接口。请重启一次 Tasi Harness，让新的 preload API 生效。'));
+      window.alert(tr(
+        `Export is not available in this window yet. Please restart ${productName} once so the updated preload API is loaded.`,
+        `当前窗口尚未加载导出接口。请重启一次 ${productName}，让新的 preload API 生效。`
+      ));
       return;
     }
     setExportBusy(format);
@@ -4706,7 +4752,7 @@ function SessionsPage({
 function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: PublicAppConfig; setConfig: (cfg: PublicAppConfig) => void }): ReactElement {
   const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
   const [testResult, setTestResult] = useState('');
-  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'channels' | 'theme' | 'markets'>('model');
+  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'channels' | 'theme' | 'branding' | 'markets'>('model');
   const [channelSubPage, setChannelSubPage] = useState<'email' | 'wechat'>('email');
   const [clawbotQrDataUrl, setClawbotQrDataUrl] = useState('');
   const [clawbotQrSource, setClawbotQrSource] = useState<'ilink-api' | 'manual-bind-url'>('manual-bind-url');
@@ -4826,6 +4872,19 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     setTestResult(`${result.ok ? 'OK' : 'FAIL'}: ${result.content}`);
   }
 
+  async function chooseBrandLogo(): Promise<void> {
+    const logoPath = await window.tasiHarness.app.selectBrandLogo();
+    if (!logoPath) return;
+    setDraft((old) => ({
+      ...old,
+      branding: {
+        ...old.branding,
+        logoPath,
+        logoDataUrl: undefined
+      }
+    }));
+  }
+
   return (
     <section className="page settings-page">
       <PageHeader
@@ -4843,6 +4902,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         <button className={`skill-tab ${subPage === 'security' ? 'active' : ''}`} onClick={() => setSubPage('security')}>{tr('Security', '安全')}</button>
         <button className={`skill-tab ${subPage === 'channels' ? 'active' : ''}`} onClick={() => setSubPage('channels')}>{tr('Channels', '通道')}</button>
         <button className={`skill-tab ${subPage === 'theme' ? 'active' : ''}`} onClick={() => setSubPage('theme')}>{tr('Theme', '主题')}</button>
+        <button className={`skill-tab ${subPage === 'branding' ? 'active' : ''}`} onClick={() => setSubPage('branding')}>{tr('Branding', '品牌')}</button>
         <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
       </div>
       {subPage === 'model' && (
@@ -5091,6 +5151,47 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           </select>
         </div>
       )}
+      {subPage === 'branding' && (
+        <div className="card">
+          <h2>{tr('Branding', '品牌')}</h2>
+          <div className="branding-settings-preview">
+            <BrandLogo branding={draft.branding} className="about-logo" />
+            <div>
+              <strong>{draft.branding.productName || 'Tasi Harness'}</strong>
+              <p>{tr('Desktop Agent', '桌面智能体')}</p>
+            </div>
+          </div>
+          <label>{tr('Product name', '产品名称')}</label>
+          <input
+            value={draft.branding.productName}
+            onChange={(e) => setDraft((old) => ({ ...old, branding: { ...old.branding, productName: e.target.value } }))}
+          />
+          <label>{tr('Logo initials', 'Logo 缩写')}</label>
+          <input
+            value={draft.branding.logoInitials}
+            onChange={(e) => setDraft((old) => ({ ...old, branding: { ...old.branding, logoInitials: e.target.value } }))}
+          />
+          <label>{tr('Logo file', 'Logo 文件')}</label>
+          <div className="input-row">
+            <input
+              value={draft.branding.logoPath}
+              onChange={(e) => setDraft((old) => ({ ...old, branding: { ...old.branding, logoPath: e.target.value, logoDataUrl: undefined } }))}
+              placeholder={tr('Optional local image path', '可选本地图片路径')}
+            />
+            <button className="ghost-button" onClick={() => void chooseBrandLogo()}>{tr('Browse', '浏览')}</button>
+            <button
+              className="ghost-button"
+              onClick={() => setDraft((old) => ({ ...old, branding: { ...old.branding, logoPath: '', logoDataUrl: undefined } }))}
+              disabled={!draft.branding.logoPath}
+            >
+              {tr('Clear', '清除')}
+            </button>
+          </div>
+          <div className="card-subtle">
+            {tr('Supported: PNG, JPG, WebP, GIF, SVG, ICO. Images over 2 MB are ignored in the UI preview.', '支持 PNG、JPG、WebP、GIF、SVG、ICO。超过 2 MB 的图片不会在界面预览中加载。')}
+          </div>
+        </div>
+      )}
       {subPage === 'markets' && (
         <div className="card">
           <h2>{tr('Skill Markets', '技能市场')}</h2>
@@ -5138,14 +5239,14 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
   );
 }
 
-function AboutPage({ tr, info }: { tr: TranslateFn; info: AppInfo | null }): ReactElement {
+function AboutPage({ tr, info, branding }: { tr: TranslateFn; info: AppInfo | null; branding: PublicAppConfig['branding'] }): ReactElement {
   return (
     <section className="page">
       <PageHeader title={tr('About', '关于')} subtitle={tr('A TypeScript Electron agent desktop app with local memory, skill markets, scheduled tasks, and sandboxed runs.', '基于 TypeScript 与 Electron 的桌面智能体应用，支持本地记忆、技能市场、定时任务与沙箱执行。')} />
       <div className="about-card">
-        <div className="about-logo">TH</div>
+        <BrandLogo branding={branding} className="about-logo" />
         <div>
-          <h2>Tasi Harness</h2>
+          <h2>{branding.productName || info?.productName || 'Tasi Harness'}</h2>
           <p>{tr('Agent loop | tool registry | skill marketplace | scheduled tasks | email notifications | sandbox execution.', '智能体循环 | 工具注册 | 技能市场 | 定时任务 | 邮件通知 | 沙箱执行')}</p>
           <p>{tr(`Version: ${info?.version ?? 'unknown'}`, `版本：${info?.version ?? '未知'}`)}</p>
         </div>

@@ -1,8 +1,49 @@
-import { join } from 'node:path';
-import type { AppConfig, PublicAppConfig } from '../../shared/types.js';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { extname, join } from 'node:path';
+import type { AppBrandingSettings, AppConfig, PublicAppConfig } from '../../shared/types.js';
 import { normalizeProviderKind } from '../../shared/providerCatalog.js';
 import { defaultConfig, ensureDir } from './pathUtils.js';
 import { JsonFileStore } from './jsonFileStore.js';
+
+const IMAGE_MIME_BY_EXT: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon'
+};
+const MAX_BRAND_LOGO_BYTES = 2 * 1024 * 1024;
+
+function cleanText(value: unknown, fallback: string, maxLength: number, allowEmpty = false): string {
+  if (typeof value !== 'string') return fallback;
+  const clean = value.trim().slice(0, maxLength);
+  return clean || (allowEmpty ? '' : fallback);
+}
+
+function sanitizeBranding(input: unknown, defaults: AppBrandingSettings): AppBrandingSettings {
+  const raw = input && typeof input === 'object' ? input as Partial<AppBrandingSettings> : {};
+  return {
+    productName: cleanText(raw.productName, defaults.productName, 80),
+    logoPath: cleanText(raw.logoPath, defaults.logoPath, 1000, true),
+    logoInitials: cleanText(raw.logoInitials, defaults.logoInitials, 8)
+  };
+}
+
+function logoDataUrl(logoPath: string): string | undefined {
+  const ext = extname(logoPath).toLowerCase();
+  const mimeType = IMAGE_MIME_BY_EXT[ext];
+  if (!mimeType) return undefined;
+  try {
+    if (!existsSync(logoPath)) return undefined;
+    const stat = statSync(logoPath);
+    if (!stat.isFile() || stat.size > MAX_BRAND_LOGO_BYTES) return undefined;
+    return `data:${mimeType};base64,${readFileSync(logoPath).toString('base64')}`;
+  } catch {
+    return undefined;
+  }
+}
 
 export class ConfigStore {
   private readonly store: JsonFileStore<AppConfig>;
@@ -17,6 +58,7 @@ export class ConfigStore {
   get(): AppConfig {
     const defaults = defaultConfig();
     const merged = { ...defaults, ...this.store.read() };
+    merged.branding = sanitizeBranding(merged.branding, defaults.branding);
     merged.provider = normalizeProviderKind(merged.provider);
     merged.temperature = Number.isFinite(merged.temperature) ? merged.temperature : defaults.temperature;
     merged.maxIterations = Math.max(1, Math.min(200, Number(merged.maxIterations) || defaults.maxIterations));
@@ -61,6 +103,10 @@ export class ConfigStore {
     const cfg = this.get();
     const pub: PublicAppConfig = {
       ...cfg,
+      branding: {
+        ...cfg.branding,
+        logoDataUrl: cfg.branding.logoPath ? logoDataUrl(cfg.branding.logoPath) : undefined
+      },
       apiKey: includeApiKey ? cfg.apiKey : undefined,
       apiKeyConfigured: Boolean(cfg.apiKey),
       emailNotifications: {
@@ -97,7 +143,8 @@ export class ConfigStore {
         ...current.wechatChannel,
         ...(partial.wechatChannel ?? {}),
         pluginName: 'clawbot'
-      }
+      },
+      branding: sanitizeBranding(partial.branding ?? current.branding, current.branding)
     };
     ensureDir(next.workspaceDir);
     this.store.write(next);
