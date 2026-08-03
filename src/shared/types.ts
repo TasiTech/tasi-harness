@@ -188,6 +188,10 @@ export interface AppConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  omniProvider: ProviderKind;
+  omniBaseUrl: string;
+  omniApiKey: string;
+  omniModel: string;
   temperature: number;
   maxIterations: number;
   sessionDocumentMaxDocs: number;
@@ -203,6 +207,7 @@ export interface AppConfig {
   browserExecutionLoggingEnabled: boolean;
   theme: 'dark' | 'light';
   systemPersona: string;
+  omniSystemPrompt: string;
   enabledToolNames: string[];
   defaultExecutionMode: ExecutionMode;
   skillMarketSources: SkillMarketplaceSource[];
@@ -215,10 +220,12 @@ export interface PublicEmailNotificationSettings extends Omit<EmailNotificationS
   password?: string;
 }
 
-export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'emailNotifications' | 'branding'> {
+export interface PublicAppConfig extends Omit<AppConfig, 'apiKey' | 'omniApiKey' | 'emailNotifications' | 'branding'> {
   branding: PublicAppBrandingSettings;
   apiKeyConfigured: boolean;
   apiKey?: string;
+  omniApiKeyConfigured: boolean;
+  omniApiKey?: string;
   emailNotifications: PublicEmailNotificationSettings;
 }
 
@@ -447,6 +454,105 @@ export interface AgentMessageDeltaStream {
 }
 
 export type ExecutionMode = 'workspace' | 'sandbox';
+
+export type LiveAgentTaskStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+
+export interface LiveAgentTaskTrace {
+  id: string;
+  taskId: string;
+  title: string;
+  label: 'Reasoning' | 'Text' | 'Tool Call' | 'Tool Result' | 'Tool Error' | 'Status';
+  content: string;
+  createdAt: string;
+}
+
+export interface LiveAgentTask {
+  id: string;
+  name: string;
+  prompt: string;
+  status: LiveAgentTaskStatus;
+  /**
+   * Realtime conversation session id. Background execution is stored separately
+   * in backendSessionId.
+   */
+  sessionId: string;
+  backendSessionId?: string;
+  executionMode: ExecutionMode;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  result?: string;
+  error?: string;
+  trace: LiveAgentTaskTrace[];
+}
+
+export interface LiveAgentTaskCreateRequest {
+  prompt: string;
+  name?: string;
+  sessionId?: string;
+  executionMode?: ExecutionMode;
+}
+
+export interface LiveAgentTaskUpdateEvent {
+  task: LiveAgentTask;
+}
+
+export interface LiveSessionTaskLink {
+  taskId: string;
+  backendSessionId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LiveSessionRelation {
+  sessionId: string;
+  backendSessions: LiveSessionTaskLink[];
+  tasks: LiveAgentTask[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LiveSessionCreateResult {
+  sessionId: string;
+  relation: LiveSessionRelation;
+}
+
+export interface LiveSessionAppendMessageRequest {
+  sessionId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  attachments?: AgentMessageAttachment[];
+  createdAt?: string;
+}
+
+export type LiveRealtimeStatus = 'connecting' | 'connected' | 'closed' | 'error';
+
+export interface LiveRealtimeStartRequest {
+  instructions?: string;
+  voice?: string;
+  sessionId?: string;
+}
+
+export interface LiveRealtimeStartResult {
+  sessionId: string;
+  provider: ProviderKind;
+  model: string;
+  status: LiveRealtimeStatus;
+}
+
+export interface LiveRealtimeClientEvent {
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface LiveRealtimeEvent {
+  sessionId: string;
+  status?: LiveRealtimeStatus;
+  event?: LiveRealtimeClientEvent;
+  message?: string;
+  createdAt: string;
+}
 
 export interface AgentExecutionDetails {
   mode: ExecutionMode;

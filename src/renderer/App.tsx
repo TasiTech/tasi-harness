@@ -24,8 +24,14 @@ import type {
   ToolEvent
 } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
+import { DEFAULT_OMNI_SYSTEM_PROMPT } from '../shared/defaultPrompts.js';
 import {
+  OMNI_PROVIDER_PRESETS,
   PROVIDER_PRESETS,
+  omniProviderDefaultBaseUrl,
+  omniProviderDefaultModel,
+  omniProviderModelOptions,
+  omniProviderPreset,
   providerDefaultBaseUrl,
   providerDefaultModel,
   providerModelOptions,
@@ -33,6 +39,7 @@ import {
   providerRequiresApiKey
 } from '../shared/providerCatalog.js';
 import { extractCitationLinks, type CitationLink } from './citations.js';
+import { LiveAgentPage, type LiveAgentOutboundMessage } from './LiveAgentPage.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
 import JSZip from 'jszip';
@@ -93,6 +100,10 @@ const defaultConfig: PublicAppConfig = {
   baseUrl: providerDefaultBaseUrl('openai'),
   apiKeyConfigured: false,
   model: providerDefaultModel('openai'),
+  omniProvider: 'openai',
+  omniBaseUrl: omniProviderDefaultBaseUrl('openai'),
+  omniApiKeyConfigured: false,
+  omniModel: omniProviderDefaultModel('openai'),
   temperature: 0.3,
   maxIterations: 200,
   sessionDocumentMaxDocs: 10,
@@ -113,6 +124,7 @@ const defaultConfig: PublicAppConfig = {
   browserExecutionLoggingEnabled: false,
   theme: 'dark',
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
+  omniSystemPrompt: DEFAULT_OMNI_SYSTEM_PROMPT,
   enabledToolNames: [],
   defaultExecutionMode: 'workspace',
   skillMarketSources: [],
@@ -550,12 +562,14 @@ export function App(): ReactElement {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | undefined>();
+  const [restoreLiveSession, setRestoreLiveSession] = useState<{ sessionId: string; token: number } | null>(null);
   const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
   const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [approvalRequest, setApprovalRequest] = useState<ToolApprovalRequest | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
   const [chatStopping, setChatStopping] = useState(false);
+  const [chatLiveModeActive, setChatLiveModeActive] = useState(false);
   const [executionMode, setExecutionMode] = useState<'workspace' | 'sandbox'>('workspace');
   const activeWechatSessionId = config.wechatChannel.sessionId?.trim() || '';
   const isWechatSessionActive = Boolean(sessionId && activeWechatSessionId && sessionId === activeWechatSessionId);
@@ -729,6 +743,18 @@ export function App(): ReactElement {
     }
   }
 
+  const statusUsesOmniModel = page === 'chat' && chatLiveModeActive;
+  const statusModelReady = statusUsesOmniModel
+    ? config.omniApiKeyConfigured && Boolean(config.omniModel)
+    : config.apiKeyConfigured || !providerRequiresApiKey(config.provider);
+  const statusModelText = statusUsesOmniModel
+    ? statusModelReady
+      ? `${tr('Model ready', '模型已就绪')} · ${config.omniProvider} · ${config.omniModel || tr('No model', '未配置模型')}`
+      : tr('Configure Omni model', '请配置 Omni 模型')
+    : statusModelReady
+    ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
+    : tr('Configure model', '请配置模型');
+
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
@@ -774,10 +800,8 @@ export function App(): ReactElement {
             <span className="soft-badge">{tr('Last', '本次')}: {usageLabel(lastUsage)}</span>
             <span className="soft-badge">{tr('Total', '累计')}: {usageLabel(totalUsage)}</span>
           </div>
-          <div className={`status-pill ${config.apiKeyConfigured || !providerRequiresApiKey(config.provider) ? 'ok' : 'warn'}`}>
-            <span className="dot" /> {config.apiKeyConfigured || !providerRequiresApiKey(config.provider)
-              ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
-              : tr('Configure model', '请配置模型')}
+          <div className={`status-pill ${statusModelReady ? 'ok' : 'warn'}`}>
+            <span className="dot" /> {statusModelText}
           </div>
         </div>
       </aside>
@@ -791,6 +815,7 @@ export function App(): ReactElement {
             setMessages={setMessages}
             sessionId={sessionId}
             setSessionId={setSessionId}
+            restoreLiveSession={restoreLiveSession}
             lastUsage={lastUsage}
             setLastUsage={setLastUsage}
             totalUsage={totalUsage}
@@ -805,6 +830,7 @@ export function App(): ReactElement {
             setExecutionMode={setExecutionMode}
             refreshSessions={refreshSessions}
             personalKnowledgeDocCount={knowledge.totalDocs}
+            onLiveModeActiveChange={setChatLiveModeActive}
           />
         )}
         {page === 'knowledge' && <KnowledgePage tr={tr} knowledge={knowledge} refreshKnowledge={refreshKnowledge} />}
@@ -829,6 +855,7 @@ export function App(): ReactElement {
             onOpen={async (id) => {
               const record = await window.tasiHarness.sessions.readForDisplay(id);
               if (record) {
+                const liveRelation = await window.tasiHarness.liveSessions.read(record.id);
                 setSessionId(record.id);
                 setMessages(record.messages);
                 setLastUsage(record.lastUsage);
@@ -837,6 +864,7 @@ export function App(): ReactElement {
                 const events = record.toolEvents ?? [];
                 setToolEvents(isWechat ? latestRoundToolEvents(record.messages, events) : events);
                 setExecutionMode(record.lastExecution?.mode ?? config.defaultExecutionMode);
+                setRestoreLiveSession(liveRelation ? { sessionId: record.id, token: Date.now() } : null);
                 setPage('chat');
               }
             }}
@@ -995,6 +1023,7 @@ function ChatPage(props: {
   setMessages: Dispatch<SetStateAction<AgentMessage[]>>;
   sessionId?: string;
   setSessionId: (id?: string) => void;
+  restoreLiveSession?: { sessionId: string; token: number } | null;
   lastUsage?: LlmUsage;
   setLastUsage: (usage?: LlmUsage) => void;
   totalUsage?: LlmUsage;
@@ -1009,8 +1038,17 @@ function ChatPage(props: {
   setExecutionMode: (mode: 'workspace' | 'sandbox') => void;
   refreshSessions: () => Promise<void>;
   personalKnowledgeDocCount: number;
+  onLiveModeActiveChange: (active: boolean) => void;
 }): ReactElement {
   const [input, setInput] = useState('');
+  const [liveModeActive, setLiveModeActive] = useState(false);
+  const [liveAutoStart, setLiveAutoStart] = useState(false);
+  const [liveStartSignal, setLiveStartSignal] = useState(0);
+  const [liveStopSignal, setLiveStopSignal] = useState(0);
+  const [liveSessionId, setLiveSessionId] = useState('');
+  const [liveRealtimeStatus, setLiveRealtimeStatus] = useState<'idle' | 'connecting' | 'connected' | 'closed' | 'error'>('idle');
+  const [liveRealtimeMessage, setLiveRealtimeMessage] = useState('');
+  const [liveOutboundMessage, setLiveOutboundMessage] = useState<LiveAgentOutboundMessage | null>(null);
   const [error, setError] = useState('');
   const [followUpQuestions, setFollowUpQuestions] = useState<string[]>([]);
   const [sessionDocs, setSessionDocs] = useState<SessionDocumentContext[]>([]);
@@ -1120,9 +1158,27 @@ function ChatPage(props: {
     globalThis.localStorage?.setItem('tasi_harness_use_personal_kb', usePersonalKnowledgeBase ? '1' : '0');
   }, [usePersonalKnowledgeBase]);
   useEffect(() => {
+    props.onLiveModeActiveChange(liveModeActive);
+    return () => props.onLiveModeActiveChange(false);
+  }, [liveModeActive]);
+  useEffect(() => {
     if (props.personalKnowledgeDocCount > 0 || !usePersonalKnowledgeBase) return;
     setUsePersonalKnowledgeBase(false);
   }, [props.personalKnowledgeDocCount, usePersonalKnowledgeBase]);
+
+  useEffect(() => {
+    const restore = props.restoreLiveSession;
+    if (!restore || restore.sessionId !== props.sessionId) return;
+    setLiveSessionId(restore.sessionId);
+    setLiveAutoStart(false);
+    setLiveStartSignal(0);
+    setLiveStopSignal(0);
+    setLiveRealtimeStatus('idle');
+    setLiveRealtimeMessage('');
+    setLiveOutboundMessage(null);
+    setLiveModeActive(true);
+  }, [props.restoreLiveSession?.token, props.restoreLiveSession?.sessionId, props.sessionId]);
+
   async function refreshSessionDocuments(sessionId = props.sessionId): Promise<void> {
     if (!sessionId) {
       setSessionDocs([]);
@@ -1609,6 +1665,21 @@ function ChatPage(props: {
   }, [shouldShowWebPreview, previewUrl]);
 
   const connected = props.config.apiKeyConfigured || !providerRequiresApiKey(props.config.provider);
+  const liveCallReady = props.config.omniApiKeyConfigured && Boolean(props.config.omniBaseUrl && props.config.omniModel);
+  const liveInputReady = liveModeActive && liveRealtimeStatus === 'connected';
+  const livePhoneTitle = liveModeActive
+    ? liveRealtimeStatus === 'connected'
+      ? props.tr('Hang up realtime call', '挂断实时通话')
+      : liveRealtimeStatus === 'connecting'
+      ? props.tr('Cancel realtime call', '取消实时通话连接')
+      : props.tr('Connect realtime call', '接通实时通话')
+    : props.tr('Enable realtime mode from the top bar first', '请先在上方打开实时模式');
+  const liveModeToggleTitle = liveModeActive
+    ? props.tr('Switch back to text chat', '切换回文字对话')
+    : liveCallReady
+    ? props.tr('Switch to realtime voice mode', '切换到实时语音模式')
+    : props.tr('Configure Omni model first', '请先配置 Omni 模型');
+  const liveModeToggleDisabled = !liveModeActive && (runBusy || !liveCallReady);
 
   function isStoppedByUserError(error: unknown): boolean {
     if (!(error instanceof Error)) return false;
@@ -1662,6 +1733,23 @@ function ChatPage(props: {
     }
   }
 
+  async function submitLiveMessage(rawText: string): Promise<void> {
+    const text = rawText.trim();
+    const outgoingAttachments = multimediaAttachments;
+    const outgoingDocuments = activeSessionDocs;
+    if ((!text && outgoingAttachments.length === 0 && outgoingDocuments.length === 0) || !liveInputReady) return;
+    setInput('');
+    setError('');
+    setMultimediaError('');
+    setMultimediaAttachments([]);
+    setLiveOutboundMessage({
+      id: createLocalId('liveout'),
+      text,
+      attachments: outgoingAttachments,
+      documents: outgoingDocuments
+    });
+  }
+
   async function stopCurrentSession(): Promise<void> {
     if ((!props.busy && !wechatBusy) || props.stopping) return;
     props.setStopping(true);
@@ -1676,6 +1764,10 @@ function ChatPage(props: {
   }
 
   async function send(): Promise<void> {
+    if (liveModeActive) {
+      await submitLiveMessage(input);
+      return;
+    }
     await submitMessage(input);
   }
 
@@ -1915,6 +2007,21 @@ function ChatPage(props: {
     setMultimediaAttachments((old) => old.filter((item) => item.id !== id));
   }
 
+  function resetTextSessionState(): void {
+    setInput('');
+    props.setMessages([]);
+    props.setSessionId(undefined);
+    props.setLastUsage(undefined);
+    props.setTotalUsage(undefined);
+    props.setToolEvents([]);
+    props.setExecutionMode(props.config.defaultExecutionMode);
+    setFollowUpQuestions([]);
+    setSessionDocs([]);
+    setSessionDocError('');
+    setMultimediaAttachments([]);
+    setMultimediaError('');
+  }
+
   async function removeSessionDocument(id: string): Promise<void> {
     if (!props.sessionId) return;
     setSessionDocBusy(true);
@@ -1930,11 +2037,83 @@ function ChatPage(props: {
     }
   }
 
+  async function startLiveMode(): Promise<void> {
+    if (runBusy || !liveCallReady) return;
+    setError('');
+    try {
+      const created = await window.tasiHarness.liveSessions.create();
+      props.setSessionId(created.sessionId);
+      props.setMessages([]);
+      props.setToolEvents([]);
+      props.setLastUsage(undefined);
+      props.setTotalUsage(undefined);
+      setFollowUpQuestions([]);
+      setSessionDocs([]);
+      setSessionDocError('');
+      setMultimediaAttachments([]);
+      setMultimediaError('');
+      setLiveSessionId(created.sessionId);
+      setLiveAutoStart(false);
+      setLiveStartSignal(0);
+      setLiveStopSignal(0);
+      setLiveRealtimeStatus('idle');
+      setLiveRealtimeMessage('');
+      setLiveOutboundMessage(null);
+      setLiveModeActive(true);
+      await props.refreshSessions();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function stopLiveMode(): Promise<void> {
+    await window.tasiHarness.liveRealtime.stop().catch(() => undefined);
+    setLiveModeActive(false);
+    setLiveAutoStart(false);
+    setLiveStartSignal(0);
+    setLiveStopSignal(0);
+    setLiveSessionId('');
+    setLiveRealtimeStatus('closed');
+    setLiveRealtimeMessage('');
+    setLiveOutboundMessage(null);
+    resetTextSessionState();
+  }
+
+  function startLiveCall(): void {
+    if (!liveModeActive || !liveCallReady || liveRealtimeStatus === 'connecting' || liveRealtimeStatus === 'connected') return;
+    setLiveRealtimeStatus('connecting');
+    setLiveRealtimeMessage('');
+    setLiveStartSignal((value) => value + 1);
+  }
+
+  function stopLiveCall(): void {
+    if (!liveModeActive || (liveRealtimeStatus !== 'connecting' && liveRealtimeStatus !== 'connected')) return;
+    setLiveStopSignal((value) => value + 1);
+    setLiveRealtimeStatus('closed');
+    setLiveRealtimeMessage('');
+  }
+
   return (
     <section className="page chat-page">
       <div className="chat-header">
         <div className="chat-session-title">{props.tr('Assistant Chat', '助手对话')}</div>
         <div className="chat-actions">
+          <label
+            className={`toggle-line chat-control chat-toggle live-mode-toggle ${liveModeActive ? 'active' : ''} ${liveModeToggleDisabled ? 'disabled' : ''}`}
+            title={liveModeToggleTitle}
+          >
+            <input
+              className="live-mode-switch-input"
+              type="checkbox"
+              checked={liveModeActive}
+              disabled={liveModeToggleDisabled}
+              onChange={(event) => void (event.target.checked ? startLiveMode() : stopLiveMode())}
+            />
+            <span className="live-mode-switch" aria-hidden="true">
+              <span />
+            </span>
+            <span>{props.tr('Realtime', '实时模式')}</span>
+          </label>
           <label
             className="toggle-line chat-control chat-toggle"
             title={
@@ -1963,17 +2142,8 @@ function ChatPage(props: {
           <button
             className="ghost-button"
             onClick={() => {
-              props.setMessages([]);
-              props.setSessionId(undefined);
-              props.setLastUsage(undefined);
-              props.setTotalUsage(undefined);
-              props.setToolEvents([]);
-              props.setExecutionMode(props.config.defaultExecutionMode);
-              setFollowUpQuestions([]);
-              setSessionDocs([]);
-              setSessionDocError('');
-              setMultimediaAttachments([]);
-              setMultimediaError('');
+              if (liveModeActive) void stopLiveMode();
+              else resetTextSessionState();
             }}
           >
             {props.tr('New session', '新会话')}
@@ -1983,6 +2153,36 @@ function ChatPage(props: {
           </button>
         </div>
       </div>
+      {liveModeActive ? (
+        <div className="chat-live-content">
+          <LiveAgentPage
+            tr={props.tr}
+            config={props.config}
+            embedded
+            autoStart={liveAutoStart}
+            startSignal={liveStartSignal}
+            stopSignal={liveStopSignal}
+            initialSessionId={liveSessionId || props.sessionId || ''}
+            initialMessages={props.messages}
+            hideHeader
+            hideComposer
+            outboundMessage={liveOutboundMessage}
+            onOutboundMessageConsumed={(id) => {
+              setLiveOutboundMessage((old) => old?.id === id ? null : old);
+            }}
+            onSessionRecordChange={(record) => {
+              props.setSessionId(record.id);
+              props.setMessages(record.messages);
+              props.setLastUsage(record.lastUsage);
+              props.setTotalUsage(record.totalUsage);
+              void props.refreshSessions();
+            }}
+            onStatusChange={setLiveRealtimeStatus}
+            onStatusMessageChange={setLiveRealtimeMessage}
+            onClose={() => void stopLiveMode()}
+          />
+        </div>
+      ) : (
       <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef}>
         <div className="chat-messages">
           {visibleMessages.length === 0 && (
@@ -2176,6 +2376,7 @@ function ChatPage(props: {
           )}
         </div>
       </div>
+      )}
       {error && <div className="error-box">{error}</div>}
       {sessionDocError && <div className="error-box">{sessionDocError}</div>}
       {multimediaError && <div className="error-box">{multimediaError}</div>}
@@ -2237,7 +2438,7 @@ function ChatPage(props: {
                   <button
                     className="chat-session-doc-remove"
                     onClick={() => removeMultimediaAttachment(attachment.id)}
-                    disabled={runBusy}
+                    disabled={!liveModeActive && runBusy}
                     title={props.tr('Remove media', '移除多媒体')}
                     aria-label={props.tr('Remove media', '移除多媒体')}
                   >
@@ -2264,17 +2465,29 @@ function ChatPage(props: {
               )}
             </div>
           )}
-          <div className="chat-textarea-wrap">
+          <div className={`chat-textarea-wrap ${liveModeActive ? 'has-phone' : ''}`}>
             <textarea
               className="chat-textarea"
-              placeholder={connected
+              placeholder={liveModeActive
+                ? liveRealtimeStatus === 'error'
+                  ? liveRealtimeMessage || props.tr('Realtime call failed. Hang up and try again.', '实时通话连接失败，请挂断后重试。')
+                  : liveRealtimeStatus === 'closed'
+                  ? liveRealtimeMessage && !/stopped/i.test(liveRealtimeMessage)
+                    ? liveRealtimeMessage
+                    : props.tr('Click the phone button to reconnect realtime call.', '点击电话按钮重新接通实时通话。')
+                  : liveInputReady
+                  ? props.tr('Realtime call is active. Speak, type, or attach files/images.', '实时通话中。可以说话、打字，也可以上传文件/图片。')
+                  : liveRealtimeStatus === 'connecting'
+                  ? props.tr('Connecting realtime call...', '实时通话连接中...')
+                  : props.tr('Click the phone button to connect realtime call.', '点击电话按钮接通实时通话。')
+                : connected
                 ? props.tr(
                   `Message ${props.config.branding.productName || 'Tasi Harness'}. Enter sends, Shift+Enter line break.`,
                   `发送给 ${props.config.branding.productName || 'Tasi Harness'}，回车发送，Shift+Enter 换行。`
                 )
                 : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
               value={input}
-              disabled={runBusy || !connected}
+              disabled={liveModeActive ? !liveInputReady : runBusy || !connected}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -2287,7 +2500,7 @@ function ChatPage(props: {
               <button
                 className="chat-attach-button"
                 onClick={openSessionDocumentPicker}
-                disabled={runBusy || sessionDocBusy || !connected}
+                disabled={liveModeActive ? !liveInputReady || sessionDocBusy : runBusy || sessionDocBusy || !connected}
                 title={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
                 aria-label={sessionDocBusy ? props.tr('Uploading...', 'Uploading...') : props.tr('Upload document', 'Upload document')}
               >
@@ -2305,7 +2518,7 @@ function ChatPage(props: {
               <button
                 className="chat-attach-button chat-media-button"
                 onClick={openMultimediaPicker}
-                disabled={runBusy || !connected}
+                disabled={liveModeActive ? !liveInputReady : runBusy || !connected}
                 title={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
                 aria-label={props.tr('Upload image, video, or audio', '上传图片、视频或音频')}
               >
@@ -2318,7 +2531,9 @@ function ChatPage(props: {
             </div>
             <button
               className={`send-btn${runBusy ? ' stop' : ''}`}
-              disabled={runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected}
+              disabled={liveModeActive
+                ? !liveInputReady || (!input.trim() && multimediaAttachments.length === 0 && activeSessionDocs.length === 0)
+                : (runBusy ? props.stopping : (!input.trim() && multimediaAttachments.length === 0) || !connected)}
               title={runBusy ? props.tr('Stop current session', '停止当前会话') : props.tr('Send message', '发送消息')}
               onClick={() => {
                 if (runBusy) {
@@ -2337,6 +2552,29 @@ function ChatPage(props: {
                 </svg>
               )}
             </button>
+            {liveModeActive && (
+              <button
+                className={`phone-btn ${liveRealtimeStatus === 'connected' || liveRealtimeStatus === 'connecting' ? 'active' : ''}`}
+                title={livePhoneTitle}
+                aria-label={livePhoneTitle}
+                disabled={!liveCallReady}
+                onClick={() => {
+                  if (liveRealtimeStatus === 'connected' || liveRealtimeStatus === 'connecting') stopLiveCall();
+                  else startLiveCall();
+                }}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M7.5 4.5 10 9l-2 1.5c1.1 2.3 2.7 3.9 5 5l1.5-2 4.5 2.5c.6.3.9 1 .7 1.7-.5 1.7-1.8 2.8-3.5 2.8C9.2 20.5 3.5 14.8 3.5 7.8c0-1.7 1.1-3 2.8-3.5.7-.2 1.4.1 1.7.7Z"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -4724,13 +4962,15 @@ function SessionsPage({
               const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
               return (
                 <div className="session-card" key={s.id}>
-                  <div>
+                  <div className="session-card-main">
                     <strong>{s.title}</strong>
                     <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
-                    {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
-                    {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
+                    <div className="session-card-badges">
+                      {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
+                      {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
+                    </div>
                   </div>
-                  <div className="button-row compact">
+                  <div className="session-card-actions">
                     <button className="primary-button" onClick={() => void onOpen(s.id)}>{tr('Open', '打开')}</button>
                     <button className="danger-button" onClick={() => void remove(s.id)}>{tr('Delete', '删除')}</button>
                   </div>
@@ -4750,9 +4990,9 @@ function SessionsPage({
 }
 
 function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: PublicAppConfig; setConfig: (cfg: PublicAppConfig) => void }): ReactElement {
-  const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
+  const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', omniApiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
   const [testResult, setTestResult] = useState('');
-  const [subPage, setSubPage] = useState<'model' | 'execution' | 'security' | 'channels' | 'theme' | 'branding' | 'markets'>('model');
+  const [subPage, setSubPage] = useState<'agent-model' | 'omni-model' | 'execution' | 'security' | 'channels' | 'theme' | 'branding' | 'markets'>('agent-model');
   const [channelSubPage, setChannelSubPage] = useState<'email' | 'wechat'>('email');
   const [clawbotQrDataUrl, setClawbotQrDataUrl] = useState('');
   const [clawbotQrSource, setClawbotQrSource] = useState<'ilink-api' | 'manual-bind-url'>('manual-bind-url');
@@ -4762,12 +5002,14 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
   const wechatLoginCheckingRef = useRef(false);
 
   useEffect(() => {
-    setDraft({ ...config, apiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
+    setDraft({ ...config, apiKey: '', omniApiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
     setWechatLoginStatus(config.wechatChannel.loginStatus ?? 'idle');
   }, [config]);
 
-  const selectedProviderPreset = providerPreset(draft.provider);
-  const suggestedModels = providerModelOptions(draft.provider);
+  const agentProviderPreset = providerPreset(draft.provider);
+  const agentSuggestedModels = providerModelOptions(draft.provider);
+  const selectedOmniProviderPreset = omniProviderPreset(draft.omniProvider);
+  const omniSuggestedModels = omniProviderModelOptions(draft.omniProvider);
 
   function stopWechatLoginPolling(): void {
     if (wechatLoginPollRef.current == null) return;
@@ -4846,7 +5088,7 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
 
   useEffect(() => () => stopWechatLoginPolling(), []);
 
-  function applyProviderPreset(nextProvider: PublicAppConfig['provider']): void {
+  function applyAgentProviderPreset(nextProvider: PublicAppConfig['provider']): void {
     const nextPreset = providerPreset(nextProvider);
     setDraft((old) => ({
       ...old,
@@ -4857,19 +5099,32 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     setTestResult('');
   }
 
+  function applyOmniProviderPreset(nextProvider: PublicAppConfig['provider']): void {
+    const nextPreset = omniProviderPreset(nextProvider);
+    setDraft((old) => ({
+      ...old,
+      omniProvider: nextProvider,
+      omniBaseUrl: nextPreset.defaultBaseUrl,
+      omniModel: omniProviderModelOptions(nextProvider).includes(old.omniModel) ? old.omniModel : nextPreset.defaultModel
+    }));
+    setTestResult('');
+  }
+
   async function save(): Promise<void> {
     const patch: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: SettingsDraft['emailNotifications'] } = { ...draft };
     if (!draft.apiKey) delete patch.apiKey;
+    if (!draft.omniApiKey) delete patch.omniApiKey;
     if (patch.emailNotifications && !draft.emailNotifications.password) delete patch.emailNotifications.password;
     const next = await window.tasiHarness.config.set(patch);
     setConfig(next);
     setTestResult(tr('Settings saved.', '设置已保存。'));
   }
 
-  async function test(): Promise<void> {
+  async function test(profile: 'agent' | 'omni'): Promise<void> {
     await save();
-    const result = await window.tasiHarness.config.test();
-    setTestResult(`${result.ok ? 'OK' : 'FAIL'}: ${result.content}`);
+    const result = await window.tasiHarness.config.test(profile);
+    const label = profile === 'omni' ? tr('Realtime WebSocket', 'Realtime WebSocket') : tr('Agent model', 'Agent 模型');
+    setTestResult(`${label} ${result.ok ? 'OK' : 'FAIL'}: ${result.content}`);
   }
 
   async function chooseBrandLogo(): Promise<void> {
@@ -4885,6 +5140,94 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     }));
   }
 
+  function renderModelConfiguration(profile: 'agent' | 'omni'): ReactElement {
+    const isOmni = profile === 'omni';
+    const activeProvider = isOmni ? draft.omniProvider : draft.provider;
+    const activeBaseUrl = isOmni ? draft.omniBaseUrl : draft.baseUrl;
+    const activeApiKey = isOmni ? draft.omniApiKey : draft.apiKey;
+    const activeModel = isOmni ? draft.omniModel : draft.model;
+    const activePreset = isOmni ? selectedOmniProviderPreset : agentProviderPreset;
+    const activeSuggestedModels = isOmni ? omniSuggestedModels : agentSuggestedModels;
+    const activeApiKeyConfigured = isOmni ? config.omniApiKeyConfigured : config.apiKeyConfigured;
+    const providerPresets = isOmni ? OMNI_PROVIDER_PRESETS : PROVIDER_PRESETS;
+
+    return (
+      <div className="card">
+        <h2>{isOmni ? tr('Omni Model Configuration', 'Omni 模型配置') : tr('Agent Model Configuration', 'Agent 模型配置')}</h2>
+        <label>{isOmni ? tr('Realtime provider', 'Realtime 服务商') : tr('Provider', '服务商')}</label>
+        <select
+          value={activeProvider}
+          onChange={(e) => {
+            const nextProvider = e.target.value as PublicAppConfig['provider'];
+            if (isOmni) applyOmniProviderPreset(nextProvider);
+            else applyAgentProviderPreset(nextProvider);
+          }}
+        >
+          {providerPresets.map((preset) => (
+            <option key={preset.kind} value={preset.kind}>{preset.label}</option>
+          ))}
+        </select>
+        <label>{isOmni ? tr('WebSocket URL', 'WebSocket URL') : tr('Base URL', 'Base URL')}</label>
+        <input
+          value={activeBaseUrl}
+          onChange={(e) => {
+            const value = e.target.value;
+            setDraft((old) => isOmni ? { ...old, omniBaseUrl: value } : { ...old, baseUrl: value });
+          }}
+        />
+        <div className="card-subtle">{isOmni ? tr('Default WebSocket endpoint:', '默认 WebSocket 端点：') : tr('Preset endpoint:', '预设端点：')} {activePreset.defaultBaseUrl}</div>
+        <label>API Key {activeApiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
+        <input
+          type="password"
+          value={activeApiKey || ''}
+          disabled={!providerRequiresApiKey(activeProvider)}
+          onChange={(e) => {
+            const value = e.target.value;
+            setDraft((old) => isOmni ? { ...old, omniApiKey: value } : { ...old, apiKey: value });
+          }}
+          placeholder={providerRequiresApiKey(activeProvider) ? tr('leave blank to keep existing', '留空则保持不变') : tr('Not required for this provider', '该服务商不需要')}
+        />
+        <label>{isOmni ? tr('Realtime models', 'Realtime 模型') : tr('Suggested models', '推荐模型')}</label>
+        <select
+          value={activeSuggestedModels.includes(activeModel) ? activeModel : ''}
+          onChange={(e) => {
+            if (!e.target.value) return;
+            const value = e.target.value;
+            setDraft((old) => isOmni ? { ...old, omniModel: value } : { ...old, model: value });
+          }}
+        >
+          <option value="">{tr('Custom model...', '自定义模型...')}</option>
+          {activeSuggestedModels.map((model) => (
+            <option key={model} value={model}>{model}</option>
+          ))}
+        </select>
+        <label>{isOmni ? tr('Realtime model', 'Realtime 模型') : tr('Model', '模型')}</label>
+        <input
+          value={activeModel}
+          onChange={(e) => {
+            const value = e.target.value;
+            setDraft((old) => isOmni ? { ...old, omniModel: value } : { ...old, model: value });
+          }}
+        />
+        <div className="button-row">
+          <button
+            className="ghost-button"
+            onClick={() => {
+              setDraft((old) => isOmni
+                ? { ...old, omniBaseUrl: activePreset.defaultBaseUrl, omniModel: activePreset.defaultModel }
+                : { ...old, baseUrl: activePreset.defaultBaseUrl, model: activePreset.defaultModel });
+            }}
+          >
+            {tr('Reset preset', '重置预设')}
+          </button>
+          <button className="ghost-button" onClick={() => void test(profile)}>
+            {isOmni ? tr('Save and test Realtime WebSocket', '保存并测试 Realtime WebSocket') : tr('Save and test Agent model', '保存并测试 Agent 模型')}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <section className="page settings-page">
       <PageHeader
@@ -4897,7 +5240,8 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         }
       />
       <div className="skill-tabs">
-        <button className={`skill-tab ${subPage === 'model' ? 'active' : ''}`} onClick={() => setSubPage('model')}>{tr('Model', '模型')}</button>
+        <button className={`skill-tab ${subPage === 'agent-model' ? 'active' : ''}`} onClick={() => setSubPage('agent-model')}>{tr('Agent Model', 'Agent 模型')}</button>
+        <button className={`skill-tab ${subPage === 'omni-model' ? 'active' : ''}`} onClick={() => setSubPage('omni-model')}>{tr('Omni Model', 'Omni 模型')}</button>
         <button className={`skill-tab ${subPage === 'execution' ? 'active' : ''}`} onClick={() => setSubPage('execution')}>{tr('Execution', '执行')}</button>
         <button className={`skill-tab ${subPage === 'security' ? 'active' : ''}`} onClick={() => setSubPage('security')}>{tr('Security', '安全')}</button>
         <button className={`skill-tab ${subPage === 'channels' ? 'active' : ''}`} onClick={() => setSubPage('channels')}>{tr('Channels', '通道')}</button>
@@ -4905,52 +5249,8 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         <button className={`skill-tab ${subPage === 'branding' ? 'active' : ''}`} onClick={() => setSubPage('branding')}>{tr('Branding', '品牌')}</button>
         <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
       </div>
-      {subPage === 'model' && (
-        <div className="card">
-          <h2>{tr('Model Configuration', '模型配置')}</h2>
-          <label>{tr('Provider', '服务商')}</label>
-          <select value={draft.provider} onChange={(e) => applyProviderPreset(e.target.value as PublicAppConfig['provider'])}>
-            {PROVIDER_PRESETS.map((preset) => (
-              <option key={preset.kind} value={preset.kind}>{preset.label}</option>
-            ))}
-          </select>
-          <label>{tr('Base URL', 'Base URL')}</label>
-          <input value={draft.baseUrl} onChange={(e) => setDraft((old) => ({ ...old, baseUrl: e.target.value }))} />
-          <div className="card-subtle">{tr('Preset endpoint:', '预设端点：')} {selectedProviderPreset.defaultBaseUrl}</div>
-          <label>API Key {config.apiKeyConfigured ? tr('(configured)', '（已配置）') : ''}</label>
-          <input
-            type="password"
-            value={draft.apiKey || ''}
-            disabled={!providerRequiresApiKey(draft.provider)}
-            onChange={(e) => setDraft((old) => ({ ...old, apiKey: e.target.value }))}
-            placeholder={providerRequiresApiKey(draft.provider) ? tr('leave blank to keep existing', '留空则保持不变') : tr('Not required for this provider', '该服务商不需要')}
-          />
-          <label>{tr('Suggested models', '推荐模型')}</label>
-          <select
-            value={suggestedModels.includes(draft.model) ? draft.model : ''}
-            onChange={(e) => {
-              if (!e.target.value) return;
-              setDraft((old) => ({ ...old, model: e.target.value }));
-            }}
-          >
-            <option value="">{tr('Custom model...', '自定义模型...')}</option>
-            {suggestedModels.map((model) => (
-              <option key={model} value={model}>{model}</option>
-            ))}
-          </select>
-          <label>{tr('Model', '模型')}</label>
-          <input value={draft.model} onChange={(e) => setDraft((old) => ({ ...old, model: e.target.value }))} />
-          <div className="button-row">
-            <button
-              className="ghost-button"
-              onClick={() => setDraft((old) => ({ ...old, baseUrl: selectedProviderPreset.defaultBaseUrl, model: selectedProviderPreset.defaultModel }))}
-            >
-              {tr('Reset preset', '重置预设')}
-            </button>
-            <button className="ghost-button" onClick={() => void test()}>{tr('Save and test model', '保存并测试模型')}</button>
-          </div>
-        </div>
-      )}
+      {subPage === 'agent-model' && renderModelConfiguration('agent')}
+      {subPage === 'omni-model' && renderModelConfiguration('omni')}
       {subPage === 'execution' && (
         <div className="card">
           <h2>{tr('Execution', '执行')}</h2>
@@ -5013,6 +5313,17 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
           <div className="card-subtle">{tr('Log file:', '日志文件：')} ~/.tasi-harness/logs/browser-execution.log</div>
           <label>{tr('Persona', '系统角色提示词')}</label>
           <textarea value={draft.systemPersona} onChange={(e) => setDraft((old) => ({ ...old, systemPersona: e.target.value }))} />
+          <label>{tr('Omni realtime prompt', 'Omni 实时提示词')}</label>
+          <textarea
+            value={draft.omniSystemPrompt}
+            onChange={(e) => setDraft((old) => ({ ...old, omniSystemPrompt: e.target.value }))}
+          />
+          <div className="card-subtle">
+            {tr(
+              'Used only by realtime voice mode. Keep it concise and tell the Omni model when to queue background tasks.',
+              '仅用于实时语音模式。建议保持简洁，并说明 Omni 模型何时把复杂工作加入后台任务队列。'
+            )}
+          </div>
         </div>
       )}
       {subPage === 'security' && (

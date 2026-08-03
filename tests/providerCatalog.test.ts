@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  OMNI_PROVIDER_PRESETS,
   normalizeProviderKind,
+  omniProviderDefaultBaseUrl,
+  omniProviderDefaultModel,
+  omniProviderModelOptions,
   providerApiStyle,
   providerDefaultBaseUrl,
   providerDefaultModel,
@@ -31,5 +35,29 @@ describe('providerCatalog', () => {
       'deepseek-v4-pro'
     ]);
     expect(providerRequiresApiKey('soildapi')).toBe(true);
+  });
+
+  it('exposes OpenAI Realtime WebSocket models for omni configuration', () => {
+    expect(OMNI_PROVIDER_PRESETS.map((preset) => preset.kind)).toEqual(['openai', 'qwen-bailian']);
+    expect(omniProviderDefaultBaseUrl('openai')).toBe('wss://api.openai.com/v1/realtime');
+    expect(omniProviderDefaultModel('openai')).toBe('gpt-realtime-2.1');
+    expect(omniProviderModelOptions('openai')).toEqual([
+      'gpt-realtime-2.1',
+      'gpt-realtime-2.1-mini',
+      'gpt-realtime',
+      'gpt-realtime-mini'
+    ]);
+  });
+
+  it('exposes Qwen Omni Realtime WebSocket models for omni configuration', () => {
+    expect(omniProviderDefaultBaseUrl('qwen-bailian')).toBe('wss://dashscope.aliyuncs.com/api-ws/v1/realtime');
+    expect(omniProviderDefaultModel('qwen-bailian')).toBe('qwen3.5-omni-flash-realtime');
+    expect(omniProviderModelOptions('qwen-bailian')).toEqual([
+      'qwen3.5-omni-plus-realtime',
+      'qwen3.5-omni-plus-realtime-2026-03-15',
+      'qwen3.5-omni-flash-realtime',
+      'qwen3.5-omni-flash-realtime-2026-03-15',
+      'qwen3-omni-flash-realtime'
+    ]);
   });
 });

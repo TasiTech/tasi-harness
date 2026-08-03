@@ -11,6 +11,16 @@ import type {
   BrowserCoachStartRequest,
   BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
+  LiveAgentTask,
+  LiveAgentTaskCreateRequest,
+  LiveAgentTaskUpdateEvent,
+  LiveSessionAppendMessageRequest,
+  LiveSessionCreateResult,
+  LiveSessionRelation,
+  LiveRealtimeClientEvent,
+  LiveRealtimeEvent,
+  LiveRealtimeStartRequest,
+  LiveRealtimeStartResult,
   MemoryClearRequest,
   MemoryQueryOptions,
   MemoryState,
@@ -55,8 +65,8 @@ declare global {
     tasiHarness: {
       config: {
         get(): Promise<PublicAppConfig>;
-        set(partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }): Promise<PublicAppConfig>;
-        test(): Promise<ToolExecutionResult>;
+        set(partial: Partial<PublicAppConfig> & { apiKey?: string; omniApiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }): Promise<PublicAppConfig>;
+        test(profile?: 'agent' | 'omni'): Promise<ToolExecutionResult>;
         wechatQrcode(): Promise<WechatChannelQrCodePayload>;
         wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
       };
@@ -66,6 +76,23 @@ declare global {
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
         onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;
+      };
+      liveRealtime: {
+        start(req?: LiveRealtimeStartRequest): Promise<LiveRealtimeStartResult>;
+        send(event: LiveRealtimeClientEvent): Promise<ToolExecutionResult>;
+        stop(): Promise<ToolExecutionResult>;
+        onEvent(listener: (payload: LiveRealtimeEvent) => void): () => void;
+      };
+      liveTasks: {
+        list(sessionId?: string): Promise<LiveAgentTask[]>;
+        enqueue(req: LiveAgentTaskCreateRequest): Promise<LiveAgentTask>;
+        stop(taskId: string): Promise<LiveAgentTask | null>;
+        onUpdated(listener: (payload: LiveAgentTaskUpdateEvent) => void): () => void;
+      };
+      liveSessions: {
+        create(): Promise<LiveSessionCreateResult>;
+        read(sessionId: string): Promise<LiveSessionRelation | null>;
+        appendMessage(req: LiveSessionAppendMessageRequest): Promise<SessionRecord>;
       };
       security: {
         onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;

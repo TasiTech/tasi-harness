@@ -10,6 +10,12 @@ import type {
   BrowserCoachStartRequest,
   BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
+  LiveAgentTaskCreateRequest,
+  LiveAgentTaskUpdateEvent,
+  LiveSessionAppendMessageRequest,
+  LiveRealtimeClientEvent,
+  LiveRealtimeEvent,
+  LiveRealtimeStartRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
   PersonalKnowledgeFolderImportResult,
@@ -39,8 +45,8 @@ const { contextBridge, ipcRenderer } = electronRequire('electron/renderer') as t
 const api = {
   config: {
     get: () => ipcRenderer.invoke('config:get') as Promise<PublicAppConfig>,
-    set: (partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }) => ipcRenderer.invoke('config:set', partial) as Promise<PublicAppConfig>,
-    test: () => ipcRenderer.invoke('config:test'),
+    set: (partial: Partial<PublicAppConfig> & { apiKey?: string; omniApiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }) => ipcRenderer.invoke('config:set', partial) as Promise<PublicAppConfig>,
+    test: (profile?: 'agent' | 'omni') => ipcRenderer.invoke('config:test', profile),
     wechatQrcode: () => ipcRenderer.invoke('config:wechatQrcode') as Promise<WechatChannelQrCodePayload>,
     wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
   },
@@ -61,6 +67,33 @@ const api = {
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }
+  },
+  liveRealtime: {
+    start: (req?: LiveRealtimeStartRequest) => ipcRenderer.invoke('liveRealtime:start', req),
+    send: (event: LiveRealtimeClientEvent) => ipcRenderer.invoke('liveRealtime:send', event),
+    stop: () => ipcRenderer.invoke('liveRealtime:stop'),
+    onEvent: (listener: (payload: LiveRealtimeEvent) => void) => {
+      const channel = 'live-realtime:event';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: LiveRealtimeEvent) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    }
+  },
+  liveTasks: {
+    list: (sessionId?: string) => ipcRenderer.invoke('liveTasks:list', sessionId),
+    enqueue: (req: LiveAgentTaskCreateRequest) => ipcRenderer.invoke('liveTasks:enqueue', req),
+    stop: (taskId: string) => ipcRenderer.invoke('liveTasks:stop', taskId),
+    onUpdated: (listener: (payload: LiveAgentTaskUpdateEvent) => void) => {
+      const channel = 'live-tasks:updated';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: LiveAgentTaskUpdateEvent) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    }
+  },
+  liveSessions: {
+    create: () => ipcRenderer.invoke('liveSessions:create'),
+    read: (sessionId: string) => ipcRenderer.invoke('liveSessions:read', sessionId),
+    appendMessage: (req: LiveSessionAppendMessageRequest) => ipcRenderer.invoke('liveSessions:appendMessage', req)
   },
   security: {
     onToolApprovalRequest: (listener: (payload: ToolApprovalRequest) => void) => {
