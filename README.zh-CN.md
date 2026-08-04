@@ -233,6 +233,7 @@ docs/         文档目录
 - [浏览器自动化](docs/BROWSER_AUTOMATION.zh-CN.md)
 - [个人知识库](docs/PERSONAL_KNOWLEDGE_BASE.zh-CN.md)
 - [版本发布说明（v1.6.0）](docs/release_v1.6.0.zh-CN.md)
+- [版本发布归档（v1.5.0）](docs/release_v1.5.0.zh-CN.md)
 - [版本发布归档（v1.4.0）](docs/release_v1.4.0.zh-CN.md)
 - [版本发布归档（v1.3.0）](docs/release_v1.3.0.zh-CN.md)
 - [版本发布归档（v1.2.0）](docs/release_v1.2.0.zh-CN.md)

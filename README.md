@@ -258,6 +258,7 @@ docs/         Engineering and security documentation
 - [Browser Automation](docs/BROWSER_AUTOMATION.en.md)
 - [Personal Knowledge Base](docs/PERSONAL_KNOWLEDGE_BASE.en.md)
 - [Release Notes (v1.6.0)](docs/release_v1.6.0.en.md)
+- [Release Notes Archive (v1.5.0)](docs/release_v1.5.0.en.md)
 - [Release Notes Archive (v1.4.0)](docs/release_v1.4.0.en.md)
 - [Release Notes Archive (v1.3.0)](docs/release_v1.3.0.en.md)
 - [Release Notes Archive (v1.2.0)](docs/release_v1.2.0.en.md)
