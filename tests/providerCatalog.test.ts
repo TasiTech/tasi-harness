@@ -38,7 +38,7 @@ describe('providerCatalog', () => {
   });
 
   it('exposes OpenAI Realtime WebSocket models for omni configuration', () => {
-    expect(OMNI_PROVIDER_PRESETS.map((preset) => preset.kind)).toEqual(['openai', 'qwen-bailian']);
+    expect(OMNI_PROVIDER_PRESETS.map((preset) => preset.kind)).toEqual(['openai', 'qwen-bailian', 'soildapi']);
     expect(omniProviderDefaultBaseUrl('openai')).toBe('wss://api.openai.com/v1/realtime');
     expect(omniProviderDefaultModel('openai')).toBe('gpt-realtime-2.1');
     expect(omniProviderModelOptions('openai')).toEqual([
@@ -58,6 +58,22 @@ describe('providerCatalog', () => {
       'qwen3.5-omni-flash-realtime',
       'qwen3.5-omni-flash-realtime-2026-03-15',
       'qwen3-omni-flash-realtime'
+    ]);
+  });
+
+  it('exposes SoildAPI as an OpenAI Realtime-compatible omni provider', () => {
+    expect(omniProviderDefaultBaseUrl('soildapi')).toBe('wss://soildapi.com/v1/realtime');
+    expect(omniProviderDefaultModel('soildapi')).toBe('qwen3.5-omni-plus-realtime');
+    expect(omniProviderModelOptions('soildapi')).toEqual([
+      'qwen3.5-omni-plus-realtime',
+      'qwen3.5-omni-plus-realtime-2026-03-15',
+      'qwen3.5-omni-flash-realtime',
+      'qwen3.5-omni-flash-realtime-2026-03-15',
+      'qwen3-omni-flash-realtime',
+      'gpt-realtime-2.1',
+      'gpt-realtime-2.1-mini',
+      'gpt-realtime',
+      'gpt-realtime-mini'
     ]);
   });
 });

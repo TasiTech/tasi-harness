@@ -12,6 +12,11 @@ import type {
 import { createId, nowIso } from '../../shared/types.js';
 
 type TaskUpdateListener = (task: LiveAgentTask) => void;
+const LIVE_TASK_DEDUPE_WINDOW_MS = 20_000;
+
+function normalizeTaskPrompt(prompt: string): string {
+  return prompt.replace(/\s+/g, ' ').trim().toLowerCase();
+}
 
 export class LiveTaskQueue {
   private readonly tasks = new Map<string, LiveAgentTask>();
@@ -46,9 +51,12 @@ export class LiveTaskQueue {
   enqueue(req: LiveAgentTaskCreateRequest, sender: WebContents): LiveAgentTask {
     const prompt = req.prompt?.trim();
     if (!prompt) throw new Error('Live task prompt cannot be empty.');
+    const frontendSessionId = req.sessionId?.trim() || createId('session');
+    const executionMode = req.executionMode ?? this.deps.defaultExecutionMode();
+    const duplicate = this.findRecentDuplicate(frontendSessionId, prompt, executionMode);
+    if (duplicate) return duplicate;
     const id = createId('livetask');
     const createdAt = nowIso();
-    const frontendSessionId = req.sessionId?.trim() || createId('session');
     const backendSessionId = createId('backend_session');
     const task: LiveAgentTask = {
       id,
@@ -57,7 +65,7 @@ export class LiveTaskQueue {
       status: 'queued',
       sessionId: frontendSessionId,
       backendSessionId,
-      executionMode: req.executionMode ?? this.deps.defaultExecutionMode(),
+      executionMode,
       createdAt,
       updatedAt: createdAt,
       trace: [
@@ -105,6 +113,21 @@ export class LiveTaskQueue {
         this.pump(sender);
       });
     }
+  }
+
+  private findRecentDuplicate(sessionId: string, prompt: string, executionMode: ExecutionMode): LiveAgentTask | null {
+    const promptKey = normalizeTaskPrompt(prompt);
+    const now = Date.now();
+    for (const task of this.tasks.values()) {
+      if (task.sessionId !== sessionId) continue;
+      if (task.executionMode !== executionMode) continue;
+      if (task.status === 'failed' || task.status === 'cancelled') continue;
+      if (normalizeTaskPrompt(task.prompt) !== promptKey) continue;
+      const createdMs = Date.parse(task.createdAt);
+      if (!Number.isFinite(createdMs) || now - createdMs > LIVE_TASK_DEDUPE_WINDOW_MS) continue;
+      return task;
+    }
+    return null;
   }
 
   private async runTask(task: LiveAgentTask, sender: WebContents): Promise<void> {

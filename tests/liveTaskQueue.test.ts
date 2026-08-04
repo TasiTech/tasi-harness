@@ -58,4 +58,36 @@ describe('LiveTaskQueue', () => {
     expect(completed?.trace.some((entry) => entry.label === 'Reasoning' && entry.content === 'thinking')).toBe(true);
     expect(completed?.trace.some((entry) => entry.label === 'Tool Result' && entry.content === 'done')).toBe(true);
   });
+
+  it('reuses a recent identical task in the same live session', async () => {
+    let runs = 0;
+    const agentLoop = {
+      run: async () => {
+        runs += 1;
+        return {
+          sessionId: 'session_live',
+          finalResponse: 'finished',
+          messages: [],
+          toolEvents: [],
+          iterations: 1,
+          execution: { mode: 'workspace', workspaceDir: '' }
+        };
+      }
+    } as unknown as AgentLoop;
+    const queue = new LiveTaskQueue({
+      agentLoop,
+      concurrency: 1,
+      defaultExecutionMode: () => 'workspace',
+      requestToolApproval: async (_sender, request) => ({ id: request.id, approved: true }),
+      onTaskUpdate: () => undefined
+    });
+
+    const first = queue.enqueue({ prompt: 'Check Beijing weather', sessionId: 'live_session' }, {} as WebContents);
+    const second = queue.enqueue({ prompt: '  check   Beijing weather  ', sessionId: 'live_session' }, {} as WebContents);
+    await waitFor(() => queue.list('live_session').some((item) => item.id === first.id && item.status === 'completed'));
+
+    expect(second.id).toBe(first.id);
+    expect(queue.list('live_session')).toHaveLength(1);
+    expect(runs).toBe(1);
+  });
 });

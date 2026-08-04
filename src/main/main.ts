@@ -1987,9 +1987,13 @@ function realtimeConnectionPath(config: AppConfig, url: URL): string {
   return `${next.pathname}${next.search}`;
 }
 
+function usesOpenAIRealtimeProtocol(config: AppConfig): boolean {
+  return config.omniProvider === 'openai' || config.omniProvider === 'soildapi';
+}
+
 async function testRealtimeConnection(config: AppConfig): Promise<{ ok: boolean; content: string }> {
-  if (config.omniProvider !== 'openai' && config.omniProvider !== 'qwen-bailian') {
-    return { ok: false, content: 'Only OpenAI and Qwen Realtime WebSocket providers are supported for Omni.' };
+  if (!usesOpenAIRealtimeProtocol(config) && config.omniProvider !== 'qwen-bailian') {
+    return { ok: false, content: 'Only OpenAI-compatible Realtime and Qwen Realtime WebSocket providers are supported for Omni.' };
   }
   if (!config.omniApiKey) return { ok: false, content: 'API key is empty.' };
   if (!config.omniBaseUrl) return { ok: false, content: 'Realtime WebSocket URL is empty.' };
@@ -2028,7 +2032,8 @@ async function testRealtimeConnection(config: AppConfig): Promise<{ ok: boolean;
         'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
         'Sec-WebSocket-Version': '13',
         'User-Agent': 'tasi-harness-realtime/1.0',
-        ...(qwenWorkspaceId ? { 'X-DashScope-WorkSpace': qwenWorkspaceId } : {})
+        ...(qwenWorkspaceId ? { 'X-DashScope-WorkSpace': qwenWorkspaceId } : {}),
+        ...(usesOpenAIRealtimeProtocol(config) ? { 'OpenAI-Beta': 'realtime=v1' } : {})
       }
     });
 

@@ -175,6 +175,7 @@ export function LiveAgentPage({
   const [assistantDraft, setAssistantDraft] = useState('');
   const [textInput, setTextInput] = useState('');
   const [tasks, setTasks] = useState<LiveAgentTask[]>([]);
+  const [flashingTaskIds, setFlashingTaskIds] = useState<Set<string>>(() => new Set());
   const [micActive, setMicActive] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
   const [audioInputs, setAudioInputs] = useState<AudioInputOption[]>([]);
@@ -185,8 +186,12 @@ export function LiveAgentPage({
   const functionArgsRef = useRef(new Map<string, string>());
   const completedFunctionCallIdsRef = useRef(new Set<string>());
   const completedAssistantResponseIdsRef = useRef(new Set<string>());
+  const completedTaskFlashIdsRef = useRef(new Set<string>());
+  const completedTaskNotificationIdsRef = useRef(new Set<string>());
   const recentLiveMessagesRef = useRef<Array<{ role: LiveMessage['role']; content: string; createdAtMs: number }>>([]);
-  const recentLiveTaskPromptsRef = useRef(new Map<string, { taskId: string; createdAtMs: number }>());
+  const recentLiveTaskPromptsRef = useRef(new Map<string, { taskId?: string; createdAtMs: number; promise?: Promise<LiveAgentTask> }>());
+  const tasksRef = useRef<LiveAgentTask[]>([]);
+  const flashTimersRef = useRef(new Map<string, number>());
   const statusRef = useRef<LiveStatus>('idle');
   const sessionIdRef = useRef('');
   const configRef = useRef(config);
@@ -213,6 +218,7 @@ export function LiveAgentPage({
   const responsePendingTimerRef = useRef<number | null>(null);
   const qwenAudioResponseTimerRef = useRef<number | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const liveTaskListRef = useRef<HTMLDivElement | null>(null);
   const traceListRef = useRef<HTMLDivElement | null>(null);
   const connected = status === 'connected';
   const canStart = config.omniApiKeyConfigured && Boolean(config.omniBaseUrl && config.omniModel);
@@ -221,7 +227,7 @@ export function LiveAgentPage({
     () => tasks.find((task) => task.id === selectedTaskId) || tasks.find((task) => task.status === 'running') || tasks[0] || null,
     [selectedTaskId, tasks]
   );
-  const selectedTaskTrace = useMemo(() => mergedTaskTrace(selectedTask), [selectedTask]);
+  const selectedTaskTrace = useMemo(() => mergedTaskTrace(selectedTask, ['Tool Call', 'Tool Result', 'Tool Error']), [selectedTask]);
 
   useEffect(() => {
     statusRef.current = status;
@@ -239,6 +245,10 @@ export function LiveAgentPage({
   useEffect(() => {
     selectedAudioInputIdRef.current = selectedAudioInputId;
   }, [selectedAudioInputId]);
+
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
 
   useEffect(() => {
     void refreshAudioInputs().catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
@@ -277,7 +287,7 @@ export function LiveAgentPage({
     setSessionId(nextSessionId);
     setMessages(liveMessagesFromAgentMessages(initialMessages));
     void window.tasiHarness.liveTasks.list(nextSessionId)
-      .then(setTasks)
+      .then(setLiveTasks)
       .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
   }, [initialSessionId, initialMessages]);
 
@@ -285,10 +295,15 @@ export function LiveAgentPage({
     clearCleanupStopTimer();
     disposedRef.current = false;
     const activeSessionId = sessionIdRef.current || initialSessionId.trim();
-    void window.tasiHarness.liveTasks.list(activeSessionId || undefined).then(setTasks).catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+    void window.tasiHarness.liveTasks.list(activeSessionId || undefined).then(setLiveTasks).catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
     const offTask = window.tasiHarness.liveTasks.onUpdated(({ task }) => {
       if (sessionIdRef.current && task.sessionId !== sessionIdRef.current) return;
-      setTasks((old) => [task, ...old.filter((item) => item.id !== task.id)].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+      upsertLiveTask(task);
+      if (task.status === 'completed' && !completedTaskFlashIdsRef.current.has(task.id)) {
+        completedTaskFlashIdsRef.current.add(task.id);
+        flashTaskCard(task.id);
+        void notifyRealtimeTaskCompleted(task).catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
+      }
     });
     const offRealtime = window.tasiHarness.liveRealtime.onEvent((payload) => {
       if (payload.sessionId !== sessionIdRef.current) return;
@@ -323,6 +338,7 @@ export function LiveAgentPage({
         clearQwenFallbackTimer();
         clearQwenAudioResponseTimer();
         clearResponsePendingTimer();
+        clearFlashTimers();
         stopMic(true);
         void window.tasiHarness.liveRealtime.stop().catch(() => undefined);
         void playerRef.current.close().catch(() => undefined);
@@ -420,7 +436,7 @@ export function LiveAgentPage({
       qwenManualCommitInFlightRef.current = false;
       resetQwenAudioBufferState();
       clearQwenFallbackTimer();
-      scheduleQwenAudioResponseCreate(type);
+      if (qwenManualTurnDetectionRef.current) scheduleQwenAudioResponseCreate(type);
       return;
     }
     if (type === 'conversation.item.input_audio_transcription.delta' || type === 'conversation.item.input_audio_transcription.text') {
@@ -482,22 +498,38 @@ export function LiveAgentPage({
     const taskKey = prompt.replace(/\s+/g, ' ').toLowerCase();
     const existing = recentLiveTaskPromptsRef.current.get(taskKey);
     if (existing && Date.now() - existing.createdAtMs < 20000) {
+      let taskId = existing.taskId || 'pending';
+      if (!existing.taskId && existing.promise) {
+        try {
+          taskId = (await existing.promise).id;
+        } catch {
+          taskId = 'pending';
+        }
+      }
       await sendRealtime({
         type: 'conversation.item.create',
         item: {
           type: 'function_call_output',
           call_id: callId,
-          output: JSON.stringify({ task_id: existing.taskId, status: 'queued', duplicate: true }, null, 2)
+          output: JSON.stringify({ task_id: taskId, status: 'queued', duplicate: true }, null, 2)
         }
       });
       return;
     }
-    const task = await window.tasiHarness.liveTasks.enqueue({
+    const enqueuePromise = window.tasiHarness.liveTasks.enqueue({
       prompt,
       name: String(args.name || '').trim(),
       sessionId: sessionIdRef.current,
       executionMode: configRef.current.defaultExecutionMode
     });
+    recentLiveTaskPromptsRef.current.set(taskKey, { createdAtMs: Date.now(), promise: enqueuePromise });
+    let task: LiveAgentTask;
+    try {
+      task = await enqueuePromise;
+    } catch (error) {
+      recentLiveTaskPromptsRef.current.delete(taskKey);
+      throw error;
+    }
     recentLiveTaskPromptsRef.current.set(taskKey, { taskId: task.id, createdAtMs: Date.now() });
     await sendRealtime({
       type: 'conversation.item.create',
@@ -509,6 +541,80 @@ export function LiveAgentPage({
     });
     await createResponse();
     setNotice(tr(`Queued background task ${task.id}.`, `已创建后台任务 ${task.id}。`));
+  }
+
+  function setLiveTasks(next: LiveAgentTask[]): void {
+    tasksRef.current = next;
+    setTasks(next);
+  }
+
+  function upsertLiveTask(task: LiveAgentTask): void {
+    setLiveTasks([task, ...tasksRef.current.filter((item) => item.id !== task.id)].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+  }
+
+  function flashTaskCard(taskId: string): void {
+    const existingTimer = flashTimersRef.current.get(taskId);
+    if (existingTimer) window.clearTimeout(existingTimer);
+    setFlashingTaskIds((old) => new Set([...old, taskId]));
+    scrollTaskCardIntoView(taskId);
+    const timer = window.setTimeout(() => {
+      flashTimersRef.current.delete(taskId);
+      setFlashingTaskIds((old) => {
+        const next = new Set(old);
+        next.delete(taskId);
+        return next;
+      });
+    }, 2200);
+    flashTimersRef.current.set(taskId, timer);
+  }
+
+  function scrollTaskCardIntoView(taskId: string): void {
+    window.requestAnimationFrame(() => {
+      const list = liveTaskListRef.current;
+      if (!list) return;
+      const card = list.querySelector<HTMLElement>(`[data-task-id="${taskId}"]`);
+      if (!card) {
+        list.scrollTop = list.scrollHeight;
+        return;
+      }
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+  }
+
+  function clearFlashTimers(): void {
+    for (const timer of flashTimersRef.current.values()) window.clearTimeout(timer);
+    flashTimersRef.current.clear();
+    setFlashingTaskIds(new Set());
+  }
+
+  function taskCompletionPrompt(task: LiveAgentTask): string {
+    const result = (task.result || '').trim() || 'The task completed, but returned no result content.';
+    return [
+      'Background task completed. This is a task-completion event from Tasi Harness, not a new user request.',
+      'Do not create another background task for this event.',
+      'Briefly tell the user the task is complete and summarize the useful result in the realtime conversation.',
+      '',
+      `Task title: ${task.name}`,
+      `Original user request: ${task.prompt}`,
+      '',
+      'Task result:',
+      result
+    ].join('\n');
+  }
+
+  async function notifyRealtimeTaskCompleted(task: LiveAgentTask): Promise<void> {
+    if (completedTaskNotificationIdsRef.current.has(task.id) || statusRef.current !== 'connected') return;
+    completedTaskNotificationIdsRef.current.add(task.id);
+    await sendRealtime({
+      type: 'conversation.item.create',
+      item: {
+        id: localId('livetaskdone'),
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: taskCompletionPrompt(task) }]
+      }
+    });
+    await createResponse();
   }
 
   function appendMessage(role: LiveMessage['role'], content: string, attachments?: AgentMessageAttachment[]): void {
@@ -1037,14 +1143,15 @@ export function LiveAgentPage({
             <strong>{tr('Background Tasks', '后台任务')}</strong>
             <span>{activeTasks.length} {tr('active', '进行中')}</span>
           </div>
-          <div className="live-task-list">
+          <div className="live-task-list" ref={liveTaskListRef}>
             {tasks.map((task) => {
               const reasoning = mergedTaskTrace(task, ['Reasoning']);
               const output = task.error || task.result || (task.status === 'completed' ? tr('No result content.', '暂无结果内容。') : '');
               return (
                 <article
                   key={task.id}
-                  className={`live-task-card ${task.status} ${selectedTask?.id === task.id ? 'selected' : ''}`}
+                  data-task-id={task.id}
+                  className={`live-task-card ${task.status} ${selectedTask?.id === task.id ? 'selected' : ''} ${flashingTaskIds.has(task.id) ? 'completion-flash' : ''}`}
                   role="button"
                   tabIndex={0}
                   onClick={() => setSelectedTaskId(task.id)}

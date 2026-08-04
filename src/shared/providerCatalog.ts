@@ -138,6 +138,25 @@ export const OMNI_PROVIDER_PRESETS: ProviderPreset[] = [
       'qwen3-omni-flash-realtime'
     ],
     requiresApiKey: true
+  },
+  {
+    kind: 'soildapi',
+    label: 'SoildAPI Omni Realtime',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'wss://soildapi.com/v1/realtime',
+    defaultModel: 'qwen3.5-omni-plus-realtime',
+    models: [
+      'qwen3.5-omni-plus-realtime',
+      'qwen3.5-omni-plus-realtime-2026-03-15',
+      'qwen3.5-omni-flash-realtime',
+      'qwen3.5-omni-flash-realtime-2026-03-15',
+      'qwen3-omni-flash-realtime',
+      'gpt-realtime-2.1',
+      'gpt-realtime-2.1-mini',
+      'gpt-realtime',
+      'gpt-realtime-mini'
+    ],
+    requiresApiKey: true
   }
 ];
 

@@ -113,6 +113,10 @@ function qwenPath(url: URL): string {
   return `${next.pathname}${next.search}`;
 }
 
+function usesOpenAIRealtimeProtocol(config: AppConfig): boolean {
+  return config.omniProvider === 'openai' || config.omniProvider === 'soildapi';
+}
+
 function liveToolSchema(): Record<string, unknown> {
   return {
     name: 'create_live_task',
@@ -288,7 +292,7 @@ class RealtimeSocket {
           'Sec-WebSocket-Version': '13',
           'User-Agent': 'tasi-harness-realtime/1.0',
           ...(qwenWorkspaceId ? { 'X-DashScope-WorkSpace': qwenWorkspaceId } : {}),
-          ...(config.omniProvider === 'openai' ? { 'OpenAI-Beta': 'realtime=v1' } : {})
+          ...(usesOpenAIRealtimeProtocol(config) ? { 'OpenAI-Beta': 'realtime=v1' } : {})
         }
       });
       this.request = req;

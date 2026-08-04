@@ -5245,9 +5245,9 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         <button className={`skill-tab ${subPage === 'execution' ? 'active' : ''}`} onClick={() => setSubPage('execution')}>{tr('Execution', '执行')}</button>
         <button className={`skill-tab ${subPage === 'security' ? 'active' : ''}`} onClick={() => setSubPage('security')}>{tr('Security', '安全')}</button>
         <button className={`skill-tab ${subPage === 'channels' ? 'active' : ''}`} onClick={() => setSubPage('channels')}>{tr('Channels', '通道')}</button>
+        <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
         <button className={`skill-tab ${subPage === 'theme' ? 'active' : ''}`} onClick={() => setSubPage('theme')}>{tr('Theme', '主题')}</button>
         <button className={`skill-tab ${subPage === 'branding' ? 'active' : ''}`} onClick={() => setSubPage('branding')}>{tr('Branding', '品牌')}</button>
-        <button className={`skill-tab ${subPage === 'markets' ? 'active' : ''}`} onClick={() => setSubPage('markets')}>{tr('Skill Markets', '技能市场')}</button>
       </div>
       {subPage === 'agent-model' && renderModelConfiguration('agent')}
       {subPage === 'omni-model' && renderModelConfiguration('omni')}
@@ -5558,7 +5558,7 @@ function AboutPage({ tr, info, branding }: { tr: TranslateFn; info: AppInfo | nu
         <BrandLogo branding={branding} className="about-logo" />
         <div>
           <h2>{branding.productName || info?.productName || 'Tasi Harness'}</h2>
-          <p>{tr('Agent loop | tool registry | skill marketplace | scheduled tasks | email notifications | sandbox execution.', '智能体循环 | 工具注册 | 技能市场 | 定时任务 | 邮件通知 | 沙箱执行')}</p>
+          <p>{tr('Agent loop | tool registry | skill marketplace | scheduled tasks | email notifications | sandbox execution | realtime voice.', '智能体循环 | 工具注册 | 技能市场 | 定时任务 | 邮件通知 | 沙箱执行 | 实时语音')}</p>
           <p>{tr(`Version: ${info?.version ?? 'unknown'}`, `版本：${info?.version ?? '未知'}`)}</p>
         </div>
       </div>
