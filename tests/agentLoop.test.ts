@@ -428,13 +428,57 @@ describe('AgentLoop', () => {
 
     const result = await loop.run({ userInput: 'keep going' });
 
-    expect(result.finalResponse).toContain('本轮已达到最大执行步数（2）');
+    expect(result.finalResponse).toContain('本轮已达到最大模型迭代轮次（2）');
+    expect(result.finalResponse).toContain('本轮实际工具调用次数：2。');
     expect(result.finalResponse).toContain('最近完成的操作');
     expect(result.finalResponse).toContain('step_probe：成功');
     expect(result.finalResponse).not.toContain('Reached iteration limit');
     expect(result.finalResponse).not.toContain('Last tool events');
     const storedSession = sessions.read(result.sessionId);
     expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
+
+  it('does not report an iteration limit when the model returns an empty final message early', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 200 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          reasoning_content: 'I have enough context but returned no visible answer.'
+        }
+      }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: new ToolRegistry(),
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (record) => {
+        void memory.syncSessionMemory(record);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'finish with nothing', stream: false });
+
+    expect(result.iterations).toBe(1);
+    expect(result.finalResponse).toContain('模型本轮返回了空回复');
+    expect(result.finalResponse).not.toContain('最大模型迭代轮次');
+    expect(result.finalResponse).not.toContain('最大执行步数');
   });
 
   it('does not send prior iteration-limit handoff messages back to the model', async () => {
@@ -483,6 +527,7 @@ describe('AgentLoop', () => {
     expect(result.finalResponse).toBe('Done.');
     expect(result.iterations).toBe(1);
     expect(capturedRequest?.messages.some((message) => message.content.includes('本轮已达到最大执行步数'))).toBe(false);
+    expect(capturedRequest?.messages.some((message) => message.content.includes('本轮已达到最大模型迭代轮次'))).toBe(false);
     expect(sessions.read(session.id)?.messages.some((message) => message.content.includes('本轮已达到最大执行步数'))).toBe(true);
   });
 });

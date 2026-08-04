@@ -6,7 +6,7 @@ import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
 
 const REPEATED_TOOL_RESULT_LIMIT = 3;
-const ITERATION_LIMIT_MESSAGE_PATTERN = /^本轮已达到最大执行步数（\d+），我先停在这里，避免继续消耗无效步骤。/;
+const ITERATION_LIMIT_MESSAGE_PATTERN = /^本轮已达到最大(?:模型迭代轮次|执行步数)（\d+），我先停在这里，避免继续消耗无效(?:请求|步骤)。/;
 
 function parseToolArgs(raw: string): unknown {
   if (!raw.trim()) return {};
@@ -46,7 +46,9 @@ function compactToolText(content: string, maxLength = 160): string {
 function iterationLimitResponse(maxIterations: number, toolEvents: ToolEvent[]): string {
   const recentEvents = toolEvents.slice(-5);
   const lines = [
-    `本轮已达到最大执行步数（${maxIterations}），我先停在这里，避免继续消耗无效步骤。`
+    `本轮已达到最大模型迭代轮次（${maxIterations}），我先停在这里，避免继续消耗无效请求。`,
+    '',
+    `本轮实际工具调用次数：${toolEvents.length}。`
   ];
   if (recentEvents.length > 0) {
     lines.push('', '最近完成的操作：');
@@ -58,6 +60,14 @@ function iterationLimitResponse(maxIterations: number, toolEvents: ToolEvent[]):
   }
   lines.push('', '当前页面和会话状态已保留，可以继续让我从当前状态接着做。');
   return lines.join('\n');
+}
+
+function emptyAssistantResponse(): string {
+  return [
+    '模型本轮返回了空回复，且没有请求新的工具调用；我先停在这里，避免继续空转。',
+    '',
+    '当前页面和会话状态已保留，可以继续让我从当前状态接着做。'
+  ].join('\n');
 }
 
 function isIterationLimitMessage(message: AgentMessage): boolean {
@@ -352,10 +362,14 @@ export class AgentLoop {
         if (finalResponse) break;
       }
 
-      if (!finalResponse) {
+      if (!finalResponse && iterations >= cfg.maxIterations) {
         finalResponse = iterationLimitResponse(cfg.maxIterations, toolEvents);
         const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
         persistMessages([limitMessage]);
+      } else if (!finalResponse) {
+        finalResponse = emptyAssistantResponse();
+        const emptyMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
+        persistMessages([emptyMessage]);
       }
 
       if (memoryEnabled) {
