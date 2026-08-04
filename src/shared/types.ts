@@ -178,6 +178,90 @@ export interface AppBrandingSettings {
   logoInitials: string;
 }
 
+export type AppTheme = 'dark' | 'light' | 'tech' | `custom:${string}`;
+
+export interface CustomThemeTokens {
+  bgPrimary?: string;
+  bgSecondary?: string;
+  bgTertiary?: string;
+  bgCard?: string;
+  bgCardHover?: string;
+  accent?: string;
+  accentDim?: string;
+  accent2?: string;
+  textPrimary?: string;
+  textSecondary?: string;
+  textMuted?: string;
+  border?: string;
+  borderActive?: string;
+  ok?: string;
+  warn?: string;
+  danger?: string;
+  shadow?: string;
+}
+
+export interface CustomTheme {
+  id: string;
+  name: string;
+  source: 'tasi' | 'dreamskin';
+  tokens: CustomThemeTokens;
+  backgroundPath?: string;
+  backgroundDataUrl?: string;
+  backgroundFocusX?: number;
+  backgroundFocusY?: number;
+  createdAt: string;
+}
+
+export interface ThemeImportRequest {
+  filename: string;
+  contentBase64: string;
+}
+
+export type DreamSkinGallerySort = 'recent' | 'popular';
+
+export interface DreamSkinGalleryQuery {
+  limit?: number;
+  offset?: number;
+  sort?: DreamSkinGallerySort;
+}
+
+export interface DreamSkinGalleryTheme {
+  id: string;
+  themeId: string;
+  slug: string;
+  name: string;
+  authorDisplayName: string;
+  version: string;
+  license: string;
+  packageBytes: number;
+  downloadCount: number;
+  reviewedAt?: string;
+  submittedAt?: string;
+  thumbnailDataUrl?: string;
+  displayMeta?: {
+    appearance?: 'auto' | 'light' | 'dark';
+    colors?: Record<string, string>;
+    art?: {
+      focusX?: number;
+      focusY?: number;
+      safeArea?: string;
+      taskMode?: string;
+    };
+  };
+}
+
+export interface DreamSkinGalleryResult {
+  items: DreamSkinGalleryTheme[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface DreamSkinThemeInstallRequest {
+  themeVersionId: string;
+  name?: string;
+}
+
 export interface PublicAppBrandingSettings extends AppBrandingSettings {
   logoDataUrl?: string;
 }
@@ -205,7 +289,9 @@ export interface AppConfig {
   externalBrowserProfileMode: ExternalBrowserProfileMode;
   browserHeadless: boolean;
   browserExecutionLoggingEnabled: boolean;
-  theme: 'dark' | 'light';
+  theme: AppTheme;
+  textBrightness: number;
+  customThemes: CustomTheme[];
   systemPersona: string;
   omniSystemPrompt: string;
   enabledToolNames: string[];

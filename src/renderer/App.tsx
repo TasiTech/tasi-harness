@@ -1,4 +1,5 @@
 ﻿import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
+import type { CSSProperties } from 'react';
 import type {
   AgentMessage,
   AgentMessageAttachment,
@@ -6,6 +7,10 @@ import type {
   BrowserCoachRecordedEvent,
   BrowserCoachRecording,
   BrowserCoachStoredRecording,
+  CustomTheme,
+  DreamSkinGalleryResult,
+  DreamSkinGallerySort,
+  DreamSkinGalleryTheme,
   LlmUsage,
   MarketplaceBrowseResult,
   MarketplaceSkill,
@@ -123,6 +128,8 @@ const defaultConfig: PublicAppConfig = {
   browserHeadless: false,
   browserExecutionLoggingEnabled: false,
   theme: 'dark',
+  textBrightness: 100,
+  customThemes: [],
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   omniSystemPrompt: DEFAULT_OMNI_SYSTEM_PROMPT,
   enabledToolNames: [],
@@ -171,6 +178,177 @@ function BrandLogo({ branding, className }: { branding: PublicAppConfig['brandin
     return <img className={`${className} brand-logo-image`} src={branding.logoDataUrl} alt={label} />;
   }
   return <div className={className}>{brandInitials(branding)}</div>;
+}
+
+const CUSTOM_THEME_STYLE_KEYS = [
+  '--bg-primary',
+  '--bg-secondary',
+  '--bg-tertiary',
+  '--bg-card',
+  '--bg-card-hover',
+  '--accent',
+  '--accent-dim',
+  '--accent-2',
+  '--text-primary',
+  '--text-secondary',
+  '--text-muted',
+  '--border',
+  '--border-active',
+  '--ok',
+  '--warn',
+  '--danger',
+  '--shadow',
+  '--custom-theme-background-image',
+  '--custom-theme-background-position'
+];
+
+const CUSTOM_THEME_TOKEN_TO_CSS: Array<[keyof CustomTheme['tokens'], string]> = [
+  ['bgPrimary', '--bg-primary'],
+  ['bgSecondary', '--bg-secondary'],
+  ['bgTertiary', '--bg-tertiary'],
+  ['bgCard', '--bg-card'],
+  ['bgCardHover', '--bg-card-hover'],
+  ['accent', '--accent'],
+  ['accentDim', '--accent-dim'],
+  ['accent2', '--accent-2'],
+  ['textPrimary', '--text-primary'],
+  ['textSecondary', '--text-secondary'],
+  ['textMuted', '--text-muted'],
+  ['border', '--border'],
+  ['borderActive', '--border-active'],
+  ['ok', '--ok'],
+  ['warn', '--warn'],
+  ['danger', '--danger'],
+  ['shadow', '--shadow']
+];
+
+function customThemeId(value: string): string {
+  return value.startsWith('custom:') ? value.slice('custom:'.length) : '';
+}
+
+const BUILTIN_TEXT_TOKENS: Record<'dark' | 'light' | 'tech', Required<Pick<CustomTheme['tokens'], 'textPrimary' | 'textSecondary' | 'textMuted'>>> = {
+  dark: {
+    textPrimary: '#f0f0f5',
+    textSecondary: '#9696b7',
+    textMuted: '#62627a'
+  },
+  light: {
+    textPrimary: '#1a1a2e',
+    textSecondary: '#5d607a',
+    textMuted: '#8b8da3'
+  },
+  tech: {
+    textPrimary: '#eef9ff',
+    textSecondary: '#9fc3df',
+    textMuted: '#64819a'
+  }
+};
+
+function parseCssColor(value: string): { r: number; g: number; b: number; a: number } | undefined {
+  const text = value.trim();
+  const hex = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+  if (hex) {
+    const raw = hex[1];
+    const full = raw.length === 3
+      ? raw.split('').map((char) => `${char}${char}`).join('')
+      : raw;
+    const r = Number.parseInt(full.slice(0, 2), 16);
+    const g = Number.parseInt(full.slice(2, 4), 16);
+    const b = Number.parseInt(full.slice(4, 6), 16);
+    const a = full.length === 8 ? Number.parseInt(full.slice(6, 8), 16) / 255 : 1;
+    return { r, g, b, a };
+  }
+  const rgb = text.match(/^rgba?\(([^)]+)\)$/i);
+  if (!rgb) return undefined;
+  const parts = rgb[1].split(',').map((part) => part.trim());
+  if (parts.length < 3) return undefined;
+  const [r, g, b] = parts.slice(0, 3).map((part) => Number.parseFloat(part));
+  const a = parts[3] == null ? 1 : Number.parseFloat(parts[3]);
+  if (![r, g, b, a].every(Number.isFinite)) return undefined;
+  return { r, g, b, a: Math.max(0, Math.min(1, a)) };
+}
+
+function mixColor(color: { r: number; g: number; b: number; a: number }, target: { r: number; g: number; b: number }, amount: number): string {
+  const weight = Math.max(0, Math.min(1, amount));
+  const r = Math.round(color.r + (target.r - color.r) * weight);
+  const g = Math.round(color.g + (target.g - color.g) * weight);
+  const b = Math.round(color.b + (target.b - color.b) * weight);
+  if (color.a < 1) return `rgba(${r}, ${g}, ${b}, ${Number(color.a.toFixed(3))})`;
+  return `rgb(${r}, ${g}, ${b})`;
+}
+
+function adjustTextColor(value: string, brightness: number): string | undefined {
+  const color = parseCssColor(value);
+  if (!color) return undefined;
+  if (brightness === 100) return value;
+  if (brightness > 100) return mixColor(color, { r: 255, g: 255, b: 255 }, Math.min(0.8, (brightness - 100) / 70));
+  return mixColor(color, { r: 0, g: 0, b: 0 }, Math.min(0.65, (100 - brightness) / 80));
+}
+
+function baseTextTokens(config: PublicAppConfig, theme?: CustomTheme): Required<Pick<CustomTheme['tokens'], 'textPrimary' | 'textSecondary' | 'textMuted'>> {
+  if (theme) {
+    return {
+      textPrimary: theme.tokens.textPrimary || BUILTIN_TEXT_TOKENS.dark.textPrimary,
+      textSecondary: theme.tokens.textSecondary || BUILTIN_TEXT_TOKENS.dark.textSecondary,
+      textMuted: theme.tokens.textMuted || BUILTIN_TEXT_TOKENS.dark.textMuted
+    };
+  }
+  if (config.theme === 'light' || config.theme === 'tech') return BUILTIN_TEXT_TOKENS[config.theme];
+  return BUILTIN_TEXT_TOKENS.dark;
+}
+
+function applyTextBrightness(config: PublicAppConfig, theme?: CustomTheme): void {
+  const brightness = Math.max(70, Math.min(150, Number(config.textBrightness) || 100));
+  const root = document.documentElement;
+  const tokens = baseTextTokens(config, theme);
+  const targets = [
+    ['--text-primary', tokens.textPrimary],
+    ['--text-secondary', tokens.textSecondary],
+    ['--text-muted', tokens.textMuted]
+  ] as const;
+  for (const [cssKey, base] of targets) {
+    const adjusted = adjustTextColor(base, brightness);
+    root.style.setProperty(cssKey, adjusted || base);
+  }
+}
+
+function applyDocumentTheme(config: PublicAppConfig): void {
+  const root = document.documentElement;
+  for (const key of CUSTOM_THEME_STYLE_KEYS) root.style.removeProperty(key);
+  const customId = customThemeId(config.theme);
+  const theme = customId ? (config.customThemes ?? []).find((item) => item.id === customId) : undefined;
+  if (!theme) {
+    root.setAttribute('data-theme', config.theme || 'dark');
+    applyTextBrightness(config);
+    return;
+  }
+  root.setAttribute('data-theme', 'custom');
+  for (const [tokenKey, cssKey] of CUSTOM_THEME_TOKEN_TO_CSS) {
+    const value = theme.tokens[tokenKey];
+    if (value) root.style.setProperty(cssKey, value);
+  }
+  if (theme.backgroundDataUrl) {
+    root.style.setProperty('--custom-theme-background-image', `url("${theme.backgroundDataUrl}")`);
+    const focusX = Math.round((theme.backgroundFocusX ?? 0.5) * 100);
+    const focusY = Math.round((theme.backgroundFocusY ?? 0.5) * 100);
+    root.style.setProperty('--custom-theme-background-position', `${focusX}% ${focusY}%`);
+  }
+  applyTextBrightness(config, theme);
+}
+
+function getActiveCustomTheme(config: PublicAppConfig): CustomTheme | undefined {
+  const id = customThemeId(config.theme);
+  return id ? config.customThemes.find((theme) => theme.id === id) : undefined;
+}
+
+function customThemeBackgroundStyle(theme?: CustomTheme): CSSProperties | undefined {
+  if (!theme?.backgroundDataUrl) return undefined;
+  const focusX = Math.round((theme.backgroundFocusX ?? 0.5) * 100);
+  const focusY = Math.round((theme.backgroundFocusY ?? 0.5) * 100);
+  return {
+    backgroundImage: `url("${theme.backgroundDataUrl}")`,
+    backgroundPosition: `${focusX}% ${focusY}%`
+  };
 }
 
 function prettyDate(iso?: string): string {
@@ -331,6 +509,19 @@ function formatBytes(bytes?: number): string {
   if (!Number.isFinite(value) || value <= 0) return '';
   if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatCount(value?: number): string {
+  const count = Number(value ?? 0);
+  if (!Number.isFinite(count) || count <= 0) return '0';
+  return new Intl.NumberFormat().format(count);
+}
+
+function dreamSkinSwatches(theme: DreamSkinGalleryTheme): string[] {
+  const colors = theme.displayMeta?.colors ?? {};
+  return ['background', 'panel', 'accent', 'highlight', 'text']
+    .map((key) => colors[key])
+    .filter((value): value is string => Boolean(value));
 }
 
 function findFirstHttpUrl(text: string): string | undefined {
@@ -613,14 +804,14 @@ export function App(): ReactElement {
     void window.tasiHarness.config.get().then((cfg) => {
       setConfig(cfg);
       setExecutionMode(cfg.defaultExecutionMode);
-      document.documentElement.setAttribute('data-theme', cfg.theme || 'dark');
+      applyDocumentTheme(cfg);
     });
     void window.tasiHarness.app.info().then(setInfo);
   }, []);
 
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', config.theme || 'dark');
-  }, [config.theme]);
+    applyDocumentTheme(config);
+  }, [config.theme, config.customThemes, config.textBrightness]);
 
   useEffect(() => {
     document.title = config.branding.productName || 'Tasi Harness';
@@ -754,9 +945,12 @@ export function App(): ReactElement {
     : statusModelReady
     ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
     : tr('Configure model', '请配置模型');
+  const activeCustomTheme = getActiveCustomTheme(config);
+  const customThemeBackground = customThemeBackgroundStyle(activeCustomTheme);
 
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
+      {customThemeBackground && <div className="custom-theme-background" style={customThemeBackground} aria-hidden="true" />}
       <aside className="sidebar">
         <div className="sidebar-logo">
           <BrandLogo branding={config.branding} className="logo-icon" />
@@ -5000,11 +5194,43 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
   const [wechatLoginStatus, setWechatLoginStatus] = useState<'idle' | 'wait' | 'scaned' | 'confirmed' | 'expired' | 'error' | 'unknown'>('idle');
   const wechatLoginPollRef = useRef<number | null>(null);
   const wechatLoginCheckingRef = useRef(false);
+  const themeImportInputRef = useRef<HTMLInputElement | null>(null);
+  const [dreamSkinSort, setDreamSkinSort] = useState<DreamSkinGallerySort>('recent');
+  const [dreamSkinOffset, setDreamSkinOffset] = useState(0);
+  const [dreamSkinGallery, setDreamSkinGallery] = useState<DreamSkinGalleryResult | null>(null);
+  const [dreamSkinLoading, setDreamSkinLoading] = useState(false);
+  const [dreamSkinError, setDreamSkinError] = useState('');
+  const [dreamSkinInstallingId, setDreamSkinInstallingId] = useState('');
 
   useEffect(() => {
     setDraft({ ...config, apiKey: '', omniApiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
     setWechatLoginStatus(config.wechatChannel.loginStatus ?? 'idle');
   }, [config]);
+
+  useEffect(() => {
+    if (subPage !== 'theme') return;
+    let cancelled = false;
+    setDreamSkinLoading(true);
+    setDreamSkinError('');
+    void window.tasiHarness.themes.listDreamSkinGallery({
+      limit: 12,
+      offset: dreamSkinOffset,
+      sort: dreamSkinSort
+    }).then((result) => {
+      if (!cancelled) setDreamSkinGallery(result);
+    }, (error) => {
+      if (!cancelled) setDreamSkinError(error instanceof Error ? error.message : String(error));
+    }).finally(() => {
+      if (!cancelled) setDreamSkinLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [subPage, dreamSkinOffset, dreamSkinSort]);
+
+  useEffect(() => {
+    if (subPage !== 'theme') applyDocumentTheme(config);
+  }, [subPage, config]);
 
   const agentProviderPreset = providerPreset(draft.provider);
   const agentSuggestedModels = providerModelOptions(draft.provider);
@@ -5140,6 +5366,62 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
     }));
   }
 
+  async function importThemePackage(file: File): Promise<void> {
+    try {
+      const next = await window.tasiHarness.themes.importPackage({
+        filename: file.name,
+        contentBase64: await fileToBase64(file)
+      });
+      setConfig(next);
+      setDraft({ ...next, apiKey: '', omniApiKey: '', emailNotifications: { ...next.emailNotifications, password: '' } });
+      const theme = next.customThemes.find((item) => `custom:${item.id}` === next.theme);
+      const themeName = theme?.name ?? file.name;
+      setTestResult(tr(`Imported theme: ${themeName}`, `已导入主题：${themeName}`));
+    } catch (error) {
+      setTestResult(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (themeImportInputRef.current) themeImportInputRef.current.value = '';
+    }
+  }
+
+  async function refreshDreamSkinGallery(): Promise<void> {
+    setDreamSkinLoading(true);
+    setDreamSkinError('');
+    try {
+      const result = await window.tasiHarness.themes.listDreamSkinGallery({
+        limit: 12,
+        offset: dreamSkinOffset,
+        sort: dreamSkinSort
+      });
+      setDreamSkinGallery(result);
+    } catch (error) {
+      setDreamSkinError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDreamSkinLoading(false);
+    }
+  }
+
+  async function installDreamSkinTheme(theme: DreamSkinGalleryTheme): Promise<void> {
+    if (dreamSkinInstallingId) return;
+    setDreamSkinInstallingId(theme.id);
+    setDreamSkinError('');
+    try {
+      const next = await window.tasiHarness.themes.installDreamSkinTheme({
+        themeVersionId: theme.id,
+        name: theme.name
+      });
+      setConfig(next);
+      setDraft({ ...next, apiKey: '', omniApiKey: '', emailNotifications: { ...next.emailNotifications, password: '' } });
+      setTestResult(tr(`Installed DreamSkin theme: ${theme.name}`, `已安装 DreamSkin 主题：${theme.name}`));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setDreamSkinError(message);
+      setTestResult(message);
+    } finally {
+      setDreamSkinInstallingId('');
+    }
+  }
+
   function renderModelConfiguration(profile: 'agent' | 'omni'): ReactElement {
     const isOmni = profile === 'omni';
     const activeProvider = isOmni ? draft.omniProvider : draft.provider;
@@ -5226,6 +5508,15 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         </div>
       </div>
     );
+  }
+
+  const selectedCustomTheme = getActiveCustomTheme(draft);
+  const selectedThemeBackground = customThemeBackgroundStyle(selectedCustomTheme);
+
+  function updateThemeDraft(patch: Partial<Pick<SettingsDraft, 'theme' | 'textBrightness'>>): void {
+    const next = { ...draft, ...patch };
+    setDraft(next);
+    applyDocumentTheme(next);
   }
 
   return (
@@ -5456,10 +5747,166 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         <div className="card">
           <h2>{tr('Theme', '主题')}</h2>
           <label>{tr('Theme', '主题')}</label>
-          <select value={draft.theme} onChange={(e) => setDraft((old) => ({ ...old, theme: e.target.value as PublicAppConfig['theme'] }))}>
+          <select value={draft.theme} onChange={(e) => updateThemeDraft({ theme: e.target.value as PublicAppConfig['theme'] })}>
             <option value="dark">{tr('Dark', '深色')}</option>
             <option value="light">{tr('Light', '浅色')}</option>
+            <option value="tech">{tr('Tech Glass', '科技蓝')}</option>
+            {draft.customThemes.length > 0 && (
+              <optgroup label={tr('Imported themes', '已导入主题')}>
+                {draft.customThemes.map((theme) => (
+                  <option key={theme.id} value={`custom:${theme.id}`}>
+                    {theme.name} · {theme.source === 'dreamskin' ? 'DreamSkin' : 'Tasi'}
+                  </option>
+                ))}
+              </optgroup>
+            )}
           </select>
+          <div className="theme-adjust-row">
+            <div>
+              <label htmlFor="text-brightness">{tr('Text brightness', '字体亮度')}</label>
+              <p>{tr('Adjusts primary, secondary, and muted text across the selected theme.', '调节当前主题里的主文字、次级文字和弱提示文字。')}</p>
+            </div>
+            <div className="theme-adjust-control">
+              <input
+                id="text-brightness"
+                type="range"
+                min="70"
+                max="150"
+                step="1"
+                value={draft.textBrightness ?? 100}
+                onChange={(event) => updateThemeDraft({ textBrightness: Number(event.currentTarget.value) })}
+              />
+              <span className="soft-badge">{draft.textBrightness ?? 100}%</span>
+            </div>
+          </div>
+          {selectedCustomTheme && (
+            <div className="theme-preview">
+              {selectedThemeBackground
+                ? <div className="theme-preview-image" style={selectedThemeBackground} />
+                : <div className="theme-preview-empty">{tr('This theme package has no background image.', '这个主题包没有背景图。')}</div>}
+              <div>
+                <strong>{selectedCustomTheme.name}</strong>
+                <p>{selectedCustomTheme.source === 'dreamskin' ? 'DreamSkin' : 'Tasi'}</p>
+              </div>
+            </div>
+          )}
+          <input
+            ref={themeImportInputRef}
+            type="file"
+            accept=".zip,.json,application/zip,application/json"
+            className="hidden-file-input"
+            onChange={(event) => {
+              const file = event.currentTarget.files?.[0];
+              if (file) void importThemePackage(file);
+            }}
+          />
+          <div className="button-row">
+            <button className="ghost-button" onClick={() => themeImportInputRef.current?.click()}>
+              {tr('Import DreamSkin theme package', '导入 DreamSkin 主题包')}
+            </button>
+            <span className="soft-badge">{tr('Imported', '已导入')} {draft.customThemes.length}</span>
+          </div>
+          <div className="card-subtle">
+            {tr(
+              'Supports DreamSkin .zip packages with theme.json and background.webp/jpg/png, or Tasi JSON token themes. Safe CSS is limited to color variables.',
+              '支持包含 theme.json 与 background.webp/jpg/png 的 DreamSkin .zip，也支持 Tasi JSON token 主题。Safe CSS 仅提取颜色变量。'
+            )}
+          </div>
+          <div className="dreamskin-gallery-panel">
+            <div className="dreamskin-gallery-head">
+              <div>
+                <h3>{tr('DreamSkin Gallery', 'DreamSkin 主题库')}</h3>
+                <p>{tr('Browse themes from dreamskin.cc/gallery and install one with a single click.', '浏览 dreamskin.cc/gallery 的主题，并一键下载安装。')}</p>
+              </div>
+              <div className="button-row compact">
+                <button
+                  className={`ghost-button ${dreamSkinSort === 'recent' ? 'active' : ''}`}
+                  onClick={() => {
+                    setDreamSkinSort('recent');
+                    setDreamSkinOffset(0);
+                  }}
+                >
+                  {tr('Latest', '最新')}
+                </button>
+                <button
+                  className={`ghost-button ${dreamSkinSort === 'popular' ? 'active' : ''}`}
+                  onClick={() => {
+                    setDreamSkinSort('popular');
+                    setDreamSkinOffset(0);
+                  }}
+                >
+                  {tr('Popular', '热门')}
+                </button>
+                <button className="ghost-button" disabled={dreamSkinLoading} onClick={() => void refreshDreamSkinGallery()}>
+                  {dreamSkinLoading ? tr('Loading...', '加载中...') : tr('Refresh', '刷新')}
+                </button>
+                <a className="ghost-button" href="https://dreamskin.cc/gallery" target="_blank" rel="noreferrer">
+                  {tr('Open Website', '打开网站')}
+                </a>
+              </div>
+            </div>
+            {dreamSkinError && <div className="notice-box error">{dreamSkinError}</div>}
+            {dreamSkinLoading && !dreamSkinGallery && <div className="tool-empty">{tr('Loading DreamSkin themes...', '正在加载 DreamSkin 主题...')}</div>}
+            {dreamSkinGallery && (
+              <>
+                <div className="dreamskin-gallery-meta">
+                  <span>{tr('Total', '总数')}: {formatCount(dreamSkinGallery.total)}</span>
+                  <span>{tr('Page', '页码')}: {Math.floor(dreamSkinGallery.offset / dreamSkinGallery.limit) + 1}</span>
+                </div>
+                <div className="dreamskin-theme-grid">
+                  {dreamSkinGallery.items.map((theme) => {
+                    const swatches = dreamSkinSwatches(theme);
+                    const installing = dreamSkinInstallingId === theme.id;
+                    return (
+                      <div className="dreamskin-theme-card" key={theme.id}>
+                        <div className="dreamskin-theme-thumb">
+                          {theme.thumbnailDataUrl
+                            ? <img src={theme.thumbnailDataUrl} alt="" />
+                            : <div className="dreamskin-theme-thumb-fallback" aria-hidden="true">
+                              {swatches.map((color, index) => <span key={`${theme.id}-${color}-${index}`} style={{ background: color }} />)}
+                            </div>}
+                        </div>
+                        <div className="dreamskin-theme-body">
+                          <div className="dreamskin-theme-title">
+                            <strong>{theme.name}</strong>
+                            <span>v{theme.version}</span>
+                          </div>
+                          <p>{theme.authorDisplayName}</p>
+                          <div className="dreamskin-theme-swatches" aria-hidden="true">
+                            {swatches.map((color, index) => <i key={`${theme.id}-swatch-${index}`} style={{ background: color }} />)}
+                          </div>
+                          <div className="dreamskin-theme-meta">
+                            <span>{formatBytes(theme.packageBytes)}</span>
+                            <span>{theme.license}</span>
+                            <span>{tr('Downloads', '下载')} {formatCount(theme.downloadCount)}</span>
+                          </div>
+                          <button
+                            className="primary-button"
+                            disabled={Boolean(dreamSkinInstallingId)}
+                            onClick={() => void installDreamSkinTheme(theme)}
+                          >
+                            {installing ? tr('Installing...', '安装中...') : tr('Install', '安装')}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="dreamskin-gallery-pager">
+                  <button className="ghost-button" disabled={dreamSkinLoading || dreamSkinGallery.offset <= 0} onClick={() => setDreamSkinOffset((value) => Math.max(0, value - (dreamSkinGallery.limit || 12)))}>
+                    {tr('Previous', '上一页')}
+                  </button>
+                  <button
+                    className="ghost-button"
+                    disabled={dreamSkinLoading || dreamSkinGallery.offset + dreamSkinGallery.limit >= dreamSkinGallery.total}
+                    onClick={() => setDreamSkinOffset((value) => value + (dreamSkinGallery.limit || 12))}
+                  >
+                    {tr('Next', '下一页')}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       )}
       {subPage === 'branding' && (

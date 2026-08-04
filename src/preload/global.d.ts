@@ -52,12 +52,16 @@ import type {
   SkillPatchRequest,
   ToolApprovalDecision,
   ToolApprovalRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinGalleryResult,
+  DreamSkinThemeInstallRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   SkillWriteRequest,
   ToolDefinition,
   ToolExecutionResult,
-  ToolRunRequest
+  ToolRunRequest,
+  ThemeImportRequest
 } from '../shared/types';
 
 declare global {
@@ -69,6 +73,11 @@ declare global {
         test(profile?: 'agent' | 'omni'): Promise<ToolExecutionResult>;
         wechatQrcode(): Promise<WechatChannelQrCodePayload>;
         wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
+      };
+      themes: {
+        importPackage(req: ThemeImportRequest): Promise<PublicAppConfig>;
+        listDreamSkinGallery(req?: DreamSkinGalleryQuery): Promise<DreamSkinGalleryResult>;
+        installDreamSkinTheme(req: DreamSkinThemeInstallRequest): Promise<PublicAppConfig>;
       };
       agent: {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]): Promise<AgentRunResult>;
@@ -166,6 +175,9 @@ declare global {
         openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
+        windowMinimize(): Promise<boolean>;
+        windowToggleMaximize(): Promise<boolean>;
+        windowClose(): Promise<boolean>;
       };
     };
   }

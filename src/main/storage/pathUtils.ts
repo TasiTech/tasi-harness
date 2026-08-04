@@ -46,6 +46,8 @@ export function defaultConfig(): AppConfig {
     browserHeadless: false,
     browserExecutionLoggingEnabled: false,
     theme: 'dark',
+    textBrightness: 100,
+    customThemes: [],
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
     omniSystemPrompt: DEFAULT_OMNI_SYSTEM_PROMPT,

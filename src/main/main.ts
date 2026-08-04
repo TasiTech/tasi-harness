@@ -42,6 +42,9 @@ import type {
   SkillOptimizationRunRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinThemeInstallRequest,
+  ThemeImportRequest,
   ToolRunRequest,
   WechatChannelLoginStatusPayload,
   WechatChannelQrCodePayload
@@ -56,10 +59,12 @@ import { isPathInside, objectArgs, resolveToolPath, stringArg } from './tools/to
 import { LiveTaskQueue } from './live/liveTaskQueue.js';
 import { LiveSessionStore } from './live/liveSessionStore.js';
 import { RealtimeSessionManager } from './live/realtimeSessionManager.js';
+import { importThemePackage } from './storage/themeImporter.js';
+import { installDreamSkinTheme, listDreamSkinGallery } from './storage/dreamSkinGallery.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const electronRequire = createRequire(import.meta.url);
-const { app, BrowserWindow, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
+const { app, BrowserWindow, Menu, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
 const { shell } = electronRequire('electron/common') as typeof import('electron/common');
 let mainWindow: ElectronBrowserWindow | null = null;
 let devToolsWindow: ElectronBrowserWindow | null = null;
@@ -1873,6 +1878,17 @@ async function createWindow(): Promise<void> {
     minWidth: 1040,
     minHeight: 680,
     title: cfg.branding.productName,
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'win32'
+      ? {
+          titleBarOverlay: {
+            color: '#0c0b18',
+            symbolColor: '#eee7ff',
+            height: 48
+          }
+        }
+      : {}),
+    autoHideMenuBar: true,
     backgroundColor: '#0a0a0f',
     ...(appIconPath ? { icon: appIconPath } : {}),
     webPreferences: {
@@ -1883,6 +1899,9 @@ async function createWindow(): Promise<void> {
       webviewTag: true
     }
   });
+  mainWindow.setMenu(null);
+  mainWindow.setAutoHideMenuBar(true);
+  mainWindow.setMenuBarVisibility(false);
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.webContents.once('did-finish-load', () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -2078,6 +2097,20 @@ function registerIpc(): void {
     const config = context.getConfig();
     return profile === 'omni' ? testRealtimeConnection(config) : testLlmConnection(config);
   });
+  ipcMain.handle('themes:import', async (_event, req: ThemeImportRequest) => {
+    const theme = await importThemePackage(context.harnessHome, req);
+    const config = context.getConfig();
+    const next = context.configStore.update({
+      customThemes: [
+        theme,
+        ...config.customThemes.filter((item) => item.id !== theme.id)
+      ],
+      theme: `custom:${theme.id}`
+    });
+    return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
+  });
+  ipcMain.handle('themes:dreamskin:list', async (_event, req?: DreamSkinGalleryQuery) => listDreamSkinGallery(req ?? {}));
+  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => installDreamSkinTheme(context.harnessHome, context.configStore, req));
   ipcMain.handle('liveRealtime:start', async (_event, req?: LiveRealtimeStartRequest) => liveRealtimeManager.start(req ?? {}));
   ipcMain.handle('liveRealtime:send', async (_event, event: LiveRealtimeClientEvent) => {
     liveRealtimeManager.send(event);
@@ -2656,6 +2689,23 @@ function registerIpc(): void {
     target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
   });
+  ipcMain.handle('app:windowMinimize', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (win && !win.isDestroyed()) win.minimize();
+    return true;
+  });
+  ipcMain.handle('app:windowToggleMaximize', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (!win || win.isDestroyed()) return false;
+    if (win.isMaximized()) win.unmaximize();
+    else win.maximize();
+    return win.isMaximized();
+  });
+  ipcMain.handle('app:windowClose', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (win && !win.isDestroyed()) win.close();
+    return true;
+  });
 }
 
 app.on('before-quit', () => {
@@ -2671,6 +2721,7 @@ app.on('before-quit', () => {
 
 app.whenReady().then(() => {
   applyPlatformAppIdentity();
+  Menu.setApplicationMenu(null);
   app.setName(context.getConfig().branding.productName);
   applyBrandDockIcon(context.getConfig().branding.logoPath);
   registerWechatTools();

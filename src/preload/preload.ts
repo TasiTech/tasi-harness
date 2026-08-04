@@ -32,8 +32,12 @@ import type {
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinGalleryResult,
+  DreamSkinThemeInstallRequest,
   ToolApprovalDecision,
   ToolApprovalRequest,
+  ThemeImportRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   ToolRunRequest
@@ -49,6 +53,11 @@ const api = {
     test: (profile?: 'agent' | 'omni') => ipcRenderer.invoke('config:test', profile),
     wechatQrcode: () => ipcRenderer.invoke('config:wechatQrcode') as Promise<WechatChannelQrCodePayload>,
     wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
+  },
+  themes: {
+    importPackage: (req: ThemeImportRequest) => ipcRenderer.invoke('themes:import', req),
+    listDreamSkinGallery: (req?: DreamSkinGalleryQuery) => ipcRenderer.invoke('themes:dreamskin:list', req) as Promise<DreamSkinGalleryResult>,
+    installDreamSkinTheme: (req: DreamSkinThemeInstallRequest) => ipcRenderer.invoke('themes:dreamskin:install', req) as Promise<PublicAppConfig>
   },
   agent: {
     chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]) =>
@@ -176,7 +185,10 @@ const api = {
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
     openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),
     closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
-    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
+    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id),
+    windowMinimize: () => ipcRenderer.invoke('app:windowMinimize') as Promise<boolean>,
+    windowToggleMaximize: () => ipcRenderer.invoke('app:windowToggleMaximize') as Promise<boolean>,
+    windowClose: () => ipcRenderer.invoke('app:windowClose') as Promise<boolean>
   }
 };
 
