@@ -165,6 +165,7 @@ export class AgentLoop {
       let usage = undefined as AgentRunResult['usage'];
       let log_probs: AgentRunResult['log_probs'];
       let finalResponse = '';
+      let stopReason: 'final' | 'empty' | 'repeated-tool' | 'iteration-limit' | undefined;
       let iterations = 0;
       let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
       options.onSessionUpdated?.(updatedSession);
@@ -197,6 +198,19 @@ export class AgentLoop {
           reasoning_content: reasoning,
           createdAt
         }]);
+      };
+      const emitDoneDelta = (content: string, reasoning?: string, reasoningParts?: string[]): void => {
+        if (options.stream === false || typeof options.onMessageDelta !== 'function') return;
+        options.onMessageDelta(session.id, {
+          sessionId: session.id,
+          messageId: visibleAssistantId,
+          role: 'assistant',
+          type: 'done',
+          content,
+          reasoning_content: reasoning,
+          reasoning_parts: reasoningParts,
+          createdAt: visibleAssistantCreatedAt
+        });
       };
 
       for (; iterations < cfg.maxIterations;) {
@@ -275,20 +289,15 @@ export class AgentLoop {
         if (toolCalls.length === 0) {
           if (accumulatedReasoning) assistant.reasoning_content = accumulatedReasoning;
           if (accumulatedReasoningParts.length > 0) assistant.reasoning_parts = [...accumulatedReasoningParts];
-          finalResponse = assistant.content || '';
-          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true);
-          if (canStream) {
-            options.onMessageDelta?.(session.id, {
-              sessionId: session.id,
-              messageId: visibleAssistantId,
-              role: 'assistant',
-              type: 'done',
-              content: assistant.content,
-              reasoning_content: assistant.reasoning_content,
-              reasoning_parts: assistant.reasoning_parts,
-              createdAt: visibleAssistantCreatedAt
-            });
+          const assistantContent = assistant.content ?? '';
+          finalResponse = assistantContent.trim() ? assistantContent : '';
+          stopReason = finalResponse ? 'final' : 'empty';
+          if (stopReason === 'empty') {
+            finalResponse = emptyAssistantResponse();
+            assistant.content = finalResponse;
           }
+          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true);
+          if (canStream) emitDoneDelta(finalResponse, assistant.reasoning_content, assistant.reasoning_parts);
           persistMessages([assistant]);
           break;
         }
@@ -336,6 +345,7 @@ export class AgentLoop {
           lastToolResultSignature = toolResultSignature;
           if (repeatedToolResultCount >= REPEATED_TOOL_RESULT_LIMIT) {
             finalResponse = repeatedToolDiagnostic(call.function.name, args, result.ok, result.content, REPEATED_TOOL_RESULT_LIMIT);
+            stopReason = 'repeated-tool';
             const diagnosticMessage: AgentMessage = {
               id: createId('msg'),
               role: 'assistant',
@@ -344,32 +354,22 @@ export class AgentLoop {
             };
             messages.push(diagnosticMessage);
             persistMessages([diagnosticMessage]);
-            if (canStream) {
-              options.onMessageDelta?.(session.id, {
-                sessionId: session.id,
-                messageId: visibleAssistantId,
-                role: 'assistant',
-                type: 'done',
-                content: finalResponse,
-                reasoning_content: accumulatedReasoning || undefined,
-                reasoning_parts: accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined,
-                createdAt: visibleAssistantCreatedAt
-              });
-            }
+            if (canStream) emitDoneDelta(finalResponse, accumulatedReasoning || undefined, accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined);
             break;
           }
         }
         if (finalResponse) break;
       }
 
-      if (!finalResponse && iterations >= cfg.maxIterations) {
+      if (!stopReason && iterations >= cfg.maxIterations) {
+        stopReason = 'iteration-limit';
+      }
+
+      if (!finalResponse && stopReason === 'iteration-limit') {
         finalResponse = iterationLimitResponse(cfg.maxIterations, toolEvents);
         const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
         persistMessages([limitMessage]);
-      } else if (!finalResponse) {
-        finalResponse = emptyAssistantResponse();
-        const emptyMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
-        persistMessages([emptyMessage]);
+        emitDoneDelta(finalResponse, accumulatedReasoning || undefined, accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined);
       }
 
       if (memoryEnabled) {

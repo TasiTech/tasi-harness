@@ -426,7 +426,13 @@ describe('AgentLoop', () => {
       }
     });
 
-    const result = await loop.run({ userInput: 'keep going' });
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'keep going',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'done') deltas.push(event.content ?? '');
+      }
+    });
 
     expect(result.finalResponse).toContain('本轮已达到最大模型迭代轮次（2）');
     expect(result.finalResponse).toContain('本轮实际工具调用次数：2。');
@@ -434,6 +440,7 @@ describe('AgentLoop', () => {
     expect(result.finalResponse).toContain('step_probe：成功');
     expect(result.finalResponse).not.toContain('Reached iteration limit');
     expect(result.finalResponse).not.toContain('Last tool events');
+    expect(deltas.at(-1)).toBe(result.finalResponse);
     const storedSession = sessions.read(result.sessionId);
     expect(storedSession?.messages.at(-1)?.content).toBe(result.finalResponse);
   });
@@ -441,7 +448,7 @@ describe('AgentLoop', () => {
   it('does not report an iteration limit when the model returns an empty final message early', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
-    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 200 };
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
     ensureDir(cfg.workspaceDir);
     const memory = new MemoryStore(env.home);
     const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
@@ -473,12 +480,23 @@ describe('AgentLoop', () => {
       }
     });
 
-    const result = await loop.run({ userInput: 'finish with nothing', stream: false });
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'finish with nothing',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'done') deltas.push(event.content ?? '');
+      }
+    });
 
     expect(result.iterations).toBe(1);
     expect(result.finalResponse).toContain('模型本轮返回了空回复');
     expect(result.finalResponse).not.toContain('最大模型迭代轮次');
     expect(result.finalResponse).not.toContain('最大执行步数');
+    expect(deltas).toEqual([result.finalResponse]);
+    expect(result.messages.map((message) => `${message.role}:${message.content}`)).toEqual([
+      'user:finish with nothing',
+      `assistant:${result.finalResponse}`
+    ]);
   });
 
   it('does not send prior iteration-limit handoff messages back to the model', async () => {
