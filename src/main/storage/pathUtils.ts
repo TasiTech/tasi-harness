@@ -2,7 +2,8 @@ import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import type { AppConfig } from '../../shared/types.js';
-import { providerDefaultBaseUrl, providerDefaultModel } from '../../shared/providerCatalog.js';
+import { DEFAULT_OMNI_SYSTEM_PROMPT } from '../../shared/defaultPrompts.js';
+import { omniProviderDefaultBaseUrl, omniProviderDefaultModel, providerDefaultBaseUrl, providerDefaultModel } from '../../shared/providerCatalog.js';
 
 export const DEFAULT_HOME = join(homedir(), '.tasi-harness');
 
@@ -13,10 +14,19 @@ export function ensureDir(path: string): string {
 
 export function defaultConfig(): AppConfig {
   return {
+    branding: {
+      productName: 'Tasi Harness',
+      logoPath: '',
+      logoInitials: 'TH'
+    },
     provider: 'openai',
     baseUrl: providerDefaultBaseUrl('openai'),
     apiKey: '',
     model: providerDefaultModel('openai'),
+    omniProvider: 'openai',
+    omniBaseUrl: omniProviderDefaultBaseUrl('openai'),
+    omniApiKey: '',
+    omniModel: omniProviderDefaultModel('openai'),
     temperature: 0.3,
     maxIterations: 200,
     sessionDocumentMaxDocs: 10,
@@ -36,8 +46,11 @@ export function defaultConfig(): AppConfig {
     browserHeadless: false,
     browserExecutionLoggingEnabled: false,
     theme: 'dark',
+    textBrightness: 100,
+    customThemes: [],
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',
+    omniSystemPrompt: DEFAULT_OMNI_SYSTEM_PROMPT,
     defaultExecutionMode: 'workspace',
     skillMarketSources: [
       {

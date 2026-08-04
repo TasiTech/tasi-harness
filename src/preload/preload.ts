@@ -10,6 +10,12 @@ import type {
   BrowserCoachStartRequest,
   BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
+  LiveAgentTaskCreateRequest,
+  LiveAgentTaskUpdateEvent,
+  LiveSessionAppendMessageRequest,
+  LiveRealtimeClientEvent,
+  LiveRealtimeEvent,
+  LiveRealtimeStartRequest,
   MemoryClearRequest,
   MemoryQueryOptions,
   PersonalKnowledgeFolderImportResult,
@@ -26,8 +32,12 @@ import type {
   SkillInstallRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinGalleryResult,
+  DreamSkinThemeInstallRequest,
   ToolApprovalDecision,
   ToolApprovalRequest,
+  ThemeImportRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   ToolRunRequest
@@ -39,10 +49,15 @@ const { contextBridge, ipcRenderer } = electronRequire('electron/renderer') as t
 const api = {
   config: {
     get: () => ipcRenderer.invoke('config:get') as Promise<PublicAppConfig>,
-    set: (partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }) => ipcRenderer.invoke('config:set', partial) as Promise<PublicAppConfig>,
-    test: () => ipcRenderer.invoke('config:test'),
+    set: (partial: Partial<PublicAppConfig> & { apiKey?: string; omniApiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }) => ipcRenderer.invoke('config:set', partial) as Promise<PublicAppConfig>,
+    test: (profile?: 'agent' | 'omni') => ipcRenderer.invoke('config:test', profile),
     wechatQrcode: () => ipcRenderer.invoke('config:wechatQrcode') as Promise<WechatChannelQrCodePayload>,
     wechatQrcodeStatus: (qrcodeKey: string) => ipcRenderer.invoke('config:wechatQrcodeStatus', qrcodeKey) as Promise<WechatChannelLoginStatusPayload>
+  },
+  themes: {
+    importPackage: (req: ThemeImportRequest) => ipcRenderer.invoke('themes:import', req),
+    listDreamSkinGallery: (req?: DreamSkinGalleryQuery) => ipcRenderer.invoke('themes:dreamskin:list', req) as Promise<DreamSkinGalleryResult>,
+    installDreamSkinTheme: (req: DreamSkinThemeInstallRequest) => ipcRenderer.invoke('themes:dreamskin:install', req) as Promise<PublicAppConfig>
   },
   agent: {
     chat: (input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]) =>
@@ -61,6 +76,33 @@ const api = {
       ipcRenderer.on(channel, wrapped);
       return () => ipcRenderer.removeListener(channel, wrapped);
     }
+  },
+  liveRealtime: {
+    start: (req?: LiveRealtimeStartRequest) => ipcRenderer.invoke('liveRealtime:start', req),
+    send: (event: LiveRealtimeClientEvent) => ipcRenderer.invoke('liveRealtime:send', event),
+    stop: () => ipcRenderer.invoke('liveRealtime:stop'),
+    onEvent: (listener: (payload: LiveRealtimeEvent) => void) => {
+      const channel = 'live-realtime:event';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: LiveRealtimeEvent) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    }
+  },
+  liveTasks: {
+    list: (sessionId?: string) => ipcRenderer.invoke('liveTasks:list', sessionId),
+    enqueue: (req: LiveAgentTaskCreateRequest) => ipcRenderer.invoke('liveTasks:enqueue', req),
+    stop: (taskId: string) => ipcRenderer.invoke('liveTasks:stop', taskId),
+    onUpdated: (listener: (payload: LiveAgentTaskUpdateEvent) => void) => {
+      const channel = 'live-tasks:updated';
+      const wrapped = (_event: Electron.IpcRendererEvent, payload: LiveAgentTaskUpdateEvent) => listener(payload);
+      ipcRenderer.on(channel, wrapped);
+      return () => ipcRenderer.removeListener(channel, wrapped);
+    }
+  },
+  liveSessions: {
+    create: () => ipcRenderer.invoke('liveSessions:create'),
+    read: (sessionId: string) => ipcRenderer.invoke('liveSessions:read', sessionId),
+    appendMessage: (req: LiveSessionAppendMessageRequest) => ipcRenderer.invoke('liveSessions:appendMessage', req)
   },
   security: {
     onToolApprovalRequest: (listener: (payload: ToolApprovalRequest) => void) => {
@@ -138,11 +180,15 @@ const api = {
   },
   app: {
     info: () => ipcRenderer.invoke('app:info'),
+    selectBrandLogo: () => ipcRenderer.invoke('app:selectBrandLogo') as Promise<string>,
     exportAssistantMessage: (req: AssistantMessageExportRequest) => ipcRenderer.invoke('app:exportAssistantMessage', req),
     openPath: (path: string) => ipcRenderer.invoke('app:openPath', path),
     openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),
     closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
-    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id)
+    setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id),
+    windowMinimize: () => ipcRenderer.invoke('app:windowMinimize') as Promise<boolean>,
+    windowToggleMaximize: () => ipcRenderer.invoke('app:windowToggleMaximize') as Promise<boolean>,
+    windowClose: () => ipcRenderer.invoke('app:windowClose') as Promise<boolean>
   }
 };
 

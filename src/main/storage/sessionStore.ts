@@ -117,6 +117,7 @@ export class SessionStore {
       .filter((name) => name.endsWith('.json'))
       .map((name) => this.read(name.slice(0, -5)))
       .filter((record): record is SessionRecord => Boolean(record))
+      .filter((record) => !this.isHiddenSession(record.id))
       .map((record) => this.summary(record))
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
@@ -466,6 +467,10 @@ export class SessionStore {
     const record = this.read(id);
     if (!record) throw new Error(`Session not found: ${id}`);
     return record;
+  }
+
+  private isHiddenSession(id: string): boolean {
+    return id.startsWith('backend_session_');
   }
 
   private summary(record: SessionRecord): SessionSummary {

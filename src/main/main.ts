@@ -1,6 +1,7 @@
 import type { BrowserWindow as ElectronBrowserWindow, Rectangle, WebContents } from 'electron';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +25,12 @@ import type {
   ToolApprovalRequest,
   ToolExecutionResult,
   MemoryQueryOptions,
+  LiveAgentTaskCreateRequest,
+  LiveAgentTaskUpdateEvent,
+  LiveSessionAppendMessageRequest,
+  LiveRealtimeClientEvent,
+  LiveRealtimeEvent,
+  LiveRealtimeStartRequest,
   PersonalKnowledgeUploadRequest,
   RegisteredTool,
   SessionDocumentUploadRequest,
@@ -35,21 +42,29 @@ import type {
   SkillOptimizationRunRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinThemeInstallRequest,
+  ThemeImportRequest,
   ToolRunRequest,
   WechatChannelLoginStatusPayload,
   WechatChannelQrCodePayload
 } from '../shared/types.js';
 import { createId, nowIso } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
-import { applyAppDockIcon, applyPlatformAppIdentity, resolveAppWindowIconPath } from './appIcon.js';
+import { applyBrandDockIcon, applyPlatformAppIdentity, resolveBrandWindowIconPath } from './appIcon.js';
 import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
 import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
 import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
 import { isPathInside, objectArgs, resolveToolPath, stringArg } from './tools/toolRegistry.js';
+import { LiveTaskQueue } from './live/liveTaskQueue.js';
+import { LiveSessionStore } from './live/liveSessionStore.js';
+import { RealtimeSessionManager } from './live/realtimeSessionManager.js';
+import { importThemePackage } from './storage/themeImporter.js';
+import { installDreamSkinTheme, listDreamSkinGallery } from './storage/dreamSkinGallery.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const electronRequire = createRequire(import.meta.url);
-const { app, BrowserWindow, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
+const { app, BrowserWindow, Menu, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
 const { shell } = electronRequire('electron/common') as typeof import('electron/common');
 let mainWindow: ElectronBrowserWindow | null = null;
 let devToolsWindow: ElectronBrowserWindow | null = null;
@@ -119,6 +134,26 @@ function logAgentChatError(details: {
   }
 }
 
+function logRealtimeEvent(event: string, details?: Record<string, unknown>): void {
+  const file = join(context.harnessHome, 'logs', 'realtime.log');
+  const record = {
+    at: new Date().toISOString(),
+    event,
+    ...details
+  };
+  const text = JSON.stringify(record);
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${text}\n`, 'utf8');
+  } catch (logError) {
+    console.warn(`[realtime] failed to write log: ${logError instanceof Error ? logError.message : String(logError)}`);
+  }
+  const important = /error|reject|failed|close|timeout|response/i.test(event);
+  const line = `[realtime] ${event} ${details ? JSON.stringify(details) : ''}`.trim();
+  if (important) console.warn(line);
+  else console.info(line);
+}
+
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
@@ -132,6 +167,36 @@ function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
     win.webContents.send('agent:tool-event', payload);
   }
 }
+
+function broadcastLiveTaskUpdate(task: LiveAgentTaskUpdateEvent['task']): void {
+  const payload: LiveAgentTaskUpdateEvent = { task };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('live-tasks:updated', payload);
+  }
+}
+
+function broadcastLiveRealtimeEvent(payload: LiveRealtimeEvent): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.send('live-realtime:event', payload);
+  }
+}
+
+const liveRealtimeManager = new RealtimeSessionManager({
+  getConfig: () => context.getConfig(),
+  onEvent: broadcastLiveRealtimeEvent,
+  log: logRealtimeEvent
+});
+const liveSessionStore = new LiveSessionStore(context.harnessHome);
+const liveTaskQueue = new LiveTaskQueue({
+  agentLoop: context.agentLoop,
+  concurrency: 2,
+  defaultExecutionMode: () => context.getConfig().defaultExecutionMode,
+  requestToolApproval: (sender, request) => requestInteractiveToolApproval(sender, request),
+  onTaskUpdate: broadcastLiveTaskUpdate,
+  liveSessionStore
+});
 
 function rememberToolApproval(key: string): void {
   const cfg = context.getConfig();
@@ -1403,7 +1468,8 @@ function getDevToolsWindowMetrics(parent: ElectronBrowserWindow): { bounds: Rect
 
 function ensureDevToolsWindow(parent: ElectronBrowserWindow): ElectronBrowserWindow {
   const layout = getDevToolsWindowMetrics(parent);
-  const appIconPath = resolveAppWindowIconPath();
+  const cfg = context.getConfig();
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
 
   if (devToolsWindow && !devToolsWindow.isDestroyed()) {
     devToolsWindow.setMinimumSize(layout.minWidth, layout.minHeight);
@@ -1419,7 +1485,7 @@ function ensureDevToolsWindow(parent: ElectronBrowserWindow): ElectronBrowserWin
     minHeight: layout.minHeight,
     autoHideMenuBar: true,
     backgroundColor: '#111118',
-    title: 'Tasi Harness DevTools'
+    title: `${cfg.branding.productName} DevTools`
   });
 
   win.on('close', (event) => {
@@ -1458,7 +1524,7 @@ function openMainWindowDevTools(win: ElectronBrowserWindow): void {
     if (devToolsWindow && !devToolsWindow.isDestroyed()) devToolsWindow.destroy();
     devToolsWindow = null;
   });
-  win.webContents.openDevTools({ mode: 'detach', title: 'Tasi Harness DevTools' });
+  win.webContents.openDevTools({ mode: 'detach', title: `${context.getConfig().branding.productName} DevTools` });
 }
 
 function resetEmbeddedPreviewWebContentsState(target: WebContents): void {
@@ -1804,13 +1870,25 @@ async function exportAssistantMessage(req: AssistantMessageExportRequest): Promi
 }
 
 async function createWindow(): Promise<void> {
-  const appIconPath = resolveAppWindowIconPath();
+  const cfg = context.getConfig();
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 1040,
     minHeight: 680,
-    title: 'Tasi Harness',
+    title: cfg.branding.productName,
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'win32'
+      ? {
+          titleBarOverlay: {
+            color: '#0c0b18',
+            symbolColor: '#eee7ff',
+            height: 48
+          }
+        }
+      : {}),
+    autoHideMenuBar: true,
     backgroundColor: '#0a0a0f',
     ...(appIconPath ? { icon: appIconPath } : {}),
     webPreferences: {
@@ -1821,6 +1899,9 @@ async function createWindow(): Promise<void> {
       webviewTag: true
     }
   });
+  mainWindow.setMenu(null);
+  mainWindow.setAutoHideMenuBar(true);
+  mainWindow.setMenuBarVisibility(false);
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.webContents.once('did-finish-load', () => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -1829,6 +1910,21 @@ async function createWindow(): Promise<void> {
     void mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
   } else {
     void mainWindow.loadFile(join(__dirname, '..', 'renderer', 'index.html'));
+  }
+}
+
+function applyMainWindowBranding(): void {
+  const cfg = context.getConfig();
+  app.setName(cfg.branding.productName);
+  applyBrandDockIcon(cfg.branding.logoPath);
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setTitle(cfg.branding.productName);
+  const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
+  if (!appIconPath) return;
+  try {
+    mainWindow.setIcon(appIconPath);
+  } catch {
+    // Some platforms ignore runtime icon updates.
   }
 }
 
@@ -1886,18 +1982,183 @@ function registerWechatTools(): void {
   context.toolRegistry.register(tool);
 }
 
+function realtimeWebSocketUrl(baseUrl: string, model: string): URL {
+  const raw = (baseUrl.trim() || 'wss://api.openai.com/v1/realtime').replace(/\/+$/, '');
+  const url = new URL(raw);
+  if (url.protocol === 'https:') url.protocol = 'wss:';
+  if (url.protocol !== 'wss:') throw new Error('Realtime WebSocket URL must start with wss://.');
+  if (!url.searchParams.has('model')) url.searchParams.set('model', model.trim());
+  return url;
+}
+
+function qwenWorkspaceIdFromRealtimeUrl(url: URL): string {
+  const explicit = url.searchParams.get('workspaceId') || url.searchParams.get('workspace_id') || '';
+  if (explicit.trim()) return explicit.trim();
+  const match = /^([^.]+)\.cn-beijing\.maas\.aliyuncs\.com$/i.exec(url.hostname);
+  return match?.[1] || '';
+}
+
+function realtimeConnectionPath(config: AppConfig, url: URL): string {
+  if (config.omniProvider !== 'qwen-bailian') return `${url.pathname}${url.search}`;
+  const next = new URL(url.toString());
+  next.searchParams.delete('workspaceId');
+  next.searchParams.delete('workspace_id');
+  return `${next.pathname}${next.search}`;
+}
+
+function usesOpenAIRealtimeProtocol(config: AppConfig): boolean {
+  return config.omniProvider === 'openai' || config.omniProvider === 'soildapi';
+}
+
+async function testRealtimeConnection(config: AppConfig): Promise<{ ok: boolean; content: string }> {
+  if (!usesOpenAIRealtimeProtocol(config) && config.omniProvider !== 'qwen-bailian') {
+    return { ok: false, content: 'Only OpenAI-compatible Realtime and Qwen Realtime WebSocket providers are supported for Omni.' };
+  }
+  if (!config.omniApiKey) return { ok: false, content: 'API key is empty.' };
+  if (!config.omniBaseUrl) return { ok: false, content: 'Realtime WebSocket URL is empty.' };
+  if (!config.omniModel) return { ok: false, content: 'Realtime model is empty.' };
+  if (config.omniBaseUrl.includes('{WorkspaceId}')) {
+    return { ok: false, content: 'Replace {WorkspaceId} with your Bailian workspace ID before testing Qwen Realtime.' };
+  }
+
+  let url: URL;
+  try {
+    url = realtimeWebSocketUrl(config.omniBaseUrl, config.omniModel);
+  } catch (error) {
+    return { ok: false, content: error instanceof Error ? error.message : String(error) };
+  }
+
+  const qwenWorkspaceId = config.omniProvider === 'qwen-bailian' ? qwenWorkspaceIdFromRealtimeUrl(url) : '';
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (result: { ok: boolean; content: string }): void => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
+    const req = httpsRequest({
+      protocol: 'https:',
+      hostname: url.hostname,
+      port: url.port ? Number(url.port) : undefined,
+      path: realtimeConnectionPath(config, url),
+      method: 'GET',
+      timeout: 10000,
+      headers: {
+        Authorization: `Bearer ${config.omniApiKey}`,
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+        'Sec-WebSocket-Version': '13',
+        'User-Agent': 'tasi-harness-realtime/1.0',
+        ...(qwenWorkspaceId ? { 'X-DashScope-WorkSpace': qwenWorkspaceId } : {}),
+        ...(usesOpenAIRealtimeProtocol(config) ? { 'OpenAI-Beta': 'realtime=v1' } : {})
+      }
+    });
+
+    req.on('upgrade', (res, socket) => {
+      socket.destroy();
+      settle({ ok: true, content: `Realtime WebSocket connected (${res.statusCode ?? 101}).` });
+    });
+    req.on('response', (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => {
+        if (chunks.reduce((sum, item) => sum + item.length, 0) < 4096) chunks.push(Buffer.from(chunk));
+      });
+      res.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf8').trim();
+        settle({ ok: false, content: `${res.statusCode ?? 'HTTP'} ${res.statusMessage ?? ''}${body ? `: ${body}` : ''}`.trim() });
+      });
+    });
+    req.on('timeout', () => {
+      req.destroy(new Error('Realtime WebSocket connection timed out.'));
+    });
+    req.on('error', (error) => {
+      settle({ ok: false, content: error.message });
+    });
+    req.end();
+  });
+}
+
 function registerIpc(): void {
   ipcMain.on('browser-coach:event', (event, payload) => browserCoachRecorder.acceptEvent(event, payload));
   ipcMain.handle('config:get', () => context.configStore.publicConfig(false));
   ipcMain.handle('config:set', async (_event, partial: Partial<AppConfig>) => {
     const sanitized = { ...partial };
     if (typeof sanitized.apiKey !== 'string') delete sanitized.apiKey;
+    if (typeof sanitized.omniApiKey !== 'string') delete sanitized.omniApiKey;
     const next = context.configStore.update(sanitized);
+    applyMainWindowBranding();
     startWechatPoller();
     if (next.browserMode !== 'external') await closeExternalBrowserPreview();
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
-  ipcMain.handle('config:test', async () => testLlmConnection(context.getConfig()));
+  ipcMain.handle('config:test', async (_event, profile?: 'agent' | 'omni') => {
+    const config = context.getConfig();
+    return profile === 'omni' ? testRealtimeConnection(config) : testLlmConnection(config);
+  });
+  ipcMain.handle('themes:import', async (_event, req: ThemeImportRequest) => {
+    const theme = await importThemePackage(context.harnessHome, req);
+    const config = context.getConfig();
+    const next = context.configStore.update({
+      customThemes: [
+        theme,
+        ...config.customThemes.filter((item) => item.id !== theme.id)
+      ],
+      theme: `custom:${theme.id}`
+    });
+    return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
+  });
+  ipcMain.handle('themes:dreamskin:list', async (_event, req?: DreamSkinGalleryQuery) => listDreamSkinGallery(req ?? {}));
+  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => installDreamSkinTheme(context.harnessHome, context.configStore, req));
+  ipcMain.handle('liveRealtime:start', async (_event, req?: LiveRealtimeStartRequest) => liveRealtimeManager.start(req ?? {}));
+  ipcMain.handle('liveRealtime:send', async (_event, event: LiveRealtimeClientEvent) => {
+    liveRealtimeManager.send(event);
+    return { ok: true, content: 'Realtime event sent.' };
+  });
+  ipcMain.handle('liveRealtime:stop', async () => {
+    liveRealtimeManager.stop();
+    return { ok: true, content: 'Realtime session stopped.' };
+  });
+  ipcMain.handle('liveSessions:create', () => {
+    const session = context.sessionStore.create('New session');
+    const relation = liveSessionStore.create(session.id);
+    broadcastSessionUpdated({
+      sessionId: session.id,
+      source: 'external',
+      updatedAt: session.updatedAt
+    });
+    return { sessionId: session.id, relation };
+  });
+  ipcMain.handle('liveSessions:read', (_event, sessionId: string) => {
+    const id = sessionId?.trim();
+    return id ? liveSessionStore.read(id) : null;
+  });
+  ipcMain.handle('liveSessions:appendMessage', (_event, req: LiveSessionAppendMessageRequest) => {
+    const sessionId = req.sessionId?.trim();
+    const content = req.content?.trim();
+    if (!sessionId) throw new Error('sessionId is required.');
+    if (!content) throw new Error('content is required.');
+    if (!context.sessionStore.read(sessionId)) {
+      context.sessionStore.create('New session', sessionId);
+    }
+    liveSessionStore.create(sessionId);
+    const updated = context.sessionStore.appendMessages(sessionId, [{
+      role: req.role === 'assistant' ? 'assistant' : 'user',
+      content,
+      attachments: Array.isArray(req.attachments) && req.attachments.length > 0 ? req.attachments : undefined,
+      createdAt: req.createdAt
+    }], []);
+    broadcastSessionUpdated({
+      sessionId: updated.id,
+      source: 'external',
+      updatedAt: updated.updatedAt
+    });
+    return updated;
+  });
+  ipcMain.handle('liveTasks:list', (_event, sessionId?: string) => liveTaskQueue.list(sessionId));
+  ipcMain.handle('liveTasks:enqueue', (_event, req: LiveAgentTaskCreateRequest) => liveTaskQueue.enqueue(req, _event.sender));
+  ipcMain.handle('liveTasks:stop', (_event, taskId: string) => liveTaskQueue.stop(taskId));
   ipcMain.handle('config:wechatQrcode', async () => {
     const payload = await fetchWechatChannelQrCode(context.getConfig().wechatChannel.bindUrl);
     if (payload.qrcodeKey) {
@@ -2315,7 +2576,7 @@ function registerIpc(): void {
       if (updated.notifyByEmail) {
         await context.emailNotifier.send(
           context.getConfig().emailNotifications,
-          `[Tasi Harness] ${updated.name}`,
+          `[${context.getConfig().branding.productName}] ${updated.name}`,
           [`Task: ${updated.name}`, `Run at: ${updated.lastRunAt ?? updated.updatedAt}`, '', result.finalResponse].join('\n')
         );
       }
@@ -2376,8 +2637,19 @@ function registerIpc(): void {
     platform: process.platform,
     electron: process.versions.electron,
     node: process.versions.node,
-    harnessHome: context.harnessHome
+    harnessHome: context.harnessHome,
+    productName: context.getConfig().branding.productName
   }));
+  ipcMain.handle('app:selectBrandLogo', async () => {
+    const picked = await dialog.showOpenDialog({
+      title: 'Select brand logo',
+      properties: ['openFile'],
+      filters: [
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'ico'] }
+      ]
+    });
+    return picked.canceled || picked.filePaths.length === 0 ? '' : picked.filePaths[0];
+  });
   ipcMain.handle('app:exportAssistantMessage', async (_event, req: AssistantMessageExportRequest) => exportAssistantMessage(req));
   ipcMain.handle('app:openPath', async (_event, path: string) => {
     const err = await shell.openPath(path);
@@ -2417,10 +2689,28 @@ function registerIpc(): void {
     target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
   });
+  ipcMain.handle('app:windowMinimize', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (win && !win.isDestroyed()) win.minimize();
+    return true;
+  });
+  ipcMain.handle('app:windowToggleMaximize', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (!win || win.isDestroyed()) return false;
+    if (win.isMaximized()) win.unmaximize();
+    else win.maximize();
+    return win.isMaximized();
+  });
+  ipcMain.handle('app:windowClose', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+    if (win && !win.isDestroyed()) win.close();
+    return true;
+  });
 }
 
 app.on('before-quit', () => {
   isAppQuitting = true;
+  liveRealtimeManager.stop();
   denyPendingToolApprovals();
   browserCoachRecorder.close();
   for (const controller of activeChatControllers.values()) controller.abort();
@@ -2431,7 +2721,9 @@ app.on('before-quit', () => {
 
 app.whenReady().then(() => {
   applyPlatformAppIdentity();
-  applyAppDockIcon();
+  Menu.setApplicationMenu(null);
+  app.setName(context.getConfig().branding.productName);
+  applyBrandDockIcon(context.getConfig().branding.logoPath);
   registerWechatTools();
   app.on('web-contents-created', (_event, contents) => {
     contents.once('destroyed', () => {

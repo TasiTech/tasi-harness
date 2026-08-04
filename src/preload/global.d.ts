@@ -11,6 +11,16 @@ import type {
   BrowserCoachStartRequest,
   BrowserCoachStoredRecording,
   ExternalSessionMessageRequest,
+  LiveAgentTask,
+  LiveAgentTaskCreateRequest,
+  LiveAgentTaskUpdateEvent,
+  LiveSessionAppendMessageRequest,
+  LiveSessionCreateResult,
+  LiveSessionRelation,
+  LiveRealtimeClientEvent,
+  LiveRealtimeEvent,
+  LiveRealtimeStartRequest,
+  LiveRealtimeStartResult,
   MemoryClearRequest,
   MemoryQueryOptions,
   MemoryState,
@@ -42,12 +52,16 @@ import type {
   SkillPatchRequest,
   ToolApprovalDecision,
   ToolApprovalRequest,
+  DreamSkinGalleryQuery,
+  DreamSkinGalleryResult,
+  DreamSkinThemeInstallRequest,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   SkillWriteRequest,
   ToolDefinition,
   ToolExecutionResult,
-  ToolRunRequest
+  ToolRunRequest,
+  ThemeImportRequest
 } from '../shared/types';
 
 declare global {
@@ -55,10 +69,15 @@ declare global {
     tasiHarness: {
       config: {
         get(): Promise<PublicAppConfig>;
-        set(partial: Partial<PublicAppConfig> & { apiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }): Promise<PublicAppConfig>;
-        test(): Promise<ToolExecutionResult>;
+        set(partial: Partial<PublicAppConfig> & { apiKey?: string; omniApiKey?: string; emailNotifications?: PublicAppConfig['emailNotifications'] & { password?: string } }): Promise<PublicAppConfig>;
+        test(profile?: 'agent' | 'omni'): Promise<ToolExecutionResult>;
         wechatQrcode(): Promise<WechatChannelQrCodePayload>;
         wechatQrcodeStatus(qrcodeKey: string): Promise<WechatChannelLoginStatusPayload>;
+      };
+      themes: {
+        importPackage(req: ThemeImportRequest): Promise<PublicAppConfig>;
+        listDreamSkinGallery(req?: DreamSkinGalleryQuery): Promise<DreamSkinGalleryResult>;
+        installDreamSkinTheme(req: DreamSkinThemeInstallRequest): Promise<PublicAppConfig>;
       };
       agent: {
         chat(input: string, sessionId?: string, executionMode?: 'workspace' | 'sandbox', usePersonalKnowledgeBase?: boolean, attachments?: AgentMessageAttachment[]): Promise<AgentRunResult>;
@@ -66,6 +85,23 @@ declare global {
         stop(): Promise<ToolExecutionResult>;
         onToolEvent(listener: (payload: AgentToolEventStream) => void): () => void;
         onMessageDelta(listener: (payload: AgentMessageDeltaStream) => void): () => void;
+      };
+      liveRealtime: {
+        start(req?: LiveRealtimeStartRequest): Promise<LiveRealtimeStartResult>;
+        send(event: LiveRealtimeClientEvent): Promise<ToolExecutionResult>;
+        stop(): Promise<ToolExecutionResult>;
+        onEvent(listener: (payload: LiveRealtimeEvent) => void): () => void;
+      };
+      liveTasks: {
+        list(sessionId?: string): Promise<LiveAgentTask[]>;
+        enqueue(req: LiveAgentTaskCreateRequest): Promise<LiveAgentTask>;
+        stop(taskId: string): Promise<LiveAgentTask | null>;
+        onUpdated(listener: (payload: LiveAgentTaskUpdateEvent) => void): () => void;
+      };
+      liveSessions: {
+        create(): Promise<LiveSessionCreateResult>;
+        read(sessionId: string): Promise<LiveSessionRelation | null>;
+        appendMessage(req: LiveSessionAppendMessageRequest): Promise<SessionRecord>;
       };
       security: {
         onToolApprovalRequest(listener: (payload: ToolApprovalRequest) => void): () => void;
@@ -133,11 +169,15 @@ declare global {
       };
       app: {
         info(): Promise<AppInfo>;
+        selectBrandLogo(): Promise<string>;
         exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult>;
         openPath(path: string): Promise<ToolExecutionResult>;
         openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
+        windowMinimize(): Promise<boolean>;
+        windowToggleMaximize(): Promise<boolean>;
+        windowClose(): Promise<boolean>;
       };
     };
   }

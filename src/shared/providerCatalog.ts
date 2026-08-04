@@ -114,6 +114,52 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   }
 ];
 
+export const OMNI_PROVIDER_PRESETS: ProviderPreset[] = [
+  {
+    kind: 'openai',
+    label: 'OpenAI Realtime',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'wss://api.openai.com/v1/realtime',
+    defaultModel: 'gpt-realtime-2.1',
+    models: ['gpt-realtime-2.1', 'gpt-realtime-2.1-mini', 'gpt-realtime', 'gpt-realtime-mini'],
+    requiresApiKey: true
+  },
+  {
+    kind: 'qwen-bailian',
+    label: 'Qwen Omni Realtime / Bailian',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime',
+    defaultModel: 'qwen3.5-omni-flash-realtime',
+    models: [
+      'qwen3.5-omni-plus-realtime',
+      'qwen3.5-omni-plus-realtime-2026-03-15',
+      'qwen3.5-omni-flash-realtime',
+      'qwen3.5-omni-flash-realtime-2026-03-15',
+      'qwen3-omni-flash-realtime'
+    ],
+    requiresApiKey: true
+  },
+  {
+    kind: 'soildapi',
+    label: 'SoildAPI Omni Realtime',
+    apiStyle: 'openai',
+    defaultBaseUrl: 'wss://soildapi.com/v1/realtime',
+    defaultModel: 'qwen3.5-omni-plus-realtime',
+    models: [
+      'qwen3.5-omni-plus-realtime',
+      'qwen3.5-omni-plus-realtime-2026-03-15',
+      'qwen3.5-omni-flash-realtime',
+      'qwen3.5-omni-flash-realtime-2026-03-15',
+      'qwen3-omni-flash-realtime',
+      'gpt-realtime-2.1',
+      'gpt-realtime-2.1-mini',
+      'gpt-realtime',
+      'gpt-realtime-mini'
+    ],
+    requiresApiKey: true
+  }
+];
+
 const PRESET_BY_KIND = new Map<ProviderKind, ProviderPreset>();
 for (const preset of PROVIDER_PRESETS) {
   PRESET_BY_KIND.set(preset.kind, preset);
@@ -151,4 +197,29 @@ export function providerDefaultModel(kind: ProviderKind): string {
 
 export function providerModelOptions(kind: ProviderKind): string[] {
   return providerPreset(kind).models;
+}
+
+const OMNI_PRESET_BY_KIND = new Map<ProviderKind, ProviderPreset>();
+for (const preset of OMNI_PROVIDER_PRESETS) {
+  OMNI_PRESET_BY_KIND.set(preset.kind, preset);
+}
+
+export function omniProviderPreset(kind: ProviderKind): ProviderPreset {
+  return OMNI_PRESET_BY_KIND.get(kind) ?? OMNI_PROVIDER_PRESETS[0];
+}
+
+export function omniProviderDefaultBaseUrl(kind: ProviderKind): string {
+  return omniProviderPreset(kind).defaultBaseUrl;
+}
+
+export function omniProviderDefaultModel(kind: ProviderKind): string {
+  return omniProviderPreset(kind).defaultModel;
+}
+
+export function omniProviderModelOptions(kind: ProviderKind): string[] {
+  return omniProviderPreset(kind).models;
+}
+
+export function isOmniProviderKind(kind: ProviderKind): boolean {
+  return OMNI_PRESET_BY_KIND.has(kind);
 }
