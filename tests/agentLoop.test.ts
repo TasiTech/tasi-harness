@@ -81,6 +81,60 @@ describe('AgentLoop', () => {
     expect(rawMessages.some((message) => message && typeof message === 'object' && (message as { role?: string }).role === 'tool')).toBe(true);
   });
 
+  it('does not persist tool-call preambles as visible assistant replies', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: 'I will check that now. Please wait.',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'answer.txt', content: '42' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Done.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'write a file' });
+    const stored = sessions.read(result.sessionId);
+    const assistantMessages = stored?.messages.filter((message) => message.role === 'assistant') ?? [];
+
+    expect(result.finalResponse).toBe('Done.');
+    expect(assistantMessages).toHaveLength(2);
+    expect(assistantMessages[0]?.content).toBe('');
+    expect(assistantMessages[0]?.tool_calls?.[0]?.function.name).toBe('file_write');
+    expect(assistantMessages[1]?.content).toBe('Done.');
+    expect(stored?.messages.some((message) => message.content === 'I will check that now. Please wait.')).toBe(false);
+  });
+
   it('emits streamed assistant deltas when the client supports streaming', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

@@ -132,6 +132,42 @@ function liveMessagesFromAgentMessages(messages: AgentMessage[] = []): LiveMessa
     }));
 }
 
+function liveMessageKey(message: Pick<LiveMessage, 'role' | 'content' | 'createdAt'>): string {
+  return [
+    message.role,
+    message.content.replace(/\s+/g, ' ').trim(),
+    message.createdAt
+  ].join('\u0000');
+}
+
+function mergeLiveMessages(current: LiveMessage[], persisted: LiveMessage[]): LiveMessage[] {
+  const currentByKey = new Map(current.map((message) => [liveMessageKey(message), message]));
+  const persistedKeys = new Set(persisted.map(liveMessageKey));
+  const mergedPersisted = persisted.map((message) => ({
+    ...message,
+    id: currentByKey.get(liveMessageKey(message))?.id || message.id
+  }));
+  const localOnly = current.filter((message) => !persistedKeys.has(liveMessageKey(message)));
+  return [...mergedPersisted, ...localOnly].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+const LIVE_TASK_INTERIM_PATTERNS = [
+  /\b(background\s+task|task)\b.{0,40}\b(queued|submitted|created|started|running)\b/i,
+  /\b(queued|submitted|created|started)\b.{0,40}\b(background\s+task|task)\b/i,
+  /[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf).{0,16}(\u63d0\u4ea4|\u521b\u5efa|\u52a0\u5165|\u6392\u961f|\u5f00\u59cb)/,
+  /(\u67e5\u8be2|\u8bf7\u6c42).{0,8}[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf)/,
+  /(\u8bf7\u7a0d\u7b49|\u7a0d\u7b49|\u7b49\u4e00\u4e0b)/,
+  /\u5e2e\u4f60.{0,12}(\u67e5|\u770b|\u5904\u7406|\u641c)/,
+  /\b(please wait|one moment|hold on|let me check|i'?ll check|i will check)\b/i
+];
+
+function isLiveTaskInterimAssistant(content: string): boolean {
+  const text = content.replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+  if (text.length > 220) return false;
+  return LIVE_TASK_INTERIM_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export function LiveAgentPage({
   tr,
   config,
@@ -190,12 +226,14 @@ export function LiveAgentPage({
   const completedTaskNotificationIdsRef = useRef(new Set<string>());
   const recentLiveMessagesRef = useRef<Array<{ role: LiveMessage['role']; content: string; createdAtMs: number }>>([]);
   const recentLiveTaskPromptsRef = useRef(new Map<string, { taskId?: string; createdAtMs: number; promise?: Promise<LiveAgentTask> }>());
+  const suppressTaskInterimAssistantUntilRef = useRef(0);
   const tasksRef = useRef<LiveAgentTask[]>([]);
   const flashTimersRef = useRef(new Map<string, number>());
   const statusRef = useRef<LiveStatus>('idle');
   const sessionIdRef = useRef('');
   const configRef = useRef(config);
   const assistantDraftRef = useRef('');
+  const initializedSessionIdRef = useRef('');
   const autoStartedRef = useRef(false);
   const disposedRef = useRef(false);
   const startTokenRef = useRef(0);
@@ -283,9 +321,15 @@ export function LiveAgentPage({
   useEffect(() => {
     const nextSessionId = initialSessionId.trim();
     if (!nextSessionId) return;
+    const nextMessages = liveMessagesFromAgentMessages(initialMessages);
     sessionIdRef.current = nextSessionId;
     setSessionId(nextSessionId);
-    setMessages(liveMessagesFromAgentMessages(initialMessages));
+    if (initializedSessionIdRef.current !== nextSessionId) {
+      initializedSessionIdRef.current = nextSessionId;
+      setMessages(nextMessages);
+    } else {
+      setMessages((old) => mergeLiveMessages(old, nextMessages));
+    }
     void window.tasiHarness.liveTasks.list(nextSessionId)
       .then(setLiveTasks)
       .catch((error) => setNotice(error instanceof Error ? error.message : String(error)));
@@ -474,8 +518,10 @@ export function LiveAgentPage({
         appendMessage('assistant', content);
         if (responseId) completedAssistantResponseIdsRef.current.add(responseId);
       }
-      assistantDraftRef.current = '';
-      setAssistantDraft('');
+      if (content || type !== 'response.done') {
+        assistantDraftRef.current = '';
+        setAssistantDraft('');
+      }
       if (type === 'response.done') markResponseIdle();
       return;
     }
@@ -498,6 +544,7 @@ export function LiveAgentPage({
     const taskKey = prompt.replace(/\s+/g, ' ').toLowerCase();
     const existing = recentLiveTaskPromptsRef.current.get(taskKey);
     if (existing && Date.now() - existing.createdAtMs < 20000) {
+      suppressTaskInterimAssistantUntilRef.current = Date.now() + 15000;
       let taskId = existing.taskId || 'pending';
       if (!existing.taskId && existing.promise) {
         try {
@@ -523,6 +570,7 @@ export function LiveAgentPage({
       executionMode: configRef.current.defaultExecutionMode
     });
     recentLiveTaskPromptsRef.current.set(taskKey, { createdAtMs: Date.now(), promise: enqueuePromise });
+    suppressTaskInterimAssistantUntilRef.current = Date.now() + 15000;
     let task: LiveAgentTask;
     try {
       task = await enqueuePromise;
@@ -621,12 +669,23 @@ export function LiveAgentPage({
     const createdAt = new Date().toISOString();
     const normalizedContent = content.replace(/\s+/g, ' ').trim();
     const nowMs = Date.now();
+    const skipTaskInterimPersistence = role === 'assistant'
+      && nowMs < suppressTaskInterimAssistantUntilRef.current
+      && isLiveTaskInterimAssistant(normalizedContent);
     recentLiveMessagesRef.current = recentLiveMessagesRef.current.filter((message) => nowMs - message.createdAtMs < 10000);
     if (recentLiveMessagesRef.current.some((message) => message.role === role && message.content === normalizedContent)) return;
     recentLiveMessagesRef.current.push({ role, content: normalizedContent, createdAtMs: nowMs });
-    setMessages((old) => [...old, { id: localId('livemsg'), role, content, createdAt }]);
+    const message = { id: localId('livemsg'), role, content, createdAt };
+    setMessages((old) => {
+      const last = old.at(-1);
+      if (role === 'assistant' && last?.role === 'assistant' && isLiveTaskInterimAssistant(last.content) && !isLiveTaskInterimAssistant(normalizedContent)) {
+        return [...old.slice(0, -1), message];
+      }
+      return [...old, message];
+    });
     const activeSessionId = sessionIdRef.current || sessionId;
     if (!activeSessionId) return;
+    if (skipTaskInterimPersistence) return;
     void window.tasiHarness.liveSessions.appendMessage({
       sessionId: activeSessionId,
       role,

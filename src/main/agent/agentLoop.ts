@@ -74,6 +74,14 @@ function isIterationLimitMessage(message: AgentMessage): boolean {
   return message.role === 'assistant' && ITERATION_LIMIT_MESSAGE_PATTERN.test(message.content.trim());
 }
 
+function sessionVisibleAssistantMessage(message: AgentMessage, toolCallCount: number): AgentMessage {
+  if (toolCallCount === 0) return message;
+  return {
+    ...message,
+    content: ''
+  };
+}
+
 interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onToolEvent?: (sessionId: string, event: ToolEvent) => void;
   onMessageDelta?: (sessionId: string, event: AgentMessageDeltaStream) => void;
@@ -284,7 +292,7 @@ export class AgentLoop {
         usage = completion.usage ?? usage;
         log_probs = completion.log_probs ?? log_probs;
         messages.push(assistant);
-        persistMessages([assistant]);
+        persistMessages([sessionVisibleAssistantMessage(assistant, toolCalls.length)]);
 
         if (toolCalls.length === 0) {
           if (accumulatedReasoning) assistant.reasoning_content = accumulatedReasoning;

@@ -934,17 +934,6 @@ export function App(): ReactElement {
     }
   }
 
-  const statusUsesOmniModel = page === 'chat' && chatLiveModeActive;
-  const statusModelReady = statusUsesOmniModel
-    ? config.omniApiKeyConfigured && Boolean(config.omniModel)
-    : config.apiKeyConfigured || !providerRequiresApiKey(config.provider);
-  const statusModelText = statusUsesOmniModel
-    ? statusModelReady
-      ? `${tr('Model ready', '模型已就绪')} · ${config.omniProvider} · ${config.omniModel || tr('No model', '未配置模型')}`
-      : tr('Configure Omni model', '请配置 Omni 模型')
-    : statusModelReady
-    ? `${tr('Model ready', '模型已就绪')} · ${config.model || tr('No model', '未配置模型')}`
-    : tr('Configure model', '请配置模型');
   const activeCustomTheme = getActiveCustomTheme(config);
   const customThemeBackground = customThemeBackgroundStyle(activeCustomTheme);
 
@@ -993,9 +982,6 @@ export function App(): ReactElement {
           <div className="meta-row wrap">
             <span className="soft-badge">{tr('Last', '本次')}: {usageLabel(lastUsage)}</span>
             <span className="soft-badge">{tr('Total', '累计')}: {usageLabel(totalUsage)}</span>
-          </div>
-          <div className={`status-pill ${statusModelReady ? 'ok' : 'warn'}`}>
-            <span className="dot" /> {statusModelText}
           </div>
         </div>
       </aside>

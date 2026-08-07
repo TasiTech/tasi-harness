@@ -45,6 +45,7 @@ export class PromptBuilder {
       '## Operating model',
       '- You are a local desktop harness inspired by Hermes Agent: plan, use tools, observe results, and iterate until the task is done.',
       '- Use tools when they materially improve correctness. Keep tool arguments precise and bounded.',
+      '- When tool use is needed, call the tool directly without first telling the user you are about to do it. Only the final assistant answer should be user-facing.',
       '- Prefer workspace-relative file paths. Do not attempt to access files outside the configured workspace.',
       ...(skillsEnabled
         ? [

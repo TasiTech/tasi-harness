@@ -11,6 +11,7 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AgentMessage,
   AgentMessageAttachment,
   AssistantMessageExportRequest,
   AppConfig,
@@ -256,6 +257,34 @@ function isAbortLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === 'AbortError') return true;
   return /operation was aborted|session stopped by user|aborted/i.test(error.message);
+}
+
+const LIVE_TASK_INTERIM_PATTERNS = [
+  /\b(background\s+task|task)\b.{0,40}\b(queued|submitted|created|started|running)\b/i,
+  /\b(queued|submitted|created|started)\b.{0,40}\b(background\s+task|task)\b/i,
+  /[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf).{0,16}(\u63d0\u4ea4|\u521b\u5efa|\u52a0\u5165|\u6392\u961f|\u5f00\u59cb)/,
+  /(\u67e5\u8be2|\u8bf7\u6c42).{0,8}[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf)/,
+  /(\u8bf7\u7a0d\u7b49|\u7a0d\u7b49|\u7b49\u4e00\u4e0b)/,
+  /\u5e2e\u4f60.{0,12}(\u67e5|\u770b|\u5904\u7406|\u641c)/,
+  /\b(please wait|one moment|hold on|let me check|i'?ll check|i will check)\b/i
+];
+
+function isLiveTaskInterimAssistantContent(content: string): boolean {
+  const text = content.replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 220) return false;
+  return LIVE_TASK_INTERIM_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hasRecentLiveTaskForSession(sessionId: string): boolean {
+  const now = Date.now();
+  const tasks = liveSessionStore.read(sessionId)?.tasks ?? [];
+  return tasks.some((task) => {
+    if (task.status === 'queued' || task.status === 'running') return true;
+    const createdMs = Date.parse(task.createdAt);
+    const updatedMs = Date.parse(task.updatedAt);
+    return (Number.isFinite(createdMs) && now - createdMs < 20000)
+      || (Number.isFinite(updatedMs) && now - updatedMs < 20000);
+  });
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -2143,12 +2172,22 @@ function registerIpc(): void {
       context.sessionStore.create('New session', sessionId);
     }
     liveSessionStore.create(sessionId);
-    const updated = context.sessionStore.appendMessages(sessionId, [{
+    const message: AgentMessage = {
       role: req.role === 'assistant' ? 'assistant' : 'user',
       content,
       attachments: Array.isArray(req.attachments) && req.attachments.length > 0 ? req.attachments : undefined,
       createdAt: req.createdAt
-    }], []);
+    };
+    const current = context.sessionStore.read(sessionId);
+    const existingMessages = current?.messages ?? [];
+    const lastMessage = existingMessages.at(-1);
+    const incomingInterim = message.role === 'assistant' && isLiveTaskInterimAssistantContent(message.content);
+    const lastInterim = lastMessage?.role === 'assistant' && isLiveTaskInterimAssistantContent(lastMessage.content);
+    const updated = incomingInterim && hasRecentLiveTaskForSession(sessionId)
+      ? (current ?? context.sessionStore.read(sessionId) ?? context.sessionStore.create('New session', sessionId))
+      : lastInterim && message.role === 'assistant' && !incomingInterim
+        ? context.sessionStore.replaceMessages(sessionId, [...existingMessages.slice(0, -1), message])
+        : context.sessionStore.appendMessages(sessionId, [message], []);
     broadcastSessionUpdated({
       sessionId: updated.id,
       source: 'external',
