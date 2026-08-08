@@ -547,7 +547,7 @@ export interface LiveAgentTaskTrace {
   id: string;
   taskId: string;
   title: string;
-  label: 'Reasoning' | 'Text' | 'Tool Call' | 'Tool Result' | 'Tool Error' | 'Status';
+  label: 'Reasoning' | 'Text' | 'Tool Call' | 'Tool Result' | 'Tool Error' | 'Result' | 'Status';
   content: string;
   createdAt: string;
 }

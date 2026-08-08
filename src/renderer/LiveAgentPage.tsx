@@ -91,6 +91,7 @@ function traceLabelText(label: string, tr: TranslateFn): string {
   if (label === 'Tool Error') return tr('Tool Error', '工具错误');
   if (label === 'Reasoning') return tr('Reasoning', '推理过程');
   if (label === 'Text') return tr('Text', '文本');
+  if (label === 'Result') return tr('Result', '结果');
   if (label === 'Status') return tr('Status', '状态');
   return tr('Trace', '轨迹');
 }
@@ -265,7 +266,7 @@ export function LiveAgentPage({
     () => tasks.find((task) => task.id === selectedTaskId) || tasks.find((task) => task.status === 'running') || tasks[0] || null,
     [selectedTaskId, tasks]
   );
-  const selectedTaskTrace = useMemo(() => mergedTaskTrace(selectedTask, ['Tool Call', 'Tool Result', 'Tool Error']), [selectedTask]);
+  const selectedTaskTrace = useMemo(() => mergedTaskTrace(selectedTask, ['Tool Call', 'Tool Result', 'Tool Error', 'Result', 'Status']), [selectedTask]);
 
   useEffect(() => {
     statusRef.current = status;
