@@ -186,6 +186,7 @@ const api = {
     openExternalUrl: (url: string, options?: { system?: boolean }) => ipcRenderer.invoke('app:openExternalUrl', url, options),
     closeExternalPreview: () => ipcRenderer.invoke('app:closeExternalPreview'),
     setEmbeddedPreviewWebContentsId: (id: number | null) => ipcRenderer.invoke('app:setEmbeddedPreviewWebContentsId', id),
+    setWindowTitleBarTheme: (preview?: Pick<PublicAppConfig, 'theme' | 'customThemes' | 'textColor'> | null) => ipcRenderer.invoke('app:setWindowTitleBarTheme', preview) as Promise<boolean>,
     windowMinimize: () => ipcRenderer.invoke('app:windowMinimize') as Promise<boolean>,
     windowToggleMaximize: () => ipcRenderer.invoke('app:windowToggleMaximize') as Promise<boolean>,
     windowClose: () => ipcRenderer.invoke('app:windowClose') as Promise<boolean>

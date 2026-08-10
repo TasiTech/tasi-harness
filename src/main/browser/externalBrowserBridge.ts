@@ -210,7 +210,8 @@ export class ExternalBrowserBridge {
       throw new Error(`CDP endpoint probe failed: ${first.errors.join(' | ')} | auto-launch=${this.cdpAutoLaunchState}`);
     }
 
-    const second = await this.tryResolveCdpConnection(rawEndpoint, probeWithAutoCandidates);
+    const secondEndpoint = this.cdpManagedEndpoint || rawEndpoint;
+    const second = await this.tryResolveCdpConnection(secondEndpoint, probeWithAutoCandidates || Boolean(this.cdpManagedEndpoint));
     if (second.connection) {
       this.log('cdp.resolve.done', { endpoint: second.connection.endpoint, browserName: second.connection.browserName, via: 'auto-launch' });
       return second.connection;
@@ -284,21 +285,24 @@ export class ExternalBrowserBridge {
       this.log('cdp.launch.skipped', { reason: 'no-chromium-executable', priorErrors });
       return false;
     }
+    let skipSystemProfileLaunch = false;
     if (config.externalBrowserProfileMode === 'system' && this.isBrowserProcessLikelyRunning(executable)) {
       this.log('cdp.launch.systemProfileInUse', { executable });
       const takeoverOk = this.forceTakeoverSystemProfile(executable);
       if (!takeoverOk) {
-        this.cdpAutoLaunchState = `failed:system-profile-force-close@${executable}`;
-        this.cdpLastLaunchFailureState = this.cdpAutoLaunchState;
-        this.cdpLaunchCooldownUntil = Date.now() + 15000;
-        return false;
+        skipSystemProfileLaunch = true;
+        this.cdpAutoLaunchState = `system-profile-in-use:fallback-isolated@${executable}`;
+        this.log('cdp.launch.systemProfileFallback', {
+          executable,
+          reason: 'system-profile-force-close-failed'
+        });
       }
     }
-    const ports = this.resolveCdpAutoLaunchPorts(rawEndpoint, config.externalBrowserProfileMode === 'system');
+    const attempts = this.resolveCdpLaunchAttempts(config, executable, rawEndpoint, skipSystemProfileLaunch);
     mkdirSync(this.runtimeDir, { recursive: true });
-    for (const port of ports) {
+    for (const attempt of attempts) {
+      const { port, launchProfile } = attempt;
       const endpoint = `http://127.0.0.1:${port}`;
-      const launchProfile = this.resolveCdpLaunchProfile(config, executable, port);
       mkdirSync(launchProfile.userDataDir, { recursive: true });
       const args = [
         `--remote-debugging-port=${port}`,
@@ -362,10 +366,17 @@ export class ExternalBrowserBridge {
           // Ignore child cleanup errors for failed startup attempts.
         }
       }
-      if (launchProfile.mode === 'system') break;
+      if (launchProfile.mode === 'system') {
+        this.cdpAutoLaunchState = `system-launch-failed:fallback-isolated@${executable}`;
+        this.log('cdp.launch.systemProfileFallback', {
+          executable,
+          endpoint,
+          reason: 'system-profile-cdp-timeout'
+        });
+      }
     }
     const requestedMode = config.externalBrowserProfileMode;
-    this.cdpAutoLaunchState = `failed:${requestedMode}@${executable}`;
+    this.cdpAutoLaunchState = `failed:${requestedMode}${requestedMode === 'system' ? '+isolated' : ''}@${executable}`;
     this.cdpLastLaunchFailureState = this.cdpAutoLaunchState;
     this.cdpLaunchCooldownUntil = Date.now() + (requestedMode === 'system' ? 20000 : 8000);
     console.warn(`${this.logPrefix} managed CDP browser launch failed for executable=${executable}.`);
@@ -388,6 +399,43 @@ export class ExternalBrowserBridge {
     }
     if (singlePort) return unique.slice(0, 1);
     return unique;
+  }
+
+  private resolveCdpLaunchAttempts(
+    config: AppConfig,
+    executable: string,
+    rawEndpoint: string,
+    skipSystemProfileLaunch: boolean
+  ): Array<{ port: number; launchProfile: CdpLaunchProfile }> {
+    const allPorts = this.resolveCdpAutoLaunchPorts(rawEndpoint, false);
+    if (config.externalBrowserProfileMode !== 'system') {
+      return allPorts.map((port) => ({ port, launchProfile: this.resolveCdpLaunchProfile(config, executable, port) }));
+    }
+
+    const attempts: Array<{ port: number; launchProfile: CdpLaunchProfile }> = [];
+    const primaryPort = this.resolveCdpAutoLaunchPorts(rawEndpoint, true)[0] ?? 9222;
+    if (!skipSystemProfileLaunch) {
+      attempts.push({ port: primaryPort, launchProfile: this.resolveCdpLaunchProfile(config, executable, primaryPort) });
+    }
+
+    for (const port of allPorts) {
+      attempts.push({
+        port,
+        launchProfile: {
+          mode: 'isolated',
+          userDataDir: join(this.runtimeDir, `cdp-profile-${port}`),
+          autoLaunchState: `fallback-isolated@${executable}`
+        }
+      });
+    }
+
+    const seen = new Set<string>();
+    return attempts.filter((attempt) => {
+      const key = `${attempt.launchProfile.mode}:${attempt.port}:${attempt.launchProfile.userDataDir}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   }
 
   private resolveCdpLaunchProfile(config: AppConfig, executable: string, port: number): CdpLaunchProfile {

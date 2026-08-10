@@ -8,13 +8,30 @@ export interface CitationLink {
 export const NUMERIC_CITATION_LINK_RE = /\[(\d+)\]\((https?:\/\/[^)\n]+)\)/g;
 const MARKDOWN_HTTP_LINK_RE = /\[([^\]\n]+)\]\((https?:\/\/[^)\n]+)\)/g;
 const SENTENCE_BOUNDARIES = ['\n', '.', ';', '\u3002', '\uff1b'];
+const DOUBLE_ENCODED_PERCENT_ESCAPE_RE = /%25[0-9a-f]{2}/i;
+
+function decodeDoubleEncodedHref(rawHref: string): string {
+  let current = rawHref;
+  for (let index = 0; index < 2 && DOUBLE_ENCODED_PERCENT_ESCAPE_RE.test(current); index += 1) {
+    try {
+      current = decodeURI(current);
+    } catch {
+      return rawHref;
+    }
+  }
+  return current;
+}
 
 export function normalizeCitationHref(rawHref: string): string {
-  const trimmed = rawHref.trim().replace(/^<(.+)>$/, '$1');
+  const trimmed = decodeDoubleEncodedHref(rawHref.trim().replace(/^<(.+)>$/, '$1'));
   try {
-    return encodeURI(trimmed);
+    return new URL(trimmed.replace(/&amp;/g, '&')).href;
   } catch {
-    return trimmed.replace(/\s+/g, '%20');
+    try {
+      return encodeURI(trimmed);
+    } catch {
+      return trimmed.replace(/\s+/g, '%20');
+    }
   }
 }
 

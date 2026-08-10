@@ -100,6 +100,21 @@ describe('ConfigStore', () => {
     expect(store.get().textBrightness).toBe(70);
   });
 
+  it('sanitizes and exposes text color', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new ConfigStore(env.home);
+
+    expect(store.publicConfig(false).textColor).toBe('');
+
+    store.update({ textColor: '#f8fafc' });
+    expect(store.get().textColor).toBe('#f8fafc');
+    expect(store.publicConfig(false).textColor).toBe('#f8fafc');
+
+    store.update({ textColor: 'url(javascript:alert(1))' });
+    expect(store.get().textColor).toBe('');
+  });
+
   it('persists an imported custom theme selection', () => {
     const env = tempHome();
     cleanup = env.cleanup;

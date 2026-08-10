@@ -33,6 +33,16 @@ describe('renderMarkdownToHtml', () => {
     expect(html).toContain(`<a href="${url}" target="_blank" rel="noreferrer">source</a>`);
   });
 
+  it('normalizes double-encoded search URLs before rendering links', () => {
+    const rawUrl = 'https://www.baidu.com/s?wd=%25E5%258C%2597%25E4%25BA%25AC%25E4%25BB%258A%25E5%25A4%25A9%25E5%25A4%25A9%25E6%25B0%2594';
+    const normalizedUrl = 'https://www.baidu.com/s?wd=%E5%8C%97%E4%BA%AC%E4%BB%8A%E5%A4%A9%E5%A4%A9%E6%B0%94';
+    const html = renderMarkdownToHtml(normalizeMarkdownForRender(`[baidu weather](${rawUrl})`));
+
+    expect(normalizeCitationHref(rawUrl)).toBe(normalizedUrl);
+    expect(html).toContain(`href="${normalizedUrl}"`);
+    expect(html).not.toContain('%25E5');
+  });
+
   it('renders citation badges for raw Chinese URLs containing spaces', () => {
     const rawUrl = 'https://baike.baidu.com/item/5·4 三亚海鲜店皮皮虾价格过高事件/67742287';
     const encodedUrl = normalizeCitationHref(rawUrl);

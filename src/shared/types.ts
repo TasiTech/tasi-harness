@@ -291,6 +291,7 @@ export interface AppConfig {
   browserExecutionLoggingEnabled: boolean;
   theme: AppTheme;
   textBrightness: number;
+  textColor: string;
   customThemes: CustomTheme[];
   systemPersona: string;
   omniSystemPrompt: string;

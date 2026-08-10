@@ -47,6 +47,14 @@ function cleanOptionalText(value: unknown, maxLength: number): string | undefine
   return clean || undefined;
 }
 
+function cleanOptionalColor(value: unknown): string {
+  const clean = cleanOptionalText(value, 80);
+  if (!clean) return '';
+  if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(clean)) return clean;
+  if (/^rgba?\(\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(clean)) return clean;
+  return '';
+}
+
 function sanitizeCustomThemeTokens(input: unknown): CustomThemeTokens {
   const raw = input && typeof input === 'object' ? input as Record<string, unknown> : {};
   const allowed = [
@@ -168,6 +176,7 @@ export class ConfigStore {
     merged.browserExecutionLoggingEnabled = merged.browserExecutionLoggingEnabled === true;
     merged.theme = sanitizeTheme(merged.theme, defaults.theme, merged.customThemes);
     merged.textBrightness = Math.max(70, Math.min(150, Number(merged.textBrightness) || defaults.textBrightness));
+    merged.textColor = cleanOptionalColor(merged.textColor);
     merged.omniSystemPrompt = cleanText(merged.omniSystemPrompt, defaults.omniSystemPrompt, 12000);
     merged.skillMarketSources = Array.isArray(merged.skillMarketSources) && merged.skillMarketSources.length > 0 ? merged.skillMarketSources : defaults.skillMarketSources;
     const configuredTools = Array.isArray(merged.enabledToolNames) ? merged.enabledToolNames.filter((name): name is string => typeof name === 'string' && name.trim().length > 0) : [];

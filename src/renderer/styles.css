@@ -112,7 +112,7 @@ label,
   place-items: center;
   border-radius: 13px;
   background: linear-gradient(135deg, var(--accent), #008f78);
-  color: white;
+  color: var(--text-primary);
   font-size: 13px;
   font-weight: 800;
   letter-spacing: 0.08em;
@@ -600,6 +600,10 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
 .chat-content-grid.tool-panel-collapsed { grid-template-columns: minmax(0, 1fr) 48px; }
 .chat-messages { min-height: 0; overflow: auto; padding: 28px; }
 .tool-panel { min-width: 0; min-height: 0; border-left: 1px solid var(--border); background: linear-gradient(180deg, rgba(0, 212, 170, 0.05), transparent 18%); display: flex; flex-direction: column; }
+.tool-panel.web-preview-floating {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
 .tool-panel.collapsed {
   align-items: stretch;
   background: var(--bg-secondary);
@@ -856,16 +860,17 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   background: #fff;
 }
 .tool-web-preview.expanded {
-  position: absolute;
+  position: fixed;
   inset: auto;
-  z-index: 1200;
+  z-index: 2400;
   border: 1px solid var(--border-active);
   border-radius: 16px;
   box-shadow: var(--shadow);
   background: var(--bg-secondary);
   min-width: 360px;
   min-height: 220px;
-  min-width: 0;
+  max-width: calc(100vw - 12px);
+  max-height: calc(100vh - 12px);
 }
 .tool-web-preview.expanded .tool-web-preview-frame {
   height: 100%;
@@ -2140,6 +2145,12 @@ progress::-webkit-progress-value { background: var(--accent); }
   position: relative;
   isolation: isolate;
   background: transparent;
+  --custom-surface-strong: color-mix(in srgb, var(--bg-secondary) 16%, transparent);
+  --custom-surface-medium: color-mix(in srgb, var(--bg-secondary) 14%, transparent);
+  --custom-surface-soft: color-mix(in srgb, var(--bg-secondary) 8%, transparent);
+  --custom-surface-control: color-mix(in srgb, var(--bg-secondary) 54%, transparent);
+  --custom-surface-sidebar: linear-gradient(90deg, color-mix(in srgb, var(--bg-secondary) 18%, transparent), color-mix(in srgb, var(--bg-secondary) 10%, transparent));
+  --custom-surface-blur: none;
 }
 [data-theme='custom'] .app-shell::before {
   content: none;
@@ -2158,9 +2169,9 @@ progress::-webkit-progress-value { background: var(--accent); }
   position: absolute;
   inset: 0;
   background:
-    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px),
-    linear-gradient(120deg, rgba(0, 0, 0, 0.12), rgba(0, 0, 0, 0.58));
+    linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
+    linear-gradient(120deg, color-mix(in srgb, var(--bg-primary) 8%, transparent), color-mix(in srgb, var(--bg-primary) 24%, transparent));
   background-size: 44px 44px, 44px 44px, auto;
   background-repeat: repeat, repeat, no-repeat;
 }
@@ -2172,6 +2183,20 @@ progress::-webkit-progress-value { background: var(--accent); }
 [data-theme='custom'] .main-pane {
   z-index: 1;
   background: transparent;
+  isolation: isolate;
+}
+[data-theme='custom'] .main-pane::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: var(--bg-primary);
+  opacity: 0.03;
+}
+[data-theme='custom'] .main-pane > * {
+  position: relative;
+  z-index: 1;
 }
 [data-theme='custom'] .page,
 [data-theme='custom'] .chat-page,
@@ -2184,12 +2209,16 @@ progress::-webkit-progress-value { background: var(--accent); }
 [data-theme='custom'] .tool-panel.collapsed,
 [data-theme='custom'] .tool-panel-header,
 [data-theme='custom'] .sidebar {
-  background: rgba(8, 18, 34, 0.34);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  background: var(--custom-surface-strong);
+  backdrop-filter: var(--custom-surface-blur);
+  -webkit-backdrop-filter: var(--custom-surface-blur);
 }
 [data-theme='custom'] .card,
 [data-theme='custom'] .about-card,
+[data-theme='custom'] .modal-card,
+[data-theme='custom'] .marketplace-card,
+[data-theme='custom'] .skill-card,
+[data-theme='custom'] .live-task-card,
 [data-theme='custom'] .tool-panel,
 [data-theme='custom'] .session-card,
 [data-theme='custom'] .task-card,
@@ -2203,28 +2232,27 @@ progress::-webkit-progress-value { background: var(--accent); }
 [data-theme='custom'] .live-conversation-panel,
 [data-theme='custom'] .live-task-panel,
 [data-theme='custom'] .live-trace-panel {
-  background: rgba(8, 18, 34, 0.38);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  background: var(--custom-surface-control);
+  backdrop-filter: var(--custom-surface-blur);
+  -webkit-backdrop-filter: var(--custom-surface-blur);
 }
 [data-theme='custom'] .sidebar {
-  background:
-    linear-gradient(90deg, rgba(8, 18, 34, 0.42), rgba(8, 18, 34, 0.24));
+  background: var(--custom-surface-sidebar);
 }
 [data-theme='custom'] .tool-panel,
 [data-theme='custom'] .tool-panel-body,
 [data-theme='custom'] .live-conversation-panel,
 [data-theme='custom'] .live-task-panel,
 [data-theme='custom'] .live-trace-panel {
-  background: rgba(8, 18, 34, 0.18);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  background: var(--custom-surface-soft);
+  backdrop-filter: var(--custom-surface-blur);
+  -webkit-backdrop-filter: var(--custom-surface-blur);
 }
 [data-theme='custom'] .tool-panel-header,
 [data-theme='custom'] .live-panel-header {
-  background: rgba(8, 18, 34, 0.3);
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  background: var(--custom-surface-medium);
+  backdrop-filter: var(--custom-surface-blur);
+  -webkit-backdrop-filter: var(--custom-surface-blur);
 }
 [data-theme='custom'] .tool-empty,
 [data-theme='custom'] .empty-state {
@@ -2234,6 +2262,10 @@ progress::-webkit-progress-value { background: var(--accent); }
 [data-theme='custom'] .live-panel-body,
 [data-theme='custom'] .tool-panel-body {
   background: transparent;
+}
+[data-theme='custom'] .tool-panel.web-preview-floating {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .dreamskin-gallery-panel {
   margin-top: 18px;
@@ -2417,6 +2449,20 @@ progress::-webkit-progress-value { background: var(--accent); }
   display: flex;
   align-items: center;
   gap: 10px;
+}
+.theme-color-control {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) auto;
+}
+.theme-color-control .ghost-button {
+  min-height: 38px;
+  white-space: nowrap;
+}
+.theme-color-swatch {
+  width: 44px;
+  height: 38px;
+  min-width: 44px;
+  padding: 3px;
 }
 .theme-adjust-control input[type='range'] {
   width: 100%;

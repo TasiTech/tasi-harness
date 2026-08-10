@@ -129,6 +129,7 @@ const defaultConfig: PublicAppConfig = {
   browserExecutionLoggingEnabled: false,
   theme: 'dark',
   textBrightness: 100,
+  textColor: '',
   customThemes: [],
   systemPersona: 'You are Tasi Harness, a desktop AI agent.',
   omniSystemPrompt: DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -244,6 +245,12 @@ const BUILTIN_TEXT_TOKENS: Record<'dark' | 'light' | 'tech', Required<Pick<Custo
   }
 };
 
+const BUILTIN_BACKGROUND_TOKENS: Record<'dark' | 'light' | 'tech', string> = {
+  dark: '#0a0a0f',
+  light: '#f5f6fb',
+  tech: '#06111f'
+};
+
 function parseCssColor(value: string): { r: number; g: number; b: number; a: number } | undefined {
   const text = value.trim();
   const hex = text.match(/^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
@@ -277,6 +284,115 @@ function mixColor(color: { r: number; g: number; b: number; a: number }, target:
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+function relativeLuminance(color: { r: number; g: number; b: number }): number {
+  const channel = (value: number) => {
+    const normalized = Math.max(0, Math.min(255, value)) / 255;
+    return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+}
+
+function themeBackgroundColor(config: Pick<PublicAppConfig, 'theme' | 'customThemes'>): string {
+  const customId = customThemeId(config.theme);
+  if (customId) {
+    const theme = config.customThemes.find((item) => item.id === customId);
+    return theme?.tokens.bgPrimary || BUILTIN_BACKGROUND_TOKENS.dark;
+  }
+  if (config.theme === 'light' || config.theme === 'tech') return BUILTIN_BACKGROUND_TOKENS[config.theme];
+  return BUILTIN_BACKGROUND_TOKENS.dark;
+}
+
+function themeAccentColor(config: Pick<PublicAppConfig, 'theme' | 'customThemes'>): string {
+  const customId = customThemeId(config.theme);
+  if (customId) {
+    const theme = config.customThemes.find((item) => item.id === customId);
+    return theme?.tokens.accent || theme?.tokens.accent2 || theme?.tokens.borderActive || '#00d4aa';
+  }
+  if (config.theme === 'tech') return '#18f0cf';
+  if (config.theme === 'light') return '#00aa88';
+  return '#00d4aa';
+}
+
+function automaticTextBrightness(config: Pick<PublicAppConfig, 'theme' | 'customThemes'>): number {
+  const background = parseCssColor(themeBackgroundColor(config));
+  if (!background) return config.theme === 'light' ? 70 : 130;
+  const luminance = relativeLuminance(background);
+  return Math.round(Math.max(70, Math.min(150, 150 - luminance * 80)));
+}
+
+function contrastRatio(a: { r: number; g: number; b: number }, b: { r: number; g: number; b: number }): number {
+  const lighter = Math.max(relativeLuminance(a), relativeLuminance(b));
+  const darker = Math.min(relativeLuminance(a), relativeLuminance(b));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function colorToHex(value: string | undefined): string {
+  const color = value ? parseCssColor(value) : undefined;
+  if (!color) return '#ffffff';
+  const part = (channel: number) => Math.round(Math.max(0, Math.min(255, channel))).toString(16).padStart(2, '0');
+  return `#${part(color.r)}${part(color.g)}${part(color.b)}`;
+}
+
+function ensureTextContrast(value: string, backgroundValue: string, minRatio: number, preserveHue = false): string {
+  const color = parseCssColor(value);
+  const background = parseCssColor(backgroundValue);
+  if (!color || !background) return value;
+  if (contrastRatio(color, background) >= minRatio) return value;
+  if (preserveHue) {
+    const towardWhite = contrastRatio({ r: 255, g: 255, b: 255 }, background) >= contrastRatio({ r: 0, g: 0, b: 0 }, background);
+    const target = towardWhite ? { r: 255, g: 255, b: 255 } : { r: 0, g: 0, b: 0 };
+    for (let step = 0.08; step <= 1; step += 0.04) {
+      const candidate = mixColor(color, target, step);
+      const parsed = parseCssColor(candidate);
+      if (parsed && contrastRatio(parsed, background) >= minRatio) return candidate;
+    }
+    return towardWhite ? '#ffffff' : '#111111';
+  }
+  const white = { r: 255, g: 255, b: 255 };
+  const black = { r: 0, g: 0, b: 0 };
+  const target = contrastRatio(white, background) >= contrastRatio(black, background) ? white : black;
+  for (let step = 0.15; step <= 1; step += 0.05) {
+    const candidate = mixColor(color, target, step);
+    const parsed = parseCssColor(candidate);
+    if (parsed && contrastRatio(parsed, background) >= minRatio) return candidate;
+  }
+  return target === white ? '#ffffff' : '#111111';
+}
+
+function automaticTextColor(config: Pick<PublicAppConfig, 'theme' | 'customThemes'>): string {
+  const background = parseCssColor(themeBackgroundColor(config));
+  const accent = parseCssColor(themeAccentColor(config));
+  if (!background) return config.theme === 'light' ? '#111827' : '#f8fafc';
+  const candidates = ['#ffffff', '#f8fafc', '#eef9ff', '#1a1a2e', '#111827', '#05070a'];
+  const scored = candidates.map((candidate) => {
+    const color = parseCssColor(candidate);
+    if (!color) return { candidate, score: 0 };
+    const backgroundScore = contrastRatio(color, background);
+    const accentScore = accent ? Math.min(contrastRatio(color, accent), 7) : 7;
+    return { candidate, score: backgroundScore * 1.8 + accentScore };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.candidate ?? '#f8fafc';
+}
+
+function textTokensFromPrimaryColor(primary: string, background: string): Required<Pick<CustomTheme['tokens'], 'textPrimary' | 'textSecondary' | 'textMuted'>> {
+  const textPrimary = ensureTextContrast(primary, background, 4.5, true);
+  const primaryColor = parseCssColor(textPrimary);
+  const backgroundColor = parseCssColor(background);
+  if (!primaryColor || !backgroundColor) {
+    return {
+      textPrimary,
+      textSecondary: textPrimary,
+      textMuted: textPrimary
+    };
+  }
+  return {
+    textPrimary,
+    textSecondary: ensureTextContrast(mixColor(primaryColor, backgroundColor, 0.26), background, 3.2),
+    textMuted: ensureTextContrast(mixColor(primaryColor, backgroundColor, 0.44), background, 2.4)
+  };
+}
+
 function adjustTextColor(value: string, brightness: number): string | undefined {
   const color = parseCssColor(value);
   if (!color) return undefined;
@@ -286,6 +402,8 @@ function adjustTextColor(value: string, brightness: number): string | undefined 
 }
 
 function baseTextTokens(config: PublicAppConfig, theme?: CustomTheme): Required<Pick<CustomTheme['tokens'], 'textPrimary' | 'textSecondary' | 'textMuted'>> {
+  const manualTextColor = config.textColor?.trim();
+  if (manualTextColor) return textTokensFromPrimaryColor(manualTextColor, themeBackgroundColor(config));
   if (theme) {
     return {
       textPrimary: theme.tokens.textPrimary || BUILTIN_TEXT_TOKENS.dark.textPrimary,
@@ -300,15 +418,17 @@ function baseTextTokens(config: PublicAppConfig, theme?: CustomTheme): Required<
 function applyTextBrightness(config: PublicAppConfig, theme?: CustomTheme): void {
   const brightness = Math.max(70, Math.min(150, Number(config.textBrightness) || 100));
   const root = document.documentElement;
+  const manualTextColor = Boolean(config.textColor?.trim());
   const tokens = baseTextTokens(config, theme);
+  const background = themeBackgroundColor(config);
   const targets = [
-    ['--text-primary', tokens.textPrimary],
-    ['--text-secondary', tokens.textSecondary],
-    ['--text-muted', tokens.textMuted]
+    ['--text-primary', tokens.textPrimary, 4.5],
+    ['--text-secondary', tokens.textSecondary, 3.2],
+    ['--text-muted', tokens.textMuted, 2.4]
   ] as const;
-  for (const [cssKey, base] of targets) {
-    const adjusted = adjustTextColor(base, brightness);
-    root.style.setProperty(cssKey, adjusted || base);
+  for (const [cssKey, base, minRatio] of targets) {
+    const adjusted = manualTextColor ? base : adjustTextColor(base, brightness);
+    root.style.setProperty(cssKey, ensureTextContrast(adjusted || base, background, minRatio, manualTextColor));
   }
 }
 
@@ -740,6 +860,7 @@ export function App(): ReactElement {
   });
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_sidebar_collapsed') === '1');
   const [config, setConfig] = useState<PublicAppConfig>(defaultConfig);
+  const [themePreviewConfig, setThemePreviewConfig] = useState<PublicAppConfig | null>(null);
   const [sessions, refreshSessions] = useAsyncData<SessionSummary[]>(() => window.tasiHarness.sessions.list(), []);
   const [tasks, refreshTasks] = useAsyncData<ScheduledTask[]>(() => window.tasiHarness.tasks.list(), []);
   const [memory, refreshMemory] = useAsyncData<MemoryState>(() => window.tasiHarness.memory.get(), { entries: [], usage: [], domains: [], rendered: '' });
@@ -810,8 +931,17 @@ export function App(): ReactElement {
   }, []);
 
   useEffect(() => {
-    applyDocumentTheme(config);
-  }, [config.theme, config.customThemes, config.textBrightness]);
+    applyDocumentTheme(themePreviewConfig ?? config);
+  }, [config, themePreviewConfig]);
+
+  useEffect(() => {
+    const source = themePreviewConfig ?? config;
+    void window.tasiHarness.app.setWindowTitleBarTheme({
+      theme: source.theme,
+      textColor: source.textColor,
+      customThemes: source.customThemes
+    });
+  }, [config.theme, config.textColor, config.customThemes, themePreviewConfig]);
 
   useEffect(() => {
     document.title = config.branding.productName || 'Tasi Harness';
@@ -934,7 +1064,7 @@ export function App(): ReactElement {
     }
   }
 
-  const activeCustomTheme = getActiveCustomTheme(config);
+  const activeCustomTheme = getActiveCustomTheme(themePreviewConfig ?? config);
   const customThemeBackground = customThemeBackgroundStyle(activeCustomTheme);
 
   return (
@@ -1051,7 +1181,7 @@ export function App(): ReactElement {
             refreshSessions={refreshSessions}
           />
         )}
-        {page === 'settings' && <SettingsPage tr={tr} config={config} setConfig={setConfig} />}
+        {page === 'settings' && <SettingsPage tr={tr} config={config} setConfig={setConfig} onThemePreviewChange={setThemePreviewConfig} />}
         {page === 'about' && <AboutPage tr={tr} info={info} branding={config.branding} />}
       </main>
       {approvalRequest && (
@@ -1137,6 +1267,13 @@ interface PreviewRect {
   height: number;
 }
 
+interface PreviewBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface PreviewWebviewElement extends HTMLElement {
   getWebContentsId?: () => number;
   getURL?: () => string;
@@ -1167,32 +1304,50 @@ function normalizePreviewUrlInput(raw: string): string | undefined {
   }
 }
 
-function clampPreviewRect(rect: PreviewRect, containerWidth: number, containerHeight: number): PreviewRect {
+function clampPreviewRect(rect: PreviewRect, bounds: PreviewBounds): PreviewRect {
   const minWidth = 360;
   const minHeight = 220;
-  const maxWidth = Math.max(minWidth, containerWidth - 12);
-  const maxHeight = Math.max(minHeight, containerHeight - 12);
+  const maxWidth = Math.max(minWidth, bounds.width - 12);
+  const maxHeight = Math.max(minHeight, bounds.height - 12);
   const width = Math.min(Math.max(rect.width, minWidth), maxWidth);
   const height = Math.min(Math.max(rect.height, minHeight), maxHeight);
-  const x = Math.min(Math.max(rect.x, 0), Math.max(0, containerWidth - width));
-  const y = Math.min(Math.max(rect.y, 0), Math.max(0, containerHeight - height));
+  const x = Math.min(Math.max(rect.x, bounds.x), bounds.x + Math.max(0, bounds.width - width));
+  const y = Math.min(Math.max(rect.y, bounds.y), bounds.y + Math.max(0, bounds.height - height));
   return { x, y, width, height };
 }
 
-function buildDefaultPreviewRect(containerWidth: number, containerHeight: number): PreviewRect {
-  const targetWidth = Math.round(containerWidth * 0.98);
-  const targetHeight = Math.round(containerHeight * 0.94);
+function buildDefaultPreviewRect(bounds: PreviewBounds): PreviewRect {
+  const targetWidth = Math.round(bounds.width * 0.9);
+  const targetHeight = Math.round(bounds.height * 0.82);
   const rect = clampPreviewRect(
     {
-      x: Math.round((containerWidth - targetWidth) / 2),
-      y: Math.round((containerHeight - targetHeight) / 2),
+      x: bounds.x + Math.round((bounds.width - targetWidth) / 2),
+      y: bounds.y + Math.round((bounds.height - targetHeight) / 2),
       width: targetWidth,
       height: targetHeight
     },
-    containerWidth,
-    containerHeight
+    bounds
   );
   return rect;
+}
+
+function previewViewportBounds(): PreviewBounds {
+  const mainPane = document.querySelector('.main-pane') as HTMLElement | null;
+  const rect = mainPane?.getBoundingClientRect();
+  if (rect && rect.width >= 420 && rect.height >= 320) {
+    return {
+      x: Math.max(0, Math.round(rect.left)),
+      y: Math.max(0, Math.round(rect.top)),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }
+  return {
+    x: 0,
+    y: 0,
+    width: Math.max(420, window.innerWidth || document.documentElement.clientWidth || 420),
+    height: Math.max(320, window.innerHeight || document.documentElement.clientHeight || 320)
+  };
 }
 
 function ChatPage(props: {
@@ -1264,8 +1419,7 @@ function ChatPage(props: {
     startClientX: number;
     startClientY: number;
     originRect: PreviewRect;
-    containerWidth: number;
-    containerHeight: number;
+    bounds: PreviewBounds;
   } | null>(null);
   const visibleMessages = useMemo(
     () => props.messages.filter((m) => {
@@ -1458,10 +1612,8 @@ function ChatPage(props: {
   useEffect(() => {
     if (!webPreviewExpanded) return;
     const syncWithinBounds = () => {
-      const container = chatContentGridRef.current;
-      if (!container) return;
-      const bounds = container.getBoundingClientRect();
-      setWebPreviewRect((old) => clampPreviewRect(old ?? buildDefaultPreviewRect(bounds.width, bounds.height), bounds.width, bounds.height));
+      const bounds = previewViewportBounds();
+      setWebPreviewRect((old) => clampPreviewRect(old ?? buildDefaultPreviewRect(bounds), bounds));
     };
     syncWithinBounds();
     window.addEventListener('resize', syncWithinBounds);
@@ -1953,11 +2105,8 @@ function ChatPage(props: {
 
   function toggleWebPreviewExpanded(): void {
     if (!webPreviewExpanded) {
-      const container = chatContentGridRef.current;
-      if (container) {
-        const bounds = container.getBoundingClientRect();
-        setWebPreviewRect(clampPreviewRect(buildDefaultPreviewRect(bounds.width, bounds.height), bounds.width, bounds.height));
-      }
+      const bounds = previewViewportBounds();
+      setWebPreviewRect(clampPreviewRect(buildDefaultPreviewRect(bounds), bounds));
       previewNeedsMeasurementRef.current = true;
       setWebPreviewExpanded(true);
       window.requestAnimationFrame(() => {
@@ -1979,15 +2128,12 @@ function ChatPage(props: {
     if (!webPreviewExpanded || !webPreviewRect) return;
     if (event.button !== 0) return;
     if ((event.target as Element).closest('button, a, input, textarea, select')) return;
-    const container = chatContentGridRef.current;
-    if (!container) return;
-    const bounds = container.getBoundingClientRect();
+    const bounds = previewViewportBounds();
     dragStateRef.current = {
       startClientX: event.clientX,
       startClientY: event.clientY,
       originRect: webPreviewRect,
-      containerWidth: bounds.width,
-      containerHeight: bounds.height
+      bounds
     };
     const onMouseMove = (moveEvent: MouseEvent) => {
       const dragging = dragStateRef.current;
@@ -2001,8 +2147,7 @@ function ChatPage(props: {
           width: dragging.originRect.width,
           height: dragging.originRect.height
         },
-        dragging.containerWidth,
-        dragging.containerHeight
+        dragging.bounds
       );
       setWebPreviewRect(next);
     };
@@ -2396,7 +2541,7 @@ function ChatPage(props: {
           )}
           <div ref={endRef} />
         </div>
-        <div className={`tool-panel ${toolPanelCollapsed ? 'collapsed' : ''}`}>
+        <div className={`tool-panel ${toolPanelCollapsed ? 'collapsed' : ''} ${webPreviewExpanded ? 'web-preview-floating' : ''}`}>
           {toolPanelCollapsed ? (
             <button
               className="tool-panel-expand-button"
@@ -5169,7 +5314,17 @@ function SessionsPage({
   );
 }
 
-function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: PublicAppConfig; setConfig: (cfg: PublicAppConfig) => void }): ReactElement {
+function SettingsPage({
+  tr,
+  config,
+  setConfig,
+  onThemePreviewChange
+}: {
+  tr: TranslateFn;
+  config: PublicAppConfig;
+  setConfig: (cfg: PublicAppConfig) => void;
+  onThemePreviewChange: (cfg: PublicAppConfig | null) => void;
+}): ReactElement {
   const [draft, setDraft] = useState<SettingsDraft>({ ...config, apiKey: '', omniApiKey: '', emailNotifications: { ...config.emailNotifications, password: '' } });
   const [testResult, setTestResult] = useState('');
   const [subPage, setSubPage] = useState<'agent-model' | 'omni-model' | 'execution' | 'security' | 'channels' | 'theme' | 'branding' | 'markets'>('agent-model');
@@ -5215,8 +5370,12 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
   }, [subPage, dreamSkinOffset, dreamSkinSort]);
 
   useEffect(() => {
-    if (subPage !== 'theme') applyDocumentTheme(config);
-  }, [subPage, config]);
+    if (subPage === 'theme') {
+      onThemePreviewChange(draft);
+      return () => onThemePreviewChange(null);
+    }
+    onThemePreviewChange(null);
+  }, [subPage, draft.theme, draft.customThemes, draft.textBrightness, draft.textColor, onThemePreviewChange]);
 
   const agentProviderPreset = providerPreset(draft.provider);
   const agentSuggestedModels = providerModelOptions(draft.provider);
@@ -5358,9 +5517,13 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         filename: file.name,
         contentBase64: await fileToBase64(file)
       });
-      setConfig(next);
-      setDraft({ ...next, apiKey: '', omniApiKey: '', emailNotifications: { ...next.emailNotifications, password: '' } });
-      const theme = next.customThemes.find((item) => `custom:${item.id}` === next.theme);
+      const adjusted = await window.tasiHarness.config.set({
+        textBrightness: automaticTextBrightness(next),
+        textColor: automaticTextColor(next)
+      });
+      setConfig(adjusted);
+      setDraft({ ...adjusted, apiKey: '', omniApiKey: '', emailNotifications: { ...adjusted.emailNotifications, password: '' } });
+      const theme = adjusted.customThemes.find((item) => `custom:${item.id}` === adjusted.theme);
       const themeName = theme?.name ?? file.name;
       setTestResult(tr(`Imported theme: ${themeName}`, `已导入主题：${themeName}`));
     } catch (error) {
@@ -5396,8 +5559,12 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
         themeVersionId: theme.id,
         name: theme.name
       });
-      setConfig(next);
-      setDraft({ ...next, apiKey: '', omniApiKey: '', emailNotifications: { ...next.emailNotifications, password: '' } });
+      const adjusted = await window.tasiHarness.config.set({
+        textBrightness: automaticTextBrightness(next),
+        textColor: automaticTextColor(next)
+      });
+      setConfig(adjusted);
+      setDraft({ ...adjusted, apiKey: '', omniApiKey: '', emailNotifications: { ...adjusted.emailNotifications, password: '' } });
       setTestResult(tr(`Installed DreamSkin theme: ${theme.name}`, `已安装 DreamSkin 主题：${theme.name}`));
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -5499,10 +5666,19 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
   const selectedCustomTheme = getActiveCustomTheme(draft);
   const selectedThemeBackground = customThemeBackgroundStyle(selectedCustomTheme);
 
-  function updateThemeDraft(patch: Partial<Pick<SettingsDraft, 'theme' | 'textBrightness'>>): void {
-    const next = { ...draft, ...patch };
+  function updateThemeDraft(patch: Partial<Pick<SettingsDraft, 'theme' | 'textBrightness' | 'textColor'>>): void {
+    const next = {
+      ...draft,
+      ...patch
+    };
+    if (patch.theme && patch.textBrightness === undefined) {
+      next.textBrightness = automaticTextBrightness(next);
+    }
+    if (patch.theme && patch.textColor === undefined) {
+      next.textColor = automaticTextColor(next);
+    }
     setDraft(next);
-    applyDocumentTheme(next);
+    onThemePreviewChange(next);
   }
 
   return (
@@ -5763,6 +5939,33 @@ function SettingsPage({ tr, config, setConfig }: { tr: TranslateFn; config: Publ
                 onChange={(event) => updateThemeDraft({ textBrightness: Number(event.currentTarget.value) })}
               />
               <span className="soft-badge">{draft.textBrightness ?? 100}%</span>
+            </div>
+          </div>
+          <div className="theme-adjust-row">
+            <div>
+              <label htmlFor="text-color">{tr('Text color', '字体颜色')}</label>
+              <p>{tr('Manual text color with contrast protection against the current theme color.', '手动设置字体颜色，并按当前主题色做对比度保护。')}</p>
+            </div>
+            <div className="theme-adjust-control theme-color-control">
+              <input
+                className="theme-color-swatch"
+                type="color"
+                value={colorToHex(draft.textColor || automaticTextColor(draft))}
+                onChange={(event) => updateThemeDraft({ textColor: event.currentTarget.value })}
+                aria-label={tr('Pick text color', '选择字体颜色')}
+              />
+              <input
+                id="text-color"
+                value={draft.textColor || ''}
+                onChange={(event) => updateThemeDraft({ textColor: event.currentTarget.value })}
+                placeholder={automaticTextColor(draft)}
+              />
+              <button
+                className="ghost-button"
+                onClick={() => updateThemeDraft({ textColor: automaticTextColor(draft), textBrightness: automaticTextBrightness(draft) })}
+              >
+                {tr('Auto contrast', '自动对比')}
+              </button>
             </div>
           </div>
           {selectedCustomTheme && (

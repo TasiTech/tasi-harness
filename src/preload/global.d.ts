@@ -175,6 +175,7 @@ declare global {
         openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;
         setEmbeddedPreviewWebContentsId(id: number | null): Promise<ToolExecutionResult>;
+        setWindowTitleBarTheme(preview?: Pick<PublicAppConfig, 'theme' | 'customThemes' | 'textColor'> | null): Promise<boolean>;
         windowMinimize(): Promise<boolean>;
         windowToggleMaximize(): Promise<boolean>;
         windowClose(): Promise<boolean>;

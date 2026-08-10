@@ -43,6 +43,7 @@ import type {
   SkillOptimizationRunRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  CustomThemeTokens,
   DreamSkinGalleryQuery,
   DreamSkinThemeInstallRequest,
   ThemeImportRequest,
@@ -92,6 +93,23 @@ const WECHAT_DOCUMENT_EXTENSIONS = new Set(['.docx', '.pptx', '.xlsx', '.pdf', '
 const MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_WECHAT_DOCUMENT_BYTES = 32 * 1024 * 1024;
 const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
+const BUILTIN_TITLE_BAR_THEME_TOKENS: Record<'dark' | 'light' | 'tech', Pick<CustomThemeTokens, 'bgPrimary' | 'textPrimary'>> = {
+  dark: {
+    bgPrimary: '#0a0a0f',
+    textPrimary: '#f0f0f5'
+  },
+  light: {
+    bgPrimary: '#f5f6fb',
+    textPrimary: '#1a1a2e'
+  },
+  tech: {
+    bgPrimary: '#081f3a',
+    textPrimary: '#eef9ff'
+  }
+};
+const TITLE_BAR_TRANSPARENT_COLOR = 'rgba(0, 0, 0, 0)';
+type TitleBarThemeConfig = Pick<AppConfig, 'theme' | 'customThemes' | 'textColor'>;
+type TitleBarThemeTokens = Pick<CustomThemeTokens, 'bgPrimary' | 'textPrimary'>;
 const pendingToolApprovals = new Map<string, {
   senderId: number;
   request: ToolApprovalRequest;
@@ -251,6 +269,59 @@ function denyPendingToolApprovals(): void {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function titleBarCssColor(value: string | undefined): string | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(text)) return text;
+  if (/^rgba?\(\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(text)) return text;
+  if (/^hsla?\(\s*\d+(?:\.\d+)?(?:deg)?\s*,\s*\d+(?:\.\d+)?%\s*,\s*\d+(?:\.\d+)?%(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(text)) return text;
+  return undefined;
+}
+
+function resolveTitleBarThemeTokens(config: TitleBarThemeConfig): TitleBarThemeTokens {
+  const textColor = titleBarCssColor(config.textColor);
+  if (config.theme === 'light' || config.theme === 'tech') {
+    return {
+      ...BUILTIN_TITLE_BAR_THEME_TOKENS[config.theme],
+      textPrimary: textColor || BUILTIN_TITLE_BAR_THEME_TOKENS[config.theme].textPrimary
+    };
+  }
+  if (config.theme.startsWith('custom:')) {
+    const themeId = config.theme.slice('custom:'.length);
+    const theme = config.customThemes.find((item) => item.id === themeId);
+    return {
+      bgPrimary: titleBarCssColor(theme?.tokens.bgPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.bgPrimary,
+      textPrimary: textColor || titleBarCssColor(theme?.tokens.textPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary
+    };
+  }
+  return {
+    ...BUILTIN_TITLE_BAR_THEME_TOKENS.dark,
+    textPrimary: textColor || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary
+  };
+}
+
+function mainWindowTitleBarOverlay(config: TitleBarThemeConfig): Electron.TitleBarOverlayOptions {
+  const tokens = resolveTitleBarThemeTokens(config);
+  return {
+    color: TITLE_BAR_TRANSPARENT_COLOR,
+    symbolColor: titleBarCssColor(tokens.textPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary,
+    height: 48
+  };
+}
+
+function titleBarThemeConfigFromPayload(payload: unknown): TitleBarThemeConfig {
+  const current = context.getConfig();
+  const raw = payload && typeof payload === 'object' ? payload as Partial<TitleBarThemeConfig> : {};
+  const theme = raw.theme === 'dark' || raw.theme === 'light' || raw.theme === 'tech' || (typeof raw.theme === 'string' && raw.theme.startsWith('custom:'))
+    ? raw.theme
+    : current.theme;
+  return {
+    theme,
+    textColor: titleBarCssColor(raw.textColor) || current.textColor,
+    customThemes: Array.isArray(raw.customThemes) ? raw.customThemes : current.customThemes
+  };
 }
 
 function isAbortLikeError(error: unknown): boolean {
@@ -1901,6 +1972,7 @@ async function exportAssistantMessage(req: AssistantMessageExportRequest): Promi
 async function createWindow(): Promise<void> {
   const cfg = context.getConfig();
   const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
+  const titleBarOverlay = mainWindowTitleBarOverlay(cfg);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -1910,11 +1982,7 @@ async function createWindow(): Promise<void> {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'win32'
       ? {
-          titleBarOverlay: {
-            color: '#0c0b18',
-            symbolColor: '#eee7ff',
-            height: 48
-          }
+          titleBarOverlay
         }
       : {}),
     autoHideMenuBar: true,
@@ -1948,6 +2016,7 @@ function applyMainWindowBranding(): void {
   applyBrandDockIcon(cfg.branding.logoPath);
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.setTitle(cfg.branding.productName);
+  applyMainWindowTitleBarOverlay(cfg);
   const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
   if (!appIconPath) return;
   try {
@@ -1955,6 +2024,11 @@ function applyMainWindowBranding(): void {
   } catch {
     // Some platforms ignore runtime icon updates.
   }
+}
+
+function applyMainWindowTitleBarOverlay(config: TitleBarThemeConfig = context.getConfig()): void {
+  if (process.platform !== 'win32' || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setTitleBarOverlay(mainWindowTitleBarOverlay(config));
 }
 
 function registerWechatTools(): void {
@@ -2136,10 +2210,15 @@ function registerIpc(): void {
       ],
       theme: `custom:${theme.id}`
     });
+    applyMainWindowTitleBarOverlay(next);
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
   ipcMain.handle('themes:dreamskin:list', async (_event, req?: DreamSkinGalleryQuery) => listDreamSkinGallery(req ?? {}));
-  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => installDreamSkinTheme(context.harnessHome, context.configStore, req));
+  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => {
+    const next = await installDreamSkinTheme(context.harnessHome, context.configStore, req);
+    applyMainWindowTitleBarOverlay();
+    return next;
+  });
   ipcMain.handle('liveRealtime:start', async (_event, req?: LiveRealtimeStartRequest) => liveRealtimeManager.start(req ?? {}));
   ipcMain.handle('liveRealtime:send', async (_event, event: LiveRealtimeClientEvent) => {
     liveRealtimeManager.send(event);
@@ -2727,6 +2806,10 @@ function registerIpc(): void {
     resetEmbeddedPreviewWebContentsState(target);
     target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
+  });
+  ipcMain.handle('app:setWindowTitleBarTheme', (_event, preview?: unknown) => {
+    applyMainWindowTitleBarOverlay(preview ? titleBarThemeConfigFromPayload(preview) : context.getConfig());
+    return true;
   });
   ipcMain.handle('app:windowMinimize', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
