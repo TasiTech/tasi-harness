@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import electronPath from 'electron';
 
 const devServerUrl = process.env.VITE_DEV_SERVER_URL || `http://127.0.0.1:${process.env.TASI_DEV_SERVER_PORT || '5187'}`;
@@ -8,6 +10,36 @@ const env = {
   VITE_DEV_SERVER_URL: devServerUrl
 };
 delete env.ELECTRON_RUN_AS_NODE;
+
+function shellSingleQuote(value) {
+  return String(value).replace(/'/g, "'\"'\"'");
+}
+
+function linuxSandboxArgs() {
+  if (process.platform !== 'linux') return [];
+  if (process.env.TASI_ELECTRON_REQUIRE_SETUID_SANDBOX === '1') return [];
+
+  const sandboxPath = join(dirname(electronPath), 'chrome-sandbox');
+  if (!existsSync(sandboxPath)) return [];
+
+  const stat = statSync(sandboxPath);
+  const hasSetuid = Boolean(stat.mode & 0o4000);
+  const isRootOwned = stat.uid === 0;
+  if (hasSetuid && isRootOwned) return [];
+
+  const quotedSandboxPath = shellSingleQuote(sandboxPath);
+  console.warn(
+    [
+      `Electron chrome-sandbox is not configured for setuid sandboxing: ${sandboxPath}`,
+      'Starting Electron with --no-sandbox for this dev session.',
+      'To use the setuid sandbox instead, run:',
+      `  sudo chown root:root '${quotedSandboxPath}'`,
+      `  sudo chmod 4755 '${quotedSandboxPath}'`,
+      'Then restart npm run dev.'
+    ].join('\n')
+  );
+  return ['--no-sandbox'];
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -36,7 +68,7 @@ async function waitForTasiDevServer(url) {
 
 await waitForTasiDevServer(devServerUrl);
 
-const child = spawn(electronPath, ['.'], {
+const child = spawn(electronPath, [...linuxSandboxArgs(), '.'], {
   env,
   shell: false,
   stdio: 'inherit',
