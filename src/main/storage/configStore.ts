@@ -5,6 +5,7 @@ import { isOmniProviderKind, normalizeProviderKind, omniProviderDefaultBaseUrl, 
 import { defaultConfig, ensureDir } from './pathUtils.js';
 import { JsonFileStore } from './jsonFileStore.js';
 
+const REASONING_EFFORTS = new Set(['auto', 'none', 'low', 'medium', 'xhigh']);
 const IMAGE_MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -53,6 +54,11 @@ function cleanOptionalColor(value: unknown): string {
   if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(clean)) return clean;
   if (/^rgba?\(\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(clean)) return clean;
   return '';
+}
+
+function sanitizeReasoningEffort(value: unknown, fallback: AppConfig['reasoningEffort']): AppConfig['reasoningEffort'] {
+  if (value === 'high') return 'xhigh';
+  return REASONING_EFFORTS.has(value as string) ? value as AppConfig['reasoningEffort'] : fallback;
 }
 
 function sanitizeCustomThemeTokens(input: unknown): CustomThemeTokens {
@@ -150,6 +156,7 @@ export class ConfigStore {
     merged.omniModel = cleanText(merged.omniModel, omniProviderDefaultModel(merged.omniProvider), 200);
     if (!merged.omniBaseUrl) merged.omniBaseUrl = omniProviderDefaultBaseUrl(merged.omniProvider);
     merged.omniApiKey = typeof merged.omniApiKey === 'string' ? merged.omniApiKey : defaults.omniApiKey;
+    merged.reasoningEffort = sanitizeReasoningEffort(merged.reasoningEffort, defaults.reasoningEffort);
     merged.temperature = Number.isFinite(merged.temperature) ? merged.temperature : defaults.temperature;
     merged.maxIterations = Math.max(1, Math.min(200, Number(merged.maxIterations) || defaults.maxIterations));
     merged.sessionDocumentMaxDocs = Math.max(1, Math.min(100, Number(merged.sessionDocumentMaxDocs) || defaults.sessionDocumentMaxDocs));
@@ -251,6 +258,7 @@ export class ConfigStore {
       },
       branding: sanitizeBranding(partial.branding ?? current.branding, current.branding)
     };
+    next.reasoningEffort = sanitizeReasoningEffort(next.reasoningEffort, current.reasoningEffort);
     ensureDir(next.workspaceDir);
     this.store.write(next);
     return next;

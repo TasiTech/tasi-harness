@@ -2,6 +2,7 @@
 import type { CSSProperties } from 'react';
 import type {
   AgentMessage,
+  AgentMessageDeltaStream,
   AgentMessageAttachment,
   AppInfo,
   BrowserCoachRecordedEvent,
@@ -109,6 +110,7 @@ const defaultConfig: PublicAppConfig = {
   omniBaseUrl: omniProviderDefaultBaseUrl('openai'),
   omniApiKeyConfigured: false,
   omniModel: omniProviderDefaultModel('openai'),
+  reasoningEffort: 'auto',
   temperature: 0.3,
   maxIterations: 200,
   sessionDocumentMaxDocs: 10,
@@ -155,6 +157,11 @@ const defaultConfig: PublicAppConfig = {
 };
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MESSAGE_DELTA_FLUSH_MS = 120;
+const REASONING_DELTA_FLUSH_MS = 180;
+const LIVE_CONTENT_PREVIEW_CHARS = 16_000;
+const LIVE_CONTENT_ITEM_CHARS = 2_000;
+const REASONING_LIVE_PREVIEW_CHARS = 6000;
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -171,6 +178,68 @@ function brandInitials(branding?: PublicAppConfig['branding']): string {
     .join('')
     .slice(0, 4)
     .toUpperCase() || 'TH';
+}
+
+function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaStream): AgentMessage[] {
+  const existing = messages.find((message) => message.id === payload.messageId);
+  if (!existing) {
+    return [
+      ...messages,
+      {
+        id: payload.messageId,
+        role: 'assistant',
+        content: payload.content ?? '',
+        reasoning_content: payload.reasoning_content,
+        reasoning_parts: payload.reasoning_parts,
+        content_parts: payload.content_parts,
+        createdAt: payload.createdAt
+      }
+    ];
+  }
+
+  return messages.map((message) => {
+    if (message.id !== payload.messageId) return message;
+    return {
+      ...message,
+      content: payload.content ?? message.content,
+      reasoning_content: payload.reasoning_content ?? message.reasoning_content,
+      reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
+      content_parts: payload.content_parts ?? message.content_parts,
+      createdAt: message.createdAt ?? payload.createdAt
+    };
+  });
+}
+
+function mergeBufferedMessageDelta(
+  current: AgentMessageDeltaStream | undefined,
+  incoming: AgentMessageDeltaStream
+): AgentMessageDeltaStream {
+  if (!current) return incoming;
+  return {
+    ...current,
+    ...incoming,
+    type: incoming.type,
+    delta: incoming.delta,
+    content: incoming.content !== undefined ? incoming.content : current.content,
+    reasoning_content: incoming.reasoning_content !== undefined ? incoming.reasoning_content : current.reasoning_content,
+    reasoning_parts: incoming.reasoning_parts !== undefined ? incoming.reasoning_parts : current.reasoning_parts,
+    content_parts: incoming.content_parts !== undefined ? incoming.content_parts : current.content_parts,
+    createdAt: current.createdAt ?? incoming.createdAt
+  };
+}
+
+export function isVisibleChatMessage(message: AgentMessage): boolean {
+  if (message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER) return false;
+  if (message.role === 'assistant' && message.hidden === true) return false;
+  const isIntermediateToolAssistant = message.role === 'assistant'
+    && !message.content?.trim()
+    && (message.tool_calls?.length ?? 0) > 0;
+  if (isIntermediateToolAssistant) return false;
+  return message.role === 'user' || (message.role === 'assistant' && Boolean(
+    message.content?.trim()
+    || message.reasoning_content?.trim()
+    || (message.content_parts?.some((part) => part.trim()) ?? false)
+  ));
 }
 
 function BrandLogo({ branding, className }: { branding: PublicAppConfig['branding']; className: string }): ReactElement {
@@ -1414,6 +1483,8 @@ function ChatPage(props: {
   const previewMeasuredViewportRef = useRef<{ width: number; height: number } | null>(null);
   const previewNeedsMeasurementRef = useRef(true);
   const externalPreviewOpenUrlRef = useRef('');
+  const messageDeltaBufferRef = useRef<Map<string, AgentMessageDeltaStream>>(new Map());
+  const messageDeltaFlushTimerRef = useRef<number | null>(null);
   const previousWechatBusyRef = useRef(false);
   const dragStateRef = useRef<{
     startClientX: number;
@@ -1421,20 +1492,14 @@ function ChatPage(props: {
     originRect: PreviewRect;
     bounds: PreviewBounds;
   } | null>(null);
-  const visibleMessages = useMemo(
-    () => props.messages.filter((m) => {
-      if (m.role === 'assistant' && m.content === WECHAT_PENDING_MARKER) return false;
-      const isIntermediateToolAssistant = m.role === 'assistant' && !m.content?.trim() && (m.tool_calls?.length ?? 0) > 0;
-      if (isIntermediateToolAssistant) return false;
-      return m.role === 'user' || (m.role === 'assistant' && Boolean(m.content?.trim() || m.reasoning_content?.trim()));
-    }),
-    [props.messages]
-  );
+  const [previewDragging, setPreviewDragging] = useState(false);
+  const visibleMessages = useMemo(() => props.messages.filter(isVisibleChatMessage), [props.messages]);
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
   const latestAssistantContent = useMemo(() => {
     const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
-    return latest?.content ?? '';
+    if (!latest) return '';
+    return [...(latest.content_parts ?? []), latest.content].filter((item) => item.trim()).join('\n\n');
   }, [visibleMessages]);
   const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
@@ -1474,6 +1539,31 @@ function ChatPage(props: {
     isWechatSession ? wechatSessionAttachments.slice(-3) : wechatSessionAttachments
   ), [isWechatSession, wechatSessionAttachments]);
   const hiddenWechatAttachmentCount = Math.max(0, wechatSessionAttachments.length - visibleWechatSessionAttachments.length);
+
+  function flushMessageDeltas(): void {
+    if (messageDeltaFlushTimerRef.current != null) {
+      window.clearTimeout(messageDeltaFlushTimerRef.current);
+      messageDeltaFlushTimerRef.current = null;
+    }
+    const pending = [...messageDeltaBufferRef.current.values()];
+    messageDeltaBufferRef.current.clear();
+    if (pending.length === 0) return;
+    props.setMessages((old) => pending.reduce((next, payload) => mergeMessageDelta(next, payload), old));
+  }
+
+  function clearPendingMessageDeltas(): void {
+    if (messageDeltaFlushTimerRef.current != null) {
+      window.clearTimeout(messageDeltaFlushTimerRef.current);
+      messageDeltaFlushTimerRef.current = null;
+    }
+    messageDeltaBufferRef.current.clear();
+  }
+
+  function scheduleMessageDeltaFlush(delayMs = MESSAGE_DELTA_FLUSH_MS): void {
+    if (messageDeltaFlushTimerRef.current != null) return;
+    messageDeltaFlushTimerRef.current = window.setTimeout(flushMessageDeltas, delayMs);
+  }
+
   useEffect(() => {
     setWechatChipClearedAt(new Date().toISOString());
     previousWechatBusyRef.current = false;
@@ -1620,12 +1710,15 @@ function ChatPage(props: {
     return () => window.removeEventListener('resize', syncWithinBounds);
   }, [webPreviewExpanded]);
 
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: 'smooth' }), [visibleMessages, props.toolEvents, runBusy]);
+  useEffect(() => {
+    if (previewDragging) return;
+    endRef.current?.scrollIntoView({ behavior: runBusy ? 'auto' : 'smooth' });
+  }, [visibleMessages, props.toolEvents, runBusy, previewDragging]);
   useEffect(() => {
     if (toolPanelCollapsed || toolPanelTab !== 'tools') return;
     const panel = toolPanelBodyRef.current;
     if (!panel) return;
-    panel.scrollTo({ top: panel.scrollHeight, behavior: 'smooth' });
+    panel.scrollTo({ top: panel.scrollHeight, behavior: runBusy ? 'auto' : 'smooth' });
   }, [props.toolEvents, toolPanelCollapsed, toolPanelTab]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onToolEvent((payload) => {
@@ -1637,34 +1730,20 @@ function ChatPage(props: {
   useEffect(() => {
     const off = window.tasiHarness.agent.onMessageDelta((payload) => {
       if (props.sessionId && payload.sessionId !== props.sessionId) return;
-      props.setMessages((old) => {
-        const existing = old.find((message) => message.id === payload.messageId);
-        if (!existing) {
-          return [
-            ...old,
-            {
-              id: payload.messageId,
-              role: 'assistant',
-              content: payload.content ?? '',
-              reasoning_content: payload.reasoning_content,
-              reasoning_parts: payload.reasoning_parts,
-              createdAt: payload.createdAt
-            }
-          ];
-        }
-        return old.map((message) => {
-          if (message.id !== payload.messageId) return message;
-          return {
-            ...message,
-            content: payload.content ?? message.content,
-            reasoning_content: payload.reasoning_content ?? message.reasoning_content,
-            reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
-            createdAt: message.createdAt ?? payload.createdAt
-          };
-        });
-      });
+      messageDeltaBufferRef.current.set(
+        payload.messageId,
+        mergeBufferedMessageDelta(messageDeltaBufferRef.current.get(payload.messageId), payload)
+      );
+      if (payload.type === 'done') {
+        flushMessageDeltas();
+        return;
+      }
+      scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS);
     });
-    return off;
+    return () => {
+      off();
+      clearPendingMessageDeltas();
+    };
   }, [props.sessionId, props.setMessages]);
   useEffect(() => {
     if (!showEmbeddedWebPreview) {
@@ -2042,6 +2121,7 @@ function ChatPage(props: {
     props.setStopping(false);
     setFollowUpQuestions([]);
     props.setToolEvents([]);
+    clearPendingMessageDeltas();
     props.setMessages([...props.messages, { role: 'user', content: text, attachments: outgoingAttachments.length > 0 ? outgoingAttachments : undefined, createdAt: new Date().toISOString() }]);
     try {
       const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled, outgoingAttachments);
@@ -2135,6 +2215,7 @@ function ChatPage(props: {
       originRect: webPreviewRect,
       bounds
     };
+    setPreviewDragging(true);
     const onMouseMove = (moveEvent: MouseEvent) => {
       const dragging = dragStateRef.current;
       if (!dragging) return;
@@ -2151,13 +2232,16 @@ function ChatPage(props: {
       );
       setWebPreviewRect(next);
     };
-    const onMouseUp = () => {
+    const endDrag = () => {
       dragStateRef.current = null;
+      setPreviewDragging(false);
       window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
+      window.removeEventListener('mouseup', endDrag);
+      window.removeEventListener('blur', endDrag);
     };
     window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
+    window.addEventListener('mouseup', endDrag);
+    window.addEventListener('blur', endDrag);
   }
 
   function syncPreviewNavigationState(): void {
@@ -2524,6 +2608,8 @@ function ChatPage(props: {
               sessionId={props.sessionId}
               tr={props.tr}
               productName={props.config.branding.productName || 'Tasi Harness'}
+              liveContentPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && m.content.trim().length > 0}
+              liveReasoningPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && !m.content.trim()}
             />
           ))}
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
@@ -2974,47 +3060,163 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
 
 const ToolEventCard = memo(ToolEventCardComponent);
 
-function reasoningItems(content: string, parts?: string[]): string[] {
-  const explicitParts = parts?.map((part) => part.trim()).filter(Boolean) ?? [];
-  if (explicitParts.length > 0) return explicitParts;
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-  if (!normalized) return [];
-
-  const lineItems = normalized
-    .split('\n')
-    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, ''))
-    .filter(Boolean);
-  if (lineItems.length > 1) return lineItems;
-
-  const sentenceItems = normalized.match(/[^。！？!?；;]+[。！？!?；;]?/g)?.map((item) => item.trim()).filter(Boolean) ?? [];
-  return sentenceItems.length > 0 ? sentenceItems : [normalized];
+function reasoningPanelText(content: string, parts: string[] | undefined, livePreview: boolean): { text: string; clippedText: boolean } {
+  const fullText = (parts?.map((part) => part.trim()).filter(Boolean).join('\n') || content)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!fullText) return { text: '', clippedText: false };
+  if (!livePreview || fullText.length <= REASONING_LIVE_PREVIEW_CHARS) {
+    return { text: fullText, clippedText: false };
+  }
+  return {
+    text: fullText.slice(-REASONING_LIVE_PREVIEW_CHARS).trimStart(),
+    clippedText: true
+  };
 }
 
-function ReasoningListComponent({ content, parts, tr }: { content: string; parts?: string[]; tr: TranslateFn }): ReactElement | null {
-  const listRef = useRef<HTMLDivElement | null>(null);
-  const items = useMemo(() => reasoningItems(content, parts), [content, parts]);
+function ReasoningListComponent({ content, parts, livePreview, tr }: { content: string; parts?: string[]; livePreview: boolean; tr: TranslateFn }): ReactElement | null {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const view = useMemo(() => reasoningPanelText(content, parts, livePreview), [content, parts, livePreview]);
   useEffect(() => {
-    const list = listRef.current;
-    if (!list) return;
-    list.scrollTo({ top: list.scrollHeight, behavior: 'smooth' });
-  }, [content, parts, items.length]);
-  if (items.length === 0) return null;
+    const panel = panelRef.current;
+    if (!panel) return;
+    panel.scrollTo({ top: panel.scrollHeight, behavior: 'auto' });
+  }, [view.text, livePreview]);
+  if (!view.text) return null;
   return (
     <div className="msg-reasoning">
       <div className="msg-reasoning-title">{tr('Reasoning', '推理过程')}</div>
-      <div className="msg-reasoning-list" ref={listRef}>
-        {items.map((item, index) => (
-          <details key={`${index}-${item.slice(0, 24)}`} className="msg-reasoning-item" open>
-            <summary>{tr(`Step ${index + 1}`, `第 ${index + 1} 条`)}</summary>
-            <div className="msg-reasoning-item-body">{item}</div>
-          </details>
-        ))}
+      <div className="msg-reasoning-list" ref={panelRef}>
+        {livePreview && view.clippedText && (
+          <div className="msg-reasoning-live-note">
+            {tr('Showing the latest reasoning text while streaming.', '实时输出中仅显示最新推理文本。')}
+          </div>
+        )}
+        <pre className="msg-reasoning-body">{view.text}</pre>
       </div>
     </div>
   );
 }
 
 const ReasoningList = memo(ReasoningListComponent);
+
+export function assistantContentListView(content: string, livePreview = false): { items: string[]; clipped: boolean } {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const clipped = livePreview && normalized.length > LIVE_CONTENT_PREVIEW_CHARS;
+  const preview = !clipped
+    ? normalized
+    : normalized.slice(-LIVE_CONTENT_PREVIEW_CHARS).trimStart();
+
+  const blocks: string[] = [];
+  const current: string[] = [];
+  let fenceChar = '';
+  let fenceLength = 0;
+
+  const flush = () => {
+    const text = current.join('\n').trim();
+    if (text) blocks.push(text);
+    current.length = 0;
+  };
+
+  for (const line of preview.split('\n')) {
+    const fence = line.match(/^[ \t]*(`{3,}|~{3,})/);
+    if (fence) {
+      const marker = fence[1];
+      if (!fenceChar) {
+        fenceChar = marker[0];
+        fenceLength = marker.length;
+      } else if (marker[0] === fenceChar && marker.length >= fenceLength) {
+        fenceChar = '';
+        fenceLength = 0;
+      }
+      current.push(line);
+      continue;
+    }
+    if (!fenceChar && !line.trim()) {
+      flush();
+      continue;
+    }
+    current.push(line);
+  }
+  flush();
+
+  const items = blocks.flatMap((block) => {
+    if (block.length <= LIVE_CONTENT_ITEM_CHARS) return [block];
+    const chunks: string[] = [];
+    for (let index = 0; index < block.length; index += LIVE_CONTENT_ITEM_CHARS) {
+      const chunk = block.slice(index, index + LIVE_CONTENT_ITEM_CHARS).trim();
+      if (chunk) chunks.push(chunk);
+    }
+    return chunks;
+  });
+
+  return { items, clipped };
+}
+
+function assistantContentPartsView(contents: string[], livePreview = false): { items: string[]; clipped: boolean } {
+  const normalized = contents.map((item) => item.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()).filter(Boolean);
+  const joined = normalized.join('\n\n');
+  const clipped = livePreview && joined.length > LIVE_CONTENT_PREVIEW_CHARS;
+  const sourceItems = !clipped
+    ? normalized
+    : [joined.slice(-LIVE_CONTENT_PREVIEW_CHARS).trimStart()];
+  const items = sourceItems.flatMap((block) => {
+    if (block.length <= LIVE_CONTENT_ITEM_CHARS) return [block];
+    const chunks: string[] = [];
+    for (let index = 0; index < block.length; index += LIVE_CONTENT_ITEM_CHARS) {
+      const chunk = block.slice(index, index + LIVE_CONTENT_ITEM_CHARS).trim();
+      if (chunk) chunks.push(chunk);
+    }
+    return chunks;
+  });
+  return { items, clipped };
+}
+
+function MessageContentListComponent({
+  content,
+  items: explicitItems,
+  livePreview,
+  tr,
+  title
+}: {
+  content: string;
+  items?: string[];
+  livePreview: boolean;
+  tr: TranslateFn;
+  title?: string;
+}): ReactElement | null {
+  const view = useMemo(
+    () => explicitItems ? assistantContentPartsView(explicitItems, livePreview) : assistantContentListView(content, livePreview),
+    [content, explicitItems, livePreview]
+  );
+  const items = view.items;
+  if (items.length === 0) return null;
+  return (
+    <div className={`msg-content-panel ${livePreview ? 'live' : 'final'}`}>
+      <div className="msg-content-title">
+        <span>{title ?? tr('Assistant content', '回复内容')}</span>
+        <span>{items.length}</span>
+      </div>
+      <div className="msg-content-list">
+        {livePreview && view.clipped && (
+          <div className="msg-content-live-note">
+            {tr('Showing the latest assistant text while streaming.', '实时输出中仅显示最新回复文本。')}
+          </div>
+        )}
+        {items.map((item, index) => (
+          <div className="msg-content-item" key={`${index}-${item.length}`}>
+            {livePreview
+              ? <pre className="msg-content-pre">{item}</pre>
+              : renderMarkdownContent(item, `msg-content-${index}-${item.length}`)}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const MessageContentList = memo(MessageContentListComponent);
 
 function CitationLinkStripComponent({ citations }: { citations: CitationLink[] }): ReactElement | null {
   if (citations.length === 0) return null;
@@ -3124,19 +3326,52 @@ function MessageAttachmentsComponent({ attachments }: { attachments?: AgentMessa
 
 const MessageAttachments = memo(MessageAttachmentsComponent);
 
-function MessageBubbleComponent({ message, sessionId, tr, productName }: { message: AgentMessage; sessionId?: string; tr: TranslateFn; productName: string }): ReactElement {
+function MessageBubbleComponent({
+  message,
+  sessionId,
+  tr,
+  productName,
+  liveContentPreview,
+  liveReasoningPreview
+}: {
+  message: AgentMessage;
+  sessionId?: string;
+  tr: TranslateFn;
+  productName: string;
+  liveContentPreview: boolean;
+  liveReasoningPreview: boolean;
+}): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullReasoning, setFullReasoning] = useState<string | undefined>();
+  const [fullContentParts, setFullContentParts] = useState<string[] | undefined>();
   const [loadingFull, setLoadingFull] = useState(false);
   const [loadError, setLoadError] = useState('');
   const content = fullContent ?? message.content;
   const reasoningContent = fullReasoning ?? message.reasoning_content;
-  const citations = useMemo(() => (message.role === 'assistant' ? extractCitationLinks(content) : []), [message.role, content]);
+  const contentParts = fullContentParts ?? message.content_parts ?? [];
+  const shouldUseLiveContentPreview = message.role === 'assistant' && liveContentPreview && fullContent === null;
+  const completedAssistantItems = message.role === 'assistant' ? contentParts.filter((item) => item.trim()) : [];
+  const completedAssistantContent = message.role === 'assistant'
+    ? completedAssistantItems.join('\n\n')
+    : '';
+  const currentLiveAssistantContent = message.role === 'assistant' && shouldUseLiveContentPreview ? content : '';
+  const finalAssistantContent = message.role === 'assistant' && !shouldUseLiveContentPreview ? content : '';
+  const assistantCitationContent = message.role === 'assistant'
+    ? [...contentParts, content].filter((item) => item.trim()).join('\n\n')
+    : content;
+  const actionContent = content;
+  const citations = useMemo(
+    () => (message.role === 'assistant' && !shouldUseLiveContentPreview ? extractCitationLinks(assistantCitationContent) : []),
+    [message.role, assistantCitationContent, shouldUseLiveContentPreview]
+  );
   const renderedMarkdown = useMemo(
-    () => (content.trim() ? renderMarkdownContent(content, `msg-${message.id ?? 'x'}`) : null),
-    [content, message.id]
+    () => {
+      const markdownContent = message.role === 'assistant' ? finalAssistantContent : content;
+      return markdownContent.trim() ? renderMarkdownContent(markdownContent, `msg-${message.id ?? 'x'}`) : null;
+    },
+    [content, finalAssistantContent, message.id, message.role]
   );
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
@@ -3150,7 +3385,7 @@ function MessageBubbleComponent({ message, sessionId, tr, productName }: { messa
 
   async function handleCopy(): Promise<void> {
     try {
-      await copyTextToClipboard(content || '');
+      await copyTextToClipboard(actionContent || '');
       setCopied(true);
     } catch {
       setCopied(false);
@@ -3165,6 +3400,7 @@ function MessageBubbleComponent({ message, sessionId, tr, productName }: { messa
       const result = await window.tasiHarness.sessions.readMessageContent({ sessionId, messageId: message.id });
       setFullContent(result.content);
       setFullReasoning(result.reasoning_content);
+      setFullContentParts(result.content_parts);
     } catch (cause) {
       setLoadError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -3184,11 +3420,11 @@ function MessageBubbleComponent({ message, sessionId, tr, productName }: { messa
     }
     setExportBusy(format);
     try {
-      const normalized = normalizeMarkdownForRender(content);
+      const normalized = normalizeMarkdownForRender(actionContent);
       const html = renderMarkdownToHtml(normalized);
       const result = await exportAssistantMessage({
         format,
-        title: assistantExportTitle(content),
+        title: assistantExportTitle(actionContent),
         content: normalized,
         html
       });
@@ -3214,8 +3450,14 @@ function MessageBubbleComponent({ message, sessionId, tr, productName }: { messa
             <>
               <CitationLinkStrip citations={citations} />
               <MessageAttachments attachments={message.attachments} />
+              {completedAssistantContent.trim()
+                ? <MessageContentList content={completedAssistantContent} items={completedAssistantItems} livePreview={false} tr={tr} title={tr('Assistant content', '回复内容')} />
+                : null}
               {message.role === 'assistant' && reasoningContent?.trim()
-                ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} tr={tr} />
+                ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} livePreview={liveReasoningPreview} tr={tr} />
+                : null}
+              {currentLiveAssistantContent.trim()
+                ? <MessageContentList content={currentLiveAssistantContent} livePreview={true} tr={tr} title={tr('Current reply', '当前回复')} />
                 : null}
               {renderedMarkdown}
               {canLoadFull && (
@@ -5644,6 +5886,27 @@ function SettingsPage({
             setDraft((old) => isOmni ? { ...old, omniModel: value } : { ...old, model: value });
           }}
         />
+        {!isOmni && activeProvider === 'vllm' && (
+          <>
+            <label>{tr('Reasoning effort', '推理强度')}</label>
+            <select
+              value={draft.reasoningEffort}
+              onChange={(e) => setDraft((old) => ({ ...old, reasoningEffort: e.target.value as PublicAppConfig['reasoningEffort'] }))}
+            >
+              <option value="auto">{tr('Auto / server default', '自动 / 服务端默认')}</option>
+              <option value="none">{tr('Off', '关闭')}</option>
+              <option value="low">{tr('Low', '低')}</option>
+              <option value="medium">{tr('Medium', '中')}</option>
+              <option value="xhigh">{tr('Extra high', '超高')}</option>
+            </select>
+            <div className="card-subtle">
+              {tr(
+                'For vLLM reasoning models, auto keeps the server default and requests visible reasoning; effort values are passed through as reasoning_effort.',
+                '对 vLLM 推理模型，自动会保留服务端默认强度并请求显示推理；其它强度会作为 reasoning_effort 传递。'
+              )}
+            </div>
+          </>
+        )}
         <div className="button-row">
           <button
             className="ghost-button"

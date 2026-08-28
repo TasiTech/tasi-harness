@@ -11,6 +11,7 @@ export type ProviderKind =
   | 'anthropic-compatible'
   | 'ollama'
   | 'mock';
+export type ReasoningEffort = 'auto' | 'none' | 'low' | 'medium' | 'xhigh';
 export type BrowserMode = 'embedded' | 'external';
 export type ExternalBrowserEngine = 'auto' | 'cdp' | 'webdriver-safari';
 export type ExternalBrowserProfileMode = 'isolated' | 'system';
@@ -32,6 +33,7 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  hidden?: boolean;
   contentOmitted?: boolean;
   contentLength?: number;
   attachments?: AgentMessageAttachment[];
@@ -39,6 +41,7 @@ export interface AgentMessage {
   reasoningOmitted?: boolean;
   reasoningLength?: number;
   reasoning_parts?: string[];
+  content_parts?: string[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -276,6 +279,7 @@ export interface AppConfig {
   omniBaseUrl: string;
   omniApiKey: string;
   omniModel: string;
+  reasoningEffort: ReasoningEffort;
   temperature: number;
   maxIterations: number;
   sessionDocumentMaxDocs: number;
@@ -443,6 +447,7 @@ export interface SessionMessageContentRequest {
 export interface SessionMessageContentResult {
   content: string;
   reasoning_content?: string;
+  content_parts?: string[];
   attachments?: AgentMessageAttachment[];
 }
 
@@ -537,6 +542,7 @@ export interface AgentMessageDeltaStream {
   content?: string;
   reasoning_content?: string;
   reasoning_parts?: string[];
+  content_parts?: string[];
   createdAt?: string;
 }
 

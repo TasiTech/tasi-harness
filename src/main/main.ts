@@ -1,4 +1,4 @@
-import type { BrowserWindow as ElectronBrowserWindow, Rectangle, WebContents } from 'electron';
+import type { BrowserWindow as ElectronBrowserWindow, ContextMenuParams, MenuItemConstructorOptions, Rectangle, WebContents } from 'electron';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request as httpsRequest } from 'node:https';
@@ -67,7 +67,7 @@ import { installDreamSkinTheme, listDreamSkinGallery } from './storage/dreamSkin
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const electronRequire = createRequire(import.meta.url);
 const { app, BrowserWindow, Menu, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
-const { shell } = electronRequire('electron/common') as typeof import('electron/common');
+const { shell, clipboard } = electronRequire('electron/common') as typeof import('electron/common');
 let mainWindow: ElectronBrowserWindow | null = null;
 let devToolsWindow: ElectronBrowserWindow | null = null;
 const context = new AppContext();
@@ -173,17 +173,34 @@ function logRealtimeEvent(event: string, details?: Record<string, unknown>): voi
   else console.info(line);
 }
 
+function isDisposedWebContentsSendError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Render frame was disposed|WebContents was destroyed|Object has been destroyed/i.test(message);
+}
+
+function safeSend(contents: WebContents | undefined | null, channel: string, payload: unknown): boolean {
+  if (!contents || contents.isDestroyed()) return false;
+  try {
+    contents.send(channel, payload);
+    return true;
+  } catch (error) {
+    if (isDisposedWebContentsSendError(error)) return false;
+    console.warn(`[ipc] failed to send ${channel}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('sessions:updated', event);
+    safeSend(win.webContents, 'sessions:updated', event);
   }
 }
 
 function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('agent:tool-event', payload);
+    safeSend(win.webContents, 'agent:tool-event', payload);
   }
 }
 
@@ -191,14 +208,14 @@ function broadcastLiveTaskUpdate(task: LiveAgentTaskUpdateEvent['task']): void {
   const payload: LiveAgentTaskUpdateEvent = { task };
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('live-tasks:updated', payload);
+    safeSend(win.webContents, 'live-tasks:updated', payload);
   }
 }
 
 function broadcastLiveRealtimeEvent(payload: LiveRealtimeEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('live-realtime:event', payload);
+    safeSend(win.webContents, 'live-realtime:event', payload);
   }
 }
 
@@ -236,7 +253,11 @@ function requestInteractiveToolApproval(sender: WebContents, request: ToolApprov
       resolve({ id: request.id, approved: false });
     }, request.timeoutMs);
     pendingToolApprovals.set(request.id, { senderId: sender.id, request, resolve, timeout });
-    sender.send('tool-approval:request', request);
+    if (!safeSend(sender, 'tool-approval:request', request)) {
+      clearTimeout(timeout);
+      pendingToolApprovals.delete(request.id);
+      resolve({ id: request.id, approved: false });
+    }
   });
 }
 
@@ -1627,6 +1648,125 @@ function openMainWindowDevTools(win: ElectronBrowserWindow): void {
   win.webContents.openDevTools({ mode: 'detach', title: `${context.getConfig().branding.productName} DevTools` });
 }
 
+function isExternalUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function copyTextToSystemClipboard(text: string): void {
+  if (!text) return;
+  clipboard.writeText(text);
+}
+
+function appendContextSeparator(template: MenuItemConstructorOptions[]): void {
+  const last = template[template.length - 1];
+  if (!last || last.type === 'separator') return;
+  template.push({ type: 'separator' });
+}
+
+function trimContextSeparators(template: MenuItemConstructorOptions[]): MenuItemConstructorOptions[] {
+  while (template[0]?.type === 'separator') template.shift();
+  while (template[template.length - 1]?.type === 'separator') template.pop();
+  return template;
+}
+
+function buildNativeContextMenuTemplate(contents: WebContents, params: ContextMenuParams): MenuItemConstructorOptions[] {
+  const template: MenuItemConstructorOptions[] = [];
+  const flags = params.editFlags;
+  const selectionText = params.selectionText?.trim() ?? '';
+  const linkUrl = params.linkURL?.trim() ?? '';
+  const srcUrl = params.srcURL?.trim() ?? '';
+  const selectedUrl = selectionText ? findFirstHttpUrl(selectionText) ?? '' : '';
+
+  if (linkUrl) {
+    if (isExternalUrl(linkUrl)) {
+      template.push({
+        label: '打开链接',
+        click: () => void shell.openExternal(linkUrl)
+      });
+    }
+    template.push({
+      label: '复制链接地址',
+      click: () => copyTextToSystemClipboard(linkUrl)
+    });
+    appendContextSeparator(template);
+  } else if (selectedUrl && isExternalUrl(selectedUrl)) {
+    template.push({
+      label: '打开选中的链接',
+      click: () => void shell.openExternal(selectedUrl)
+    });
+    template.push({
+      label: '复制选中的链接',
+      click: () => copyTextToSystemClipboard(selectedUrl)
+    });
+    appendContextSeparator(template);
+  }
+
+  if (srcUrl && (params.mediaType === 'image' || params.mediaType === 'video' || params.mediaType === 'audio')) {
+    if (params.mediaType === 'image') {
+      template.push({
+        label: '复制图片',
+        click: () => contents.copyImageAt(params.x, params.y)
+      });
+    }
+    template.push({
+      label: params.mediaType === 'image' ? '复制图片地址' : '复制媒体地址',
+      click: () => copyTextToSystemClipboard(srcUrl)
+    });
+    if (isExternalUrl(srcUrl) || srcUrl.startsWith('data:')) {
+      template.push({
+        label: params.mediaType === 'image' ? '图片另存为...' : '媒体另存为...',
+        click: () => contents.downloadURL(srcUrl)
+      });
+    }
+    appendContextSeparator(template);
+  }
+
+  if (params.isEditable) {
+    template.push(
+      { label: '撤销', role: 'undo', enabled: flags.canUndo },
+      { label: '重做', role: 'redo', enabled: flags.canRedo },
+      { type: 'separator' },
+      { label: '剪切', role: 'cut', enabled: flags.canCut },
+      { label: '复制', role: 'copy', enabled: flags.canCopy },
+      { label: '粘贴', role: 'paste', enabled: flags.canPaste },
+      { label: '删除', role: 'delete', enabled: flags.canDelete },
+      { type: 'separator' },
+      { label: '全选', role: 'selectAll', enabled: flags.canSelectAll }
+    );
+  } else {
+    if (selectionText) {
+      template.push({
+        label: '复制',
+        role: 'copy',
+        enabled: flags.canCopy
+      });
+      appendContextSeparator(template);
+    }
+    template.push({
+      label: '全选',
+      role: 'selectAll',
+      enabled: flags.canSelectAll
+    });
+  }
+
+  return trimContextSeparators(template).filter((item, index, list) => !(item.type === 'separator' && list[index - 1]?.type === 'separator'));
+}
+
+function registerNativeContextMenu(contents: WebContents): void {
+  contents.on('context-menu', (_event, params) => {
+    if (contents.isDestroyed()) return;
+    const template = buildNativeContextMenuTemplate(contents, params);
+    if (template.length === 0) return;
+    const win = BrowserWindow.fromWebContents(contents) ?? mainWindow ?? undefined;
+    Menu.buildFromTemplate(template).popup(win ? { window: win } : undefined);
+  });
+}
+
 function resetEmbeddedPreviewWebContentsState(target: WebContents): void {
   try {
     target.setZoomFactor(1);
@@ -2358,10 +2498,10 @@ function registerIpc(): void {
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-          _event.sender.send('agent:tool-event', payload);
+          safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
-          _event.sender.send('agent:message-delta', messageDelta);
+          safeSend(_event.sender, 'agent:message-delta', messageDelta);
         },
         onSessionUpdated: (record) => {
           broadcastSessionUpdated({
@@ -2439,10 +2579,10 @@ function registerIpc(): void {
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
           const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-          _event.sender.send('agent:tool-event', payload);
+          safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
-          _event.sender.send('agent:message-delta', messageDelta);
+          safeSend(_event.sender, 'agent:message-delta', messageDelta);
         },
         onSessionUpdated: (record) => {
           broadcastSessionUpdated({
@@ -2848,6 +2988,7 @@ app.whenReady().then(() => {
   applyBrandDockIcon(context.getConfig().branding.logoPath);
   registerWechatTools();
   app.on('web-contents-created', (_event, contents) => {
+    registerNativeContextMenu(contents);
     contents.once('destroyed', () => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;
       const controller = activeChatControllers.get(contents.id);

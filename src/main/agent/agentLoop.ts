@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
@@ -6,6 +6,12 @@ import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
 
 const REPEATED_TOOL_RESULT_LIMIT = 3;
+const REPEATED_REASONING_PATTERN_LIMIT = 5;
+const REPEATED_REASONING_MAX_BLOCK_LINES = 24;
+const REASONING_WITHOUT_CONTENT_CHAR_LIMIT = 12000;
+const REASONING_TOTAL_CHAR_LIMIT = 32000;
+const REASONING_ONLY_CONTINUE_LIMIT = 3;
+const RECOVERABLE_LLM_INTERRUPTION_PATTERN = /Invalid LLM (?:JSON )?stream event|LLM stream response did not include a readable body|fetch failed|terminated|socket hang up|ECONNRESET|EPIPE|UND_ERR|network/i;
 const ITERATION_LIMIT_MESSAGE_PATTERN = /^本轮已达到最大(?:模型迭代轮次|执行步数)（\d+），我先停在这里，避免继续消耗无效(?:请求|步骤)。/;
 
 function parseToolArgs(raw: string): unknown {
@@ -35,6 +41,82 @@ function repeatedToolDiagnostic(toolName: string, args: unknown, ok: boolean, co
     `Args: ${stableStringify(args)}`,
     `Result: ${resultLabel} - ${content || '(empty)'}`
   ].join('\n');
+}
+
+interface ReasoningLoopDetection {
+  repeats: number;
+  block: string[];
+}
+
+class ReasoningLoopAbort extends Error {
+  constructor(readonly diagnostic: string) {
+    super(diagnostic);
+    this.name = 'ReasoningLoopAbort';
+  }
+}
+
+function normalizeReasoningNewlines(content: string): string {
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\\r\\n|\\n|\\r/g, '\n');
+}
+
+function normalizeReasoningLines(content: string): string[] {
+  return normalizeReasoningNewlines(content)
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+[.)]\s+/, '').replace(/\s+/g, ' '))
+    .filter(Boolean);
+}
+
+function arraysEqual(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((item, index) => item === right[index]);
+}
+
+function detectRepeatedReasoningLoop(content: string): ReasoningLoopDetection | null {
+  const lines = normalizeReasoningLines(content);
+  const maxBlockLines = Math.min(REPEATED_REASONING_MAX_BLOCK_LINES, Math.floor(lines.length / REPEATED_REASONING_PATTERN_LIMIT));
+  for (let blockSize = 1; blockSize <= maxBlockLines; blockSize += 1) {
+    const block = lines.slice(lines.length - blockSize);
+    let repeats = 1;
+    for (let offset = lines.length - blockSize * 2; offset >= 0; offset -= blockSize) {
+      if (!arraysEqual(lines.slice(offset, offset + blockSize), block)) break;
+      repeats += 1;
+    }
+    if (repeats >= REPEATED_REASONING_PATTERN_LIMIT) return { repeats, block };
+  }
+  return null;
+}
+
+function repeatedReasoningDiagnostic(detection: ReasoningLoopDetection): string {
+  const preview = detection.block.slice(0, 12).map((line) => `- ${line}`);
+  if (detection.block.length > preview.length) preview.push(`- ... (${detection.block.length - preview.length} more lines)`);
+  return [
+    `Stopped because the model reasoning repeated the same planning pattern ${detection.repeats} times.`,
+    'This usually indicates the model is stuck in a planning loop, so the run was stopped before more context was consumed.',
+    '',
+    'Repeated reasoning block:',
+    ...preview
+  ].join('\n');
+}
+
+function reasoningOverrunDiagnostic(reasoning: string, reason: 'without-content' | 'total-limit'): string {
+  const lineCount = normalizeReasoningLines(reasoning).length;
+  const lead = reason === 'without-content'
+    ? 'Stopped because the model produced a long reasoning stream without any visible answer or tool call.'
+    : 'Stopped because the model reasoning exceeded the safety limit for one run.';
+  return [
+    lead,
+    `Reasoning length: ${reasoning.length} chars, ${lineCount} non-empty lines.`,
+    'This usually means the model is stuck planning instead of making progress. Try continuing with a narrower next step, or use a tool/file-backed workflow for the blocking operation.'
+  ].join('\n');
+}
+
+function reasoningOverrunReason(reasoning: string, visibleContent: string): 'without-content' | 'total-limit' | null {
+  if (reasoning.length >= REASONING_TOTAL_CHAR_LIMIT) return 'total-limit';
+  if (!visibleContent.trim() && reasoning.length >= REASONING_WITHOUT_CONTENT_CHAR_LIMIT) return 'without-content';
+  return null;
 }
 
 function compactToolText(content: string, maxLength = 160): string {
@@ -70,15 +152,29 @@ function emptyAssistantResponse(): string {
   ].join('\n');
 }
 
+function isRecoverableLlmInterruption(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/LLM request failed \((?:400|401|403|404|422)\)/i.test(message)) return false;
+  return RECOVERABLE_LLM_INTERRUPTION_PATTERN.test(message);
+}
+
 function isIterationLimitMessage(message: AgentMessage): boolean {
   return message.role === 'assistant' && ITERATION_LIMIT_MESSAGE_PATTERN.test(message.content.trim());
+}
+
+function isInvisibleEmptyAssistantMessage(message: AgentMessage): boolean {
+  return message.role === 'assistant'
+    && message.hidden === true
+    && !message.content.trim()
+    && !message.reasoning_content?.trim()
+    && (message.tool_calls?.length ?? 0) === 0;
 }
 
 function sessionVisibleAssistantMessage(message: AgentMessage, toolCallCount: number): AgentMessage {
   if (toolCallCount === 0) return message;
   return {
     ...message,
-    content: ''
+    hidden: true
   };
 }
 
@@ -101,7 +197,7 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 function splitReasoningParts(content: string): string[] {
-  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  const normalized = normalizeReasoningNewlines(content).trim();
   if (!normalized) return [];
   const lineItems = normalized
     .split('\n')
@@ -147,7 +243,10 @@ export class AgentLoop {
       createdAt: nowIso()
     };
     try {
-      const history = [...session.messages.filter((message) => !isIterationLimitMessage(message)), userMessage];
+      const history = [
+        ...session.messages.filter((message) => !isIterationLimitMessage(message) && !isInvisibleEmptyAssistantMessage(message)),
+        userMessage
+      ];
       const prompt = await this.deps.promptBuilder.build(cfg, {
         sessionId: session.id,
         userInput: options.userInput,
@@ -173,7 +272,7 @@ export class AgentLoop {
       let usage = undefined as AgentRunResult['usage'];
       let log_probs: AgentRunResult['log_probs'];
       let finalResponse = '';
-      let stopReason: 'final' | 'empty' | 'repeated-tool' | 'iteration-limit' | undefined;
+      let stopReason: 'final' | 'empty' | 'repeated-tool' | 'reasoning-loop' | 'iteration-limit' | undefined;
       let iterations = 0;
       let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
       options.onSessionUpdated?.(updatedSession);
@@ -181,6 +280,10 @@ export class AgentLoop {
       const visibleAssistantCreatedAt = nowIso();
       let accumulatedReasoning = '';
       const accumulatedReasoningParts: string[] = [];
+      let latestIterationReasoning = '';
+      let latestIterationReasoningParts: string[] = [];
+      const visibleContentParts: string[] = [];
+      let reasoningOnlyContinuationCount = 0;
       let lastStreamPersistedAt = 0;
       let lastStreamPersistedLength = 0;
       let lastToolResultSignature = '';
@@ -193,7 +296,7 @@ export class AgentLoop {
         options.onSessionUpdated?.(updatedSession);
         return updatedSession;
       };
-      const persistStreamSnapshot = (messageId: string, createdAt: string, content: string, reasoning: string | undefined, force = false): void => {
+      const persistStreamSnapshot = (messageId: string, createdAt: string, content: string, reasoning: string | undefined, force = false, contentParts: string[] = []): void => {
         if (!content && !reasoning) return;
         const now = Date.now();
         if (!force && now - lastStreamPersistedAt < 250 && content.length - lastStreamPersistedLength < 160) return;
@@ -204,10 +307,11 @@ export class AgentLoop {
           role: 'assistant',
           content,
           reasoning_content: reasoning,
+          content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
           createdAt
         }]);
       };
-      const emitDoneDelta = (content: string, reasoning?: string, reasoningParts?: string[]): void => {
+      const emitDoneDelta = (content: string, reasoning?: string, reasoningParts?: string[], contentParts: string[] = []): void => {
         if (options.stream === false || typeof options.onMessageDelta !== 'function') return;
         options.onMessageDelta(session.id, {
           sessionId: session.id,
@@ -217,8 +321,13 @@ export class AgentLoop {
           content,
           reasoning_content: reasoning,
           reasoning_parts: reasoningParts,
+          content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
           createdAt: visibleAssistantCreatedAt
         });
+      };
+      const currentReasoningPayload = (reasoning: string): { text: string; parts: string[] } => {
+        const parts = joinReasoningParts(splitReasoningParts(reasoning));
+        return { text: joinReasoning(parts), parts };
       };
 
       for (; iterations < cfg.maxIterations;) {
@@ -232,27 +341,48 @@ export class AgentLoop {
         let streamedReasoning = '';
         const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
         const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
-        const completion = canStream
-          ? await streamComplete!({ messages, tools, temperature: cfg.temperature, metadata: requestMetadata, signal: options.signal }, (delta) => {
+        if (canStream && iterations > 1) {
+          options.onMessageDelta?.(session.id, {
+            sessionId: session.id,
+            messageId: visibleAssistantId,
+            role: 'assistant',
+            type: 'reasoning_content',
+            delta: '',
+            content: '',
+            reasoning_content: '',
+            reasoning_parts: [],
+            content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            createdAt: visibleAssistantCreatedAt
+          });
+        }
+        let completion: LlmCompletion;
+        try {
+          completion = canStream
+            ? await streamComplete!({ messages, tools, temperature: cfg.temperature, metadata: requestMetadata, signal: options.signal }, (delta) => {
               if (delta.reasoning_content) {
                 streamedReasoning += delta.reasoning_content;
-                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                const reasoningLoop = detectRepeatedReasoningLoop([accumulatedReasoning, streamedReasoning].filter(Boolean).join('\n'));
+                if (reasoningLoop) throw new ReasoningLoopAbort(repeatedReasoningDiagnostic(reasoningLoop));
+                const overrunReason = reasoningOverrunReason(streamedReasoning, streamedContent);
+                if (overrunReason) throw new ReasoningLoopAbort(reasoningOverrunDiagnostic(streamedReasoning, overrunReason));
+                const visibleReasoning = currentReasoningPayload(streamedReasoning);
                 options.onMessageDelta?.(session.id, {
                   sessionId: session.id,
                   messageId: visibleAssistantId,
                   role: 'assistant',
                   type: 'reasoning_content',
                   delta: delta.reasoning_content,
-                  reasoning_content: joinReasoning(visibleReasoningParts),
-                  reasoning_parts: visibleReasoningParts,
+                  reasoning_content: visibleReasoning.text,
+                  reasoning_parts: visibleReasoning.parts,
+                  content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
                   content: streamedContent,
                   createdAt: visibleAssistantCreatedAt
                 });
-                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, visibleReasoning.text || undefined, false, visibleContentParts);
               }
               if (delta.content) {
                 streamedContent += delta.content;
-                const visibleReasoningParts = joinReasoningParts([...accumulatedReasoningParts, ...splitReasoningParts(streamedReasoning)]);
+                const visibleReasoning = currentReasoningPayload(streamedReasoning);
                 options.onMessageDelta?.(session.id, {
                   sessionId: session.id,
                   messageId: visibleAssistantId,
@@ -260,14 +390,15 @@ export class AgentLoop {
                   type: 'content',
                   delta: delta.content,
                   content: streamedContent,
-                  reasoning_content: joinReasoning(visibleReasoningParts) || undefined,
-                  reasoning_parts: visibleReasoningParts.length > 0 ? visibleReasoningParts : undefined,
+                  reasoning_content: visibleReasoning.text,
+                  reasoning_parts: visibleReasoning.parts,
+                  content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
                   createdAt: visibleAssistantCreatedAt
                 });
-                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, joinReasoning(visibleReasoningParts) || undefined);
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, visibleReasoning.text || undefined, false, visibleContentParts);
               }
             })
-          : await client.complete({
+            : await client.complete({
               messages,
               tools,
               temperature: cfg.temperature,
@@ -276,6 +407,49 @@ export class AgentLoop {
               metadata: requestMetadata,
               signal: options.signal
             });
+        } catch (error) {
+          if (error instanceof ReasoningLoopAbort) {
+            finalResponse = error.diagnostic;
+            stopReason = 'reasoning-loop';
+            const diagnosticMessage: AgentMessage = {
+              id: streamPersistId,
+              role: 'assistant',
+              content: finalResponse,
+              content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+              createdAt: streamPersistCreatedAt
+            };
+            messages.push(diagnosticMessage);
+            persistMessages([diagnosticMessage]);
+            const visibleReasoning = currentReasoningPayload(streamedReasoning);
+            if (canStream) emitDoneDelta(finalResponse, visibleReasoning.text, visibleReasoning.parts, visibleContentParts);
+            break;
+          }
+          if (!canStream || !isRecoverableLlmInterruption(error) || options.signal?.aborted) throw error;
+          console.warn(`[agent] streaming LLM call interrupted; retrying once without streaming: ${error instanceof Error ? error.message : String(error)}`);
+          streamedContent = '';
+          streamedReasoning = '';
+          options.onMessageDelta?.(session.id, {
+            sessionId: session.id,
+            messageId: visibleAssistantId,
+            role: 'assistant',
+            type: 'reasoning_content',
+            delta: '',
+            content: '',
+            reasoning_content: '',
+            reasoning_parts: [],
+            content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            createdAt: visibleAssistantCreatedAt
+          });
+          completion = await client.complete({
+            messages,
+            tools,
+            temperature: cfg.temperature,
+            logProbs: options.logProbs,
+            topLogProbs: options.topLogProbs,
+            metadata: requestMetadata,
+            signal: options.signal
+          });
+        }
         const toolCalls = completion.message.tool_calls ?? [];
         const assistant = {
           ...completion.message,
@@ -283,32 +457,99 @@ export class AgentLoop {
           createdAt: streamPersistCreatedAt
         };
         const currentReasoning = assistant.reasoning_content || streamedReasoning;
+        const reasoningOverrun = currentReasoning.trim() ? reasoningOverrunReason(currentReasoning, assistant.content ?? streamedContent) : null;
+        if (reasoningOverrun) {
+          usage = completion.usage ?? usage;
+          log_probs = completion.log_probs ?? log_probs;
+          finalResponse = reasoningOverrunDiagnostic(currentReasoning, reasoningOverrun);
+          stopReason = 'reasoning-loop';
+          const diagnosticMessage: AgentMessage = {
+            id: streamPersistId,
+            role: 'assistant',
+            content: finalResponse,
+            content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            createdAt: streamPersistCreatedAt
+          };
+          messages.push(diagnosticMessage);
+          persistMessages([diagnosticMessage]);
+          const visibleReasoning = currentReasoningPayload(currentReasoning);
+          if (canStream) emitDoneDelta(finalResponse, visibleReasoning.text, visibleReasoning.parts, visibleContentParts);
+          break;
+        }
+        const reasoningLoop = currentReasoning.trim()
+          ? detectRepeatedReasoningLoop([accumulatedReasoning, currentReasoning].filter(Boolean).join('\n'))
+          : null;
+        if (reasoningLoop) {
+          usage = completion.usage ?? usage;
+          log_probs = completion.log_probs ?? log_probs;
+          finalResponse = repeatedReasoningDiagnostic(reasoningLoop);
+          stopReason = 'reasoning-loop';
+          const diagnosticMessage: AgentMessage = {
+            id: streamPersistId,
+            role: 'assistant',
+            content: finalResponse,
+            content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            createdAt: streamPersistCreatedAt
+          };
+          messages.push(diagnosticMessage);
+          persistMessages([diagnosticMessage]);
+          const visibleReasoning = currentReasoningPayload(currentReasoning);
+          if (canStream) emitDoneDelta(finalResponse, visibleReasoning.text, visibleReasoning.parts, visibleContentParts);
+          break;
+        }
         if (currentReasoning.trim()) {
           const currentParts = splitReasoningParts(currentReasoning);
+          latestIterationReasoningParts = currentParts;
+          latestIterationReasoning = joinReasoning(currentParts);
           accumulatedReasoningParts.push(...currentParts);
           accumulatedReasoning = joinReasoning(accumulatedReasoningParts);
           assistant.reasoning_parts = currentParts.length > 0 ? currentParts : undefined;
+          assistant.reasoning_content = latestIterationReasoning || currentReasoning;
+        } else {
+          latestIterationReasoning = '';
+          latestIterationReasoningParts = [];
+          delete assistant.reasoning_content;
+          delete assistant.reasoning_parts;
         }
         usage = completion.usage ?? usage;
         log_probs = completion.log_probs ?? log_probs;
         messages.push(assistant);
-        persistMessages([sessionVisibleAssistantMessage(assistant, toolCalls.length)]);
 
         if (toolCalls.length === 0) {
-          if (accumulatedReasoning) assistant.reasoning_content = accumulatedReasoning;
-          if (accumulatedReasoningParts.length > 0) assistant.reasoning_parts = [...accumulatedReasoningParts];
           const assistantContent = assistant.content ?? '';
+          const hasCurrentReasoning = currentReasoning.trim().length > 0;
+          if (!assistantContent.trim() && hasCurrentReasoning && iterations < cfg.maxIterations && reasoningOnlyContinuationCount < REASONING_ONLY_CONTINUE_LIMIT) {
+            reasoningOnlyContinuationCount += 1;
+            persistMessages([{
+              id: streamPersistId,
+              role: 'assistant',
+              hidden: true,
+              content: '',
+              reasoning_content: undefined,
+              reasoning_parts: undefined,
+              createdAt: streamPersistCreatedAt
+            }]);
+            continue;
+          }
           finalResponse = assistantContent.trim() ? assistantContent : '';
           stopReason = finalResponse ? 'final' : 'empty';
           if (stopReason === 'empty') {
             finalResponse = emptyAssistantResponse();
             assistant.content = finalResponse;
           }
-          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true);
-          if (canStream) emitDoneDelta(finalResponse, assistant.reasoning_content, assistant.reasoning_parts);
+          assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
+          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true, visibleContentParts);
+          if (canStream) emitDoneDelta(finalResponse, assistant.reasoning_content, assistant.reasoning_parts, visibleContentParts);
           persistMessages([assistant]);
           break;
         }
+
+        reasoningOnlyContinuationCount = 0;
+        if (assistant.content?.trim()) {
+          visibleContentParts.push(assistant.content.trim());
+        }
+        assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
+        persistMessages([sessionVisibleAssistantMessage(assistant, toolCalls.length)]);
 
         for (const call of toolCalls) {
           throwIfAborted(options.signal);
@@ -358,11 +599,12 @@ export class AgentLoop {
               id: createId('msg'),
               role: 'assistant',
               content: finalResponse,
+              content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
               createdAt: nowIso()
             };
             messages.push(diagnosticMessage);
             persistMessages([diagnosticMessage]);
-            if (canStream) emitDoneDelta(finalResponse, accumulatedReasoning || undefined, accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined);
+            if (canStream) emitDoneDelta(finalResponse, latestIterationReasoning, latestIterationReasoningParts, visibleContentParts);
             break;
           }
         }
@@ -375,9 +617,15 @@ export class AgentLoop {
 
       if (!finalResponse && stopReason === 'iteration-limit') {
         finalResponse = iterationLimitResponse(cfg.maxIterations, toolEvents);
-        const limitMessage: AgentMessage = { id: createId('msg'), role: 'assistant', content: finalResponse, createdAt: nowIso() };
+        const limitMessage: AgentMessage = {
+          id: createId('msg'),
+          role: 'assistant',
+          content: finalResponse,
+          content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+          createdAt: nowIso()
+        };
         persistMessages([limitMessage]);
-        emitDoneDelta(finalResponse, accumulatedReasoning || undefined, accumulatedReasoningParts.length > 0 ? accumulatedReasoningParts : undefined);
+        emitDoneDelta(finalResponse, latestIterationReasoning, latestIterationReasoningParts, visibleContentParts);
       }
 
       if (memoryEnabled) {

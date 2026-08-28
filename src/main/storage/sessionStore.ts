@@ -91,13 +91,14 @@ export class SessionStore {
     };
   }
 
-  readMessageContent(sessionId: string, messageId: string): { content: string; reasoning_content?: string; attachments?: AgentMessage['attachments'] } | null {
+  readMessageContent(sessionId: string, messageId: string): { content: string; reasoning_content?: string; content_parts?: string[]; attachments?: AgentMessage['attachments'] } | null {
     const record = this.read(sessionId);
     const message = record?.messages.find((item) => item.id === messageId);
     if (!message) return null;
     return {
       content: message.content,
       reasoning_content: message.reasoning_content,
+      content_parts: message.content_parts,
       attachments: message.attachments
     };
   }
@@ -211,10 +212,11 @@ export class SessionStore {
     for (const summary of this.list()) {
       const record = this.read(summary.id);
       if (!record) continue;
-      const corpus = `${record.title}\n${record.messages.map((m) => m.content).join('\n')}`.toLowerCase();
+      const searchableMessages = record.messages.filter((message) => message.role !== 'assistant' || message.hidden !== true);
+      const corpus = `${record.title}\n${searchableMessages.map((m) => m.content).join('\n')}`.toLowerCase();
       const score = terms.reduce((sum, term) => sum + (corpus.includes(term) ? 1 : 0), 0);
       if (score > 0) {
-        const highlights = record.messages
+        const highlights = searchableMessages
           .map((m) => m.content)
           .filter((text) => terms.some((term) => text.toLowerCase().includes(term)))
           .slice(0, 3)
@@ -327,6 +329,7 @@ export class SessionStore {
       reasoningOmitted: reasoning?.omitted || undefined,
       reasoningLength: reasoning?.omitted ? reasoning.length : undefined,
       reasoning_parts: message.reasoning_parts?.map((part) => this.clipText(part, 1000)),
+      content_parts: message.content_parts?.map((part) => this.clipText(part, 2000)),
       attachments: message.attachments?.map((attachment) => ({
         ...attachment,
         contentBase64: DISPLAY_ATTACHMENT_BASE64_CHARS > 0
@@ -378,7 +381,7 @@ export class SessionStore {
       .slice(-3)
       .map((message, index) => `User ${index + 1}: ${this.clipText(message.content, 1000)}`);
     const assistantMessages = record.messages
-      .filter((message) => message.role === 'assistant' && message.content.trim())
+      .filter((message) => message.role === 'assistant' && message.hidden !== true && message.content.trim())
       .slice(-2)
       .map((message, index) => `Assistant ${index + 1}: ${this.clipText(message.content, 1000)}`);
     const failureEvents = record.toolEvents
@@ -488,7 +491,7 @@ export class SessionStore {
     const seed = [
       record.title,
       ...record.messages
-        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .filter((message) => message.role === 'user' || (message.role === 'assistant' && message.hidden !== true))
         .slice(0, 8)
         .map((message) => message.content)
     ]

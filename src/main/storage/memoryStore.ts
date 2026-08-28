@@ -524,7 +524,7 @@ export class MemoryStore {
       .map((message) => compactText(message.content, 180))
       .filter(Boolean);
     const assistantMessages = record.messages
-      .filter((message) => message.role === 'assistant')
+      .filter((message) => message.role === 'assistant' && message.hidden !== true)
       .map((message) => message.content)
       .filter((content) => content.trim() && !/^Reached iteration limit\b/i.test(content))
       .map((content) => compactText(content, 220))

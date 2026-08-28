@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
+import { isUnsafeWindowsMultilinePythonCommand } from '../src/main/tools/terminalRunner.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
 import type { BrowserAutomation } from '../src/main/tools/browserAutomation.js';
 import { MemoryStore } from '../src/main/storage/memoryStore.js';
@@ -203,6 +204,37 @@ describe('builtin tools', () => {
       expect(list.ok).toBe(true);
     }
     expect(approvals).toBe(0);
+  });
+
+  it('rejects non-text documents in file_read instead of reading them as UTF-8', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace') };
+    ensureDir(cfg.workspaceDir);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({
+      getConfig: () => cfg,
+      memoryStore: new MemoryStore(env.home),
+      sessionStore: new SessionStore(env.home),
+      skillManager: new SkillManager(env.home)
+    })) registry.register(tool);
+
+    writeFileSync(join(cfg.workspaceDir, 'notes.ts'), 'export const answer = 42;\n', 'utf8');
+    writeFileSync(join(cfg.workspaceDir, 'bid.pdf'), Buffer.from('%PDF-1.7\nfake pdf content\n'));
+    writeFileSync(join(cfg.workspaceDir, 'image.bin'), Buffer.from([0, 1, 2, 3]));
+
+    const source = await registry.execute('file_read', { path: 'notes.ts' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-source' });
+    expect(source.ok).toBe(true);
+    expect(source.content).toContain('answer = 42');
+
+    const pdf = await registry.execute('file_read', { path: 'bid.pdf' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-pdf' });
+    expect(pdf.ok).toBe(false);
+    expect(pdf.content).toContain('document file (.pdf)');
+    expect(pdf.content).toContain('dedicated document converter');
+
+    const binary = await registry.execute('file_read', { path: 'image.bin' }, { sessionId: 's', workspaceDir: cfg.workspaceDir, requestId: 'r-bin' });
+    expect(binary.ok).toBe(false);
+    expect(binary.content).toContain('binary or non-text');
   });
 
   it('uses remembered approval keys', async () => {
@@ -494,6 +526,13 @@ describe('builtin tools', () => {
     expect(result.content).toContain('exit=0');
     expect(result.content).toContain('stdout:\nhello');
     expect(result.content).not.toContain('browser_preview_url:');
+  });
+
+  it('flags multiline python -c commands as unsafe on Windows shells', () => {
+    const command = 'python -c "\nprint(123)\n"';
+    expect(isUnsafeWindowsMultilinePythonCommand(command, 'win32')).toBe(true);
+    expect(isUnsafeWindowsMultilinePythonCommand('python -c "print(123)"', 'win32')).toBe(false);
+    expect(isUnsafeWindowsMultilinePythonCommand(command, 'linux')).toBe(false);
   });
 
   it('returns browser preview markers for built-in browser tools in embedded mode', async () => {

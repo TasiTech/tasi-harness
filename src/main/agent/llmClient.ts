@@ -26,9 +26,353 @@ interface AnthropicMessage {
 const MAX_LLM_REQUEST_RETRIES = 2;
 const RETRY_BASE_DELAY_MS = 300;
 const RETRY_MAX_DELAY_MS = 2000;
+const CONTEXT_COMPRESSION_THRESHOLD = 0.8;
+const MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR = 1024;
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
+const MIN_CONTEXT_SUMMARY_TOKENS = 512;
+const MAX_CONTEXT_SUMMARY_TOKENS = 24_000;
+const RECENT_CONTEXT_BLOCKS = 6;
+const CONTEXT_RETRY_COMPRESSION_RATIO = 0.65;
+
+const MODEL_CONTEXT_WINDOW_HINTS: Array<[RegExp, number]> = [
+  [/^gpt-5\.6(?:-|$)|^gpt-5\.6$/i, 1_050_000],
+  [/^gpt-5\.4(?:-|$)|^gpt-5\.4$/i, 1_010_000],
+  [/^gpt-4\.1(?:-|$)|^gpt-4\.1$/i, 1_000_000],
+  [/^gpt-4o(?:-|$)|^chatgpt-4o/i, 128_000],
+  [/^o[134](?:-|$)|^o[134]-/i, 200_000],
+  [/^claude-3|^claude-opus|^claude-sonnet|^claude-haiku/i, 200_000],
+  [/^deepseek/i, 128_000],
+  [/^kimi/i, 128_000],
+  [/^qwen/i, 128_000],
+  [/^llama|^mistral|^gemma/i, 128_000]
+];
 
 function normalizeBase(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '');
+}
+
+function estimateTextTokens(text: string): number {
+  if (!text) return 0;
+  const cjk = text.match(/[\u3400-\u9fff\uf900-\ufaff]/g)?.length ?? 0;
+  const nonCjkLength = Math.max(0, text.length - cjk);
+  return cjk + Math.ceil(nonCjkLength / 3);
+}
+
+function estimateValueTokens(value: unknown): number {
+  if (typeof value === 'string') return estimateTextTokens(value);
+  if (value == null) return 0;
+  try {
+    return estimateTextTokens(JSON.stringify(value));
+  } catch {
+    return estimateTextTokens(String(value));
+  }
+}
+
+function estimateOpenAiPromptTokens(messages: Array<Record<string, unknown>>, tools?: ToolDefinition[]): number {
+  const messageTokens = messages.reduce((sum, message) => sum + 6 + estimateValueTokens(message), 0);
+  const toolTokens = tools && tools.length > 0 ? estimateValueTokens(tools) : 0;
+  return messageTokens + toolTokens + 12;
+}
+
+function modelContextHint(model: string): number | undefined {
+  const clean = model.trim();
+  return MODEL_CONTEXT_WINDOW_HINTS.find(([pattern]) => pattern.test(clean))?.[1];
+}
+
+function readNumericField(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
+  if (typeof value !== 'string') return undefined;
+  const compact = value.trim().toLowerCase();
+  const match = /^(\d+(?:\.\d+)?)\s*([kmb])?$/.exec(compact);
+  if (!match) return undefined;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base) || base <= 0) return undefined;
+  const suffix = match[2];
+  const multiplier = suffix === 'm' ? 1_000_000 : suffix === 'k' ? 1_000 : suffix === 'b' ? 1_000_000_000 : 1;
+  return Math.floor(base * multiplier);
+}
+
+function modelMetadataContextTokens(metadata: unknown): number | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const queue: unknown[] = [metadata];
+  const seen = new Set<unknown>();
+  const names = new Set([
+    'context_window',
+    'context_length',
+    'context_size',
+    'max_context_length',
+    'max_context_tokens',
+    'max_model_len',
+    'max_sequence_length',
+    'max_seq_len',
+    'input_token_limit',
+    'max_input_tokens'
+  ]);
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== 'object' || seen.has(current)) continue;
+    seen.add(current);
+    for (const [key, value] of Object.entries(current as Record<string, unknown>)) {
+      if (names.has(key.toLowerCase())) {
+        const parsed = readNumericField(value);
+        if (parsed) return parsed;
+      }
+      if (value && typeof value === 'object') queue.push(value);
+    }
+  }
+  return undefined;
+}
+
+function parseContextLimitFromError(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  const patterns = [
+    /maximum context length is\s+(\d+)\s+tokens/i,
+    /context (?:window|length|limit).*?(\d+)\s+tokens/i,
+    /max(?:imum)?(?: context)?(?: length)?[:= ]+(\d+)/i
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(message);
+    const value = match?.[1] ? Number(match[1]) : NaN;
+    if (Number.isFinite(value) && value > 0) return Math.floor(value);
+  }
+  return undefined;
+}
+
+function contentToText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return valuePreview(content, 400);
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, any>;
+    if (record.type === 'text' && typeof record.text === 'string') {
+      parts.push(record.text);
+    } else if (typeof record.type === 'string') {
+      parts.push(`[${record.type} attachment omitted from compressed history]`);
+    }
+  }
+  return parts.join('\n');
+}
+
+function valuePreview(value: unknown, maxChars: number): string {
+  let text: string;
+  if (typeof value === 'string') text = value;
+  else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  const compact = text.replace(/\s+/g, ' ').trim();
+  return compact.length > maxChars ? `${compact.slice(0, Math.max(0, maxChars - 3))}...` : compact;
+}
+
+function tokenizeQuery(text: string): string[] {
+  const latin = text.toLowerCase().match(/[a-z0-9_]{3,}/g) ?? [];
+  const cjk = text.match(/[\u3400-\u9fff\uf900-\ufaff]{2,}/g) ?? [];
+  return [...new Set([...latin, ...cjk])].slice(0, 80);
+}
+
+function lineScore(line: string, queryTokens: string[]): number {
+  const lower = line.toLowerCase();
+  let score = 0;
+  for (const token of queryTokens) {
+    if (lower.includes(token.toLowerCase())) score += token.length >= 6 ? 4 : 2;
+  }
+  if (/error|failed|exception|trace|todo|决定|错误|失败|异常|结论|需求|问题/.test(lower)) score += 3;
+  if (/^\s*(#{1,6}|[-*]|\d+[.)])\s+/.test(line)) score += 1;
+  return score;
+}
+
+function compressTextExtractive(text: string, targetTokens: number, query = ''): string {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!normalized || estimateTextTokens(normalized) <= targetTokens) return normalized;
+  if (targetTokens <= 0) return '';
+
+  const targetChars = Math.max(160, targetTokens * 4);
+  const queryTokens = tokenizeQuery(query);
+  const lines = normalized
+    .split('\n')
+    .map((line, index) => ({ index, line: line.trim() }))
+    .filter((item) => item.line);
+
+  if (lines.length <= 2) {
+    const head = normalized.slice(0, Math.floor(targetChars * 0.62)).trim();
+    const tail = normalized.slice(-Math.floor(targetChars * 0.28)).trim();
+    return [head, '[...compressed...]', tail].filter(Boolean).join('\n');
+  }
+
+  const selected = new Map<number, string>();
+  const edgeCount = Math.min(4, Math.ceil(lines.length * 0.08));
+  for (const item of lines.slice(0, edgeCount)) selected.set(item.index, item.line);
+  for (const item of lines.slice(-edgeCount)) selected.set(item.index, item.line);
+
+  const ranked = lines
+    .slice(edgeCount, Math.max(edgeCount, lines.length - edgeCount))
+    .map((item) => ({ ...item, score: lineScore(item.line, queryTokens) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+
+  let assembled = [...selected.entries()].sort((a, b) => a[0] - b[0]).map(([, line]) => line).join('\n');
+  for (const item of ranked) {
+    const next = [...selected.entries(), [item.index, item.line] as [number, string]]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, line]) => line)
+      .join('\n');
+    if (next.length > targetChars) break;
+    selected.set(item.index, item.line);
+    assembled = next;
+  }
+
+  if (estimateTextTokens(assembled) > targetTokens) {
+    assembled = assembled.slice(0, targetChars).trim();
+  }
+  return `${assembled}\n[compressed from ${estimateTextTokens(normalized)} estimated tokens to fit context budget]`;
+}
+
+function compactMessageContent(message: Record<string, unknown>, targetTokens: number, query: string): Record<string, unknown> {
+  const text = contentToText(message.content);
+  const compressed = compressTextExtractive(text, targetTokens, query);
+  return {
+    ...message,
+    content: compressed || '[content omitted by context compression]'
+  };
+}
+
+function stripHistoricalAttachments(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const lastUserIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === 'user') return index;
+    }
+    return messages.length - 1;
+  })();
+  return messages.map((message, index) => {
+    if (index === lastUserIndex || !Array.isArray(message.content)) return message;
+    return { ...message, content: contentToText(message.content) };
+  });
+}
+
+interface MessageBlock {
+  start: number;
+  end: number;
+  messages: Array<Record<string, unknown>>;
+}
+
+function buildMessageBlocks(messages: Array<Record<string, unknown>>): MessageBlock[] {
+  const blocks: MessageBlock[] = [];
+  for (let index = 0; index < messages.length;) {
+    const message = messages[index];
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls as Array<Record<string, any>> : [];
+    if (message.role === 'assistant' && toolCalls.length > 0) {
+      const ids = new Set(toolCalls.map((call) => String(call?.id ?? '')).filter(Boolean));
+      let end = index + 1;
+      while (end < messages.length && messages[end].role === 'tool' && ids.has(String(messages[end].tool_call_id ?? ''))) {
+        end += 1;
+      }
+      blocks.push({ start: index, end, messages: messages.slice(index, end) });
+      index = end;
+      continue;
+    }
+    blocks.push({ start: index, end: index + 1, messages: [message] });
+    index += 1;
+  }
+  return blocks;
+}
+
+function summarizeBlocks(blocks: MessageBlock[], targetTokens: number, query: string): string {
+  const raw = blocks
+    .flatMap((block) => block.messages)
+    .map((message) => {
+      const role = String(message.role ?? 'message');
+      const name = typeof message.name === 'string' && message.name ? ` ${message.name}` : '';
+      const text = contentToText(message.content);
+      const toolCalls = Array.isArray(message.tool_calls)
+        ? `\nTool calls: ${valuePreview(message.tool_calls, 800)}`
+        : '';
+      return `<${role}${name}>\n${text}${toolCalls}\n</${role}>`;
+    })
+    .join('\n\n');
+  return [
+    'Earlier conversation history was compressed to keep the request inside the model context window.',
+    'Preserve these decisions, constraints, user preferences, files touched, tool observations, and unresolved tasks:',
+    compressTextExtractive(raw, targetTokens, query)
+  ].join('\n');
+}
+
+function compressOpenAiMessagesToBudget(
+  messages: Array<Record<string, unknown>>,
+  tools: ToolDefinition[] | undefined,
+  contextWindowTokens: number,
+  query: string,
+  recentBlocks = RECENT_CONTEXT_BLOCKS,
+  budgetRatio = CONTEXT_COMPRESSION_THRESHOLD
+): { messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens: number } {
+  const budgetTokens = Math.max(256, Math.floor(contextWindowTokens * budgetRatio));
+  const beforeTokens = estimateOpenAiPromptTokens(messages, tools);
+  if (beforeTokens <= budgetTokens) {
+    return { messages, compressed: false, beforeTokens, afterTokens: beforeTokens, budgetTokens };
+  }
+
+  const sanitized = stripHistoricalAttachments(messages);
+  if (estimateOpenAiPromptTokens(sanitized, tools) <= budgetTokens) {
+    const afterTokens = estimateOpenAiPromptTokens(sanitized, tools);
+    return { messages: sanitized, compressed: true, beforeTokens, afterTokens, budgetTokens };
+  }
+
+  const systemMessages = sanitized.filter((message) => message.role === 'system');
+  const nonSystem = sanitized.filter((message) => message.role !== 'system');
+  const blocks = buildMessageBlocks(nonSystem);
+  const suffixCount = Math.max(1, Math.min(recentBlocks, blocks.length));
+  const keepStart = Math.max(0, blocks.length - suffixCount);
+  const olderBlocks = blocks.slice(0, keepStart);
+  const recentMessages = blocks.slice(keepStart).flatMap((block) => block.messages);
+  const summaryTokenFloor = Math.min(MIN_CONTEXT_SUMMARY_TOKENS, Math.max(64, Math.floor(budgetTokens * 0.25)));
+  const summaryTokens = Math.max(
+    summaryTokenFloor,
+    Math.min(MAX_CONTEXT_SUMMARY_TOKENS, Math.floor(budgetTokens * 0.12))
+  );
+  const summary = olderBlocks.length > 0 ? summarizeBlocks(olderBlocks, summaryTokens, query) : '';
+  let nextMessages =
+    summary && systemMessages.length > 0
+      ? [
+          { ...systemMessages[0], content: [contentToText(systemMessages[0].content), summary].filter(Boolean).join('\n\n') },
+          ...systemMessages.slice(1),
+          ...recentMessages
+        ]
+      : [...systemMessages, ...recentMessages];
+  let afterTokens = estimateOpenAiPromptTokens(nextMessages, tools);
+  if (afterTokens <= budgetTokens || suffixCount <= 1) {
+    if (afterTokens > budgetTokens) {
+      nextMessages = shrinkLargestMessages(nextMessages, tools, budgetTokens, query);
+      afterTokens = estimateOpenAiPromptTokens(nextMessages, tools);
+    }
+    return { messages: nextMessages, compressed: true, beforeTokens, afterTokens, budgetTokens };
+  }
+  return compressOpenAiMessagesToBudget(sanitized, tools, contextWindowTokens, query, Math.max(1, Math.floor(suffixCount / 2)), budgetRatio);
+}
+
+function shrinkLargestMessages(
+  messages: Array<Record<string, unknown>>,
+  tools: ToolDefinition[] | undefined,
+  budgetTokens: number,
+  query: string
+): Array<Record<string, unknown>> {
+  let next = [...messages];
+  let guard = 0;
+  while (estimateOpenAiPromptTokens(next, tools) > budgetTokens && guard < 12) {
+    guard += 1;
+    const candidates = next
+      .map((message, index) => ({ index, tokens: estimateValueTokens(message.content), role: String(message.role ?? '') }))
+      .filter((item) => item.tokens > 256)
+      .sort((a, b) => b.tokens - a.tokens);
+    const largest = candidates[0];
+    if (!largest) break;
+    const overflow = estimateOpenAiPromptTokens(next, tools) - budgetTokens;
+    const target = Math.max(128, largest.tokens - overflow - 256, Math.floor(largest.tokens * 0.55));
+    next = next.map((message, index) => (index === largest.index ? compactMessageContent(message, target, query) : message));
+  }
+  return next;
 }
 
 async function runtimeFetch(input: string, init: RequestInit): Promise<Response> {
@@ -51,6 +395,104 @@ function parseJsonBody(text: string): unknown {
   } catch {
     return { text };
   }
+}
+
+function parseSseJsonData(dataParts: string[]): unknown {
+  const specData = dataParts.join('\n').trim();
+  try {
+    return JSON.parse(specData);
+  } catch (specError) {
+    const compactData = dataParts.join('').trim();
+    if (compactData !== specData) {
+      try {
+        return JSON.parse(compactData);
+      } catch {
+        // Report the original SSE-shaped payload below.
+      }
+    }
+    throw specError;
+  }
+}
+
+function looksLikeIncompleteJson(text: string): boolean {
+  return analyzeIncompleteJson(text).incomplete;
+}
+
+function analyzeIncompleteJson(text: string): { incomplete: boolean; missingClosers: string } {
+  const trimmed = text.trim();
+  if (!trimmed) return { incomplete: false, missingClosers: '' };
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const char of trimmed) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === '{' || char === '[') {
+      stack.push(char === '{' ? '}' : ']');
+    } else if (char === '}' || char === ']') {
+      if (stack.pop() !== char) return { incomplete: false, missingClosers: '' };
+    }
+  }
+  return {
+    incomplete: inString || stack.length > 0 || /[:,]\s*$/.test(trimmed),
+    missingClosers: !inString && !/[:,]\s*$/.test(trimmed) ? [...stack].reverse().join('') : ''
+  };
+}
+
+function parseRepairableFinalSseJson(dataParts: string[]): unknown | undefined {
+  const candidates = [dataParts.join('\n').trim(), dataParts.join('').trim()]
+    .filter((item, index, items) => item && items.indexOf(item) === index);
+  for (const candidate of candidates) {
+    const analysis = analyzeIncompleteJson(candidate);
+    if (!analysis.incomplete || !analysis.missingClosers) continue;
+    try {
+      return JSON.parse(`${candidate}${analysis.missingClosers}`);
+    } catch {
+      // Try the next candidate shape.
+    }
+  }
+  return undefined;
+}
+
+type SseEventBlockStatus = 'processed' | 'done' | 'open';
+
+function processSseEventBlock(block: string, onJsonEvent: (json: any) => void, options: { final?: boolean } = {}): SseEventBlockStatus {
+  const dataParts: string[] = [];
+  for (const line of block.split('\n')) {
+    if (line.startsWith('data:')) {
+      const value = line.slice('data:'.length);
+      dataParts.push(value.startsWith(' ') ? value.slice(1) : value);
+      continue;
+    }
+    if (/^(?:event|id|retry):/.test(line)) continue;
+    if (dataParts.length > 0 && line.trim()) dataParts[dataParts.length - 1] += line.trimEnd();
+  }
+  if (dataParts.length === 0) return 'processed';
+  const data = dataParts.join('\n').trim();
+  if (!data) return 'processed';
+  if (data === '[DONE]') return 'done';
+  try {
+    onJsonEvent(parseSseJsonData(dataParts));
+  } catch {
+    if (!options.final && looksLikeIncompleteJson(data)) return 'open';
+    if (options.final && looksLikeIncompleteJson(data)) {
+      const repaired = parseRepairableFinalSseJson(dataParts);
+      if (repaired !== undefined) onJsonEvent(repaired);
+      return 'processed';
+    }
+    throw new Error(`Invalid LLM stream event: ${data.slice(0, 200)}`);
+  }
+  return 'processed';
 }
 
 function fetchFailureDetail(error: unknown): string {
@@ -210,6 +652,40 @@ function normalizeToolArgumentsForRequest(value: unknown): string {
   }
 }
 
+function reasoningTextFromValue(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (!Array.isArray(value)) return undefined;
+  const parts = value
+    .map((item) => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return '';
+      const record = item as Record<string, unknown>;
+      for (const key of ['text', 'content', 'reasoning', 'summary']) {
+        if (typeof record[key] === 'string') return record[key] as string;
+      }
+      return '';
+    })
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
+function splitThinkBlocks(content: string, explicitReasoning?: string): { content: string; reasoning_content?: string } {
+  const thinkParts: string[] = [];
+  const stripped = content
+    .replace(/<think>\s*([\s\S]*?)\s*<\/think>/gi, (_match, inner: string) => {
+      const clean = String(inner ?? '').trim();
+      if (clean) thinkParts.push(clean);
+      return '';
+    })
+    .trim();
+  const reasoningParts = [explicitReasoning?.trim(), ...thinkParts].filter((part): part is string => Boolean(part));
+  return {
+    content: stripped,
+    reasoning_content: reasoningParts.length > 0 ? reasoningParts.join('\n') : undefined
+  };
+}
+
 function anthropicTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text: text.trim() || ' ' };
 }
@@ -326,6 +802,10 @@ function toAnthropicTools(tools: ToolDefinition[] | undefined): Array<{ name: st
 function parseOpenAiCompletion(json: any): LlmCompletion {
   const choice = json.choices?.[0];
   const msg = choice?.message ?? {};
+  const parsedContent = splitThinkBlocks(
+    String(msg.content ?? ''),
+    reasoningTextFromValue(msg.reasoning) ?? reasoningTextFromValue(msg.reasoning_content) ?? reasoningTextFromValue(msg.reasoning_details)
+  );
   const toolCalls: ToolCall[] | undefined = Array.isArray(msg.tool_calls)
     ? msg.tool_calls.map((tc: any) => ({
         id: String(tc.id ?? createId('toolcall')),
@@ -341,8 +821,8 @@ function parseOpenAiCompletion(json: any): LlmCompletion {
     message: {
       id: createId('msg'),
       role: 'assistant',
-      content: String(msg.content ?? ''),
-      reasoning_content: typeof msg.reasoning_content === 'string' ? msg.reasoning_content : undefined,
+      content: parsedContent.content,
+      reasoning_content: parsedContent.reasoning_content,
       tool_calls: toolCalls
     },
     usage: {
@@ -415,7 +895,10 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
         content: String(message.content ?? '')
       };
       if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
-      if (typeof message.reasoning_content === 'string') next.reasoning_content = message.reasoning_content;
+      if (typeof message.reasoning_content === 'string') {
+        if (provider === 'vllm') next.reasoning = message.reasoning_content;
+        else next.reasoning_content = message.reasoning_content;
+      }
 
       const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
       const toolCalls = rawToolCalls
@@ -452,6 +935,15 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
   }
 
   return normalized;
+}
+
+function vllmReasoningRequestParams(config: AppConfig): Record<string, unknown> {
+  if (config.provider !== 'vllm') return {};
+  if (config.reasoningEffort === 'auto') return { include_reasoning: true };
+  return {
+    reasoning_effort: config.reasoningEffort,
+    include_reasoning: config.reasoningEffort !== 'none'
+  };
 }
 
 function parseAnthropicCompletion(json: any): LlmCompletion {
@@ -496,6 +988,8 @@ function parseAnthropicCompletion(json: any): LlmCompletion {
 }
 
 class ModelClient implements LlmClient {
+  private readonly modelContextCache = new Map<string, number | undefined>();
+
   constructor(private readonly config: AppConfig) {}
 
   async complete(request: LlmRequest): Promise<LlmCompletion> {
@@ -549,6 +1043,20 @@ class ModelClient implements LlmClient {
     }
   }
 
+  private async getJson(endpoint: string, headers: Record<string, string>, request: LlmRequest): Promise<any | undefined> {
+    try {
+      const response = await runtimeFetch(endpoint, {
+        method: 'GET',
+        headers,
+        signal: request.signal
+      });
+      if (!response.ok) return undefined;
+      return parseJsonBody(await response.text());
+    } catch {
+      return undefined;
+    }
+  }
+
   private async postEventStream(
     endpoint: string,
     headers: Record<string, string>,
@@ -597,35 +1105,29 @@ class ModelClient implements LlmClient {
         const next = await reader.read();
         if (next.done) break;
         buffer += decoder.decode(next.value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? '';
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice('data:'.length).trim();
-          if (!data) continue;
-          if (data === '[DONE]') {
-            doneEventSeen = true;
-            break;
+        buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        while (true) {
+          const boundary = buffer.indexOf('\n\n');
+          if (boundary < 0) break;
+          const eventBlock = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const status = processSseEventBlock(eventBlock, onJsonEvent);
+          if (status === 'open') {
+            buffer = `${eventBlock}\n${buffer}`;
+            continue;
           }
-          try {
-            onJsonEvent(JSON.parse(data));
-          } catch {
-            throw new Error(`Invalid LLM stream event: ${data.slice(0, 200)}`);
-          }
+          doneEventSeen = status === 'done';
+          if (doneEventSeen) break;
         }
         if (doneEventSeen) break;
       }
       buffer += decoder.decode();
+      buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-      if (!doneEventSeen && buffer.trim().startsWith('data:')) {
-        const data = buffer.trim().slice('data:'.length).trim();
-        if (data && data !== '[DONE]') {
-          try {
-            onJsonEvent(JSON.parse(data));
-          } catch {
-            throw new Error(`Invalid LLM stream event: ${data.slice(0, 200)}`);
-          }
+      if (!doneEventSeen) {
+        const trimmed = buffer.trim();
+        if (trimmed) {
+          doneEventSeen = processSseEventBlock(trimmed, onJsonEvent, { final: true }) === 'done';
         }
       }
       return;
@@ -713,22 +1215,78 @@ class ModelClient implements LlmClient {
     return this.completeWithOpenAiCompatibleStream(request, onDelta);
   }
 
+  private async prepareOpenAiCompatibleMessages(
+    request: LlmRequest,
+    headers: Record<string, string>
+  ): Promise<{ messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens?: number }> {
+    const messages = normalizeOpenAiCompatibleMessages(request.messages, this.config.provider);
+    const estimatedTokens = estimateOpenAiPromptTokens(messages, request.tools);
+    const localHint = modelContextHint(this.config.model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    const shouldResolveContext =
+      estimatedTokens > Math.floor(localHint * CONTEXT_COMPRESSION_THRESHOLD) ||
+      estimatedTokens > MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR;
+    const contextWindowTokens = shouldResolveContext
+      ? (await this.resolveModelContextWindow(headers, request)) ?? localHint
+      : localHint;
+    return this.compressOpenAiRequest(request, contextWindowTokens, messages);
+  }
+
+  private async resolveModelContextWindow(headers: Record<string, string>, request: LlmRequest): Promise<number | undefined> {
+    const cacheKey = `${normalizeBase(this.config.baseUrl)}\n${this.config.model}`;
+    if (this.modelContextCache.has(cacheKey)) return this.modelContextCache.get(cacheKey);
+    const endpoint = `${normalizeBase(this.config.baseUrl)}/models/${encodeURIComponent(this.config.model)}`;
+    const json = await this.getJson(endpoint, headers, request);
+    const tokens = modelMetadataContextTokens(json) ?? modelContextHint(this.config.model);
+    this.modelContextCache.set(cacheKey, tokens);
+    return tokens;
+  }
+
+  private compressOpenAiRequest(
+    request: LlmRequest,
+    contextWindowTokens: number,
+    normalizedMessages?: Array<Record<string, unknown>>,
+    budgetRatio = CONTEXT_COMPRESSION_THRESHOLD
+  ): { messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens: number } {
+    const messages = normalizedMessages ?? normalizeOpenAiCompatibleMessages(request.messages, this.config.provider);
+    const query = [...request.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
+    return compressOpenAiMessagesToBudget(messages, request.tools, contextWindowTokens, query, RECENT_CONTEXT_BLOCKS, budgetRatio);
+  }
+
+  private async postJsonWithContextRetry(
+    endpoint: string,
+    headers: Record<string, string>,
+    body: Record<string, unknown>,
+    request: LlmRequest,
+    _prepared: { compressed: boolean }
+  ): Promise<any> {
+    try {
+      return await this.postJson(endpoint, headers, body, request);
+    } catch (error) {
+      const contextWindowTokens = parseContextLimitFromError(error);
+      if (!contextWindowTokens) throw error;
+      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO);
+      return this.postJson(endpoint, headers, { ...body, messages: retry.messages }, request);
+    }
+  }
+
   private async completeWithOpenAiCompatible(request: LlmRequest): Promise<LlmCompletion> {
     const endpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
+    const prepared = await this.prepareOpenAiCompatibleMessages(request, headers);
     const body = {
       model: this.config.model,
-      messages: normalizeOpenAiCompatibleMessages(request.messages, this.config.provider),
+      messages: prepared.messages,
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
       logprobs: request.logProbs === true ? true : undefined,
       top_logprobs: request.logProbs === true ? request.topLogProbs : undefined,
       metadata: request.metadata,
-      stream: false
+      stream: false,
+      ...vllmReasoningRequestParams(this.config)
     };
-    const json = await this.postJson(endpoint, headers, body, request);
+    const json = await this.postJsonWithContextRetry(endpoint, headers, body, request, prepared);
     return parseOpenAiCompletion(json);
   }
 
@@ -736,14 +1294,16 @@ class ModelClient implements LlmClient {
     const endpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (this.config.apiKey) headers.Authorization = `Bearer ${this.config.apiKey}`;
-    const body = {
+    const prepared = await this.prepareOpenAiCompatibleMessages(request, headers);
+    let body = {
       model: this.config.model,
-      messages: normalizeOpenAiCompatibleMessages(request.messages, this.config.provider),
+      messages: prepared.messages,
       tools: request.tools && request.tools.length > 0 ? request.tools : undefined,
       temperature: request.temperature ?? this.config.temperature,
       max_tokens: request.maxTokens,
       metadata: request.metadata,
-      stream: true
+      stream: true,
+      ...vllmReasoningRequestParams(this.config)
     };
 
     let content = '';
@@ -753,7 +1313,7 @@ class ModelClient implements LlmClient {
     const toolCallAcc: OpenAiStreamingToolCall[] = [];
     let rawEventCount = 0;
 
-    await this.postEventStream(endpoint, headers, body, request, (json) => {
+    const handleEvent = (json: any): void => {
       rawEventCount += 1;
       if (typeof json.id === 'string' && json.id) rawId = json.id;
       if (json.usage) {
@@ -765,7 +1325,11 @@ class ModelClient implements LlmClient {
       }
       const choice = json.choices?.[0];
       const delta = choice?.delta ?? {};
-      const reasoningDelta = typeof delta.reasoning_content === 'string' ? delta.reasoning_content : '';
+      const reasoningDelta = typeof delta.reasoning === 'string'
+        ? delta.reasoning
+        : typeof delta.reasoning_content === 'string'
+          ? delta.reasoning_content
+          : '';
       const contentDelta = typeof delta.content === 'string' ? delta.content : '';
       if (reasoningDelta) {
         reasoningContent += reasoningDelta;
@@ -776,14 +1340,31 @@ class ModelClient implements LlmClient {
         onDelta({ content: contentDelta });
       }
       applyOpenAiToolCallDeltas(toolCallAcc, delta.tool_calls);
-    });
+    };
 
+    try {
+      await this.postEventStream(endpoint, headers, body, request, handleEvent);
+    } catch (error) {
+      const contextWindowTokens = parseContextLimitFromError(error);
+      if (!contextWindowTokens) throw error;
+      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO);
+      body = { ...body, messages: retry.messages };
+      content = '';
+      reasoningContent = '';
+      usage = undefined;
+      rawId = '';
+      toolCallAcc.length = 0;
+      rawEventCount = 0;
+      await this.postEventStream(endpoint, headers, body, request, handleEvent);
+    }
+
+    const parsedContent = splitThinkBlocks(content, reasoningContent || undefined);
     return {
       message: {
         id: rawId || createId('msg'),
         role: 'assistant',
-        content,
-        reasoning_content: reasoningContent || undefined,
+        content: parsedContent.content,
+        reasoning_content: parsedContent.reasoning_content,
         tool_calls: finalizeStreamingToolCalls(toolCallAcc)
       },
       usage,

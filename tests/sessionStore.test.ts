@@ -115,6 +115,47 @@ describe('SessionStore', () => {
     }
   });
 
+  it('preserves hidden assistant content while omitting it from searchable visible context', () => {
+    const env = tempHome();
+    try {
+      const store = new SessionStore(env.home);
+      const session = store.create('Hidden assistant preamble');
+      store.appendMessages(session.id, [
+        { id: 'm1', role: 'user', content: 'Write a file.', createdAt: '2026-01-01T00:00:00.000Z' },
+        {
+          id: 'm2',
+          role: 'assistant',
+          hidden: true,
+          content: 'I will call the file tool before answering.',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'file_write', arguments: '{}' }
+          }],
+          createdAt: '2026-01-01T00:00:01.000Z'
+        },
+        { id: 'm3', role: 'tool', name: 'file_write', tool_call_id: 'call_1', content: 'ok', createdAt: '2026-01-01T00:00:02.000Z' },
+        { id: 'm4', role: 'assistant', content: 'Done.', createdAt: '2026-01-01T00:00:03.000Z' }
+      ]);
+
+      const raw = readFileSync(join(env.home, 'sessions', `${session.id}.json`), 'utf8');
+      const full = store.read(session.id);
+      const display = store.readForDisplay(session.id);
+      const search = store.search('before answering');
+      const optimization = store.buildOptimizationContext({ sessionIds: [session.id] });
+
+      expect(raw).toContain('I will call the file tool before answering.');
+      expect(full?.messages[1]?.content).toBe('I will call the file tool before answering.');
+      expect(full?.messages[1]?.hidden).toBe(true);
+      expect(display?.messages[1]?.content).toBe('I will call the file tool before answering.');
+      expect(search).toHaveLength(0);
+      expect(optimization.context).not.toContain('before answering');
+      expect(optimization.context).toContain('Done.');
+    } finally {
+      env.cleanup();
+    }
+  });
+
   it('redacts browser credential values before persisting session records', () => {
     const env = tempHome();
     try {

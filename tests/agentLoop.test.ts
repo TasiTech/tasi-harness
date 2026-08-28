@@ -129,10 +129,11 @@ describe('AgentLoop', () => {
 
     expect(result.finalResponse).toBe('Done.');
     expect(assistantMessages).toHaveLength(2);
-    expect(assistantMessages[0]?.content).toBe('');
+    expect(assistantMessages[0]?.content).toBe('I will check that now. Please wait.');
+    expect(assistantMessages[0]?.hidden).toBe(true);
     expect(assistantMessages[0]?.tool_calls?.[0]?.function.name).toBe('file_write');
     expect(assistantMessages[1]?.content).toBe('Done.');
-    expect(stored?.messages.some((message) => message.content === 'I will check that now. Please wait.')).toBe(false);
+    expect(stored?.messages.some((message) => message.content === 'I will check that now. Please wait.')).toBe(true);
   });
 
   it('emits streamed assistant deltas when the client supports streaming', async () => {
@@ -183,6 +184,317 @@ describe('AgentLoop', () => {
 
     expect(result.finalResponse).toBe('Streamed answer.');
     expect(deltas).toEqual(['r:Brief reasoning.', 'c:Streamed answer.', 'done:Streamed answer.']);
+  });
+
+  it('continues with a non-stream retry after a recoverable streamed LLM interruption', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    let streamCalls = 0;
+    let completeCalls = 0;
+    const client: LlmClient = {
+      async complete(): Promise<LlmCompletion> {
+        completeCalls += 1;
+        return { message: { role: 'assistant', content: 'Recovered answer.' } };
+      },
+      async streamComplete(_request: LlmRequest, onDelta: (delta: { reasoning_content?: string; content?: string }) => void): Promise<LlmCompletion> {
+        streamCalls += 1;
+        onDelta({ reasoning_content: 'partial thought' });
+        onDelta({ content: 'partial answer' });
+        throw new Error('Invalid LLM stream event: {"choices":[{"delta":{"reasoning":"."},"finish_reason":null');
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'recover please',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
+        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_content ?? ''}`);
+        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_content ?? ''}`);
+      }
+    });
+
+    expect(streamCalls).toBe(1);
+    expect(completeCalls).toBe(1);
+    expect(result.finalResponse).toBe('Recovered answer.');
+    expect(deltas).toEqual([
+      'r:partial thought:',
+      'c:partial answer:partial thought',
+      'r::',
+      'done:Recovered answer.:'
+    ]);
+    expect(sessions.read(result.sessionId)?.messages.at(-1)?.content).toBe('Recovered answer.');
+  });
+
+  it('continues automatically when a completion has reasoning but no content or tool calls', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 3 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const requests: LlmRequest[] = [];
+    let streamCalls = 0;
+    const client: LlmClient = {
+      async complete(): Promise<LlmCompletion> {
+        return { message: { role: 'assistant', content: 'fallback' } };
+      },
+      async streamComplete(request: LlmRequest, onDelta: (delta: { reasoning_content?: string; content?: string }) => void): Promise<LlmCompletion> {
+        requests.push(request);
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          onDelta({ reasoning_content: 'Need one more pass.' });
+          return { message: { role: 'assistant', content: '', reasoning_content: 'Need one more pass.' } };
+        }
+        onDelta({ content: 'Visible answer.' });
+        return { message: { role: 'assistant', content: 'Visible answer.' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const deltas: string[] = [];
+    const result = await loop.run({
+      userInput: 'continue from reasoning',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
+        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_content ?? ''}`);
+        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_content ?? ''}`);
+      }
+    });
+
+    expect(streamCalls).toBe(2);
+    expect(result.iterations).toBe(2);
+    expect(result.finalResponse).toBe('Visible answer.');
+    expect(requests[1]?.messages.some((message) => message.role === 'assistant' && message.reasoning_content === 'Need one more pass.')).toBe(true);
+    expect(deltas).toEqual([
+      'r:Need one more pass.:',
+      'r::',
+      'c:Visible answer.:',
+      'done:Visible answer.:'
+    ]);
+    const visibleAssistantMessages = result.messages.filter((message) => message.role === 'assistant' && message.hidden !== true && (message.content.trim() || message.reasoning_content?.trim()));
+    expect(visibleAssistantMessages).toHaveLength(1);
+    expect(visibleAssistantMessages[0]?.content).toBe('Visible answer.');
+  });
+
+  it('stops when streamed reasoning repeats the same planning pattern', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 10 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const planningBlock = [
+      'Has detailed reformat planning plan',
+      'Has detailed reindex planning plan',
+      'Has detailed recompile planning plan',
+      'Has detailed rebuild planning plan',
+      'Has detailed repackage planning plan',
+      'Has detailed redistribute planning plan',
+      'Has detailed reinstall planning plan',
+      'Has detailed reconfigure planning plan',
+      'Has detailed reinitialize planning plan'
+    ];
+    let emittedReasoningLines = 0;
+    const client: LlmClient = {
+      async complete(): Promise<LlmCompletion> {
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      },
+      async streamComplete(_request: LlmRequest, onDelta: (delta: { reasoning_content?: string; content?: string }) => void): Promise<LlmCompletion> {
+        for (let repeat = 0; repeat < 20; repeat += 1) {
+          for (const line of planningBlock) {
+            emittedReasoningLines += 1;
+            onDelta({ reasoning_content: `${line}\n` });
+          }
+        }
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const done: string[] = [];
+    const result = await loop.run({
+      userInput: 'loop in planning',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.type === 'done') done.push(event.content ?? '');
+      }
+    });
+
+    expect(emittedReasoningLines).toBe(planningBlock.length * 5);
+    expect(result.iterations).toBe(1);
+    expect(result.finalResponse).toContain('Stopped because the model reasoning repeated the same planning pattern 5 times.');
+    expect(result.finalResponse).toContain('Has detailed reformat planning plan');
+    expect(done).toEqual([result.finalResponse]);
+    expect(sessions.read(result.sessionId)?.messages.at(-1)?.content).toBe(result.finalResponse);
+  });
+
+  it('stops when streamed reasoning repeats with escaped newline text', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 10 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const planningBlock = [
+      'Let me start with the plan:',
+      '**A section structure:**',
+      'Now let me start drafting.',
+      'I will write the content in a structured way.',
+      'OK, I am going to stop overthinking and just start drafting.'
+    ];
+    let emittedBlocks = 0;
+    const client: LlmClient = {
+      async complete(): Promise<LlmCompletion> {
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      },
+      async streamComplete(_request: LlmRequest, onDelta: (delta: { reasoning_content?: string; content?: string }) => void): Promise<LlmCompletion> {
+        for (let repeat = 0; repeat < 20; repeat += 1) {
+          emittedBlocks += 1;
+          onDelta({ reasoning_content: `${planningBlock.join('\\n')}\\n` });
+        }
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({
+      userInput: 'loop with escaped newline planning',
+      onMessageDelta: () => undefined
+    });
+
+    expect(emittedBlocks).toBe(5);
+    expect(result.iterations).toBe(1);
+    expect(result.finalResponse).toContain('Stopped because the model reasoning repeated the same planning pattern 5 times.');
+    expect(result.finalResponse).toContain('Let me start with the plan:');
+  });
+
+  it('stops when streamed reasoning grows too long without visible progress', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 10 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    let emittedChars = 0;
+    const client: LlmClient = {
+      async complete(): Promise<LlmCompletion> {
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      },
+      async streamComplete(_request: LlmRequest, onDelta: (delta: { reasoning_content?: string; content?: string }) => void): Promise<LlmCompletion> {
+        for (let index = 0; index < 1000; index += 1) {
+          const chunk = `Considering next planning option ${index} with a slightly different phrase. `;
+          emittedChars += chunk.length;
+          onDelta({ reasoning_content: chunk });
+        }
+        return { message: { role: 'assistant', content: 'should not finish normally' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({
+      userInput: 'loop with varied planning',
+      onMessageDelta: () => undefined
+    });
+
+    expect(emittedChars).toBeGreaterThanOrEqual(12000);
+    expect(result.iterations).toBe(1);
+    expect(result.finalResponse).toContain('Stopped because the model produced a long reasoning stream without any visible answer or tool call.');
+    expect(sessions.read(result.sessionId)?.messages.at(-1)?.content).toBe(result.finalResponse);
   });
 
   it('returns log probabilities from the final completion when requested', async () => {
@@ -291,7 +603,7 @@ describe('AgentLoop', () => {
     ))).toBe(false);
   });
 
-  it('keeps tool-call reasoning on the same streamed assistant bubble as the final answer', async () => {
+  it('replaces streamed reasoning with the current iteration instead of accumulating tool-call reasoning', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
@@ -306,7 +618,7 @@ describe('AgentLoop', () => {
       {
         message: {
           role: 'assistant',
-          content: '',
+          content: 'I will inspect first.',
           reasoning_content: 'Need to inspect the workspace.\nNeed to write the file.',
           tool_calls: [{
             id: 'call_1',
@@ -315,7 +627,13 @@ describe('AgentLoop', () => {
           }]
         }
       },
-      { message: { role: 'assistant', content: 'Done.' } }
+      {
+        message: {
+          role: 'assistant',
+          content: 'Done.',
+          reasoning_content: 'Ready to answer.'
+        }
+      }
     ]);
     const loop = new AgentLoop({
       getConfig: () => cfg,
@@ -340,21 +658,26 @@ describe('AgentLoop', () => {
       userInput: 'write a file',
       onMessageDelta: (_sessionId, event) => {
         messageIds.push(event.messageId);
-        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_parts?.join('|')}`);
-        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_parts?.join('|')}`);
-        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_parts?.join('|')}`);
+        const contentParts = event.content_parts?.join('|') ?? '';
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_parts?.join('|')}:${event.content ?? ''}:${contentParts}`);
+        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_parts?.join('|')}:${contentParts}`);
+        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_parts?.join('|')}:${contentParts}`);
       }
     });
 
     expect(new Set(messageIds).size).toBe(1);
     expect(deltas).toEqual([
-      'r:Need to inspect the workspace.|Need to write the file.',
-      'c:Done.:Need to inspect the workspace.|Need to write the file.',
-      'done:Done.:Need to inspect the workspace.|Need to write the file.'
+      'r:Need to inspect the workspace.|Need to write the file.::',
+      'c:I will inspect first.:Need to inspect the workspace.|Need to write the file.:',
+      'r:::I will inspect first.',
+      'r:Ready to answer.::I will inspect first.',
+      'c:Done.:Ready to answer.:I will inspect first.',
+      'done:Done.:Ready to answer.:I will inspect first.'
     ]);
     const finalAssistant = [...result.messages].reverse().find((message) => message.role === 'assistant' && message.content === 'Done.');
-    expect(finalAssistant?.reasoning_content).toBe('Need to inspect the workspace.\nNeed to write the file.');
-    expect(finalAssistant?.reasoning_parts).toEqual(['Need to inspect the workspace.', 'Need to write the file.']);
+    expect(finalAssistant?.reasoning_content).toBe('Ready to answer.');
+    expect(finalAssistant?.reasoning_parts).toEqual(['Ready to answer.']);
+    expect(finalAssistant?.content_parts).toEqual(['I will inspect first.']);
   });
 
   it('stops when the same tool call returns the same result repeatedly', async () => {

@@ -27,6 +27,7 @@ export function defaultConfig(): AppConfig {
     omniBaseUrl: omniProviderDefaultBaseUrl('openai'),
     omniApiKey: '',
     omniModel: omniProviderDefaultModel('openai'),
+    reasoningEffort: 'auto',
     temperature: 0.3,
     maxIterations: 200,
     sessionDocumentMaxDocs: 10,

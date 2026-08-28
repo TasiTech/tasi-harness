@@ -1,5 +1,5 @@
 ---
-name: document
+name: solution-writer
 description: "Generate, rewrite, expand, or polish high-quality document text for solutions, reports, proposals, plans, presentations, or analysis before Word/PDF/PPT formatting. Use for text-first deliverables that may need planned figure insertions, including flowcharts, architecture diagrams, topology diagrams, process diagrams, design sketches, data charts, and analytical visualizations. Enforce Request → Plan → Draft → Audit → Refine → Deliver for complex writing tasks; allow streamlined handling for simple text-only requests."
 category: work
 license: Proprietary

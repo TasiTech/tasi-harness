@@ -115,6 +115,27 @@ describe('ConfigStore', () => {
     expect(store.get().textColor).toBe('');
   });
 
+  it('sanitizes and exposes reasoning effort', () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const store = new ConfigStore(env.home);
+
+    expect(store.publicConfig(false).reasoningEffort).toBe('auto');
+
+    store.update({ reasoningEffort: 'xhigh' });
+    expect(store.get().reasoningEffort).toBe('xhigh');
+    expect(store.publicConfig(false).reasoningEffort).toBe('xhigh');
+
+    store.update({ reasoningEffort: 'unsupported' as any });
+    expect(store.get().reasoningEffort).toBe('xhigh');
+
+    store.update({ reasoningEffort: 'high' as any });
+    expect(store.get().reasoningEffort).toBe('xhigh');
+
+    writeFileSync(join(env.home, 'config.json'), JSON.stringify({ reasoningEffort: 'unsupported' }));
+    expect(store.get().reasoningEffort).toBe('auto');
+  });
+
   it('persists an imported custom theme selection', () => {
     const env = tempHome();
     cleanup = env.cleanup;

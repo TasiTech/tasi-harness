@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { extractCitationLinks, normalizeCitationHref } from '../src/renderer/citations';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from '../src/renderer/markdown';
+import { assistantContentListView, isVisibleChatMessage } from '../src/renderer/App';
 
 function escapeAttr(value: string): string {
   return value.replaceAll('&', '&amp;');
@@ -75,5 +76,40 @@ describe('extractCitationLinks fallback links', () => {
 
     expect(citations.map((citation) => citation.label)).toEqual(['1', '2']);
     expect(citations.map((citation) => citation.host)).toEqual(['journals.physiology.org', 'frontiersin.org']);
+  });
+});
+
+describe('assistantContentListView', () => {
+  it('splits assistant content into display items without splitting fenced code blanks', () => {
+    const view = assistantContentListView([
+      '第一段回复。',
+      '',
+      '```ts',
+      'const value = 1;',
+      '',
+      'console.log(value);',
+      '```',
+      '',
+      '- 后续条目'
+    ].join('\n'));
+
+    expect(view.clipped).toBe(false);
+    expect(view.items).toHaveLength(3);
+    expect(view.items[0]).toBe('第一段回复。');
+    expect(view.items[1]).toContain('const value = 1;\n\nconsole.log(value);');
+    expect(view.items[2]).toBe('- 后续条目');
+  });
+});
+
+describe('isVisibleChatMessage', () => {
+  it('keeps the streamed assistant bubble visible when only prior iteration content remains', () => {
+    expect(isVisibleChatMessage({
+      id: 'msg_visible',
+      role: 'assistant',
+      content: '',
+      reasoning_content: '',
+      content_parts: ['I will inspect first.'],
+      createdAt: '2026-08-28T00:00:00.000Z'
+    })).toBe(true);
   });
 });

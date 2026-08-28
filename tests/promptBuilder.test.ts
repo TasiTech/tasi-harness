@@ -44,6 +44,17 @@ describe('PromptBuilder', () => {
     const prompt = await builder.build(defaultConfig(), { userInput: 'plan a trip itinerary' });
 
     expect(prompt).toContain('treat that skill as an execution workflow, not optional background reading');
+    expect(prompt).toContain('Keep internal reasoning compact and non-repetitive');
+    expect(prompt).toContain('Do not restate the same plan, checklist, instruction block, or unresolved option more than once');
+    expect(prompt).toContain('If you notice you are re-planning the same step');
+    expect(prompt).toContain('call the needed tool, ask one focused blocking question, produce the final answer, or report a degraded/blocked result');
+    expect(prompt).toContain('Do not loop through synonyms for the same plan');
+    expect(prompt).toContain('Do not continue generating hidden reasoning that repeats the failed approach');
+    expect(prompt).toContain('hidden reasoning is not progress');
+    expect(prompt).toContain('the next assistant message must contain a tool call or visible deliverable content');
+    expect(prompt).toContain('Treat those phrases as a signal to act immediately');
+    expect(prompt).toContain('If you have already produced a plan and still have no new evidence');
+    expect(prompt).toContain('For document-generation tasks, do not cycle between outline and drafting promises');
     expect(prompt).toContain('enter skill execution mode and stay in that mode');
     expect(prompt).toContain('your first substantive step should be to call skill_view for that skill');
     expect(prompt).toContain('follow its instructions, routing rules, and completion criteria');

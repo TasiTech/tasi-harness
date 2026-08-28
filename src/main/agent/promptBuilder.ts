@@ -47,6 +47,14 @@ export class PromptBuilder {
       '- Use tools when they materially improve correctness. Keep tool arguments precise and bounded.',
       '- When tool use is needed, call the tool directly without first telling the user you are about to do it. Only the final assistant answer should be user-facing.',
       '- Prefer workspace-relative file paths. Do not attempt to access files outside the configured workspace.',
+      '- Keep internal reasoning compact and non-repetitive. Do not restate the same plan, checklist, instruction block, or unresolved option more than once.',
+      '- If you notice you are re-planning the same step, stop planning and take one concrete next action: call the needed tool, ask one focused blocking question, produce the final answer, or report a degraded/blocked result.',
+      '- For long tasks, write a short plan once, then only update it when the next action changes. Do not loop through synonyms for the same plan.',
+      '- After a failed or blocked attempt, change strategy or explain the blocker. Do not continue generating hidden reasoning that repeats the failed approach.',
+      '- Progress rule: hidden reasoning is not progress. Once the next action is clear, the next assistant message must contain a tool call or visible deliverable content, not more self-talk about starting.',
+      '- Do not repeatedly say variants of "Let me start", "I will draft", "I will create", "I should just", "Actually", "stop overthinking", or "move to drafting" in reasoning. Treat those phrases as a signal to act immediately.',
+      '- If you have already produced a plan and still have no new evidence, tool result, file change, or visible answer, do not produce another plan. Execute the first concrete step or stop with the blocker.',
+      '- For document-generation tasks, do not cycle between outline and drafting promises. After one outline, either write the document content, create/update the target file with tools, or ask for the single missing input that blocks writing.',
       ...(skillsEnabled
         ? [
             '- For skill execution, if a skill entry includes skill_file or skill_dir, treat them as absolute paths and do not guess relative paths.',
