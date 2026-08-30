@@ -540,7 +540,11 @@ export interface AgentMessageDeltaStream {
   type: 'content' | 'reasoning_content' | 'done';
   delta?: string;
   content?: string;
+  contentOmitted?: boolean;
+  contentLength?: number;
   reasoning_content?: string;
+  reasoningOmitted?: boolean;
+  reasoningLength?: number;
   reasoning_parts?: string[];
   content_parts?: string[];
   createdAt?: string;

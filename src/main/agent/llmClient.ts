@@ -33,6 +33,8 @@ const MIN_CONTEXT_SUMMARY_TOKENS = 512;
 const MAX_CONTEXT_SUMMARY_TOKENS = 24_000;
 const RECENT_CONTEXT_BLOCKS = 6;
 const CONTEXT_RETRY_COMPRESSION_RATIO = 0.65;
+const MODEL_CONTEXT_PROBE_MAX_TOKENS = 99_999_999;
+const MODEL_CONTEXT_PROBE_TIMEOUT_MS = 5000;
 
 const MODEL_CONTEXT_WINDOW_HINTS: Array<[RegExp, number]> = [
   [/^gpt-5\.6(?:-|$)|^gpt-5\.6$/i, 1_050_000],
@@ -128,7 +130,10 @@ function parseContextLimitFromError(error: unknown): number | undefined {
   const patterns = [
     /maximum context length is\s+(\d+)\s+tokens/i,
     /context (?:window|length|limit).*?(\d+)\s+tokens/i,
-    /max(?:imum)?(?: context)?(?: length)?[:= ]+(\d+)/i
+    /max(?:imum)?(?: context)?(?: length)?[:= ]+(\d+)/i,
+    /max(?:imum)?(?: model)?(?: len| length).*?(\d+)/i,
+    /(?:supports|allows|allowed|limit is|at most|up to)\s+(\d+)\s+tokens/i,
+    /max_tokens.*?(?:<=|less than or equal to|at most|maximum(?: value)?(?: is)?|limit(?: is)?)[^\d]*(\d+)/i
   ];
   for (const pattern of patterns) {
     const match = pattern.exec(message);
@@ -1057,6 +1062,35 @@ class ModelClient implements LlmClient {
     }
   }
 
+  private async postContextProbe(endpoint: string, headers: Record<string, string>, request: LlmRequest): Promise<string | undefined> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), MODEL_CONTEXT_PROBE_TIMEOUT_MS);
+    const abortProbe = (): void => controller.abort();
+    request.signal?.addEventListener('abort', abortProbe, { once: true });
+    try {
+      const response = await runtimeFetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: this.config.model,
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: MODEL_CONTEXT_PROBE_MAX_TOKENS,
+          stream: false
+        }),
+        signal: controller.signal
+      });
+      const text = await response.text();
+      if (response.ok) return undefined;
+      const json = parseJsonBody(text) as any;
+      return responseErrorDetail(response, text, json);
+    } catch {
+      return undefined;
+    } finally {
+      clearTimeout(timeoutId);
+      request.signal?.removeEventListener('abort', abortProbe);
+    }
+  }
+
   private async postEventStream(
     endpoint: string,
     headers: Record<string, string>,
@@ -1234,9 +1268,12 @@ class ModelClient implements LlmClient {
   private async resolveModelContextWindow(headers: Record<string, string>, request: LlmRequest): Promise<number | undefined> {
     const cacheKey = `${normalizeBase(this.config.baseUrl)}\n${this.config.model}`;
     if (this.modelContextCache.has(cacheKey)) return this.modelContextCache.get(cacheKey);
-    const endpoint = `${normalizeBase(this.config.baseUrl)}/models/${encodeURIComponent(this.config.model)}`;
-    const json = await this.getJson(endpoint, headers, request);
-    const tokens = modelMetadataContextTokens(json) ?? modelContextHint(this.config.model);
+    const chatEndpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
+    const probeDetail = await this.postContextProbe(chatEndpoint, headers, request);
+    const probeTokens = probeDetail ? parseContextLimitFromError(probeDetail) : undefined;
+    const modelEndpoint = `${normalizeBase(this.config.baseUrl)}/models/${encodeURIComponent(this.config.model)}`;
+    const json = probeTokens ? undefined : await this.getJson(modelEndpoint, headers, request);
+    const tokens = probeTokens ?? modelMetadataContextTokens(json) ?? modelContextHint(this.config.model);
     this.modelContextCache.set(cacheKey, tokens);
     return tokens;
   }

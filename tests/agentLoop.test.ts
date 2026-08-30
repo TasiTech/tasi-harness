@@ -11,7 +11,7 @@ import { SkillManager } from '../src/main/skills/skillManager.js';
 import { defaultConfig, ensureDir } from '../src/main/storage/pathUtils.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
-import type { LlmCompletion, LlmRequest } from '../src/shared/types.js';
+import type { AgentMessageDeltaStream, LlmCompletion, LlmRequest } from '../src/shared/types.js';
 import { tempHome } from './helpers.js';
 
 let cleanup = () => {};
@@ -186,6 +186,69 @@ describe('AgentLoop', () => {
     expect(deltas).toEqual(['r:Brief reasoning.', 'c:Streamed answer.', 'done:Streamed answer.']);
   });
 
+  it('clips long streamed reasoning deltas while preserving full reasoning in the result', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const longReasoning = [
+      'old reasoning '.repeat(320),
+      'middle reasoning '.repeat(260),
+      'latest reasoning'
+    ].join('\n');
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: 'Streamed answer.',
+          reasoning_content: longReasoning
+        }
+      }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const reasoningDeltas: Array<{ content?: string; omitted?: boolean; length?: number }> = [];
+    const result = await loop.run({
+      userInput: 'hello',
+      onMessageDelta: (_sessionId, event) => {
+        if (event.reasoning_content) {
+          reasoningDeltas.push({
+            content: event.reasoning_content,
+            omitted: event.reasoningOmitted,
+            length: event.reasoningLength
+          });
+        }
+      }
+    });
+
+    expect(reasoningDeltas.length).toBeGreaterThan(0);
+    expect(reasoningDeltas.every((event) => (event.content?.length ?? 0) <= 3000)).toBe(true);
+    expect(reasoningDeltas.some((event) => event.omitted === true && (event.length ?? 0) > 3000)).toBe(true);
+    const finalAssistant = [...result.messages].reverse().find((message) => message.role === 'assistant' && message.content === 'Streamed answer.');
+    expect(finalAssistant?.reasoning_content).toContain('latest reasoning');
+    expect(finalAssistant?.reasoning_content?.length).toBeGreaterThan(3000);
+  });
+
   it('continues with a non-stream retry after a recoverable streamed LLM interruption', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
@@ -231,8 +294,8 @@ describe('AgentLoop', () => {
     const result = await loop.run({
       userInput: 'recover please',
       onMessageDelta: (_sessionId, event) => {
-        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
-        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_content ?? ''}`);
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.delta ?? ''}:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
+        if (event.type === 'content') deltas.push(`c:${event.delta ?? ''}:${event.content ?? ''}:${event.reasoning_content ?? ''}`);
         if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_content ?? ''}`);
       }
     });
@@ -241,9 +304,9 @@ describe('AgentLoop', () => {
     expect(completeCalls).toBe(1);
     expect(result.finalResponse).toBe('Recovered answer.');
     expect(deltas).toEqual([
-      'r:partial thought:',
-      'c:partial answer:partial thought',
-      'r::',
+      'r:partial thought::',
+      'c:partial answer::',
+      'r:::',
       'done:Recovered answer.:'
     ]);
     expect(sessions.read(result.sessionId)?.messages.at(-1)?.content).toBe('Recovered answer.');
@@ -297,8 +360,8 @@ describe('AgentLoop', () => {
     const result = await loop.run({
       userInput: 'continue from reasoning',
       onMessageDelta: (_sessionId, event) => {
-        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
-        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_content ?? ''}`);
+        if (event.type === 'reasoning_content') deltas.push(`r:${event.delta ?? ''}:${event.reasoning_content ?? ''}:${event.content ?? ''}`);
+        if (event.type === 'content') deltas.push(`c:${event.delta ?? ''}:${event.content ?? ''}:${event.reasoning_content ?? ''}`);
         if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_content ?? ''}`);
       }
     });
@@ -308,9 +371,9 @@ describe('AgentLoop', () => {
     expect(result.finalResponse).toBe('Visible answer.');
     expect(requests[1]?.messages.some((message) => message.role === 'assistant' && message.reasoning_content === 'Need one more pass.')).toBe(true);
     expect(deltas).toEqual([
-      'r:Need one more pass.:',
-      'r::',
-      'c:Visible answer.:',
+      'r:Need one more pass.::',
+      'r:::',
+      'c:Visible answer.::',
       'done:Visible answer.:'
     ]);
     const visibleAssistantMessages = result.messages.filter((message) => message.role === 'assistant' && message.hidden !== true && (message.content.trim() || message.reasoning_content?.trim()));
@@ -653,27 +716,23 @@ describe('AgentLoop', () => {
     });
 
     const messageIds: string[] = [];
-    const deltas: string[] = [];
+    const deltas: AgentMessageDeltaStream[] = [];
     const result = await loop.run({
       userInput: 'write a file',
       onMessageDelta: (_sessionId, event) => {
         messageIds.push(event.messageId);
-        const contentParts = event.content_parts?.join('|') ?? '';
-        if (event.type === 'reasoning_content') deltas.push(`r:${event.reasoning_parts?.join('|')}:${event.content ?? ''}:${contentParts}`);
-        if (event.type === 'content') deltas.push(`c:${event.content}:${event.reasoning_parts?.join('|')}:${contentParts}`);
-        if (event.type === 'done') deltas.push(`done:${event.content}:${event.reasoning_parts?.join('|')}:${contentParts}`);
+        deltas.push(event);
       }
     });
 
     expect(new Set(messageIds).size).toBe(1);
-    expect(deltas).toEqual([
-      'r:Need to inspect the workspace.|Need to write the file.::',
-      'c:I will inspect first.:Need to inspect the workspace.|Need to write the file.:',
-      'r:::I will inspect first.',
-      'r:Ready to answer.::I will inspect first.',
-      'c:Done.:Ready to answer.:I will inspect first.',
-      'done:Done.:Ready to answer.:I will inspect first.'
-    ]);
+    expect(deltas.some((event) => event.type === 'reasoning_content' && event.content_parts?.[0] === 'I will inspect first.')).toBe(true);
+    expect(deltas.every((event) => (event.reasoning_content?.length ?? 0) <= 3000)).toBe(true);
+    const doneDelta = deltas.at(-1);
+    expect(doneDelta?.type).toBe('done');
+    expect(doneDelta?.content).toBe('Done.');
+    expect(doneDelta?.reasoning_parts).toEqual(['Ready to answer.']);
+    expect(doneDelta?.content_parts).toEqual(['I will inspect first.']);
     const finalAssistant = [...result.messages].reverse().find((message) => message.role === 'assistant' && message.content === 'Done.');
     expect(finalAssistant?.reasoning_content).toBe('Ready to answer.');
     expect(finalAssistant?.reasoning_parts).toEqual(['Ready to answer.']);

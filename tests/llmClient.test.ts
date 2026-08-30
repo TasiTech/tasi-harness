@@ -164,17 +164,18 @@ describe('llmClient', () => {
     expect(result.message.content).toBe('vLLM response.');
   });
 
-  it('uses model metadata context fields to compress oversized OpenAI-compatible prompts', async () => {
+  it('uses a chat completions probe to compress oversized OpenAI-compatible prompts', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            id: 'served-model',
-            object: 'model',
-            context_length: 1000
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
         )
       )
       .mockResolvedValueOnce(
@@ -211,8 +212,15 @@ describe('llmClient', () => {
 
     expect(result.message.content).toBe('compressed ok');
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    const [modelEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(modelEndpoint).toBe('http://127.0.0.1:8000/v1/models/served-model');
+    const [probeEndpoint, probeInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    const probeBody = JSON.parse(String(probeInit.body));
+    expect(probeBody).toMatchObject({
+      model: 'served-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 99999999,
+      stream: false
+    });
     const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     const body = JSON.parse(String(init.body));
     expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user']);
@@ -220,9 +228,87 @@ describe('llmClient', () => {
     expect(JSON.stringify(body).length).toBeLessThan(oldText.length);
   });
 
+  it('falls back to model metadata when the context probe is not parseable', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: 'max_tokens is too large'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'served-model',
+            object: 'model',
+            context_length: 1000
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'metadata compressed ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const oldText = Array.from({ length: 1200 }, (_, index) => `old decision line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'What should we do next?' }
+      ]
+    });
+
+    expect(result.message.content).toBe('metadata compressed ok');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [modelEndpoint] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect(modelEndpoint).toBe('http://127.0.0.1:8000/v1/models/served-model');
+    const [, init] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages[0].content).toContain('Earlier conversation history was compressed');
+  });
+
   it('retries once with compressed context when the provider reports the real context limit', async () => {
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'probe ignored' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
@@ -277,11 +363,13 @@ describe('llmClient', () => {
     });
 
     expect(result.message.content).toBe('retry ok');
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    const [modelEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [modelEndpoint] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
     expect(modelEndpoint).toBe('http://127.0.0.1:8000/v1/models/tiny-context-model');
-    const [, firstInit] = fetchMock.mock.calls[1] as [string, RequestInit];
-    const [, secondInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const [, firstInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const [, secondInit] = fetchMock.mock.calls[3] as [string, RequestInit];
     const firstBody = JSON.parse(String(firstInit.body));
     const secondBody = JSON.parse(String(secondInit.body));
     expect(JSON.stringify(firstBody).length).toBeGreaterThan(JSON.stringify(secondBody).length);
@@ -294,11 +382,12 @@ describe('llmClient', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            id: 'served-model',
-            object: 'model',
-            context_length: 1000
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
           }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
         )
       )
       .mockResolvedValueOnce(

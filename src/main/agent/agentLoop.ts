@@ -1,6 +1,7 @@
 import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
+import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS, prepareMessageDeltaForDisplay } from '../../shared/reasoningPreview.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
 import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
@@ -11,6 +12,10 @@ const REPEATED_REASONING_MAX_BLOCK_LINES = 24;
 const REASONING_WITHOUT_CONTENT_CHAR_LIMIT = 12000;
 const REASONING_TOTAL_CHAR_LIMIT = 32000;
 const REASONING_ONLY_CONTINUE_LIMIT = 3;
+const STREAM_REASONING_EMIT_MS = 650;
+const STREAM_CONTENT_EMIT_MS = 45;
+const STREAM_SNAPSHOT_PERSIST_MS = 2000;
+const STREAM_SNAPSHOT_PERSIST_CHARS = 4096;
 const RECOVERABLE_LLM_INTERRUPTION_PATTERN = /Invalid LLM (?:JSON )?stream event|LLM stream response did not include a readable body|fetch failed|terminated|socket hang up|ECONNRESET|EPIPE|UND_ERR|network/i;
 const ITERATION_LIMIT_MESSAGE_PATTERN = /^本轮已达到最大(?:模型迭代轮次|执行步数)（\d+），我先停在这里，避免继续消耗无效(?:请求|步骤)。/;
 
@@ -288,6 +293,9 @@ export class AgentLoop {
       let lastStreamPersistedLength = 0;
       let lastToolResultSignature = '';
       let repeatedToolResultCount = 0;
+      let lastMessageDeltaEmittedAt = 0;
+      let pendingMessageDelta: AgentMessageDeltaStream | undefined;
+      let messageDeltaFlushTimer: ReturnType<typeof setTimeout> | undefined;
 
       const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
       const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
@@ -297,33 +305,96 @@ export class AgentLoop {
         return updatedSession;
       };
       const persistStreamSnapshot = (messageId: string, createdAt: string, content: string, reasoning: string | undefined, force = false, contentParts: string[] = []): void => {
-        if (!content && !reasoning) return;
+        const persistedReasoning = force ? reasoning : undefined;
+        if (!content && !persistedReasoning) return;
         const now = Date.now();
-        if (!force && now - lastStreamPersistedAt < 250 && content.length - lastStreamPersistedLength < 160) return;
+        if (!force && now - lastStreamPersistedAt < STREAM_SNAPSHOT_PERSIST_MS && content.length - lastStreamPersistedLength < STREAM_SNAPSHOT_PERSIST_CHARS) return;
         lastStreamPersistedAt = now;
         lastStreamPersistedLength = content.length;
         persistMessages([{
           id: messageId,
           role: 'assistant',
           content,
-          reasoning_content: reasoning,
+          reasoning_content: persistedReasoning,
           content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
           createdAt
         }]);
       };
       const emitDoneDelta = (content: string, reasoning?: string, reasoningParts?: string[], contentParts: string[] = []): void => {
         if (options.stream === false || typeof options.onMessageDelta !== 'function') return;
+        flushMessageDelta();
         options.onMessageDelta(session.id, {
-          sessionId: session.id,
-          messageId: visibleAssistantId,
-          role: 'assistant',
-          type: 'done',
-          content,
-          reasoning_content: reasoning,
-          reasoning_parts: reasoningParts,
-          content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
-          createdAt: visibleAssistantCreatedAt
+          ...prepareMessageDeltaForDisplay({
+            sessionId: session.id,
+            messageId: visibleAssistantId,
+            role: 'assistant',
+            type: 'done',
+            content,
+            reasoning_content: reasoning,
+            reasoning_parts: reasoningParts,
+            content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
+            createdAt: visibleAssistantCreatedAt
+          })
         });
+      };
+      const messageDeltaDelay = (type: AgentMessageDeltaStream['type']): number => (
+        type === 'reasoning_content' ? STREAM_REASONING_EMIT_MS : STREAM_CONTENT_EMIT_MS
+      );
+      const sendMessageDelta = (payload: AgentMessageDeltaStream): void => {
+        if (options.stream === false || typeof options.onMessageDelta !== 'function') return;
+        if (messageDeltaFlushTimer) {
+          clearTimeout(messageDeltaFlushTimer);
+          messageDeltaFlushTimer = undefined;
+        }
+        options.onMessageDelta(session.id, prepareMessageDeltaForDisplay(payload));
+        lastMessageDeltaEmittedAt = Date.now();
+      };
+      const schedulePendingMessageDeltaFlush = (delayMs: number): void => {
+        if (messageDeltaFlushTimer || delayMs <= 0) return;
+        messageDeltaFlushTimer = setTimeout(() => {
+          messageDeltaFlushTimer = undefined;
+          flushMessageDelta();
+        }, delayMs);
+      };
+      const mergePendingMessageDelta = (current: AgentMessageDeltaStream | undefined, incoming: AgentMessageDeltaStream): AgentMessageDeltaStream => {
+        if (!current) return incoming;
+        if (current.messageId !== incoming.messageId || current.type !== incoming.type) {
+          flushMessageDelta();
+          return incoming;
+        }
+        return {
+          ...current,
+          ...incoming,
+          delta: `${current.delta ?? ''}${incoming.delta ?? ''}`,
+          content: incoming.content !== undefined ? incoming.content : current.content,
+          reasoning_content: incoming.reasoning_content !== undefined ? incoming.reasoning_content : current.reasoning_content,
+          reasoning_parts: incoming.reasoning_parts !== undefined ? incoming.reasoning_parts : current.reasoning_parts,
+          content_parts: incoming.content_parts !== undefined ? incoming.content_parts : current.content_parts,
+          createdAt: current.createdAt ?? incoming.createdAt
+        };
+      };
+      const emitMessageDelta = (payload: AgentMessageDeltaStream, force = false): void => {
+        if (options.stream === false || typeof options.onMessageDelta !== 'function') return;
+        pendingMessageDelta = mergePendingMessageDelta(pendingMessageDelta, payload);
+        const now = Date.now();
+        const delayMs = messageDeltaDelay(payload.type);
+        if (!force && lastMessageDeltaEmittedAt > 0 && now - lastMessageDeltaEmittedAt < delayMs) {
+          schedulePendingMessageDeltaFlush(delayMs - (now - lastMessageDeltaEmittedAt));
+          return;
+        }
+        const next = pendingMessageDelta;
+        pendingMessageDelta = undefined;
+        sendMessageDelta(next);
+      };
+      const flushMessageDelta = (): void => {
+        if (messageDeltaFlushTimer) {
+          clearTimeout(messageDeltaFlushTimer);
+          messageDeltaFlushTimer = undefined;
+        }
+        if (!pendingMessageDelta) return;
+        const next = pendingMessageDelta;
+        pendingMessageDelta = undefined;
+        sendMessageDelta(next);
       };
       const currentReasoningPayload = (reasoning: string): { text: string; parts: string[] } => {
         const parts = joinReasoningParts(splitReasoningParts(reasoning));
@@ -342,7 +413,7 @@ export class AgentLoop {
         const streamComplete = typeof client.streamComplete === 'function' ? client.streamComplete.bind(client) : undefined;
         const canStream = options.stream !== false && Boolean(streamComplete) && typeof options.onMessageDelta === 'function';
         if (canStream && iterations > 1) {
-          options.onMessageDelta?.(session.id, {
+          emitMessageDelta({
             sessionId: session.id,
             messageId: visibleAssistantId,
             role: 'assistant',
@@ -353,7 +424,7 @@ export class AgentLoop {
             reasoning_parts: [],
             content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
             createdAt: visibleAssistantCreatedAt
-          });
+          }, true);
         }
         let completion: LlmCompletion;
         try {
@@ -365,37 +436,35 @@ export class AgentLoop {
                 if (reasoningLoop) throw new ReasoningLoopAbort(repeatedReasoningDiagnostic(reasoningLoop));
                 const overrunReason = reasoningOverrunReason(streamedReasoning, streamedContent);
                 if (overrunReason) throw new ReasoningLoopAbort(reasoningOverrunDiagnostic(streamedReasoning, overrunReason));
-                const visibleReasoning = currentReasoningPayload(streamedReasoning);
-                options.onMessageDelta?.(session.id, {
+                emitMessageDelta({
                   sessionId: session.id,
                   messageId: visibleAssistantId,
                   role: 'assistant',
                   type: 'reasoning_content',
                   delta: delta.reasoning_content,
-                  reasoning_content: visibleReasoning.text,
-                  reasoning_parts: visibleReasoning.parts,
-                  content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
-                  content: streamedContent,
+                  reasoningOmitted: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS,
+                  reasoningLength: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS ? streamedReasoning.length : undefined,
+                  contentOmitted: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS,
+                  contentLength: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS ? streamedContent.length : undefined,
                   createdAt: visibleAssistantCreatedAt
                 });
-                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, visibleReasoning.text || undefined, false, visibleContentParts);
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, streamedReasoning || undefined, false, visibleContentParts);
               }
               if (delta.content) {
                 streamedContent += delta.content;
-                const visibleReasoning = currentReasoningPayload(streamedReasoning);
-                options.onMessageDelta?.(session.id, {
+                emitMessageDelta({
                   sessionId: session.id,
                   messageId: visibleAssistantId,
                   role: 'assistant',
                   type: 'content',
                   delta: delta.content,
-                  content: streamedContent,
-                  reasoning_content: visibleReasoning.text,
-                  reasoning_parts: visibleReasoning.parts,
-                  content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+                  contentOmitted: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS,
+                  contentLength: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS ? streamedContent.length : undefined,
+                  reasoningOmitted: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS,
+                  reasoningLength: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS ? streamedReasoning.length : undefined,
                   createdAt: visibleAssistantCreatedAt
                 });
-                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, visibleReasoning.text || undefined, false, visibleContentParts);
+                persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, streamedReasoning || undefined, false, visibleContentParts);
               }
             })
             : await client.complete({
@@ -428,7 +497,8 @@ export class AgentLoop {
           console.warn(`[agent] streaming LLM call interrupted; retrying once without streaming: ${error instanceof Error ? error.message : String(error)}`);
           streamedContent = '';
           streamedReasoning = '';
-          options.onMessageDelta?.(session.id, {
+          flushMessageDelta();
+          emitMessageDelta({
             sessionId: session.id,
             messageId: visibleAssistantId,
             role: 'assistant',
@@ -439,7 +509,7 @@ export class AgentLoop {
             reasoning_parts: [],
             content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
             createdAt: visibleAssistantCreatedAt
-          });
+          }, true);
           completion = await client.complete({
             messages,
             tools,
@@ -538,7 +608,6 @@ export class AgentLoop {
             assistant.content = finalResponse;
           }
           assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
-          persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, finalResponse, assistant.reasoning_content, true, visibleContentParts);
           if (canStream) emitDoneDelta(finalResponse, assistant.reasoning_content, assistant.reasoning_parts, visibleContentParts);
           persistMessages([assistant]);
           break;

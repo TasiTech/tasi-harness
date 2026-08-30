@@ -2497,7 +2497,7 @@ function registerIpc(): void {
         signal: controller.signal,
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
-          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) };
           safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
@@ -2524,7 +2524,14 @@ function registerIpc(): void {
         source: 'chat',
         updatedAt: new Date().toISOString()
       });
-      return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
+      const displayRecord = context.sessionStore.readForDisplay(result.sessionId);
+      return {
+        ...result,
+        messages: displayRecord?.messages ?? result.messages,
+        toolEvents: displayRecord?.toolEvents ?? result.toolEvents,
+        followUpQuestions,
+        totalUsage: usageRecord.totalUsage
+      };
     } catch (error) {
       if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
       logAgentChatError({
@@ -2578,7 +2585,7 @@ function registerIpc(): void {
         enabledToolNames,
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
-          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) };
           safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
@@ -2600,7 +2607,13 @@ function registerIpc(): void {
         source: 'chat',
         updatedAt: new Date().toISOString()
       });
-      return { ...result, totalUsage: usageRecord.totalUsage };
+      const displayRecord = context.sessionStore.readForDisplay(result.sessionId);
+      return {
+        ...result,
+        messages: displayRecord?.messages ?? result.messages,
+        toolEvents: displayRecord?.toolEvents ?? result.toolEvents,
+        totalUsage: usageRecord.totalUsage
+      };
     } catch (error) {
       if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
       logAgentChatError({

@@ -1,4 +1,4 @@
-﻿import { memo, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
+﻿import { memo, startTransition, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
 import type { CSSProperties } from 'react';
 import type {
   AgentMessage,
@@ -31,6 +31,7 @@ import type {
 } from '../shared/types.js';
 import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { DEFAULT_OMNI_SYSTEM_PROMPT } from '../shared/defaultPrompts.js';
+import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS, prepareReasoningDeltaForDisplay, reasoningPanelText } from '../shared/reasoningPreview.js';
 import {
   OMNI_PROVIDER_PRESETS,
   PROVIDER_PRESETS,
@@ -49,6 +50,8 @@ import { LiveAgentPage, type LiveAgentOutboundMessage } from './LiveAgentPage.js
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
 import * as QRCode from 'qrcode';
 import JSZip from 'jszip';
+
+export { reasoningPanelText };
 
 type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
@@ -157,11 +160,13 @@ const defaultConfig: PublicAppConfig = {
 };
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
-const MESSAGE_DELTA_FLUSH_MS = 120;
+const MESSAGE_DELTA_FLUSH_MS = 33;
 const REASONING_DELTA_FLUSH_MS = 180;
-const LIVE_CONTENT_PREVIEW_CHARS = 16_000;
+const UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS = 450;
+const TOOL_EVENT_FLUSH_MS = 220;
+const MAX_LIVE_RENDERED_TOOL_EVENTS = 60;
 const LIVE_CONTENT_ITEM_CHARS = 2_000;
-const REASONING_LIVE_PREVIEW_CHARS = 6000;
+const EMPTY_STRING_ARRAY: string[] = [];
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -180,16 +185,27 @@ function brandInitials(branding?: PublicAppConfig['branding']): string {
     .toUpperCase() || 'TH';
 }
 
+function appendPreviewText(current: string | undefined, delta: string | undefined, maxChars: number): string | undefined {
+  if (typeof delta !== 'string') return current;
+  const combined = `${current ?? ''}${delta}`.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return combined.length > maxChars ? combined.slice(-maxChars).trimStart() : combined;
+}
+
 function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaStream): AgentMessage[] {
-  const existing = messages.find((message) => message.id === payload.messageId);
-  if (!existing) {
+  const existingIndex = messages.findIndex((message) => message.id === payload.messageId);
+  if (existingIndex < 0) {
+    const content = payload.content ?? (payload.type === 'content' ? appendPreviewText('', payload.delta, CONTENT_STREAM_PREVIEW_CHARS) ?? '' : '');
     return [
       ...messages,
       {
         id: payload.messageId,
         role: 'assistant',
-        content: payload.content ?? '',
-        reasoning_content: payload.reasoning_content,
+        content,
+        contentOmitted: payload.contentOmitted,
+        contentLength: payload.contentLength,
+        reasoning_content: payload.reasoning_content ?? (payload.type === 'reasoning_content' ? appendPreviewText('', payload.delta, REASONING_STREAM_PREVIEW_CHARS) : undefined),
+        reasoningOmitted: payload.reasoningOmitted,
+        reasoningLength: payload.reasoningLength,
         reasoning_parts: payload.reasoning_parts,
         content_parts: payload.content_parts,
         createdAt: payload.createdAt
@@ -197,17 +213,24 @@ function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaS
     ];
   }
 
-  return messages.map((message) => {
-    if (message.id !== payload.messageId) return message;
-    return {
+  const message = messages[existingIndex];
+  const next = [
+    ...messages.slice(0, existingIndex),
+    {
       ...message,
-      content: payload.content ?? message.content,
-      reasoning_content: payload.reasoning_content ?? message.reasoning_content,
+      content: payload.content ?? (payload.type === 'content' ? appendPreviewText(message.content, payload.delta, CONTENT_STREAM_PREVIEW_CHARS) ?? message.content : message.content),
+      contentOmitted: payload.contentOmitted !== undefined ? payload.contentOmitted : message.contentOmitted,
+      contentLength: payload.contentLength !== undefined ? payload.contentLength : (payload.contentOmitted === false ? undefined : message.contentLength),
+      reasoning_content: payload.reasoning_content ?? (payload.type === 'reasoning_content' ? appendPreviewText(message.reasoning_content, payload.delta, REASONING_STREAM_PREVIEW_CHARS) : message.reasoning_content),
+      reasoningOmitted: payload.reasoningOmitted !== undefined ? payload.reasoningOmitted : message.reasoningOmitted,
+      reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : (payload.reasoningOmitted === false ? undefined : message.reasoningLength),
       reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
       content_parts: payload.content_parts ?? message.content_parts,
       createdAt: message.createdAt ?? payload.createdAt
-    };
-  });
+    },
+    ...messages.slice(existingIndex + 1)
+  ];
+  return next;
 }
 
 function mergeBufferedMessageDelta(
@@ -215,13 +238,29 @@ function mergeBufferedMessageDelta(
   incoming: AgentMessageDeltaStream
 ): AgentMessageDeltaStream {
   if (!current) return incoming;
+  const currentContent = current.content ?? (current.type === 'content' ? current.delta : undefined);
+  const currentReasoningContent = current.reasoning_content ?? (current.type === 'reasoning_content' ? current.delta : undefined);
+  const content = incoming.content !== undefined
+    ? incoming.content
+    : incoming.type === 'content'
+      ? appendPreviewText(currentContent, incoming.delta, CONTENT_STREAM_PREVIEW_CHARS)
+      : currentContent;
+  const reasoningContent = incoming.reasoning_content !== undefined
+    ? incoming.reasoning_content
+    : incoming.type === 'reasoning_content'
+      ? appendPreviewText(currentReasoningContent, incoming.delta, REASONING_STREAM_PREVIEW_CHARS)
+      : currentReasoningContent;
   return {
     ...current,
     ...incoming,
     type: incoming.type,
     delta: incoming.delta,
-    content: incoming.content !== undefined ? incoming.content : current.content,
-    reasoning_content: incoming.reasoning_content !== undefined ? incoming.reasoning_content : current.reasoning_content,
+    content,
+    contentOmitted: incoming.contentOmitted !== undefined ? incoming.contentOmitted : current.contentOmitted,
+    contentLength: incoming.contentLength !== undefined ? incoming.contentLength : (incoming.contentOmitted === false ? undefined : current.contentLength),
+    reasoning_content: reasoningContent,
+    reasoningOmitted: incoming.reasoningOmitted !== undefined ? incoming.reasoningOmitted : current.reasoningOmitted,
+    reasoningLength: incoming.reasoningLength !== undefined ? incoming.reasoningLength : (incoming.reasoningOmitted === false ? undefined : current.reasoningLength),
     reasoning_parts: incoming.reasoning_parts !== undefined ? incoming.reasoning_parts : current.reasoning_parts,
     content_parts: incoming.content_parts !== undefined ? incoming.content_parts : current.content_parts,
     createdAt: current.createdAt ?? incoming.createdAt
@@ -1471,6 +1510,7 @@ function ChatPage(props: {
   const [previewCanGoForward, setPreviewCanGoForward] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const toolPanelBodyRef = useRef<HTMLDivElement | null>(null);
   const chatContentGridRef = useRef<HTMLDivElement | null>(null);
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
@@ -1485,7 +1525,19 @@ function ChatPage(props: {
   const externalPreviewOpenUrlRef = useRef('');
   const messageDeltaBufferRef = useRef<Map<string, AgentMessageDeltaStream>>(new Map());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
+  const messageDeltaFlushDueAtRef = useRef(0);
+  const messageDeltaUrgentFlushRef = useRef(false);
+  const messageDeltaWorkerRef = useRef<Worker | null>(null);
+  const messageDeltaWorkerSeqRef = useRef(0);
+  const toolEventBufferRef = useRef<ToolEvent[]>([]);
+  const toolEventFlushTimerRef = useRef<number | null>(null);
   const previousWechatBusyRef = useRef(false);
+  const activeSessionIdRef = useRef(props.sessionId);
+  const previewDraggingRef = useRef(false);
+  const previewDragRafRef = useRef<number | null>(null);
+  const previewDragNextRectRef = useRef<PreviewRect | null>(null);
+  const uiInteractionActiveRef = useRef(false);
+  const uiInteractionReleaseTimerRef = useRef<number | null>(null);
   const dragStateRef = useRef<{
     startClientX: number;
     startClientY: number;
@@ -1494,17 +1546,19 @@ function ChatPage(props: {
   } | null>(null);
   const [previewDragging, setPreviewDragging] = useState(false);
   const visibleMessages = useMemo(() => props.messages.filter(isVisibleChatMessage), [props.messages]);
+  const latestVisibleMessage = visibleMessages[visibleMessages.length - 1];
   const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
-  const latestAssistantContent = useMemo(() => {
-    const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
-    if (!latest) return '';
-    return [...(latest.content_parts ?? []), latest.content].filter((item) => item.trim()).join('\n\n');
-  }, [visibleMessages]);
-  const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
+  const latestAssistantContent = useMemo(() => {
+    if (props.busy && toolPanelTab !== 'sources') return '';
+    const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
+    if (!latest) return '';
+    return [...(latest.content_parts ?? []), latest.content].filter((item) => item.trim()).join('\n\n');
+  }, [visibleMessages, props.busy, toolPanelTab]);
+  const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const isWechatSession = Boolean(
     props.sessionId
       && props.config.wechatChannel.sessionId
@@ -1512,6 +1566,10 @@ function ChatPage(props: {
   );
   const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
   const runBusy = props.busy || wechatBusy;
+  const visibleToolEvents = useMemo(
+    () => runBusy ? props.toolEvents.slice(-MAX_LIVE_RENDERED_TOOL_EVENTS) : props.toolEvents,
+    [props.toolEvents, runBusy]
+  );
   const wechatSessionAttachments = useMemo(() => {
     if (!isWechatSession) return [];
     const seen = new Set<string>();
@@ -1540,15 +1598,105 @@ function ChatPage(props: {
   ), [isWechatSession, wechatSessionAttachments]);
   const hiddenWechatAttachmentCount = Math.max(0, wechatSessionAttachments.length - visibleWechatSessionAttachments.length);
 
-  function flushMessageDeltas(): void {
+  useEffect(() => {
+    previewDraggingRef.current = previewDragging;
+    if (!previewDragging) {
+      flushMessageDeltas();
+      flushToolEvents();
+    }
+  }, [previewDragging]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = props.sessionId;
+  }, [props.sessionId]);
+
+  useEffect(() => {
+    if (typeof Worker === 'undefined') return;
+    let worker: Worker;
+    try {
+      worker = new Worker(new URL('./reasoningPreviewWorker.ts', import.meta.url), { type: 'module' });
+    } catch (error) {
+      console.warn('[renderer] reasoning preview worker unavailable:', error);
+      return;
+    }
+
+    messageDeltaWorkerRef.current = worker;
+    worker.onmessage = (event: MessageEvent<{ id: number; payload: AgentMessageDeltaStream }>) => {
+      processPreparedMessageDelta(event.data.payload);
+    };
+    worker.onerror = (event) => {
+      console.warn('[renderer] reasoning preview worker failed:', event.message);
+      if (messageDeltaWorkerRef.current === worker) messageDeltaWorkerRef.current = null;
+      worker.terminate();
+    };
+
+    return () => {
+      if (messageDeltaWorkerRef.current === worker) messageDeltaWorkerRef.current = null;
+      worker.terminate();
+    };
+  }, []);
+
+  useEffect(() => {
+    const markActive = () => {
+      uiInteractionActiveRef.current = true;
+      if (uiInteractionReleaseTimerRef.current != null) {
+        window.clearTimeout(uiInteractionReleaseTimerRef.current);
+        uiInteractionReleaseTimerRef.current = null;
+      }
+    };
+    const releaseSoon = () => {
+      if (uiInteractionReleaseTimerRef.current != null) {
+        window.clearTimeout(uiInteractionReleaseTimerRef.current);
+      }
+      uiInteractionReleaseTimerRef.current = window.setTimeout(() => {
+        uiInteractionActiveRef.current = false;
+        uiInteractionReleaseTimerRef.current = null;
+        flushMessageDeltas();
+        flushToolEvents();
+      }, UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS);
+    };
+
+    window.addEventListener('pointerdown', markActive, true);
+    window.addEventListener('pointerup', releaseSoon, true);
+    window.addEventListener('pointercancel', releaseSoon, true);
+    window.addEventListener('blur', releaseSoon);
+    return () => {
+      window.removeEventListener('pointerdown', markActive, true);
+      window.removeEventListener('pointerup', releaseSoon, true);
+      window.removeEventListener('pointercancel', releaseSoon, true);
+      window.removeEventListener('blur', releaseSoon);
+      if (uiInteractionReleaseTimerRef.current != null) {
+        window.clearTimeout(uiInteractionReleaseTimerRef.current);
+        uiInteractionReleaseTimerRef.current = null;
+      }
+      uiInteractionActiveRef.current = false;
+    };
+  }, []);
+
+  function flushMessageDeltas(forceUrgent = false): void {
     if (messageDeltaFlushTimerRef.current != null) {
       window.clearTimeout(messageDeltaFlushTimerRef.current);
       messageDeltaFlushTimerRef.current = null;
     }
+    messageDeltaFlushDueAtRef.current = 0;
+    if (previewDraggingRef.current) return;
+    if (uiInteractionActiveRef.current) {
+      scheduleMessageDeltaFlush(UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS, messageDeltaUrgentFlushRef.current || forceUrgent);
+      return;
+    }
     const pending = [...messageDeltaBufferRef.current.values()];
     messageDeltaBufferRef.current.clear();
     if (pending.length === 0) return;
-    props.setMessages((old) => pending.reduce((next, payload) => mergeMessageDelta(next, payload), old));
+    const urgent = forceUrgent || messageDeltaUrgentFlushRef.current || pending.some((payload) => payload.type === 'content' || payload.type === 'done');
+    messageDeltaUrgentFlushRef.current = false;
+    const applyDeltas = () => {
+      props.setMessages((old) => pending.reduce((next, payload) => mergeMessageDelta(next, payload), old));
+    };
+    if (urgent) {
+      applyDeltas();
+    } else {
+      startTransition(applyDeltas);
+    }
   }
 
   function clearPendingMessageDeltas(): void {
@@ -1556,17 +1704,110 @@ function ChatPage(props: {
       window.clearTimeout(messageDeltaFlushTimerRef.current);
       messageDeltaFlushTimerRef.current = null;
     }
+    messageDeltaFlushDueAtRef.current = 0;
+    messageDeltaUrgentFlushRef.current = false;
     messageDeltaBufferRef.current.clear();
   }
 
-  function scheduleMessageDeltaFlush(delayMs = MESSAGE_DELTA_FLUSH_MS): void {
-    if (messageDeltaFlushTimerRef.current != null) return;
-    messageDeltaFlushTimerRef.current = window.setTimeout(flushMessageDeltas, delayMs);
+  function flushToolEvents(): void {
+    if (toolEventFlushTimerRef.current != null) {
+      window.clearTimeout(toolEventFlushTimerRef.current);
+      toolEventFlushTimerRef.current = null;
+    }
+    if (previewDraggingRef.current) return;
+    if (uiInteractionActiveRef.current) {
+      scheduleToolEventFlush();
+      return;
+    }
+    const pending = toolEventBufferRef.current;
+    toolEventBufferRef.current = [];
+    if (pending.length === 0) return;
+    startTransition(() => {
+      props.setToolEvents((old) => [...old, ...pending]);
+    });
+  }
+
+  function clearPendingToolEvents(): void {
+    if (toolEventFlushTimerRef.current != null) {
+      window.clearTimeout(toolEventFlushTimerRef.current);
+      toolEventFlushTimerRef.current = null;
+    }
+    toolEventBufferRef.current = [];
+  }
+
+  function scheduleMessageDeltaFlush(delayMs = MESSAGE_DELTA_FLUSH_MS, urgent = false): void {
+    if (previewDraggingRef.current) return;
+    if (urgent) messageDeltaUrgentFlushRef.current = true;
+    const interactionDelayMs = uiInteractionActiveRef.current ? UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS : 0;
+    const nextDelayMs = Math.max(delayMs, interactionDelayMs);
+    const nextDueAt = Date.now() + nextDelayMs;
+    if (messageDeltaFlushTimerRef.current != null && messageDeltaFlushDueAtRef.current <= nextDueAt) return;
+    if (messageDeltaFlushTimerRef.current != null) {
+      window.clearTimeout(messageDeltaFlushTimerRef.current);
+      messageDeltaFlushTimerRef.current = null;
+    }
+    messageDeltaFlushDueAtRef.current = nextDueAt;
+    messageDeltaFlushTimerRef.current = window.setTimeout(flushMessageDeltas, nextDelayMs);
+  }
+
+  function scheduleToolEventFlush(delayMs = TOOL_EVENT_FLUSH_MS): void {
+    if (previewDraggingRef.current) return;
+    if (toolEventFlushTimerRef.current != null) return;
+    const interactionDelayMs = uiInteractionActiveRef.current ? UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS : 0;
+    const nextDelayMs = Math.max(delayMs, interactionDelayMs);
+    toolEventFlushTimerRef.current = window.setTimeout(flushToolEvents, nextDelayMs);
+  }
+
+  function enqueueToolEvent(event: ToolEvent): void {
+    toolEventBufferRef.current = [...toolEventBufferRef.current, event];
+    scheduleToolEventFlush();
+  }
+
+  function processPreparedMessageDelta(payload: AgentMessageDeltaStream): void {
+    if (activeSessionIdRef.current && payload.sessionId !== activeSessionIdRef.current) return;
+    messageDeltaBufferRef.current.set(
+      payload.messageId,
+      mergeBufferedMessageDelta(messageDeltaBufferRef.current.get(payload.messageId), payload)
+    );
+    if (previewDraggingRef.current) return;
+    if (uiInteractionActiveRef.current) {
+      scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, payload.type === 'content');
+      return;
+    }
+    if (payload.type === 'done') {
+      flushMessageDeltas(true);
+      return;
+    }
+    scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, payload.type === 'content');
+  }
+
+  function enqueueMessageDelta(payload: AgentMessageDeltaStream): void {
+    const isLightContentDelta = payload.type === 'content'
+      && payload.content === undefined
+      && payload.reasoning_content === undefined
+      && payload.reasoning_parts === undefined
+      && payload.content_parts === undefined;
+    if (isLightContentDelta) {
+      processPreparedMessageDelta(payload);
+      return;
+    }
+    const worker = messageDeltaWorkerRef.current;
+    if (!worker) {
+      processPreparedMessageDelta(prepareReasoningDeltaForDisplay(payload));
+      return;
+    }
+    const id = messageDeltaWorkerSeqRef.current + 1;
+    messageDeltaWorkerSeqRef.current = id;
+    worker.postMessage({
+      id,
+      payload
+    });
   }
 
   useEffect(() => {
     setWechatChipClearedAt(new Date().toISOString());
     previousWechatBusyRef.current = false;
+    clearPendingToolEvents();
   }, [props.sessionId]);
   useEffect(() => {
     if (!isWechatSession) {
@@ -1712,33 +1953,40 @@ function ChatPage(props: {
 
   useEffect(() => {
     if (previewDragging) return;
-    endRef.current?.scrollIntoView({ behavior: runBusy ? 'auto' : 'smooth' });
-  }, [visibleMessages, props.toolEvents, runBusy, previewDragging]);
+    const panel = chatMessagesRef.current;
+    if (!panel) return;
+    const distanceFromBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight;
+    if (distanceFromBottom > 260) return;
+    const rafId = window.requestAnimationFrame(() => {
+      endRef.current?.scrollIntoView({ behavior: runBusy ? 'auto' : 'smooth', block: 'end' });
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [visibleMessages.length, latestVisibleMessage?.id, latestVisibleMessage?.content, latestVisibleMessage?.reasoning_content, runBusy, previewDragging]);
   useEffect(() => {
     if (toolPanelCollapsed || toolPanelTab !== 'tools') return;
     const panel = toolPanelBodyRef.current;
     if (!panel) return;
-    panel.scrollTo({ top: panel.scrollHeight, behavior: runBusy ? 'auto' : 'smooth' });
-  }, [props.toolEvents, toolPanelCollapsed, toolPanelTab]);
+    const distanceFromBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight;
+    if (distanceFromBottom > 260) return;
+    const rafId = window.requestAnimationFrame(() => {
+      panel.scrollTo({ top: panel.scrollHeight, behavior: runBusy ? 'auto' : 'smooth' });
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [visibleToolEvents.length, toolPanelCollapsed, toolPanelTab, runBusy]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onToolEvent((payload) => {
       if (props.sessionId && payload.sessionId !== props.sessionId) return;
-      props.setToolEvents((old) => [...old, payload.event]);
+      enqueueToolEvent(payload.event);
     });
-    return off;
+    return () => {
+      off();
+      clearPendingToolEvents();
+    };
   }, [props.sessionId, props.setToolEvents]);
   useEffect(() => {
     const off = window.tasiHarness.agent.onMessageDelta((payload) => {
       if (props.sessionId && payload.sessionId !== props.sessionId) return;
-      messageDeltaBufferRef.current.set(
-        payload.messageId,
-        mergeBufferedMessageDelta(messageDeltaBufferRef.current.get(payload.messageId), payload)
-      );
-      if (payload.type === 'done') {
-        flushMessageDeltas();
-        return;
-      }
-      scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS);
+      enqueueMessageDelta(payload);
     });
     return () => {
       off();
@@ -2120,11 +2368,13 @@ function ChatPage(props: {
     props.setBusy(true);
     props.setStopping(false);
     setFollowUpQuestions([]);
+    clearPendingToolEvents();
     props.setToolEvents([]);
     clearPendingMessageDeltas();
     props.setMessages([...props.messages, { role: 'user', content: text, attachments: outgoingAttachments.length > 0 ? outgoingAttachments : undefined, createdAt: new Date().toISOString() }]);
     try {
       const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled, outgoingAttachments);
+      clearPendingToolEvents();
       props.setSessionId(result.sessionId);
       props.setMessages(result.messages.filter((m) => m.role !== 'system'));
       props.setLastUsage(result.usage);
@@ -2216,9 +2466,18 @@ function ChatPage(props: {
       bounds
     };
     setPreviewDragging(true);
+    event.preventDefault();
+    const applyPendingDragRect = () => {
+      previewDragRafRef.current = null;
+      const next = previewDragNextRectRef.current;
+      previewDragNextRectRef.current = null;
+      if (!next || !dragStateRef.current) return;
+      setWebPreviewRect(next);
+    };
     const onMouseMove = (moveEvent: MouseEvent) => {
       const dragging = dragStateRef.current;
       if (!dragging) return;
+      moveEvent.preventDefault();
       const deltaX = moveEvent.clientX - dragging.startClientX;
       const deltaY = moveEvent.clientY - dragging.startClientY;
       const next = clampPreviewRect(
@@ -2230,10 +2489,20 @@ function ChatPage(props: {
         },
         dragging.bounds
       );
-      setWebPreviewRect(next);
+      previewDragNextRectRef.current = next;
+      if (previewDragRafRef.current == null) {
+        previewDragRafRef.current = window.requestAnimationFrame(applyPendingDragRect);
+      }
     };
     const endDrag = () => {
       dragStateRef.current = null;
+      if (previewDragRafRef.current != null) {
+        window.cancelAnimationFrame(previewDragRafRef.current);
+        previewDragRafRef.current = null;
+      }
+      const finalRect = previewDragNextRectRef.current;
+      previewDragNextRectRef.current = null;
+      if (finalRect) setWebPreviewRect(finalRect);
       setPreviewDragging(false);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', endDrag);
@@ -2593,7 +2862,7 @@ function ChatPage(props: {
         </div>
       ) : (
       <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef}>
-        <div className="chat-messages">
+        <div className="chat-messages" ref={chatMessagesRef}>
           {visibleMessages.length === 0 && (
             <div className="empty-state">
               <div className="empty-icon">AI</div>
@@ -2609,7 +2878,7 @@ function ChatPage(props: {
               tr={props.tr}
               productName={props.config.branding.productName || 'Tasi Harness'}
               liveContentPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && m.content.trim().length > 0}
-              liveReasoningPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && !m.content.trim()}
+              liveReasoningPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && Boolean(m.reasoning_content?.trim())}
             />
           ))}
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
@@ -2700,7 +2969,7 @@ function ChatPage(props: {
             ) : props.toolEvents.length === 0 ? (
               <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
             ) : (
-              props.toolEvents.map((event) => (
+              visibleToolEvents.map((event) => (
                 <ToolEventCard key={event.id} event={event} sessionId={props.sessionId} tr={props.tr} />
               ))
             )}
@@ -2736,8 +3005,14 @@ function ChatPage(props: {
           )}
           {showEmbeddedWebPreview && (
             <div
-              className={`tool-web-preview ${shouldShowWebPreview ? '' : 'hidden'} ${webPreviewExpanded ? 'expanded' : ''}`}
-              style={webPreviewExpanded && webPreviewRect ? { left: webPreviewRect.x, top: webPreviewRect.y, width: webPreviewRect.width, height: webPreviewRect.height } : undefined}
+              className={`tool-web-preview ${shouldShowWebPreview ? '' : 'hidden'} ${webPreviewExpanded ? 'expanded' : ''} ${previewDragging ? 'dragging' : ''}`}
+              style={webPreviewExpanded && webPreviewRect ? {
+                left: 0,
+                top: 0,
+                width: webPreviewRect.width,
+                height: webPreviewRect.height,
+                transform: `translate3d(${webPreviewRect.x}px, ${webPreviewRect.y}px, 0)`
+              } : undefined}
             >
               <div className={`tool-web-preview-head ${webPreviewExpanded ? 'draggable' : ''}`} onMouseDown={handlePreviewDragStart}>
                 <strong>{props.tr('Web Preview', '网页预览')}</strong>
@@ -3060,21 +3335,6 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
 
 const ToolEventCard = memo(ToolEventCardComponent);
 
-function reasoningPanelText(content: string, parts: string[] | undefined, livePreview: boolean): { text: string; clippedText: boolean } {
-  const fullText = (parts?.map((part) => part.trim()).filter(Boolean).join('\n') || content)
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .trim();
-  if (!fullText) return { text: '', clippedText: false };
-  if (!livePreview || fullText.length <= REASONING_LIVE_PREVIEW_CHARS) {
-    return { text: fullText, clippedText: false };
-  }
-  return {
-    text: fullText.slice(-REASONING_LIVE_PREVIEW_CHARS).trimStart(),
-    clippedText: true
-  };
-}
-
 function ReasoningListComponent({ content, parts, livePreview, tr }: { content: string; parts?: string[]; livePreview: boolean; tr: TranslateFn }): ReactElement | null {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const view = useMemo(() => reasoningPanelText(content, parts, livePreview), [content, parts, livePreview]);
@@ -3103,10 +3363,10 @@ const ReasoningList = memo(ReasoningListComponent);
 
 export function assistantContentListView(content: string, livePreview = false): { items: string[]; clipped: boolean } {
   const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const clipped = livePreview && normalized.length > LIVE_CONTENT_PREVIEW_CHARS;
+  const clipped = livePreview && normalized.length > CONTENT_STREAM_PREVIEW_CHARS;
   const preview = !clipped
     ? normalized
-    : normalized.slice(-LIVE_CONTENT_PREVIEW_CHARS).trimStart();
+    : normalized.slice(-CONTENT_STREAM_PREVIEW_CHARS).trimStart();
 
   const blocks: string[] = [];
   const current: string[] = [];
@@ -3157,10 +3417,10 @@ export function assistantContentListView(content: string, livePreview = false): 
 function assistantContentPartsView(contents: string[], livePreview = false): { items: string[]; clipped: boolean } {
   const normalized = contents.map((item) => item.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()).filter(Boolean);
   const joined = normalized.join('\n\n');
-  const clipped = livePreview && joined.length > LIVE_CONTENT_PREVIEW_CHARS;
+  const clipped = livePreview && joined.length > CONTENT_STREAM_PREVIEW_CHARS;
   const sourceItems = !clipped
     ? normalized
-    : [joined.slice(-LIVE_CONTENT_PREVIEW_CHARS).trimStart()];
+    : [joined.slice(-CONTENT_STREAM_PREVIEW_CHARS).trimStart()];
   const items = sourceItems.flatMap((block) => {
     if (block.length <= LIVE_CONTENT_ITEM_CHARS) return [block];
     const chunks: string[] = [];
@@ -3171,6 +3431,15 @@ function assistantContentPartsView(contents: string[], livePreview = false): { i
     return chunks;
   });
   return { items, clipped };
+}
+
+export function assistantLiveContentPreviewText(content: string, items?: string[]): { text: string; clipped: boolean } {
+  const source = items && items.length > 0
+    ? items.map((item) => item.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()).filter(Boolean).join('\n\n')
+    : content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const clipped = source.length > CONTENT_STREAM_PREVIEW_CHARS;
+  const text = (clipped ? source.slice(-CONTENT_STREAM_PREVIEW_CHARS).trimStart() : source).trim();
+  return { text, clipped };
 }
 
 function MessageContentListComponent({
@@ -3186,29 +3455,47 @@ function MessageContentListComponent({
   tr: TranslateFn;
   title?: string;
 }): ReactElement | null {
-  const view = useMemo(
-    () => explicitItems ? assistantContentPartsView(explicitItems, livePreview) : assistantContentListView(content, livePreview),
+  const liveView = useMemo(
+    () => livePreview ? assistantLiveContentPreviewText(content, explicitItems) : undefined,
     [content, explicitItems, livePreview]
   );
+  const view = useMemo(
+    () => livePreview ? undefined : (explicitItems ? assistantContentPartsView(explicitItems) : assistantContentListView(content)),
+    [content, explicitItems, livePreview]
+  );
+  if (livePreview) {
+    if (!liveView?.text) return null;
+    return (
+      <div className="msg-content-panel live">
+        <div className="msg-content-title">
+          <span>{title ?? tr('Assistant content', '回复内容')}</span>
+          <span>1</span>
+        </div>
+        <div className="msg-content-list">
+          {liveView.clipped && (
+            <div className="msg-content-live-note">
+              {tr('Showing the latest assistant text while streaming.', '实时输出中仅显示最新回复文本。')}
+            </div>
+          )}
+          <pre className="msg-content-pre">{liveView.text}</pre>
+        </div>
+      </div>
+    );
+  }
+
+  if (!view) return null;
   const items = view.items;
   if (items.length === 0) return null;
   return (
-    <div className={`msg-content-panel ${livePreview ? 'live' : 'final'}`}>
+    <div className="msg-content-panel final">
       <div className="msg-content-title">
         <span>{title ?? tr('Assistant content', '回复内容')}</span>
         <span>{items.length}</span>
       </div>
       <div className="msg-content-list">
-        {livePreview && view.clipped && (
-          <div className="msg-content-live-note">
-            {tr('Showing the latest assistant text while streaming.', '实时输出中仅显示最新回复文本。')}
-          </div>
-        )}
         {items.map((item, index) => (
           <div className="msg-content-item" key={`${index}-${item.length}`}>
-            {livePreview
-              ? <pre className="msg-content-pre">{item}</pre>
-              : renderMarkdownContent(item, `msg-content-${index}-${item.length}`)}
+            {renderMarkdownContent(item, `msg-content-${index}-${item.length}`)}
           </div>
         ))}
       </div>
@@ -3350,21 +3637,27 @@ function MessageBubbleComponent({
   const [loadError, setLoadError] = useState('');
   const content = fullContent ?? message.content;
   const reasoningContent = fullReasoning ?? message.reasoning_content;
-  const contentParts = fullContentParts ?? message.content_parts ?? [];
+  const contentParts = fullContentParts ?? message.content_parts ?? EMPTY_STRING_ARRAY;
   const shouldUseLiveContentPreview = message.role === 'assistant' && liveContentPreview && fullContent === null;
-  const completedAssistantItems = message.role === 'assistant' ? contentParts.filter((item) => item.trim()) : [];
-  const completedAssistantContent = message.role === 'assistant'
-    ? completedAssistantItems.join('\n\n')
-    : '';
+  const completedAssistantItems = useMemo(
+    () => message.role === 'assistant' ? contentParts.filter((item) => item.trim()) : EMPTY_STRING_ARRAY,
+    [message.role, contentParts]
+  );
+  const completedAssistantContent = useMemo(
+    () => message.role === 'assistant' ? completedAssistantItems.join('\n\n') : '',
+    [message.role, completedAssistantItems]
+  );
   const currentLiveAssistantContent = message.role === 'assistant' && shouldUseLiveContentPreview ? content : '';
   const finalAssistantContent = message.role === 'assistant' && !shouldUseLiveContentPreview ? content : '';
-  const assistantCitationContent = message.role === 'assistant'
-    ? [...contentParts, content].filter((item) => item.trim()).join('\n\n')
-    : content;
   const actionContent = content;
+  const isLivePreviewing = shouldUseLiveContentPreview || liveReasoningPreview;
   const citations = useMemo(
-    () => (message.role === 'assistant' && !shouldUseLiveContentPreview ? extractCitationLinks(assistantCitationContent) : []),
-    [message.role, assistantCitationContent, shouldUseLiveContentPreview]
+    () => {
+      if (message.role !== 'assistant' || isLivePreviewing) return [];
+      const source = [...contentParts, content].filter((item) => item.trim()).join('\n\n');
+      return extractCitationLinks(source);
+    },
+    [message.role, contentParts, content, isLivePreviewing]
   );
   const renderedMarkdown = useMemo(
     () => {
@@ -3375,7 +3668,7 @@ function MessageBubbleComponent({
   );
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
-  const canLoadFull = Boolean(sessionId && message.id && message.contentOmitted && fullContent === null);
+  const canLoadFull = Boolean(sessionId && message.id && !isLivePreviewing && (message.contentOmitted || message.reasoningOmitted) && fullContent === null);
 
   useEffect(() => {
     if (!copied) return;

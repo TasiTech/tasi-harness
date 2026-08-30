@@ -156,6 +156,49 @@ describe('SessionStore', () => {
     }
   });
 
+  it('derives assistant content parts from hidden session messages without persisting content_parts', () => {
+    const env = tempHome();
+    try {
+      const store = new SessionStore(env.home);
+      const session = store.create('Derived content parts');
+      store.appendMessages(session.id, [
+        { id: 'm1', role: 'user', content: 'Write a file.', createdAt: '2026-01-01T00:00:00.000Z' },
+        {
+          id: 'm2',
+          role: 'assistant',
+          hidden: true,
+          content: 'I will inspect first.',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'file_read', arguments: '{}' }
+          }],
+          createdAt: '2026-01-01T00:00:01.000Z'
+        },
+        { id: 'm3', role: 'tool', name: 'file_read', tool_call_id: 'call_1', content: 'ok', createdAt: '2026-01-01T00:00:02.000Z' },
+        {
+          id: 'm4',
+          role: 'assistant',
+          content: 'Done.',
+          content_parts: ['I will inspect first.'],
+          createdAt: '2026-01-01T00:00:03.000Z'
+        }
+      ]);
+
+      const raw = readFileSync(join(env.home, 'sessions', `${session.id}.json`), 'utf8');
+      const full = store.read(session.id);
+      const display = store.readForDisplay(session.id);
+      const fullMessage = store.readMessageContent(session.id, 'm4');
+
+      expect(raw).not.toContain('content_parts');
+      expect(full?.messages.find((message) => message.id === 'm4')?.content_parts).toBeUndefined();
+      expect(display?.messages.find((message) => message.id === 'm4')?.content_parts).toEqual(['I will inspect first.']);
+      expect(fullMessage?.content_parts).toEqual(['I will inspect first.']);
+    } finally {
+      env.cleanup();
+    }
+  });
+
   it('redacts browser credential values before persisting session records', () => {
     const env = tempHome();
     try {

@@ -871,6 +871,11 @@ label { display: block; margin: 12px 0 6px; color: var(--text-secondary); font-s
   min-height: 220px;
   max-width: calc(100vw - 12px);
   max-height: calc(100vh - 12px);
+  contain: layout paint;
+  will-change: transform;
+}
+.tool-web-preview.expanded.dragging .tool-web-preview-body {
+  pointer-events: none;
 }
 .tool-web-preview.expanded .tool-web-preview-frame {
   height: 100%;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { extractCitationLinks, normalizeCitationHref } from '../src/renderer/citations';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from '../src/renderer/markdown';
-import { assistantContentListView, isVisibleChatMessage } from '../src/renderer/App';
+import { assistantContentListView, assistantLiveContentPreviewText, isVisibleChatMessage, reasoningPanelText } from '../src/renderer/App';
 
 function escapeAttr(value: string): string {
   return value.replaceAll('&', '&amp;');
@@ -98,6 +98,33 @@ describe('assistantContentListView', () => {
     expect(view.items[0]).toBe('第一段回复。');
     expect(view.items[1]).toContain('const value = 1;\n\nconsole.log(value);');
     expect(view.items[2]).toBe('- 后续条目');
+  });
+});
+
+describe('assistantLiveContentPreviewText', () => {
+  it('clips live assistant content to the latest text as a single preview block', () => {
+    const view = assistantLiveContentPreviewText(`start-marker\n${'older content '.repeat(600)}\nlatest answer`);
+
+    expect(view.clipped).toBe(true);
+    expect(view.text).toContain('latest answer');
+    expect(view.text).not.toContain('start-marker');
+    expect(view.text.length).toBeLessThanOrEqual(5000);
+  });
+});
+
+describe('reasoningPanelText', () => {
+  it('clips live reasoning from the newest reasoning parts', () => {
+    const parts = [
+      'old reasoning '.repeat(400),
+      'middle reasoning '.repeat(300),
+      'latest reasoning'
+    ];
+    const view = reasoningPanelText(parts.join('\n'), parts, true);
+
+    expect(view.clippedText).toBe(true);
+    expect(view.text).toContain('latest reasoning');
+    expect(view.text).not.toContain('old reasoning old reasoning');
+    expect(view.text.length).toBeLessThanOrEqual(3000);
   });
 });
 

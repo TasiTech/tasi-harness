@@ -26,12 +26,14 @@ const DISPLAY_TOOL_CONTENT_CHARS = 6000;
 const DISPLAY_REASONING_CHARS = 4000;
 const DISPLAY_ATTACHMENT_BASE64_CHARS = 0;
 const DISPLAY_ARGS_CHARS = 2000;
+const CONTENT_PARTS_CACHE_LIMIT = 200;
 const FAILURE_SIGNAL_PATTERN = /\b(error|failed?|failure|exception|timeout|timed out|denied|refused|exceeded|too large|not found)\b|失败|错误|异常|超时|超过|拒绝|找不到/i;
 const IMPORTANT_TOOL_PATTERN = /^(browser_|skill_|file_|terminal$|session_search$)/;
 
 export class SessionStore {
   private readonly dir: string;
   private readonly maxSystemPromptHistory = 1;
+  private readonly contentPartsCache = new Map<string, { signature: string; partsByMessageId: Map<string, string[]> }>();
 
   constructor(harnessHome: string) {
     this.dir = join(harnessHome, 'sessions');
@@ -79,6 +81,7 @@ export class SessionStore {
   readForDisplay(id: string): SessionRecord | null {
     const record = this.read(id);
     if (!record) return null;
+    const contentPartsByMessageId = this.contentPartsForRecord(record);
     return {
       ...record,
       systemPrompt: record.systemPrompt ? this.clipText(record.systemPrompt, DISPLAY_MESSAGE_CHARS) : undefined,
@@ -86,7 +89,7 @@ export class SessionStore {
         ...item,
         prompt: this.clipText(item.prompt, DISPLAY_MESSAGE_CHARS)
       })),
-      messages: record.messages.map((message) => this.compactMessageForDisplay(message)),
+      messages: record.messages.map((message) => this.compactMessageForDisplay(message, contentPartsByMessageId.get(message.id ?? ''))),
       toolEvents: record.toolEvents.map((event) => this.compactToolEventForDisplay(event))
     };
   }
@@ -95,10 +98,11 @@ export class SessionStore {
     const record = this.read(sessionId);
     const message = record?.messages.find((item) => item.id === messageId);
     if (!message) return null;
+    const contentParts = record ? this.contentPartsForRecord(record).get(messageId) : undefined;
     return {
       content: message.content,
       reasoning_content: message.reasoning_content,
-      content_parts: message.content_parts,
+      content_parts: contentParts ?? message.content_parts,
       attachments: message.attachments
     };
   }
@@ -111,6 +115,10 @@ export class SessionStore {
       content: event.content,
       args: event.args
     };
+  }
+
+  toolEventForDisplay(event: ToolEvent): ToolEvent {
+    return this.compactToolEventForDisplay(event);
   }
 
   list(): SessionSummary[] {
@@ -317,7 +325,7 @@ export class SessionStore {
     return messages.map((message) => ({ ...message, createdAt: message.createdAt ?? nowIso() }));
   }
 
-  private compactMessageForDisplay(message: AgentMessage): AgentMessage {
+  private compactMessageForDisplay(message: AgentMessage, derivedContentParts?: string[]): AgentMessage {
     const content = this.compactTextForDisplay(message.content, DISPLAY_MESSAGE_CHARS);
     const reasoning = message.reasoning_content ? this.compactTextForDisplay(message.reasoning_content, DISPLAY_REASONING_CHARS) : undefined;
     return {
@@ -329,7 +337,7 @@ export class SessionStore {
       reasoningOmitted: reasoning?.omitted || undefined,
       reasoningLength: reasoning?.omitted ? reasoning.length : undefined,
       reasoning_parts: message.reasoning_parts?.map((part) => this.clipText(part, 1000)),
-      content_parts: message.content_parts?.map((part) => this.clipText(part, 2000)),
+      content_parts: derivedContentParts?.map((part) => this.clipText(part, 2000)) ?? message.content_parts?.map((part) => this.clipText(part, 2000)),
       attachments: message.attachments?.map((attachment) => ({
         ...attachment,
         contentBase64: DISPLAY_ATTACHMENT_BASE64_CHARS > 0
@@ -449,7 +457,54 @@ export class SessionStore {
   private persistableMessage(message: AgentMessage): AgentMessage {
     const next = { ...message };
     delete next.reasoning_parts;
+    delete next.content_parts;
     return next;
+  }
+
+  private contentPartsForRecord(record: SessionRecord): Map<string, string[]> {
+    const signature = this.contentPartsSignature(record);
+    const cached = this.contentPartsCache.get(record.id);
+    if (cached?.signature === signature) return cached.partsByMessageId;
+
+    const partsByMessageId = new Map<string, string[]>();
+    let pendingParts: string[] = [];
+    for (const message of record.messages ?? []) {
+      if (message.role === 'user') {
+        pendingParts = [];
+        continue;
+      }
+      if (message.role !== 'assistant') continue;
+
+      const content = message.content.trim();
+      if (message.hidden === true) {
+        if (content) pendingParts.push(content);
+        continue;
+      }
+      if (content && pendingParts.length > 0 && message.id) {
+        partsByMessageId.set(message.id, [...pendingParts]);
+      }
+      if (content) pendingParts = [];
+    }
+
+    this.contentPartsCache.set(record.id, { signature, partsByMessageId });
+    if (this.contentPartsCache.size > CONTENT_PARTS_CACHE_LIMIT) {
+      const oldestKey = this.contentPartsCache.keys().next().value;
+      if (oldestKey) this.contentPartsCache.delete(oldestKey);
+    }
+    return partsByMessageId;
+  }
+
+  private contentPartsSignature(record: SessionRecord): string {
+    return (record.messages ?? [])
+      .map((message) => [
+        message.id ?? '',
+        message.role,
+        message.hidden === true ? '1' : '0',
+        message.createdAt ?? '',
+        message.content.length,
+        message.hidden === true ? message.content : ''
+      ].join(':'))
+      .join('|');
   }
 
   private ensureValidProvidedId(id: string): string {
