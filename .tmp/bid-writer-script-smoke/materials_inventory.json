@@ -1,0 +1,181 @@
+{
+  "schema": "bid-writer.materials-inventory.v1",
+  "roots": [
+    {
+      "label": "materials:1",
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer",
+      "exists": true
+    }
+  ],
+  "summary": {
+    "total_files": 12,
+    "image_files": 0,
+    "document_files": 8,
+    "by_root": {
+      "materials:1": 12
+    },
+    "by_category": {
+      "uncategorized": 12
+    },
+    "uncategorized_files": 12
+  },
+  "missing_roots": [],
+  "files": [
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\audit-checklist.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\audit-checklist.md",
+      "name": "audit-checklist.md",
+      "suffix": ".md",
+      "size": 6743,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\bid-writer-process-rules.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\bid-writer-process-rules.md",
+      "name": "bid-writer-process-rules.md",
+      "suffix": ".md",
+      "size": 6178,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\docx-delivery.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\docx-delivery.md",
+      "name": "docx-delivery.md",
+      "suffix": ".md",
+      "size": 3908,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\full-bid-workflow.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\full-bid-workflow.md",
+      "name": "full-bid-workflow.md",
+      "suffix": ".md",
+      "size": 5404,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\legacy-bid-writer-rules.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\legacy-bid-writer-rules.md",
+      "name": "legacy-bid-writer-rules.md",
+      "suffix": ".md",
+      "size": 76659,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\script-helpers.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\script-helpers.md",
+      "name": "script-helpers.md",
+      "suffix": ".md",
+      "size": 2406,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\references\\visual-assets.md",
+      "root_label": "materials:1",
+      "relative_path": "references\\visual-assets.md",
+      "name": "visual-assets.md",
+      "suffix": ".md",
+      "size": 3313,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\scripts\\create_bid_checkpoint.py",
+      "root_label": "materials:1",
+      "relative_path": "scripts\\create_bid_checkpoint.py",
+      "name": "create_bid_checkpoint.py",
+      "suffix": ".py",
+      "size": 5400,
+      "is_image": false,
+      "is_document": false,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\scripts\\extract_tender_text.py",
+      "root_label": "materials:1",
+      "relative_path": "scripts\\extract_tender_text.py",
+      "name": "extract_tender_text.py",
+      "suffix": ".py",
+      "size": 6837,
+      "is_image": false,
+      "is_document": false,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\scripts\\inventory_materials.py",
+      "root_label": "materials:1",
+      "relative_path": "scripts\\inventory_materials.py",
+      "name": "inventory_materials.py",
+      "suffix": ".py",
+      "size": 5901,
+      "is_image": false,
+      "is_document": false,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\scripts\\validate_bid_package.py",
+      "root_label": "materials:1",
+      "relative_path": "scripts\\validate_bid_package.py",
+      "name": "validate_bid_package.py",
+      "suffix": ".py",
+      "size": 7548,
+      "is_image": false,
+      "is_document": false,
+      "categories": [
+        "uncategorized"
+      ]
+    },
+    {
+      "path": "C:\\Users\\hujuntao\\.tasi-harness\\skills\\work\\bid-writer\\SKILL.md",
+      "root_label": "materials:1",
+      "relative_path": "SKILL.md",
+      "name": "SKILL.md",
+      "suffix": ".md",
+      "size": 15920,
+      "is_image": false,
+      "is_document": true,
+      "categories": [
+        "uncategorized"
+      ]
+    }
+  ]
+}

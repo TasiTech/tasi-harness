@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createLlmClient } from '../src/main/agent/llmClient.js';
+import { clearModelContextWindowCacheForTests, createLlmClient } from '../src/main/agent/llmClient.js';
 import type { ToolDefinition } from '../src/shared/types.js';
 import { defaultConfig } from '../src/main/storage/pathUtils.js';
 
@@ -19,7 +19,9 @@ const browserOpenTool: ToolDefinition = {
 };
 
 afterEach(() => {
+  clearModelContextWindowCacheForTests();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('llmClient', () => {
@@ -165,6 +167,7 @@ describe('llmClient', () => {
   });
 
   it('uses a chat completions probe to compress oversized OpenAI-compatible prompts', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -225,10 +228,89 @@ describe('llmClient', () => {
     const body = JSON.parse(String(init.body));
     expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user']);
     expect(body.messages[0].content).toContain('Earlier conversation history was compressed');
+    expect(body.messages[0].content).toContain('Critical Context Capsule');
+    expect(body.messages[0].content).toContain('Active task: What should we do next?');
     expect(JSON.stringify(body).length).toBeLessThan(oldText.length);
+    expect(infoSpy).toHaveBeenCalledTimes(1);
+    const logLine = String(infoSpy.mock.calls[0]?.[0] ?? '');
+    expect(logLine).toContain('[llm][context-compression]');
+    expect(logLine).toContain('"before_tokens"');
+    expect(logLine).toContain('"after_tokens"');
+    expect(logLine).toContain('"trigger_condition"');
   });
 
-  it('falls back to model metadata when the context probe is not parseable', async () => {
+  it('keeps context compression stable when tool-call arguments omit optional fields', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'compressed without crashing' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const oldText = Array.from({ length: 1100 }, (_, index) => `old tool context line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'skill_view', arguments: JSON.stringify({ name: 'demo-skill' }) }
+          }]
+        },
+        { role: 'tool', name: 'skill_view', tool_call_id: 'call_1', content: '# Skill: demo-skill\nMust validate.' },
+        {
+          role: 'assistant',
+          content: oldText,
+          tool_calls: [{
+            id: 'call_2',
+            type: 'function',
+            function: { name: 'file_read', arguments: '{}' }
+          }]
+        },
+        { role: 'tool', name: 'file_read', tool_call_id: 'call_2', content: 'File not found.' },
+        { role: 'user', content: 'Continue.' }
+      ]
+    });
+
+    expect(result.message.content).toBe('compressed without crashing');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages[0].content).toContain('Critical Context Capsule');
+    expect(body.messages[0].content).toContain('demo-skill');
+  });
+
+  it('does not call the models endpoint when the context probe is not parseable', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(
@@ -244,19 +326,9 @@ describe('llmClient', () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
-            id: 'served-model',
-            object: 'model',
-            context_length: 1000
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
             choices: [
               {
-                message: { role: 'assistant', content: 'metadata compressed ok' }
+                message: { role: 'assistant', content: 'local hint ok' }
               }
             ]
           }),
@@ -283,15 +355,216 @@ describe('llmClient', () => {
       ]
     });
 
-    expect(result.message.content).toBe('metadata compressed ok');
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(result.message.content).toBe('local hint ok');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const [modelEndpoint] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const [chatEndpoint, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
-    expect(modelEndpoint).toBe('http://127.0.0.1:8000/v1/models/served-model');
-    const [, init] = fetchMock.mock.calls[2] as [string, RequestInit];
+    expect(chatEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).not.toContain('http://127.0.0.1:8000/v1/models/served-model');
     const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+  });
+
+  it('does not probe known-context models for prompts below the interactive soft budget', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'modest prompt ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = Array.from({ length: 1200 }, (_, index) => `old decision line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'What should we do next?' }
+      ]
+    });
+
+    expect(result.message.content).toBe('modest prompt ok');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(body.max_tokens).not.toBe(99999999);
+  });
+
+  it('uses an interactive soft budget even when the probed model context is very large', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens. (parameter=max_tokens, value=99999999)'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'soft-budget compressed ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = 'x'.repeat(330_000);
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'Continue from the important decisions.' }
+      ]
+    });
+
+    expect(result.message.content).toBe('soft-budget compressed ok');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user']);
     expect(body.messages[0].content).toContain('Earlier conversation history was compressed');
+    const logLine = String(infoSpy.mock.calls[0]?.[0] ?? '');
+    expect(logLine).toContain('"budget_tokens":96000');
+    expect(logLine).toContain('"budget_source":"interactive_soft_budget"');
+  });
+
+  it('uses the context-window budget for intra-turn iteration requests', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens.'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'iteration prompt ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = 'x'.repeat(330_000);
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'Continue from the important decisions.' }
+      ],
+      metadata: { context_compression: 'iteration' }
+    });
+
+    expect(result.message.content).toBe('iteration prompt ok');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(infoSpy).not.toHaveBeenCalled();
+  });
+
+  it('reuses probed context length across client instances for the same endpoint and model', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let probeCalls = 0;
+    const fetchMock = vi.fn(async (_endpoint: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      if (body.max_tokens === 99999999) {
+        probeCalls += 1;
+        return new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens.'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: `ok ${probeCalls}` }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = {
+      ...defaultConfig(),
+      provider: 'vllm' as const,
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    };
+    const prompt = 'x'.repeat(330_000);
+
+    await createLlmClient(config).complete({ messages: [{ role: 'user', content: prompt }] });
+    await createLlmClient(config).complete({ messages: [{ role: 'user', content: prompt }] });
+
+    expect(probeCalls).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it('retries once with compressed context when the provider reports the real context limit', async () => {
@@ -305,16 +578,6 @@ describe('llmClient', () => {
                 message: { role: 'assistant', content: 'probe ignored' }
               }
             ]
-          }),
-          { status: 200, headers: { 'Content-Type': 'application/json' } }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: 'tiny-context-model',
-            object: 'model',
-            owned_by: 'test'
           }),
           { status: 200, headers: { 'Content-Type': 'application/json' } }
         )
@@ -363,13 +626,12 @@ describe('llmClient', () => {
     });
 
     expect(result.message.content).toBe('retry ok');
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
     const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
-    const [modelEndpoint] = fetchMock.mock.calls[1] as [string, RequestInit];
     expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
-    expect(modelEndpoint).toBe('http://127.0.0.1:8000/v1/models/tiny-context-model');
-    const [, firstInit] = fetchMock.mock.calls[2] as [string, RequestInit];
-    const [, secondInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).not.toContain('http://127.0.0.1:8000/v1/models/tiny-context-model');
+    const [, firstInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const [, secondInit] = fetchMock.mock.calls[2] as [string, RequestInit];
     const firstBody = JSON.parse(String(firstInit.body));
     const secondBody = JSON.parse(String(secondInit.body));
     expect(JSON.stringify(firstBody).length).toBeGreaterThan(JSON.stringify(secondBody).length);
@@ -1104,6 +1366,33 @@ describe('llmClient', () => {
 
     expect(result?.message.reasoning_content).toBe('.');
     expect(deltas).toEqual(['r:.']);
+  });
+
+  it('cancels an OpenAI-compatible stream when SSE parsing fails', async () => {
+    const cancelSpy = vi.fn();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {not json}\n\n'));
+      },
+      cancel: cancelSpy
+    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    await expect(client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, () => {}))
+      .rejects
+      .toThrow('Invalid LLM stream event');
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
   });
 
   it('streams anthropic content deltas', async () => {

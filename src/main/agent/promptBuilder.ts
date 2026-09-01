@@ -4,6 +4,12 @@ import type { SkillManager } from '../skills/skillManager.js';
 import type { PersonalKnowledgeBase } from '../knowledge/personalKnowledgeBase.js';
 import type { SessionDocumentContextStore } from '../knowledge/sessionDocumentContextStore.js';
 
+export interface PromptMessageBuild {
+  systemPrompt: string;
+  runtimeContext: string;
+  displayPrompt: string;
+}
+
 export class PromptBuilder {
   constructor(
     private readonly memoryStore: MemoryStore,
@@ -25,6 +31,21 @@ export class PromptBuilder {
       enabledSkillNames?: string[];
     }
   ): Promise<string> {
+    return (await this.buildForMessages(config, context)).displayPrompt;
+  }
+
+  async buildForMessages(
+    config: AppConfig,
+    context?: {
+      sessionId?: string;
+      userInput?: string;
+      usePersonalKnowledgeBase?: boolean;
+      useMemory?: boolean;
+      memoryDomains?: MemoryDomain[];
+      useSkills?: boolean;
+      enabledSkillNames?: string[];
+    }
+  ): Promise<PromptMessageBuild> {
     const date = new Date().toISOString();
     const memoryEnabled = context?.useMemory !== false;
     const skillsEnabled = context?.useSkills !== false;
@@ -39,7 +60,7 @@ export class PromptBuilder {
       maxDocs: config.sessionDocumentMaxDocs,
       maxChars: 40_000
     }) ?? '';
-    return [
+    const systemPrompt = [
       config.systemPersona,
       '',
       '## Operating model',
@@ -111,8 +132,23 @@ export class PromptBuilder {
       '- Use session_search when previous conversations are likely relevant.',
       '- When a "Personal knowledge snapshot" section is present, treat it as user-provided source material. If it is relevant, use it before general knowledge and cite the filename in square brackets.',
       '',
+      '## Installed skills index',
+      skillsEnabled ? this.skillManager.renderPromptIndex(context?.enabledSkillNames) : 'Skills disabled for this run.',
+      context?.sessionId
+        ? [
+            '',
+            '## Session context',
+            `Current session id: ${context.sessionId}`,
+            '',
+            '## Session document XML snapshot',
+            'When this section contains XML, treat it as user-uploaded source material for the current session.',
+            sessionDocumentBlock || '(no session document)'
+          ].join('\n')
+        : ''
+    ].join('\n');
+    const runtimeContext = [
+      '## Runtime context',
       `Current timestamp: ${date}`,
-      context?.sessionId ? `Current session id: ${context.sessionId}` : '',
       explicitMemoryDomains.length > 0
         ? `Requested memory domains: ${explicitMemoryDomains.join(', ')}`
         : (inferredDomains.length > 0 ? `Inferred intent domains: ${inferredDomains.join(', ')}` : ''),
@@ -129,18 +165,13 @@ export class PromptBuilder {
             personalKnowledgeBlock || '(no personal knowledge documents)'
           ].join('\n')
         : '',
-      context?.sessionId
-        ? [
-            '',
-            '## Session document XML snapshot',
-            'When this section contains XML, treat it as user-uploaded source material for the current session.',
-            sessionDocumentBlock || '(no session document)'
-          ].join('\n')
-        : '',
       '',
-      '## Installed skills index',
-      skillsEnabled ? this.skillManager.renderPromptIndex(context?.enabledSkillNames) : 'Skills disabled for this run.'
-    ].join('\n');
+    ].join('\n').trim();
+    return {
+      systemPrompt,
+      runtimeContext,
+      displayPrompt: [systemPrompt, runtimeContext].filter(Boolean).join('\n\n')
+    };
   }
 
   private renderMemoryPromptBlock(sessionId?: string, intent?: string, domains: MemoryDomain[] = []): string {

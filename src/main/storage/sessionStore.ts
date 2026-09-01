@@ -89,7 +89,9 @@ export class SessionStore {
         ...item,
         prompt: this.clipText(item.prompt, DISPLAY_MESSAGE_CHARS)
       })),
-      messages: record.messages.map((message) => this.compactMessageForDisplay(message, contentPartsByMessageId.get(message.id ?? ''))),
+      messages: record.messages
+        .filter((message) => message.hidden !== true)
+        .map((message) => this.compactMessageForDisplay(message, contentPartsByMessageId.get(message.id ?? ''))),
       toolEvents: record.toolEvents.map((event) => this.compactToolEventForDisplay(event))
     };
   }

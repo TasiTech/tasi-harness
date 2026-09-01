@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { join } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { AgentLoop } from '../src/main/agent/agentLoop.js';
 import { MockLlmClient, type LlmClient } from '../src/main/agent/llmClient.js';
 import { PromptBuilder } from '../src/main/agent/promptBuilder.js';
@@ -79,6 +79,402 @@ describe('AgentLoop', () => {
     expect(Object.prototype.hasOwnProperty.call(rawSession, 'toolEvents')).toBe(false);
     const rawMessages = Array.isArray(rawSession.messages) ? rawSession.messages : [];
     expect(rawMessages.some((message) => message && typeof message === 'object' && (message as { role?: string }).role === 'tool')).toBe(true);
+  });
+
+  it('orders messages so stable prompt and previous history remain prefix-cache friendly', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 2 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const requests: LlmRequest[] = [];
+    const client: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
+        return { message: { role: 'assistant', content: 'Done.' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'first request', stream: false });
+    await loop.run({ sessionId: result.sessionId, userInput: 'second request', stream: false });
+
+    const firstMessages = requests[0]?.messages ?? [];
+    const secondMessages = requests[1]?.messages ?? [];
+    expect(firstMessages[0]?.role).toBe('system');
+    expect(firstMessages[0]?.content).toContain('## Installed skills index');
+    expect(firstMessages[0]?.content).not.toContain('Current timestamp:');
+    expect(firstMessages[1]?.role).toBe('user');
+    expect(firstMessages[1]?.content).toContain('first request');
+    expect(firstMessages[1]?.content).toContain('## Runtime context');
+    expect(secondMessages[1]).toMatchObject({ role: 'user', content: 'first request' });
+    expect(secondMessages[2]).toMatchObject({ role: 'assistant', content: 'Done.' });
+    expect(secondMessages.at(-1)?.content).toContain('second request');
+    expect(secondMessages.at(-1)?.content).toContain('## Runtime context');
+    expect(sessions.read(result.sessionId)?.messages[0]?.content).toBe('first request');
+  });
+
+  it('repairs a skill-driven final answer when delivery validation fails', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 5 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    skills.create({
+      name: 'demo-delivery',
+      category: 'work',
+      content: [
+        '---',
+        'name: demo-delivery',
+        'description: Demo delivery skill.',
+        '---',
+        '',
+        '# Demo Delivery',
+        '',
+        'Before finalizing, the answer must mention the verified source and completed validation.'
+      ].join('\n')
+    });
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_skill',
+            type: 'function',
+            function: { name: 'skill_view', arguments: JSON.stringify({ name: 'demo-delivery' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Done.' } },
+      { message: { role: 'assistant', content: '{"ok":false,"issues":["missing validation"],"required_actions":["mention validation"]}' } },
+      { message: { role: 'assistant', content: 'Done after checking the verified source and completed validation.' } },
+      { message: { role: 'assistant', content: '{"ok":true,"issues":[],"required_actions":[]}' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'use demo-delivery to finish the task' });
+
+    expect(result.finalResponse).toBe('Done after checking the verified source and completed validation.');
+    expect(result.iterations).toBe(3);
+    const stored = sessions.read(result.sessionId);
+    expect(stored?.messages.some((message) => message.hidden && message.content.includes('Skill delivery validation failed'))).toBe(true);
+    expect(stored?.messages.some((message) => !message.hidden && message.content === 'Done.')).toBe(false);
+    const display = sessions.readForDisplay(result.sessionId);
+    expect(display?.messages.some((message) => message.content.includes('Skill delivery validation failed'))).toBe(false);
+    expect(display?.messages.some((message) => message.hidden === true)).toBe(false);
+  });
+
+  it('does not repair-loop when skill delivery validation returns neutral non-json text', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    skills.create({
+      name: 'demo-delivery',
+      category: 'work',
+      content: '---\nname: demo-delivery\ndescription: Demo delivery skill.\n---\n\n# Demo Delivery\n\nValidate before final.'
+    });
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_skill',
+            type: 'function',
+            function: { name: 'skill_view', arguments: JSON.stringify({ name: 'demo-delivery' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Done.' } },
+      { message: { role: 'assistant', content: 'Looks acceptable.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'use demo-delivery to finish the task' });
+
+    expect(result.finalResponse).toBe('Done.');
+    expect(result.iterations).toBe(2);
+    expect(sessions.readForDisplay(result.sessionId)?.messages.some((message) => message.content.includes('Skill delivery validation failed'))).toBe(false);
+  });
+
+  it('validates document artifacts even when no skill was loaded', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const requests: LlmRequest[] = [];
+    const client = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_report',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'report.md', content: '# Report\n\nThis generated report has enough body text for validation.' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Final delivery: report.md is ready.' } },
+      { message: { role: 'assistant', content: '{"ok":true,"issues":[],"required_actions":[]}' } }
+    ]);
+    const wrappedClient: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        requests.push(request);
+        return client.complete();
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => wrappedClient,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'generate a report markdown file', stream: false });
+
+    expect(result.finalResponse).toBe('Final delivery: report.md is ready.');
+    expect(result.iterations).toBe(2);
+    expect(requests.some((request) => request.metadata?.turn_type === 'skill_delivery_validation')).toBe(true);
+  });
+
+  it('hard-gates final document delivery when generated artifacts contain placeholders', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 6 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_report_draft',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'report.md', content: '# Report\n\n[\u5f85\u8865\u5145: conclusion]' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Final delivery: report.md is complete.' } },
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_report_repair',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'report.md', content: '# Report\n\nCompleted audited body with final conclusions and evidence.' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Final delivery: report.md is complete.' } },
+      { message: { role: 'assistant', content: '{"ok":true,"issues":[],"required_actions":[]}' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'generate a report markdown file', stream: false });
+
+    expect(result.finalResponse).toBe('Final delivery: report.md is complete.');
+    expect(result.iterations).toBe(4);
+    expect(result.toolEvents).toHaveLength(2);
+    expect(readFileSync(join(cfg.workspaceDir, 'report.md'), 'utf8')).not.toContain('[\u5f85\u8865\u5145');
+    const stored = sessions.read(result.sessionId);
+    expect(stored?.messages.some((message) => message.hidden && message.content.includes('deterministic document delivery gate failed'))).toBe(true);
+  });
+
+  it('does not hard-validate source materials, URLs, or corrupt path fragments as document artifacts', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      safety: 'executes-command',
+      definition: {
+        type: 'function',
+        function: {
+          name: 'terminal',
+          description: 'Mock terminal for artifact discovery tests.',
+          parameters: {
+            type: 'object',
+            properties: { command: { type: 'string' } },
+            required: ['command']
+          }
+        }
+      },
+      async execute(_args, context) {
+        writeFileSync(join(context.workspaceDir, 'A-bid.md'), '# A Bid\n\nFinal audited bid content with enough text.', 'utf8');
+        return {
+          ok: true,
+          content: [
+            String.raw`Read source: D:\tender\source\tender_text.md`,
+            String.raw`Tender notice: D:\tender\notice\notice.docx`,
+            String.raw`Address: http://www.gxzfcg.gov.cn/view/staticpags/shengji_cggg/example.html`,
+            'Corrupt fragment: d=docx.Doc',
+            'Corrupt fragment: checkpoint_\uFFFD\uFFFDIPTV.md',
+            'Ran inventory_materials.py',
+            'Ran extract_tender_text.py',
+            'Ran create_bid_checkpoint.py',
+            'Ran validate_bid_package.py',
+            'Generated: A-bid.md'
+          ].join('\n')
+        };
+      }
+    });
+    const requests: LlmRequest[] = [];
+    const client = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_bid',
+            type: 'function',
+            function: { name: 'terminal', arguments: JSON.stringify({ command: 'mock bid generation' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Final delivery: A-bid.md is complete.' } },
+      { message: { role: 'assistant', content: '{"ok":true,"issues":[],"required_actions":[]}' } }
+    ]);
+    const wrappedClient: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        requests.push(request);
+        return client.complete();
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => wrappedClient,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'generate a complete bid document from tender sources', stream: false });
+
+    expect(result.finalResponse).toBe('Final delivery: A-bid.md is complete.');
+    const validationRequest = requests.find((request) => request.metadata?.turn_type === 'skill_delivery_validation');
+    const validationPrompt = validationRequest?.messages.at(-1)?.content ?? '';
+    const contextLine = /Deterministic document delivery context:\n(.+)\n\nRelevant tool and skill evidence:/.exec(validationPrompt)?.[1] ?? '';
+    expect(contextLine).toContain('"artifacts":["A-bid.md"]');
+    expect(contextLine).not.toContain('tender_text.md');
+    expect(contextLine).not.toContain('notice.docx');
+    expect(contextLine).not.toContain('gxzfcg.gov.cn');
+    expect(contextLine).not.toContain('docx.Doc');
+    expect(contextLine).not.toContain('checkpoint_');
   });
 
   it('does not persist tool-call preambles as visible assistant replies', async () => {

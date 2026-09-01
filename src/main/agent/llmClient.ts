@@ -29,12 +29,15 @@ const RETRY_MAX_DELAY_MS = 2000;
 const CONTEXT_COMPRESSION_THRESHOLD = 0.8;
 const MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR = 1024;
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
+const INTERACTIVE_CONTEXT_SOFT_BUDGET_TOKENS = 96_000;
 const MIN_CONTEXT_SUMMARY_TOKENS = 512;
 const MAX_CONTEXT_SUMMARY_TOKENS = 24_000;
 const RECENT_CONTEXT_BLOCKS = 6;
 const CONTEXT_RETRY_COMPRESSION_RATIO = 0.65;
 const MODEL_CONTEXT_PROBE_MAX_TOKENS = 99_999_999;
 const MODEL_CONTEXT_PROBE_TIMEOUT_MS = 5000;
+const MODEL_CONTEXT_WINDOW_CACHE = new Map<string, number | undefined>();
+type ContextCompressionMode = 'turn_boundary' | 'iteration' | 'provider_retry';
 
 const MODEL_CONTEXT_WINDOW_HINTS: Array<[RegExp, number]> = [
   [/^gpt-5\.6(?:-|$)|^gpt-5\.6$/i, 1_050_000],
@@ -81,48 +84,28 @@ function modelContextHint(model: string): number | undefined {
   return MODEL_CONTEXT_WINDOW_HINTS.find(([pattern]) => pattern.test(clean))?.[1];
 }
 
-function readNumericField(value: unknown): number | undefined {
-  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return Math.floor(value);
-  if (typeof value !== 'string') return undefined;
-  const compact = value.trim().toLowerCase();
-  const match = /^(\d+(?:\.\d+)?)\s*([kmb])?$/.exec(compact);
-  if (!match) return undefined;
-  const base = Number(match[1]);
-  if (!Number.isFinite(base) || base <= 0) return undefined;
-  const suffix = match[2];
-  const multiplier = suffix === 'm' ? 1_000_000 : suffix === 'k' ? 1_000 : suffix === 'b' ? 1_000_000_000 : 1;
-  return Math.floor(base * multiplier);
+export function clearModelContextWindowCacheForTests(): void {
+  MODEL_CONTEXT_WINDOW_CACHE.clear();
 }
 
-function modelMetadataContextTokens(metadata: unknown): number | undefined {
-  if (!metadata || typeof metadata !== 'object') return undefined;
-  const queue: unknown[] = [metadata];
-  const seen = new Set<unknown>();
-  const names = new Set([
-    'context_window',
-    'context_length',
-    'context_size',
-    'max_context_length',
-    'max_context_tokens',
-    'max_model_len',
-    'max_sequence_length',
-    'max_seq_len',
-    'input_token_limit',
-    'max_input_tokens'
-  ]);
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || typeof current !== 'object' || seen.has(current)) continue;
-    seen.add(current);
-    for (const [key, value] of Object.entries(current as Record<string, unknown>)) {
-      if (names.has(key.toLowerCase())) {
-        const parsed = readNumericField(value);
-        if (parsed) return parsed;
-      }
-      if (value && typeof value === 'object') queue.push(value);
-    }
-  }
-  return undefined;
+function requestContextCompressionMode(request: LlmRequest): ContextCompressionMode {
+  return request.metadata?.context_compression ?? 'turn_boundary';
+}
+
+function effectiveContextBudget(
+  contextWindowTokens: number,
+  budgetRatio: number,
+  mode: ContextCompressionMode = 'turn_boundary'
+): { budgetTokens: number; windowBudgetTokens: number; softBudgetTokens: number; budgetSource: string } {
+  const windowBudgetTokens = Math.max(256, Math.floor(contextWindowTokens * budgetRatio));
+  const softBudgetTokens = Math.min(INTERACTIVE_CONTEXT_SOFT_BUDGET_TOKENS, windowBudgetTokens);
+  const useSoftBudget = mode === 'turn_boundary';
+  return {
+    budgetTokens: useSoftBudget ? softBudgetTokens : windowBudgetTokens,
+    windowBudgetTokens,
+    softBudgetTokens,
+    budgetSource: useSoftBudget && softBudgetTokens < windowBudgetTokens ? 'interactive_soft_budget' : 'context_window_ratio'
+  };
 }
 
 function parseContextLimitFromError(error: unknown): number | undefined {
@@ -130,6 +113,8 @@ function parseContextLimitFromError(error: unknown): number | undefined {
   const patterns = [
     /maximum context length is\s+(\d+)\s+tokens/i,
     /context (?:window|length|limit).*?(\d+)\s+tokens/i,
+    /max_model_len\s*=\s*(?:max_total_tokens\s*=\s*)?(\d+)/i,
+    /max_total_tokens\s*=\s*(\d+)/i,
     /max(?:imum)?(?: context)?(?: length)?[:= ]+(\d+)/i,
     /max(?:imum)?(?: model)?(?: len| length).*?(\d+)/i,
     /(?:supports|allows|allowed|limit is|at most|up to)\s+(\d+)\s+tokens/i,
@@ -164,13 +149,124 @@ function valuePreview(value: unknown, maxChars: number): string {
   if (typeof value === 'string') text = value;
   else {
     try {
-      text = JSON.stringify(value);
+      const json = JSON.stringify(value);
+      text = typeof json === 'string' ? json : String(value ?? '');
     } catch {
       text = String(value);
     }
   }
   const compact = text.replace(/\s+/g, ' ').trim();
   return compact.length > maxChars ? `${compact.slice(0, Math.max(0, maxChars - 3))}...` : compact;
+}
+
+function textValue(value: unknown): string {
+  return typeof value === 'string' ? value : (value == null ? '' : String(value));
+}
+
+function parseToolArgumentsRecord(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
+  if (typeof value !== 'string' || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function addBounded(set: Set<string>, value: unknown, maxChars = 240): void {
+  const text = typeof value === 'string' ? value.trim() : valuePreview(value, maxChars).trim();
+  if (text) set.add(text.length > maxChars ? `${text.slice(0, maxChars - 3).trimEnd()}...` : text);
+}
+
+function extractLinesMatching(text: unknown, pattern: RegExp, maxLines: number): string[] {
+  const lines: string[] = [];
+  for (const rawLine of textValue(text).replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')) {
+    const line = rawLine.trim();
+    if (!line || !pattern.test(line)) continue;
+    lines.push(line.length > 260 ? `${line.slice(0, 257).trimEnd()}...` : line);
+    if (lines.length >= maxLines) break;
+  }
+  return lines;
+}
+
+function buildCriticalContextCapsule(messages: Array<Record<string, unknown>>, query: string): string {
+  const activeTasks: string[] = [];
+  const skills = new Set<string>();
+  const references = new Set<string>();
+  const sourceFiles = new Set<string>();
+  const outputFiles = new Set<string>();
+  const constraints = new Set<string>();
+  const blockers = new Set<string>();
+  let sawSkill = false;
+  let sawDelivery = false;
+
+  const importantLinePattern = /must|required|mandatory|shall|should|verify|validate|blocked|blocker|failure|failed|error|source|evidence|skill|reference|必须|务必|一定|不要|禁止|除非|验证|检查|源文件|证据|引用|格式|目录|编号|废标|星号|评分|授权|缺少|失败|错误|阻塞/i;
+  const blockerPattern = /blocked|blocker|failed|failure|error|missing|unresolved|cannot|invalid|缺少|未完成|未读取|失败|错误|阻塞|无法|不通过/i;
+
+  for (const message of messages) {
+    const role = String(message.role ?? '');
+    const text = contentToText(message.content);
+    if (role === 'user' && text.trim()) activeTasks.push(valuePreview(text, 420));
+    if (role === 'user' || role === 'system') {
+      for (const line of extractLinesMatching(text, importantLinePattern, 10)) constraints.add(line);
+    }
+    if (role === 'assistant' || role === 'tool') {
+      for (const line of extractLinesMatching(text, blockerPattern, 8)) blockers.add(line);
+    }
+    if (role === 'tool' && String(message.name ?? '') === 'skill_view') {
+      sawSkill = true;
+      const skillName = /^# Skill(?: reference for)?:\s*(.+)$/im.exec(text)?.[1]?.trim();
+      const refPath = /^# Reference path:\s*(.+)$/im.exec(text)?.[1]?.trim();
+      if (skillName) addBounded(skills, skillName);
+      if (refPath) addBounded(references, refPath);
+      for (const line of extractLinesMatching(text, importantLinePattern, 14)) constraints.add(line);
+    }
+
+    const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls as Array<Record<string, unknown>> : [];
+    for (const call of toolCalls) {
+      const fn = call.function && typeof call.function === 'object' ? call.function as Record<string, unknown> : {};
+      const name = String(fn.name ?? '');
+      const args = parseToolArgumentsRecord(fn.arguments);
+      if (name === 'skill_view') {
+        sawSkill = true;
+        addBounded(skills, args.name);
+        addBounded(references, args.ref_path);
+      } else if (name === 'file_read') {
+        addBounded(sourceFiles, args.path);
+      } else if (name === 'file_write') {
+        sawDelivery = true;
+        addBounded(outputFiles, args.path);
+      } else if (name === 'skill_manage') {
+        sawDelivery = true;
+        addBounded(outputFiles, `skill:${String(args.name ?? '(unknown)')} ${String(args.action ?? '')}`.trim());
+      } else if (/terminal|exec|bash|shell/i.test(name)) {
+        const command = String(args.command ?? args.cmd ?? '');
+        if (/\b(Get-Content|cat|type|rg|Select-String)\b/i.test(command)) addBounded(sourceFiles, command);
+        if (/\b(apply_patch|Set-Content|Out-File|Copy-Item|Move-Item|npm run build|npm test|pytest|cargo test|uv run)\b/i.test(command)) {
+          sawDelivery = true;
+          addBounded(outputFiles, command);
+        }
+      }
+    }
+  }
+
+  if (query.trim()) constraints.add(`Current user request/query: ${valuePreview(query, 360)}`);
+  if (!sawSkill && !sawDelivery && constraints.size === 0 && blockers.size === 0) return '';
+
+  const latestTask = query.trim() ? valuePreview(query, 420) : (activeTasks.at(-1) ?? '');
+  const lines = [
+    'Critical Context Capsule:',
+    `- Active task: ${latestTask || '(unknown)'}`,
+    `- Active skill(s): ${skills.size > 0 ? [...skills].slice(-5).join('; ') : '(none recorded)'}`,
+    `- Loaded skill reference(s): ${references.size > 0 ? [...references].slice(-8).join('; ') : '(none recorded)'}`,
+    `- Source files read: ${sourceFiles.size > 0 ? [...sourceFiles].slice(-12).join('; ') : '(none recorded)'}`,
+    `- Output files created/modified: ${outputFiles.size > 0 ? [...outputFiles].slice(-12).join('; ') : '(none recorded)'}`,
+    `- Mandatory constraints: ${constraints.size > 0 ? [...constraints].slice(-18).join(' | ') : '(none recorded)'}`,
+    `- Unresolved blockers or failed checks: ${blockers.size > 0 ? [...blockers].slice(-10).join(' | ') : '(none recorded)'}`,
+    `- Required validation before final: ${sawSkill ? 'validate the deliverable against the loaded skill and references; fail if required sources or mandatory steps are missing.' : 'validate produced deliverables before presenting them as complete.'}`
+  ];
+  return lines.join('\n');
 }
 
 function tokenizeQuery(text: string): string[] {
@@ -286,6 +382,7 @@ function buildMessageBlocks(messages: Array<Record<string, unknown>>): MessageBl
 }
 
 function summarizeBlocks(blocks: MessageBlock[], targetTokens: number, query: string): string {
+  const capsule = buildCriticalContextCapsule(blocks.flatMap((block) => block.messages), query);
   const raw = blocks
     .flatMap((block) => block.messages)
     .map((message) => {
@@ -301,8 +398,9 @@ function summarizeBlocks(blocks: MessageBlock[], targetTokens: number, query: st
   return [
     'Earlier conversation history was compressed to keep the request inside the model context window.',
     'Preserve these decisions, constraints, user preferences, files touched, tool observations, and unresolved tasks:',
+    capsule,
     compressTextExtractive(raw, targetTokens, query)
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 function compressOpenAiMessagesToBudget(
@@ -311,18 +409,19 @@ function compressOpenAiMessagesToBudget(
   contextWindowTokens: number,
   query: string,
   recentBlocks = RECENT_CONTEXT_BLOCKS,
-  budgetRatio = CONTEXT_COMPRESSION_THRESHOLD
-): { messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens: number } {
-  const budgetTokens = Math.max(256, Math.floor(contextWindowTokens * budgetRatio));
+  budgetRatio = CONTEXT_COMPRESSION_THRESHOLD,
+  mode: ContextCompressionMode = 'turn_boundary'
+): { messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens: number; windowBudgetTokens: number; softBudgetTokens: number; budgetSource: string } {
+  const { budgetTokens, windowBudgetTokens, softBudgetTokens, budgetSource } = effectiveContextBudget(contextWindowTokens, budgetRatio, mode);
   const beforeTokens = estimateOpenAiPromptTokens(messages, tools);
   if (beforeTokens <= budgetTokens) {
-    return { messages, compressed: false, beforeTokens, afterTokens: beforeTokens, budgetTokens };
+    return { messages, compressed: false, beforeTokens, afterTokens: beforeTokens, budgetTokens, windowBudgetTokens, softBudgetTokens, budgetSource };
   }
 
   const sanitized = stripHistoricalAttachments(messages);
   if (estimateOpenAiPromptTokens(sanitized, tools) <= budgetTokens) {
     const afterTokens = estimateOpenAiPromptTokens(sanitized, tools);
-    return { messages: sanitized, compressed: true, beforeTokens, afterTokens, budgetTokens };
+    return { messages: sanitized, compressed: true, beforeTokens, afterTokens, budgetTokens, windowBudgetTokens, softBudgetTokens, budgetSource };
   }
 
   const systemMessages = sanitized.filter((message) => message.role === 'system');
@@ -352,9 +451,46 @@ function compressOpenAiMessagesToBudget(
       nextMessages = shrinkLargestMessages(nextMessages, tools, budgetTokens, query);
       afterTokens = estimateOpenAiPromptTokens(nextMessages, tools);
     }
-    return { messages: nextMessages, compressed: true, beforeTokens, afterTokens, budgetTokens };
+    return { messages: nextMessages, compressed: true, beforeTokens, afterTokens, budgetTokens, windowBudgetTokens, softBudgetTokens, budgetSource };
   }
-  return compressOpenAiMessagesToBudget(sanitized, tools, contextWindowTokens, query, Math.max(1, Math.floor(suffixCount / 2)), budgetRatio);
+  return compressOpenAiMessagesToBudget(sanitized, tools, contextWindowTokens, query, Math.max(1, Math.floor(suffixCount / 2)), budgetRatio, mode);
+}
+
+function logContextCompression(event: {
+  provider: string;
+  model: string;
+  beforeTokens: number;
+  afterTokens: number;
+  budgetTokens: number;
+  windowBudgetTokens?: number;
+  softBudgetTokens?: number;
+  budgetSource?: string;
+  mode?: ContextCompressionMode;
+  contextWindowTokens: number;
+  budgetRatio: number;
+  triggerReason: string;
+}): void {
+  const windowBudget = event.windowBudgetTokens ?? Math.max(256, Math.floor(event.contextWindowTokens * event.budgetRatio));
+  const budgetSource = event.budgetSource ?? (event.budgetTokens < windowBudget ? 'interactive_soft_budget' : 'context_window_ratio');
+  const triggerCondition = budgetSource === 'interactive_soft_budget'
+    ? `${event.beforeTokens} > ${event.budgetTokens} (interactive soft budget; ${Math.round(event.budgetRatio * 100)}% of ${event.contextWindowTokens} = ${windowBudget})`
+    : `${event.beforeTokens} > ${event.budgetTokens} (${Math.round(event.budgetRatio * 100)}% of ${event.contextWindowTokens})`;
+  console.info(`[llm][context-compression] ${JSON.stringify({
+    at: new Date().toISOString(),
+    provider: event.provider,
+    model: event.model,
+    before_tokens: event.beforeTokens,
+    after_tokens: event.afterTokens,
+    budget_tokens: event.budgetTokens,
+    window_budget_tokens: windowBudget,
+    soft_budget_tokens: event.softBudgetTokens,
+    budget_source: budgetSource,
+    context_compression: event.mode,
+    context_window_tokens: event.contextWindowTokens,
+    budget_ratio: event.budgetRatio,
+    trigger_reason: event.triggerReason,
+    trigger_condition: triggerCondition
+  })}`);
 }
 
 function shrinkLargestMessages(
@@ -993,8 +1129,6 @@ function parseAnthropicCompletion(json: any): LlmCompletion {
 }
 
 class ModelClient implements LlmClient {
-  private readonly modelContextCache = new Map<string, number | undefined>();
-
   constructor(private readonly config: AppConfig) {}
 
   async complete(request: LlmRequest): Promise<LlmCompletion> {
@@ -1132,39 +1266,52 @@ class ModelClient implements LlmClient {
       if (!response.body) throw new Error('LLM stream response did not include a readable body.');
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buffer = '';
-      let doneEventSeen = false;
+      let streamFinished = false;
+      try {
+        let buffer = '';
+        let doneEventSeen = false;
 
-      while (true) {
-        const next = await reader.read();
-        if (next.done) break;
-        buffer += decoder.decode(next.value, { stream: true });
-        buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
         while (true) {
-          const boundary = buffer.indexOf('\n\n');
-          if (boundary < 0) break;
-          const eventBlock = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
-          const status = processSseEventBlock(eventBlock, onJsonEvent);
-          if (status === 'open') {
-            buffer = `${eventBlock}\n${buffer}`;
-            continue;
+          const next = await reader.read();
+          if (next.done) break;
+          buffer += decoder.decode(next.value, { stream: true });
+          buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+          while (true) {
+            const boundary = buffer.indexOf('\n\n');
+            if (boundary < 0) break;
+            const eventBlock = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2);
+            const status = processSseEventBlock(eventBlock, onJsonEvent);
+            if (status === 'open') {
+              buffer = `${eventBlock}\n${buffer}`;
+              continue;
+            }
+            doneEventSeen = status === 'done';
+            if (doneEventSeen) break;
           }
-          doneEventSeen = status === 'done';
           if (doneEventSeen) break;
         }
-        if (doneEventSeen) break;
-      }
-      buffer += decoder.decode();
-      buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-      if (!doneEventSeen) {
-        const trimmed = buffer.trim();
-        if (trimmed) {
-          doneEventSeen = processSseEventBlock(trimmed, onJsonEvent, { final: true }) === 'done';
+        buffer += decoder.decode();
+        buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+        if (!doneEventSeen) {
+          const trimmed = buffer.trim();
+          if (trimmed) {
+            doneEventSeen = processSseEventBlock(trimmed, onJsonEvent, { final: true }) === 'done';
+          }
+        }
+        streamFinished = true;
+        return;
+      } finally {
+        if (!streamFinished) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Ignore cancellation cleanup failures; the original parse/network error is more useful.
+          }
         }
       }
-      return;
     }
   }
 
@@ -1255,26 +1402,33 @@ class ModelClient implements LlmClient {
   ): Promise<{ messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens?: number }> {
     const messages = normalizeOpenAiCompatibleMessages(request.messages, this.config.provider);
     const estimatedTokens = estimateOpenAiPromptTokens(messages, request.tools);
-    const localHint = modelContextHint(this.config.model) ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
-    const shouldResolveContext =
-      estimatedTokens > Math.floor(localHint * CONTEXT_COMPRESSION_THRESHOLD) ||
-      estimatedTokens > MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR;
-    const contextWindowTokens = shouldResolveContext
-      ? (await this.resolveModelContextWindow(headers, request)) ?? localHint
+    const compressionMode = requestContextCompressionMode(request);
+    const explicitHint = modelContextHint(this.config.model);
+    const localHint = explicitHint ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    const cacheKey = `${normalizeBase(this.config.baseUrl)}\n${this.config.model}`;
+    let contextWindowTokens = MODEL_CONTEXT_WINDOW_CACHE.has(cacheKey)
+      ? MODEL_CONTEXT_WINDOW_CACHE.get(cacheKey) ?? localHint
       : localHint;
-    return this.compressOpenAiRequest(request, contextWindowTokens, messages);
+    if (!MODEL_CONTEXT_WINDOW_CACHE.has(cacheKey)) {
+      const localBudget = effectiveContextBudget(localHint, CONTEXT_COMPRESSION_THRESHOLD, compressionMode).budgetTokens;
+      const shouldResolveContext =
+        estimatedTokens > localBudget ||
+        (explicitHint === undefined && estimatedTokens > MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR);
+      contextWindowTokens = shouldResolveContext
+        ? (await this.resolveModelContextWindow(headers, request)) ?? localHint
+        : localHint;
+    }
+    return this.compressOpenAiRequest(request, contextWindowTokens, messages, CONTEXT_COMPRESSION_THRESHOLD, 'estimated_prompt_tokens_exceed_context_budget', compressionMode);
   }
 
   private async resolveModelContextWindow(headers: Record<string, string>, request: LlmRequest): Promise<number | undefined> {
     const cacheKey = `${normalizeBase(this.config.baseUrl)}\n${this.config.model}`;
-    if (this.modelContextCache.has(cacheKey)) return this.modelContextCache.get(cacheKey);
+    if (MODEL_CONTEXT_WINDOW_CACHE.has(cacheKey)) return MODEL_CONTEXT_WINDOW_CACHE.get(cacheKey);
     const chatEndpoint = `${normalizeBase(this.config.baseUrl)}/chat/completions`;
     const probeDetail = await this.postContextProbe(chatEndpoint, headers, request);
     const probeTokens = probeDetail ? parseContextLimitFromError(probeDetail) : undefined;
-    const modelEndpoint = `${normalizeBase(this.config.baseUrl)}/models/${encodeURIComponent(this.config.model)}`;
-    const json = probeTokens ? undefined : await this.getJson(modelEndpoint, headers, request);
-    const tokens = probeTokens ?? modelMetadataContextTokens(json) ?? modelContextHint(this.config.model);
-    this.modelContextCache.set(cacheKey, tokens);
+    const tokens = probeTokens ?? modelContextHint(this.config.model);
+    MODEL_CONTEXT_WINDOW_CACHE.set(cacheKey, tokens);
     return tokens;
   }
 
@@ -1282,11 +1436,30 @@ class ModelClient implements LlmClient {
     request: LlmRequest,
     contextWindowTokens: number,
     normalizedMessages?: Array<Record<string, unknown>>,
-    budgetRatio = CONTEXT_COMPRESSION_THRESHOLD
+    budgetRatio = CONTEXT_COMPRESSION_THRESHOLD,
+    triggerReason = 'estimated_prompt_tokens_exceed_context_budget',
+    mode: ContextCompressionMode = requestContextCompressionMode(request)
   ): { messages: Array<Record<string, unknown>>; compressed: boolean; beforeTokens: number; afterTokens: number; budgetTokens: number } {
     const messages = normalizedMessages ?? normalizeOpenAiCompatibleMessages(request.messages, this.config.provider);
     const query = [...request.messages].reverse().find((message) => message.role === 'user')?.content ?? '';
-    return compressOpenAiMessagesToBudget(messages, request.tools, contextWindowTokens, query, RECENT_CONTEXT_BLOCKS, budgetRatio);
+    const result = compressOpenAiMessagesToBudget(messages, request.tools, contextWindowTokens, query, RECENT_CONTEXT_BLOCKS, budgetRatio, mode);
+    if (result.compressed) {
+      logContextCompression({
+        provider: this.config.provider,
+        model: this.config.model,
+        beforeTokens: result.beforeTokens,
+        afterTokens: result.afterTokens,
+        budgetTokens: result.budgetTokens,
+        windowBudgetTokens: result.windowBudgetTokens,
+        softBudgetTokens: result.softBudgetTokens,
+        budgetSource: result.budgetSource,
+        mode,
+        contextWindowTokens,
+        budgetRatio,
+        triggerReason
+      });
+    }
+    return result;
   }
 
   private async postJsonWithContextRetry(
@@ -1301,7 +1474,7 @@ class ModelClient implements LlmClient {
     } catch (error) {
       const contextWindowTokens = parseContextLimitFromError(error);
       if (!contextWindowTokens) throw error;
-      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO);
+      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO, 'provider_context_limit_error', 'provider_retry');
       return this.postJson(endpoint, headers, { ...body, messages: retry.messages }, request);
     }
   }
@@ -1384,7 +1557,7 @@ class ModelClient implements LlmClient {
     } catch (error) {
       const contextWindowTokens = parseContextLimitFromError(error);
       if (!contextWindowTokens) throw error;
-      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO);
+      const retry = this.compressOpenAiRequest(request, contextWindowTokens, undefined, CONTEXT_RETRY_COMPRESSION_RATIO, 'provider_context_limit_error', 'provider_retry');
       body = { ...body, messages: retry.messages };
       content = '';
       reasoningContent = '';

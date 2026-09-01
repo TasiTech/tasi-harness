@@ -147,7 +147,8 @@ describe('SessionStore', () => {
       expect(raw).toContain('I will call the file tool before answering.');
       expect(full?.messages[1]?.content).toBe('I will call the file tool before answering.');
       expect(full?.messages[1]?.hidden).toBe(true);
-      expect(display?.messages[1]?.content).toBe('I will call the file tool before answering.');
+      expect(display?.messages.some((message) => message.hidden === true)).toBe(false);
+      expect(display?.messages.some((message) => message.content === 'I will call the file tool before answering.')).toBe(false);
       expect(search).toHaveLength(0);
       expect(optimization.context).not.toContain('before answering');
       expect(optimization.context).toContain('Done.');

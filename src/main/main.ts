@@ -351,6 +351,29 @@ function isAbortLikeError(error: unknown): boolean {
   return /operation was aborted|session stopped by user|aborted/i.test(error.message);
 }
 
+function abortReasonText(controller: AbortController): string {
+  const reason = controller.signal.reason;
+  if (typeof reason === 'string' && reason.trim()) return reason.trim();
+  if (reason instanceof Error && reason.message.trim()) return reason.message.trim();
+  return 'unknown';
+}
+
+function abortChatController(controller: AbortController, reason: string): void {
+  try {
+    controller.abort(reason);
+  } catch {
+    controller.abort();
+  }
+}
+
+function chatAbortError(controller: AbortController): Error {
+  const reason = abortReasonText(controller);
+  if (reason === 'agent:stop') return new Error('Session stopped by user.');
+  if (reason === 'app:before-quit') return new Error('Session stopped because the app is quitting.');
+  if (reason === 'web-contents-destroyed') return new Error('Session stopped because the chat window was closed or reloaded.');
+  return new Error(`Session stopped by harness abort signal (${reason}).`);
+}
+
 const LIVE_TASK_INTERIM_PATTERNS = [
   /\b(background\s+task|task)\b.{0,40}\b(queued|submitted|created|started|running)\b/i,
   /\b(queued|submitted|created|started)\b.{0,40}\b(background\s+task|task)\b/i,
@@ -361,8 +384,12 @@ const LIVE_TASK_INTERIM_PATTERNS = [
   /\b(please wait|one moment|hold on|let me check|i'?ll check|i will check)\b/i
 ];
 
-function isLiveTaskInterimAssistantContent(content: string): boolean {
-  const text = content.replace(/\s+/g, ' ').trim();
+function textValue(value: unknown): string {
+  return typeof value === 'string' ? value : (value == null ? '' : String(value));
+}
+
+function isLiveTaskInterimAssistantContent(content: unknown): boolean {
+  const text = textValue(content).replace(/\s+/g, ' ').trim();
   if (!text || text.length > 220) return false;
   return LIVE_TASK_INTERIM_PATTERNS.some((pattern) => pattern.test(text));
 }
@@ -383,8 +410,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
 }
 
-function escapeHtmlText(input: string): string {
-  return input
+function escapeHtmlText(input: unknown): string {
+  return textValue(input)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
@@ -757,14 +784,14 @@ function buildBuiltinSkillCreatorGuide(): string {
   ].join('\n\n');
 }
 
-function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
+function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content?: string; createdAt?: string }> }): string {
   const lines = [
     `Iterations: ${result.iterations}`,
     `Execution mode: ${result.execution.mode}`,
     `Tool events: ${result.toolEvents.length}`
   ];
   for (const event of result.toolEvents) {
-    const preview = event.content.replace(/\s+/g, ' ').slice(0, 140);
+    const preview = textValue(event.content).replace(/\s+/g, ' ').slice(0, 140);
     lines.push(`- [${event.ok ? 'ok' : 'fail'}] ${event.toolName}${event.createdAt ? ` @ ${event.createdAt}` : ''} :: ${preview}`);
   }
   return lines.join('\n');
@@ -2533,7 +2560,7 @@ function registerIpc(): void {
         totalUsage: usageRecord.totalUsage
       };
     } catch (error) {
-      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      if (controller.signal.aborted) throw chatAbortError(controller);
       logAgentChatError({
         error,
         input,
@@ -2615,7 +2642,7 @@ function registerIpc(): void {
         totalUsage: usageRecord.totalUsage
       };
     } catch (error) {
-      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      if (controller.signal.aborted) throw chatAbortError(controller);
       logAgentChatError({
         error,
         input,
@@ -2635,7 +2662,7 @@ function registerIpc(): void {
     const controller = activeChatControllers.get(senderId);
     let stoppedChat = 0;
     if (controller) {
-      controller.abort();
+      abortChatController(controller, 'agent:stop');
       stoppedChat = 1;
     }
     const wechatControllers = [...activeWechatRuns.values()];
@@ -2988,7 +3015,7 @@ app.on('before-quit', () => {
   liveRealtimeManager.stop();
   denyPendingToolApprovals();
   browserCoachRecorder.close();
-  for (const controller of activeChatControllers.values()) controller.abort();
+  for (const controller of activeChatControllers.values()) abortChatController(controller, 'app:before-quit');
   activeChatControllers.clear();
   stopWechatPoller();
   void closeExternalBrowserPreview();
@@ -3006,7 +3033,7 @@ app.whenReady().then(() => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;
       const controller = activeChatControllers.get(contents.id);
       if (controller) {
-        controller.abort();
+        abortChatController(controller, 'web-contents-destroyed');
         activeChatControllers.delete(contents.id);
       }
     });

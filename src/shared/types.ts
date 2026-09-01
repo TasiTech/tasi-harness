@@ -162,6 +162,7 @@ export interface LlmRequestMetadata {
   session?: string;
   turn_type?: string;
   session_done?: boolean;
+  context_compression?: 'turn_boundary' | 'iteration' | 'provider_retry';
 }
 
 export interface LlmRequest {

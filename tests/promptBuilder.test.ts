@@ -32,6 +32,28 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('shell.openExternal fallback');
   });
 
+  it('separates stable system instructions from volatile runtime context', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home)
+    );
+
+    const prompt = await builder.buildForMessages(defaultConfig(), { sessionId: 'session_cache', userInput: 'remember this' });
+
+    expect(prompt.systemPrompt).toContain('## Operating model');
+    expect(prompt.systemPrompt).toContain('## Installed skills index');
+    expect(prompt.systemPrompt).toContain('Current session id: session_cache');
+    expect(prompt.systemPrompt).not.toContain('Current timestamp:');
+    expect(prompt.systemPrompt).not.toContain('## Persistent memory snapshot');
+    expect(prompt.runtimeContext).toContain('Current timestamp:');
+    expect(prompt.runtimeContext).toContain('## Persistent memory snapshot');
+    expect(prompt.displayPrompt).toContain(prompt.systemPrompt);
+    expect(prompt.displayPrompt).toContain(prompt.runtimeContext);
+  });
+
   it('tells the agent to follow relevant skill workflows instead of skipping to a self-generated answer', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

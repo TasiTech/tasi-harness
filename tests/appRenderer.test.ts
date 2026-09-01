@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { extractCitationLinks, normalizeCitationHref } from '../src/renderer/citations';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from '../src/renderer/markdown';
-import { assistantContentListView, assistantLiveContentPreviewText, isVisibleChatMessage, reasoningPanelText } from '../src/renderer/App';
+import { assistantContentListView, assistantLiveContentPreviewText, decodeLikelyPercentEncodedChineseText, isVisibleChatMessage, reasoningPanelText } from '../src/renderer/App';
 
 function escapeAttr(value: string): string {
   return value.replaceAll('&', '&amp;');
@@ -98,6 +98,20 @@ describe('assistantContentListView', () => {
     expect(view.items[0]).toBe('第一段回复。');
     expect(view.items[1]).toContain('const value = 1;\n\nconsole.log(value);');
     expect(view.items[2]).toBe('- 后续条目');
+  });
+});
+
+describe('decodeLikelyPercentEncodedChineseText', () => {
+  it('decodes pasted URL-encoded Chinese in user-visible text', () => {
+    const raw = 'c:\\Users\\hujuntao\\.tasi-harness\\sessions\\session_mtfoi7vl_lfndcngk.json %E7%BB%93%E5%90%88session %E8%AE%B0%E5%BD%95%E5%88%86%E6%9E%90';
+
+    expect(decodeLikelyPercentEncodedChineseText(raw)).toBe(
+      'c:\\Users\\hujuntao\\.tasi-harness\\sessions\\session_mtfoi7vl_lfndcngk.json 结合session 记录分析'
+    );
+  });
+
+  it('leaves non-Chinese percent encodings unchanged', () => {
+    expect(decodeLikelyPercentEncodedChineseText('progress 100% and file%20name')).toBe('progress 100% and file%20name');
   });
 });
 

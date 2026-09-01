@@ -191,6 +191,25 @@ function appendPreviewText(current: string | undefined, delta: string | undefine
   return combined.length > maxChars ? combined.slice(-maxChars).trimStart() : combined;
 }
 
+const PERCENT_ENCODED_UTF8_RUN = /(?:%[0-9A-Fa-f]{2}){2,}/g;
+const CJK_TEXT = /[\u3400-\u9fff\uf900-\ufaff]/;
+
+export function decodeLikelyPercentEncodedChineseText(content: string): string {
+  if (!content.includes('%')) return content;
+  let decodedAny = false;
+  const decoded = content.replace(PERCENT_ENCODED_UTF8_RUN, (match) => {
+    try {
+      const value = decodeURIComponent(match);
+      if (!CJK_TEXT.test(value)) return match;
+      decodedAny = true;
+      return value;
+    } catch {
+      return match;
+    }
+  });
+  return decodedAny ? decoded : content;
+}
+
 function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaStream): AgentMessage[] {
   const existingIndex = messages.findIndex((message) => message.id === payload.messageId);
   if (existingIndex < 0) {
@@ -2358,7 +2377,7 @@ function ChatPage(props: {
   }
 
   async function submitMessage(rawText: string): Promise<void> {
-    const text = rawText.trim();
+    const text = decodeLikelyPercentEncodedChineseText(rawText).trim();
     const outgoingAttachments = multimediaAttachments;
     if ((!text && outgoingAttachments.length === 0) || props.busy) return;
     setInput('');
@@ -2396,7 +2415,7 @@ function ChatPage(props: {
   }
 
   async function submitLiveMessage(rawText: string): Promise<void> {
-    const text = rawText.trim();
+    const text = decodeLikelyPercentEncodedChineseText(rawText).trim();
     const outgoingAttachments = multimediaAttachments;
     const outgoingDocuments = activeSessionDocs;
     if ((!text && outgoingAttachments.length === 0 && outgoingDocuments.length === 0) || !liveInputReady) return;
@@ -3585,11 +3604,12 @@ function assistantExportTitle(content: string): string {
 
 function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
+  const content = message.role === 'user' ? decodeLikelyPercentEncodedChineseText(message.content) : message.content;
   return (
     <div className={`msg-row ${role}`}>
       <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
       <div className="msg-bubble-wrap">
-        <div className="msg-bubble">{renderMarkdownContent(message.content, `msg-${message.id ?? 'x'}`)}</div>
+        <div className="msg-bubble">{renderMarkdownContent(content, `msg-${message.id ?? 'x'}`)}</div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
     </div>
@@ -3635,7 +3655,8 @@ function MessageBubbleComponent({
   const [fullContentParts, setFullContentParts] = useState<string[] | undefined>();
   const [loadingFull, setLoadingFull] = useState(false);
   const [loadError, setLoadError] = useState('');
-  const content = fullContent ?? message.content;
+  const rawContent = fullContent ?? message.content;
+  const content = message.role === 'user' ? decodeLikelyPercentEncodedChineseText(rawContent) : rawContent;
   const reasoningContent = fullReasoning ?? message.reasoning_content;
   const contentParts = fullContentParts ?? message.content_parts ?? EMPTY_STRING_ARRAY;
   const shouldUseLiveContentPreview = message.role === 'assistant' && liveContentPreview && fullContent === null;
@@ -5440,7 +5461,7 @@ function SkillsPage({
                     onChange={() => toggleOptimizeSession(session.id)}
                   />
                   <span>
-                    <strong>{session.title || session.id}</strong>
+                    <strong>{decodeLikelyPercentEncodedChineseText(session.title || session.id)}</strong>
                     <span>{prettyDate(session.updatedAt)} · {session.messageCount} {tr('messages', '条消息')}</span>
                     <code>{session.id}</code>
                   </span>
@@ -5823,7 +5844,7 @@ function SessionsPage({
               return (
                 <div className="session-card" key={s.id}>
                   <div className="session-card-main">
-                    <strong>{s.title}</strong>
+                    <strong>{decodeLikelyPercentEncodedChineseText(s.title)}</strong>
                     <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
                     <div className="session-card-badges">
                       {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
