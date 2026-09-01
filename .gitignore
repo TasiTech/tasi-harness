@@ -7,3 +7,4 @@ coverage/
 *.log
 .tasi-harness-test/
 workspace/
+.tmp
