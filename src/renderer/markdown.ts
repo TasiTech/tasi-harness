@@ -2,6 +2,7 @@ import { normalizeCitationHref } from './citations.js';
 import katex from 'katex';
 
 const BARE_HTTP_URL_RE = /(^|[\s(>])((https?:\/\/[^\s<)]+))/gi;
+const MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\(((?:https?:\/\/|\/|data:image\/[^;]+;base64,)[^)\n]+)\)/g;
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\(((?:https?:\/\/|\/)[^)\n]+)\)/g;
 const INLINE_TOKEN_RE = /@@INLINE_TOKEN_(\d+)@@/g;
 
@@ -93,6 +94,12 @@ function renderMarkdownLink(label: string, href: string): string {
     return `<sup class="msg-cite-ref"><a href="${escapedHref}" target="_blank" rel="noreferrer" title="${escapedHref}">${label}</a></sup>`;
   }
   return `<a href="${escapedHref}" target="_blank" rel="noreferrer">${label}</a>`;
+}
+
+function renderMarkdownImage(label: string, src: string): string {
+  const escapedSrc = escapeHtml(src.trim());
+  const escapedAlt = escapeHtml(label.trim());
+  return `<img class="msg-inline-image" src="${escapedSrc}" alt="${escapedAlt}" loading="lazy" />`;
 }
 
 function tokenFor(index: number): string {
@@ -224,6 +231,7 @@ function renderInlineHtml(text: string): string {
   const inlineTokens: string[] = [];
   const protectedText = protectMath(protectInlineCode(text, inlineTokens), inlineTokens);
   let html = escapeHtml(protectedText);
+  html = html.replace(MARKDOWN_IMAGE_RE, (_match, label: string, src: string) => renderMarkdownImage(label, src));
   html = html.replace(MARKDOWN_LINK_RE, (_match, label: string, href: string) => renderMarkdownLink(label, href));
   html = html.replace(BARE_HTTP_URL_RE, (_match, prefix: string, url: string) => {
     const safePrefix = prefix ?? '';

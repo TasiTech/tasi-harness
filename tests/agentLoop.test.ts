@@ -11,7 +11,7 @@ import { SkillManager } from '../src/main/skills/skillManager.js';
 import { defaultConfig, ensureDir } from '../src/main/storage/pathUtils.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
-import type { AgentMessageDeltaStream, LlmCompletion, LlmRequest } from '../src/shared/types.js';
+import type { AgentMessageDeltaStream, DshSidecarRuntimeStatus, LlmCompletion, LlmRequest, RegisteredTool } from '../src/shared/types.js';
 import { tempHome } from './helpers.js';
 
 let cleanup = () => {};
@@ -62,6 +62,13 @@ describe('AgentLoop', () => {
     const result = await loop.run({ userInput: 'write a file' });
     expect(result.finalResponse).toBe('Done.');
     expect(result.toolEvents).toHaveLength(1);
+    expect(result.messages.at(-1)?.artifacts?.[0]).toMatchObject({
+      name: 'answer.txt',
+      path: 'answer.txt',
+      ext: '.txt',
+      kind: 'text',
+      previewMode: 'text'
+    });
     expect(existsSync(join(cfg.workspaceDir, 'answer.txt'))).toBe(true);
     expect(readFileSync(join(cfg.workspaceDir, 'answer.txt'), 'utf8')).toBe('42');
     const storedMemory = memory.getState({ target: 'memory', sessionId: result.sessionId, includeGlobal: false }).entries;
@@ -131,6 +138,140 @@ describe('AgentLoop', () => {
     expect(secondMessages.at(-1)?.content).toContain('second request');
     expect(secondMessages.at(-1)?.content).toContain('## Runtime context');
     expect(sessions.read(result.sessionId)?.messages[0]?.content).toBe('first request');
+  });
+
+  it('can run an internal followup without persisting or duplicating user turns', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 1 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const session = sessions.create('Plugin turn');
+    sessions.appendMessages(session.id, [{
+      id: 'msg_visible_user',
+      role: 'user',
+      content: '@nanmicoder/dsh-agent-teams explain weather',
+      createdAt: '2026-09-02T00:00:00.000Z'
+    }]);
+    const registry = new ToolRegistry();
+    let capturedRequest: LlmRequest | undefined;
+    const client: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        capturedRequest = JSON.parse(JSON.stringify(request)) as LlmRequest;
+        return { message: { role: 'assistant', content: 'Done.' } };
+      }
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (record) => {
+        void memory.syncSessionMemory(record);
+      }
+    });
+
+    const result = await loop.run({
+      sessionId: session.id,
+      userInput: '/agent-teams explain weather',
+      stream: false,
+      persistUserMessage: false,
+      omitHistoryMessageIds: ['msg_visible_user']
+    });
+
+    expect(result.finalResponse).toBe('Done.');
+    const requestUsers = capturedRequest?.messages.filter((message) => message.role === 'user') ?? [];
+    expect(requestUsers).toHaveLength(1);
+    expect(requestUsers[0]?.content).toContain('/agent-teams explain weather');
+    expect(requestUsers[0]?.content).not.toContain('@nanmicoder/dsh-agent-teams explain weather');
+    expect(sessions.read(session.id)?.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
+  });
+
+  it('enables referenced DSH plugin tools for the current turn with @ syntax', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 2, enabledToolNames: [] };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const pluginTool: RegisteredTool = {
+      definition: {
+        type: 'function',
+        function: {
+          name: 'demo_plugin_tool',
+          description: 'Demo plugin tool.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      safety: 'stateful',
+      execute: async () => ({ ok: true, content: 'ok' })
+    };
+    registry.register(pluginTool);
+    const requests: LlmRequest[] = [];
+    const client: LlmClient = {
+      async complete(request: LlmRequest): Promise<LlmCompletion> {
+        requests.push(JSON.parse(JSON.stringify(request)) as LlmRequest);
+        return { message: { role: 'assistant', content: 'Done.' } };
+      }
+    };
+    const runtimeStatus: DshSidecarRuntimeStatus = {
+      status: {
+        available: true,
+        running: true,
+        protocolVersion: 1,
+        home: env.home,
+        profileName: 'default',
+        profileDir: join(env.home, 'profile')
+      },
+      plugins: [{
+        id: 'demo-plugin',
+        packageName: '@owner/demo-plugin',
+        version: '1.0.0',
+        enabled: true,
+        status: 'loaded',
+        tools: ['demo_plugin_tool'],
+        commands: ['/demo-plugin'],
+        settingsEntries: ['Demo Plugin']
+      }],
+      tools: [pluginTool.definition]
+    };
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => client,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      },
+      getDshRuntimeStatus: async () => runtimeStatus
+    });
+
+    await loop.run({ userInput: '@demo-plugin handle this', stream: false });
+
+    expect(requests[0]?.tools?.map((tool) => tool.function.name)).toEqual(['demo_plugin_tool']);
+    expect(requests[0]?.messages.at(-1)?.content).toContain('## DSH Plugin References');
+    expect(requests[0]?.messages.at(-1)?.content).toContain('@demo-plugin -> @owner/demo-plugin (loaded)');
+    expect(requests[0]?.messages.at(-1)?.content).toContain('Tools: demo_plugin_tool');
   });
 
   it('repairs a skill-driven final answer when delivery validation fails', async () => {

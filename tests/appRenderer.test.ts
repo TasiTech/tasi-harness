@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { extractCitationLinks, normalizeCitationHref } from '../src/renderer/citations';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from '../src/renderer/markdown';
-import { assistantContentListView, assistantLiveContentPreviewText, decodeLikelyPercentEncodedChineseText, isVisibleChatMessage, reasoningPanelText } from '../src/renderer/App';
+import { reasoningPanelText } from '../src/shared/reasoningPreview';
+import { artifactSelectionContextPrompt, artifactSelectionQuestionPrompt, assistantContentListView, assistantLiveContentPreviewText, decodeLikelyPercentEncodedChineseText, findPluginMentionTrigger, isVisibleChatMessage, mergeMessageDelta, pluginMentionItems, pluginMentionToken } from '../src/renderer/appHelpers';
+import type { AgentArtifactRef, DshSidecarRuntimeStatus } from '../src/shared/types';
 
 function escapeAttr(value: string): string {
   return value.replaceAll('&', '&amp;');
@@ -126,6 +128,37 @@ describe('assistantLiveContentPreviewText', () => {
   });
 });
 
+describe('artifact selection prompt helpers', () => {
+  const artifact: AgentArtifactRef = {
+    id: 'artifact_py',
+    name: 'demo.py',
+    path: 'demo.py',
+    absPath: 'D:\\workspace\\demo.py',
+    ext: '.py',
+    kind: 'text',
+    previewMode: 'code',
+    mimeType: 'text/x-python',
+    sizeBytes: 120,
+    source: 'assistant-link'
+  };
+
+  it('builds a question prompt with selected file context', () => {
+    const prompt = artifactSelectionQuestionPrompt(artifact, 'def hello():\n    return "world"');
+
+    expect(prompt).toContain('文件：demo.py');
+    expect(prompt).toContain('路径：D:\\workspace\\demo.py');
+    expect(prompt).toContain('```text\ndef hello():\n    return "world"\n```');
+    expect(prompt.endsWith('问题：')).toBe(true);
+  });
+
+  it('builds an add-context prompt for selected file content', () => {
+    const prompt = artifactSelectionContextPrompt(artifact, 'print("ok")');
+
+    expect(prompt).toContain('文件预览中选中的内容');
+    expect(prompt).toContain('print("ok")');
+  });
+});
+
 describe('reasoningPanelText', () => {
   it('clips live reasoning from the newest reasoning parts', () => {
     const parts = [
@@ -143,6 +176,16 @@ describe('reasoningPanelText', () => {
 });
 
 describe('isVisibleChatMessage', () => {
+  it('hides internal user followup messages', () => {
+    expect(isVisibleChatMessage({
+      id: 'msg_hidden_user',
+      role: 'user',
+      hidden: true,
+      content: '/agent-teams hidden followup',
+      createdAt: '2026-09-02T00:00:00.000Z'
+    })).toBe(false);
+  });
+
   it('keeps the streamed assistant bubble visible when only prior iteration content remains', () => {
     expect(isVisibleChatMessage({
       id: 'msg_visible',
@@ -152,5 +195,99 @@ describe('isVisibleChatMessage', () => {
       content_parts: ['I will inspect first.'],
       createdAt: '2026-08-28T00:00:00.000Z'
     })).toBe(true);
+  });
+});
+
+describe('mergeMessageDelta', () => {
+  it('coalesces a late done delta with the final persisted assistant message', () => {
+    const messages = mergeMessageDelta([
+      {
+        id: 'msg_user',
+        role: 'user',
+        content: '@nanmicoder/dsh-agent-teams 介绍一下天气预报的原理',
+        createdAt: '2026-09-02T09:17:54.000Z'
+      },
+      {
+        id: 'msg_persisted',
+        role: 'assistant',
+        content: '天气预报的核心是用观测数据和物理模型推算大气变化。',
+        createdAt: '2026-09-02T09:17:55.000Z'
+      }
+    ], {
+      sessionId: 'session_test',
+      messageId: 'msg_streamed',
+      role: 'assistant',
+      type: 'done',
+      content: '天气预报的核心是用观测数据和物理模型推算大气变化。',
+      createdAt: '2026-09-02T09:17:55.000Z'
+    });
+
+    expect(messages.filter((message) => message.role === 'assistant')).toHaveLength(1);
+    expect(messages.at(-1)?.id).toBe('msg_persisted');
+  });
+});
+
+describe('plugin mention helpers', () => {
+  const runtimeStatus: DshSidecarRuntimeStatus = {
+    status: {
+      available: true,
+      running: true,
+      protocolVersion: 1,
+      home: 'home',
+      profileName: 'default',
+      profileDir: 'profile'
+    },
+    plugins: [{
+      id: 'nanmicoder-dsh-agent-teams',
+      packageName: '@nanmicoder/dsh-agent-teams',
+      version: '0.1.15',
+      enabled: true,
+      status: 'partial',
+      tools: ['agent_teams_view'],
+      commands: ['/agent-teams'],
+      settingsEntries: ['Agent Teams']
+    }, {
+      id: 'xmanrui-dsh-im',
+      packageName: '@xmanrui/dsh-im',
+      enabled: false,
+      status: 'skipped',
+      tools: []
+    }, {
+      id: 'superdesign-dsh',
+      packageName: 'superdesign-dsh',
+      version: '0.6.0',
+      enabled: true,
+      status: 'loaded',
+      tools: [],
+      commands: []
+    }],
+    tools: []
+  };
+
+  it('detects the active @ query before the cursor', () => {
+    expect(findPluginMentionTrigger('use @dsh', 8)).toEqual({ start: 4, end: 8, query: 'dsh' });
+    expect(findPluginMentionTrigger('email a@b.com', 13)).toBeNull();
+  });
+
+  it('filters installed plugins by alias and creates insert tokens', () => {
+    const items = pluginMentionItems(runtimeStatus, 'agent');
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.label).toBe('@nanmicoder/dsh-agent-teams');
+    expect(pluginMentionToken(items[0]!.plugin)).toBe('nanmicoder/dsh-agent-teams');
+  });
+
+  it('only lists enabled and runtime-available plugins', () => {
+    const items = pluginMentionItems(runtimeStatus, '');
+
+    expect(items.map((item) => item.label)).toEqual(['@nanmicoder/dsh-agent-teams', 'superdesign-dsh']);
+  });
+
+  it('lists skills-only plugins as skill providers in @ suggestions', () => {
+    const items = pluginMentionItems(runtimeStatus, 'superdesign');
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.label).toBe('superdesign-dsh');
+    expect(items[0]?.detail).toContain('skill provider');
   });
 });

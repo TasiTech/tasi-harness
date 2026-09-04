@@ -4,6 +4,9 @@ import type {
   AgentMessageAttachment,
   AgentRunResult,
   AppInfo,
+  ArtifactPathRequest,
+  ArtifactPreviewRequest,
+  ArtifactPreviewResult,
   AssistantMessageExportRequest,
   BrowserCoachGenerateSkillRequest,
   BrowserCoachGenerateSkillResult,
@@ -29,6 +32,7 @@ import type {
   PersonalKnowledgeState,
   PersonalKnowledgeUploadRequest,
   MarketplaceBrowseResult,
+  MarketplaceBrowseRequest,
   MarketplaceSkill,
   PublicAppConfig,
   ScheduledTask,
@@ -37,6 +41,8 @@ import type {
   SessionDocumentContext,
   SessionDocumentUploadRequest,
   SessionDocumentUploadResult,
+  SessionListPageRequest,
+  SessionListPageResult,
   SessionMessageContentRequest,
   SessionMessageContentResult,
   SkillArchiveUploadRequest,
@@ -55,6 +61,21 @@ import type {
   DreamSkinGalleryQuery,
   DreamSkinGalleryResult,
   DreamSkinThemeInstallRequest,
+  DshMarketplaceBrowseResult,
+  DshMarketplaceBrowseRequest,
+  DshMarketplacePluginDetail,
+  DshMarketplacePluginInstallRequest,
+  DshSidecarClientMount,
+  DshSidecarClientMountOpenRequest,
+  DshSidecarChatRunRequest,
+  DshSidecarChatRunResult,
+  DshSidecarPluginActionRequest,
+  DshSidecarPluginInstallRequest,
+  DshSidecarPluginListResult,
+  DshSidecarPluginRecord,
+  DshSidecarRuntimeStatus,
+  DshSidecarPluginUploadRequest,
+  DshSidecarStatus,
   WechatChannelQrCodePayload,
   WechatChannelLoginStatusPayload,
   SkillWriteRequest,
@@ -109,6 +130,7 @@ declare global {
       };
       sessions: {
         list(): Promise<SessionSummary[]>;
+        listPage(req?: SessionListPageRequest): Promise<SessionListPageResult>;
         read(id: string): Promise<SessionRecord | null>;
         readForDisplay(id: string): Promise<SessionRecord | null>;
         readMessageContent(req: SessionMessageContentRequest): Promise<SessionMessageContentResult>;
@@ -142,9 +164,30 @@ declare global {
         delete(name: string): Promise<boolean>;
         installBundled(name: string, overwrite?: boolean): Promise<SkillDocument>;
         uploadArchive(req: SkillArchiveUploadRequest): Promise<SkillDocument>;
-        browseMarketplace(query?: string): Promise<MarketplaceBrowseResult>;
+        browseMarketplace(req?: string | MarketplaceBrowseRequest): Promise<MarketplaceBrowseResult>;
         installFromMarketplace(req: SkillInstallRequest): Promise<MarketplaceSkill>;
         uninstallMarketplaceSkill(name: string): Promise<boolean>;
+      };
+      dshSidecar: {
+        status(): Promise<DshSidecarStatus>;
+        start(): Promise<DshSidecarStatus>;
+        stop(): Promise<DshSidecarStatus>;
+        listPlugins(): Promise<DshSidecarPluginListResult>;
+        runtimeStatus(): Promise<DshSidecarRuntimeStatus>;
+        syncRuntime(): Promise<{ toolNames: string[]; error?: string }>;
+        listClientMounts(): Promise<DshSidecarClientMount[]>;
+        openClientMount(req: DshSidecarClientMountOpenRequest): Promise<DshSidecarClientMount>;
+        chatRun(req: DshSidecarChatRunRequest): Promise<DshSidecarChatRunResult>;
+        installPlugin(req: DshSidecarPluginInstallRequest): Promise<DshSidecarPluginRecord>;
+        uploadPlugin(req: DshSidecarPluginUploadRequest): Promise<DshSidecarPluginRecord>;
+        enablePlugin(req: DshSidecarPluginActionRequest): Promise<DshSidecarPluginRecord>;
+        disablePlugin(req: DshSidecarPluginActionRequest): Promise<DshSidecarPluginRecord>;
+        uninstallPlugin(req: DshSidecarPluginActionRequest): Promise<boolean>;
+      };
+      plugins: {
+        browseMarketplace(req?: string | DshMarketplaceBrowseRequest): Promise<DshMarketplaceBrowseResult>;
+        readMarketplacePlugin(id: string): Promise<DshMarketplacePluginDetail>;
+        installFromMarketplace(req: DshMarketplacePluginInstallRequest): Promise<DshSidecarPluginRecord>;
       };
       browserCoach: {
         start(req?: BrowserCoachStartRequest): Promise<BrowserCoachRecording>;
@@ -171,6 +214,9 @@ declare global {
         info(): Promise<AppInfo>;
         selectBrandLogo(): Promise<string>;
         exportAssistantMessage(req: AssistantMessageExportRequest): Promise<ToolExecutionResult>;
+        artifactPreview(req: ArtifactPreviewRequest): Promise<ArtifactPreviewResult>;
+        openArtifact(req: ArtifactPathRequest): Promise<ToolExecutionResult>;
+        revealArtifact(req: ArtifactPathRequest): Promise<ToolExecutionResult>;
         openPath(path: string): Promise<ToolExecutionResult>;
         openExternalUrl(url: string, options?: { system?: boolean }): Promise<ToolExecutionResult>;
         closeExternalPreview(): Promise<ToolExecutionResult>;

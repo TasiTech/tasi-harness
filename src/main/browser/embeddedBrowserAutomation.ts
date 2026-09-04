@@ -1135,7 +1135,13 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     const width = clampInt(Number(options.width), 1280, 320, 3840);
     const height = clampInt(Number(options.height), 900, 240, 2400);
     const scale = Number.isFinite(Number(options.scale)) ? Math.max(0.25, Math.min(4, Number(options.scale))) : 1;
-    const wc = this.getTargetWebContents();
+    const shared = this.resolveSharedWebContents();
+    const wc = shared ?? this.ensureWindow().webContents;
+    this.trackWebContents(wc);
+    if (shared) {
+      wc.setZoomFactor(1);
+      return this.stateFrom(wc);
+    }
     const win = BrowserWindow.fromWebContents(wc) ?? this.window;
     if (win && !win.isDestroyed()) win.setContentSize(width, height);
     wc.setZoomFactor(scale);

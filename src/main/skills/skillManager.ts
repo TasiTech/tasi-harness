@@ -1,7 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import JSZip from 'jszip';
-import type { BrowserCoachRecording, BrowserCoachStoredRecording, SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
+import type { BrowserCoachRecording, BrowserCoachStoredRecording, DshSidecarRuntimeSkill, SkillArchiveUploadRequest, SkillDocument, SkillMetadata, SkillPatchRequest, SkillWriteRequest } from '../../shared/types.js';
 import { ensureDir, safeJoin, slugifyName } from '../storage/pathUtils.js';
 
 type FrontmatterValue = string | string[] | boolean | number;
@@ -47,6 +47,7 @@ function stringifySkill(frontmatter: Frontmatter, body: string): string {
 
 export class SkillManager {
   private readonly localRoot: string;
+  private readonly runtimeSkills = new Map<string, SkillDocument>();
 
   constructor(
     private readonly harnessHome: string,
@@ -86,13 +87,26 @@ export class SkillManager {
         }
         : skill);
     }
+    for (const skill of this.runtimeSkills.values()) {
+      if (!byName.has(skill.name) && !byName.has(slugifyName(skill.name))) byName.set(skill.name, skill);
+    }
     return [...byName.values()].sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
   }
 
   read(name: string): SkillDocument | null {
+    const runtime = this.runtimeSkill(name);
+    if (runtime) return runtime;
     const file = this.resolveSkillFile(name);
     if (!file) return null;
     return this.documentFromFile(file, file.startsWith(this.localRoot), file.startsWith(this.localRoot) ? 'local' : 'bundled');
+  }
+
+  setRuntimeSkills(skills: DshSidecarRuntimeSkill[]): void {
+    this.runtimeSkills.clear();
+    for (const skill of skills) {
+      const document = this.runtimeSkillDocument(skill);
+      if (document) this.runtimeSkills.set(slugifyName(document.name), document);
+    }
   }
 
   listBrowserCoachRecordings(): BrowserCoachStoredRecording[] {
@@ -268,12 +282,18 @@ export class SkillManager {
     if (skills.length === 0) return enabled ? 'No matching skills are enabled for this run.' : 'No skills are installed.';
     return skills
       .map((skill) => {
-        const skillDir = dirname(skill.path);
         const display = skill.displayName && skill.displayName !== skill.name ? `${skill.displayName} (${skill.name})` : skill.name;
         const category = skill.displayCategory && skill.displayCategory !== skill.category ? `${skill.displayCategory} (${skill.category})` : skill.category;
-        return `- ${display} [${category}]: ${skill.description} | skill_file=${skill.path} | skill_dir=${skillDir}`;
+        const description = this.compactDescription(skill.description);
+        return `- ${display} [${category}]: ${description}`;
       })
       .join('\n');
+  }
+
+  private compactDescription(description: string, maxChars = 240): string {
+    const compact = description.replace(/\s+/g, ' ').trim();
+    if (compact.length <= maxChars) return compact;
+    return `${compact.slice(0, maxChars - 1).trimEnd()}...`;
   }
 
   private findSkillFiles(root: string): string[] {
@@ -311,6 +331,34 @@ export class SkillManager {
       }
       copyFileSync(source, target);
     }
+  }
+
+  private runtimeSkill(name: string): SkillDocument | null {
+    const slug = slugifyName(name);
+    return this.runtimeSkills.get(slug) ?? [...this.runtimeSkills.values()].find((skill) => basename(dirname(skill.path)) === slug) ?? null;
+  }
+
+  private runtimeSkillDocument(skill: DshSidecarRuntimeSkill): SkillDocument | null {
+    const name = String(skill.name ?? '').trim();
+    if (!name || !skill.content?.trim()) return null;
+    const path = skill.path?.trim() || join(this.harnessHome, 'dsh-sidecar', 'runtime-skills', slugifyName(skill.pluginId || skill.packageName || 'plugin'), slugifyName(name), 'SKILL.md');
+    const updatedAt = skill.updatedAt || new Date().toISOString();
+    const { frontmatter } = parseSkillMarkdown(skill.content);
+    const category = String(frontmatter.category ?? skill.category ?? 'dsh');
+    return {
+      name,
+      displayName: typeof frontmatter.display_name === 'string' ? frontmatter.display_name : undefined,
+      description: String(frontmatter.description ?? skill.description ?? `DSH runtime skill ${name}`),
+      category,
+      displayCategory: typeof frontmatter.display_category === 'string' ? frontmatter.display_category : (skill.packageName ? `DSH (${skill.packageName})` : 'DSH'),
+      path,
+      readonly: true,
+      source: 'dsh',
+      updatedAt,
+      version: typeof frontmatter.version === 'string' ? frontmatter.version : undefined,
+      content: skill.content,
+      frontmatter
+    };
   }
 
   private metadataFromFile(file: string, readonly: boolean, source: 'bundled' | 'local'): SkillMetadata {

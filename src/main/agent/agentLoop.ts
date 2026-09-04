@@ -1,10 +1,11 @@
-import type { AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentArtifactRef, AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, DshSidecarRuntimePlugin, DshSidecarRuntimeStatus, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { extname, isAbsolute, resolve, sep } from 'node:path';
+import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import JSZip from 'jszip';
 import type { LlmClient } from './llmClient.js';
 import { createId, nowIso } from '../../shared/types.js';
 import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS, prepareMessageDeltaForDisplay } from '../../shared/reasoningPreview.js';
+import { ARTIFACT_EXTENSIONS, classifyArtifactKind, isArtifactExtension, mimeTypeForArtifact, previewModeForArtifact } from '../../shared/artifacts.js';
 import { ToolRegistry } from '../tools/toolRegistry.js';
 import { SessionStore } from '../storage/sessionStore.js';
 import { PromptBuilder } from './promptBuilder.js';
@@ -17,6 +18,10 @@ const REASONING_TOTAL_CHAR_LIMIT = 32000;
 const REASONING_ONLY_CONTINUE_LIMIT = 3;
 const SKILL_DELIVERY_VALIDATION_REPAIR_LIMIT = 3;
 const DOCUMENT_OUTPUT_EXTENSIONS = new Set(['.md', '.markdown', '.docx', '.doc', '.pdf', '.pptx', '.ppt', '.xlsx', '.xls']);
+const ARTIFACT_EXTENSION_PATTERN = [...ARTIFACT_EXTENSIONS]
+  .map((ext) => ext.replace(/^\./, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .sort((a, b) => b.length - a.length)
+  .join('|');
 const TEXT_DOCUMENT_EXTENSIONS = new Set(['.md', '.markdown']);
 const OFFICE_ZIP_DOCUMENT_EXTENSIONS = new Set(['.docx', '.pptx', '.xlsx']);
 const DOCUMENT_TASK_PATTERN = new RegExp([
@@ -155,6 +160,98 @@ function isDocumentArtifactPath(path: string, documentIntent: boolean): boolean 
   return DOCUMENT_OUTPUT_EXTENSIONS.has(ext) || (documentIntent && ext === '.html');
 }
 
+function isGeneratedArtifactPath(path: string): boolean {
+  return isArtifactExtension(extname(path).toLowerCase());
+}
+
+interface PluginMentionResolution {
+  runtimeContext: string;
+  enabledToolNames: string[];
+}
+
+function pluginMentionTokens(input: string): string[] {
+  const tokens = new Set<string>();
+  const pattern = /(^|[\s,，;；。！？!?])@([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)/g;
+  for (const match of input.matchAll(pattern)) {
+    const token = match[2]?.trim();
+    if (token) tokens.add(token.toLowerCase());
+  }
+  return [...tokens];
+}
+
+function pluginAliases(plugin: DshSidecarRuntimePlugin): string[] {
+  const aliases = new Set<string>();
+  const add = (value?: string) => {
+    const clean = value?.trim().replace(/^@/, '').toLowerCase();
+    if (clean) aliases.add(clean);
+  };
+  add(plugin.id);
+  add(plugin.packageName);
+  const packageParts = plugin.packageName.replace(/^@/, '').split('/');
+  if (packageParts.length > 1) {
+    add(packageParts.join('/'));
+    add(packageParts.at(-1));
+  }
+  for (const command of plugin.commands ?? []) add(command.replace(/^\//, ''));
+  return [...aliases];
+}
+
+function resolvePluginMention(token: string, plugins: DshSidecarRuntimePlugin[]): DshSidecarRuntimePlugin | undefined {
+  const clean = token.replace(/^@/, '').toLowerCase();
+  return plugins.find((plugin) => pluginAliases(plugin).includes(clean));
+}
+
+function pluginMentionStatusText(plugin: DshSidecarRuntimePlugin): string {
+  if (!plugin.enabled) return 'disabled';
+  return plugin.status;
+}
+
+async function resolvePluginMentions(
+  userInput: string,
+  getDshRuntimeStatus?: () => Promise<DshSidecarRuntimeStatus>
+): Promise<PluginMentionResolution> {
+  const mentions = pluginMentionTokens(userInput);
+  if (mentions.length === 0 || !getDshRuntimeStatus) return { runtimeContext: '', enabledToolNames: [] };
+  let status: DshSidecarRuntimeStatus;
+  try {
+    status = await getDshRuntimeStatus();
+  } catch (error) {
+    return {
+      runtimeContext: [
+        '## DSH Plugin References',
+        `- Requested: ${mentions.map((mention) => `@${mention}`).join(', ')}`,
+        `- Runtime status unavailable: ${error instanceof Error ? error.message : String(error)}`
+      ].join('\n'),
+      enabledToolNames: []
+    };
+  }
+  const resolved: Array<{ mention: string; plugin: DshSidecarRuntimePlugin }> = [];
+  const missing: string[] = [];
+  for (const mention of mentions) {
+    const plugin = resolvePluginMention(mention, status.plugins);
+    if (plugin) resolved.push({ mention, plugin });
+    else missing.push(mention);
+  }
+  if (resolved.length === 0 && missing.length === 0) return { runtimeContext: '', enabledToolNames: [] };
+  const enabledToolNames = resolved
+    .filter(({ plugin }) => plugin.enabled && (plugin.status === 'loaded' || plugin.status === 'partial'))
+    .flatMap(({ plugin }) => plugin.tools);
+  const lines = [
+    '## DSH Plugin References',
+    'The user referenced plugin(s) with @ syntax. Prefer the referenced plugin tools when they fit the task. If a referenced plugin is disabled, failed, or exposes no agent-callable tools, state that limitation plainly.'
+  ];
+  for (const { mention, plugin } of resolved) {
+    lines.push(`- @${mention} -> ${plugin.packageName} (${pluginMentionStatusText(plugin)})`);
+    if (plugin.tools.length > 0) lines.push(`  Tools: ${plugin.tools.join(', ')}`);
+    if ((plugin.skills ?? []).length > 0) lines.push(`  Skills: ${(plugin.skills ?? []).join(', ')}`);
+    if ((plugin.commands ?? []).length > 0) lines.push(`  Commands: ${(plugin.commands ?? []).join(', ')}`);
+    if ((plugin.settingsEntries ?? []).length > 0) lines.push(`  Settings: ${(plugin.settingsEntries ?? []).join(', ')}`);
+    if (plugin.lastError) lines.push(`  Runtime note: ${plugin.lastError}`);
+  }
+  if (missing.length > 0) lines.push(`- Unmatched plugin references: ${missing.map((mention) => `@${mention}`).join(', ')}`);
+  return { runtimeContext: lines.join('\n'), enabledToolNames: [...new Set(enabledToolNames)] };
+}
+
 function normalizeArtifactCandidate(candidate: string): string {
   return candidate
     .trim()
@@ -179,9 +276,20 @@ function addDocumentArtifact(artifacts: Set<string>, candidate: string, document
   if (isDocumentArtifactPath(path, documentIntent)) artifacts.add(path);
 }
 
+function addGeneratedArtifact(artifacts: Set<string>, candidate: string): void {
+  const path = normalizeArtifactCandidate(candidate);
+  if (isInvalidArtifactCandidate(path)) return;
+  if (isGeneratedArtifactPath(path)) artifacts.add(path);
+}
+
+function artifactPathPattern(): RegExp {
+  return new RegExp(`"([^"]+\\.(${ARTIFACT_EXTENSION_PATTERN}))"|'([^']+\\.(${ARTIFACT_EXTENSION_PATTERN}))'|([^\\s"'<>]+\\.(${ARTIFACT_EXTENSION_PATTERN}))`, 'gi');
+}
+
 function collectTerminalCommandOutputArtifacts(command: string, artifacts: Set<string>, documentIntent: boolean): void {
-  const outputArgPattern = /(?:^|\s)(?:--output(?:-file)?|--out|--outfile|--dest(?:ination)?|-o)\s+(?:"([^"]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))"|'([^']+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))'|([^\s"'<>]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html)))/gi;
-  const redirectPattern = /(?:^|\s)(?:1?>|>>)\s*(?:"([^"]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))"|'([^']+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))'|([^\s"'<>]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html)))/gi;
+  const docExts = 'md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html';
+  const outputArgPattern = new RegExp(`(?:^|\\s)(?:--output(?:-file)?|--out|--outfile|--dest(?:ination)?|-o)\\s+(?:"([^"]+\\.(?:${docExts}))"|'([^']+\\.(?:${docExts}))'|([^\\s"'<>]+\\.(?:${docExts})))`, 'gi');
+  const redirectPattern = new RegExp(`(?:^|\\s)(?:1?>|>>)\\s*(?:"([^"]+\\.(?:${docExts}))"|'([^']+\\.(?:${docExts}))'|([^\\s"'<>]+\\.(?:${docExts})))`, 'gi');
   for (const pattern of [outputArgPattern, redirectPattern]) {
     for (const match of command.matchAll(pattern)) {
       addDocumentArtifact(artifacts, match[1] || match[2] || match[3] || '', documentIntent);
@@ -191,7 +299,7 @@ function collectTerminalCommandOutputArtifacts(command: string, artifacts: Set<s
 
 function collectTerminalOutputArtifacts(content: string, artifacts: Set<string>, documentIntent: boolean): void {
   const generatedLinePattern = /^(?:wrote|written|generated|created|saved|exported|converted|output(?:\s+(?:file|path|document))?|\u751f\u6210|\u5df2\u751f\u6210|\u5df2\u5199\u5165|\u5199\u5165|\u521b\u5efa|\u5df2\u521b\u5efa|\u4fdd\u5b58|\u5df2\u4fdd\u5b58|\u5bfc\u51fa|\u5df2\u5bfc\u51fa|\u8f93\u51fa)\s*[:\uff1a]?\s*(.+)$/i;
-  const pathPattern = /"([^"]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))"|'([^']+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))'|([^\s"'<>]+\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))/gi;
+  const pathPattern = new RegExp(`"([^"]+\\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))"|'([^']+\\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))'|([^\\s"'<>]+\\.(?:md|markdown|docx|doc|pdf|pptx|ppt|xlsx|xls|html))`, 'gi');
   for (const rawLine of content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')) {
     const line = rawLine.trim();
     const generated = generatedLinePattern.exec(line);
@@ -200,6 +308,54 @@ function collectTerminalOutputArtifacts(content: string, artifacts: Set<string>,
       addDocumentArtifact(artifacts, match[1] || match[2] || match[3] || '', documentIntent);
     }
   }
+}
+
+function collectGeneratedArtifactPaths(toolEvents: ToolEvent[]): string[] {
+  const artifacts = new Set<string>();
+  for (const event of toolEvents) {
+    const args = toolArgsRecord(event.args);
+    const explicitPath = stringArgValue(args, 'path');
+    if (event.toolName === 'file_write' && explicitPath) addGeneratedArtifact(artifacts, explicitPath);
+    if (event.toolName === 'terminal') {
+      const command = stringArgValue(args, 'command');
+      for (const source of [command, event.content]) {
+        for (const match of source.matchAll(artifactPathPattern())) {
+          addGeneratedArtifact(artifacts, match[1] || match[3] || match[5] || '');
+        }
+      }
+    }
+  }
+  return [...artifacts].slice(0, 20);
+}
+
+function buildArtifactRefs(paths: string[], workspaceDir: string, source: AgentArtifactRef['source']): AgentArtifactRef[] {
+  const seen = new Set<string>();
+  const artifacts: AgentArtifactRef[] = [];
+  for (const rawPath of paths) {
+    const cleanPath = normalizeArtifactCandidate(rawPath);
+    if (isInvalidArtifactCandidate(cleanPath)) continue;
+    const absPath = resolveWorkspaceArtifact(workspaceDir, cleanPath);
+    if (!absPath || seen.has(absPath) || !existsSync(absPath)) continue;
+    const stat = statSync(absPath);
+    if (!stat.isFile()) continue;
+    const ext = extname(absPath).toLowerCase();
+    if (!isArtifactExtension(ext)) continue;
+    seen.add(absPath);
+    artifacts.push({
+      id: createId('artifact'),
+      name: basename(absPath),
+      path: isPathInside(workspaceDir, absPath) ? relative(workspaceDir, absPath) : absPath,
+      absPath,
+      ext,
+      kind: classifyArtifactKind(ext),
+      previewMode: previewModeForArtifact(ext),
+      mimeType: mimeTypeForArtifact(ext),
+      sizeBytes: stat.size,
+      source,
+      createdAt: nowIso()
+    });
+  }
+  return artifacts;
 }
 
 function collectDocumentArtifacts(toolEvents: ToolEvent[], documentIntent: boolean): string[] {
@@ -264,6 +420,12 @@ function resolveWorkspaceArtifact(workspaceDir: string, artifactPath: string): s
   const workspace = resolve(workspaceDir);
   const target = isAbsolute(artifactPath) ? resolve(artifactPath) : resolve(workspace, artifactPath);
   return target;
+}
+
+function isPathInside(root: string, target: string): boolean {
+  const normalizedRoot = resolve(root).replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedTarget = resolve(target).replace(/\\/g, '/');
+  return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}/`);
 }
 
 function deliveredAsDegraded(candidateFinalResponse: string): boolean {
@@ -627,6 +789,9 @@ interface AgentLoopRuntimeOptions extends AgentRunOptions {
   onSessionUpdated?: (session: SessionRecord) => void;
   requestToolApproval?: ToolApprovalRequester;
   signal?: AbortSignal;
+  userMessageHidden?: boolean;
+  persistUserMessage?: boolean;
+  omitHistoryMessageIds?: string[];
 }
 
 function createAbortError(): Error {
@@ -659,11 +824,12 @@ export class AgentLoop {
       toolRegistry: ToolRegistry;
       sessions: SessionStore;
       promptBuilder: PromptBuilder;
-      prepareExecution: (mode: AgentRunOptions['executionMode'], runId: string) => AgentRunResult['execution'];
+      prepareExecution: (mode: AgentRunOptions['executionMode'], runId: string, workspaceDir?: string) => AgentRunResult['execution'];
       beginDeferredMemory: (sessionId: string) => void;
       commitDeferredMemory: (sessionId: string) => void;
       discardDeferredMemory: (sessionId: string) => void;
       syncSessionMemory: (session: SessionRecord) => void;
+      getDshRuntimeStatus?: () => Promise<DshSidecarRuntimeStatus>;
     }
   ) {}
 
@@ -673,7 +839,7 @@ export class AgentLoop {
     const memoryEnabled = options.useMemory !== false;
     const skillsEnabled = options.useSkills !== false;
     const requestId = createId('run');
-    const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId);
+    const execution = this.deps.prepareExecution(options.executionMode ?? cfg.defaultExecutionMode, requestId, options.workspaceDir);
     const session = options.sessionId
       ? this.deps.sessions.read(options.sessionId) ?? this.deps.sessions.create('New session', options.sessionId)
       : this.deps.sessions.create();
@@ -682,11 +848,18 @@ export class AgentLoop {
       id: createId('msg'),
       role: 'user',
       content: options.userInput,
+      hidden: options.userMessageHidden === true ? true : undefined,
       attachments: options.attachments?.length ? options.attachments : undefined,
       createdAt: nowIso()
     };
     try {
-      const previousHistory = session.messages.filter((message) => !isIterationLimitMessage(message) && !isInvisibleEmptyAssistantMessage(message));
+      const omitHistoryMessageIds = new Set(options.omitHistoryMessageIds ?? []);
+      const previousHistory = session.messages.filter((message) => (
+        message.hidden !== true
+        && !omitHistoryMessageIds.has(message.id ?? '')
+        && !isIterationLimitMessage(message)
+        && !isInvisibleEmptyAssistantMessage(message)
+      ));
       const prompt = await this.deps.promptBuilder.buildForMessages(cfg, {
         sessionId: session.id,
         userInput: options.userInput,
@@ -696,17 +869,19 @@ export class AgentLoop {
         useSkills: options.useSkills,
         enabledSkillNames: options.enabledSkillNames
       });
-      this.deps.sessions.setSystemPrompt(session.id, prompt.displayPrompt);
+      const pluginMentions = await resolvePluginMentions(options.userInput, this.deps.getDshRuntimeStatus);
+      this.deps.sessions.setSystemPrompt(session.id, prompt.systemPrompt);
       const messages: AgentMessage[] = [
         { role: 'system', content: prompt.systemPrompt },
         ...previousHistory,
-        withRuntimeContext(userMessage, prompt.runtimeContext)
+        withRuntimeContext(userMessage, [prompt.runtimeContext, pluginMentions.runtimeContext].filter(Boolean).join('\n\n'))
       ];
       const requestMetadata: LlmRequestMetadata = { session: session.id };
       if (options.turnType !== undefined) requestMetadata.turn_type = options.turnType;
       if (options.sessionDone !== undefined) requestMetadata.session_done = options.sessionDone;
       const client = this.deps.createClient();
-      const enabledToolNames = (options.enabledToolNames ?? cfg.enabledToolNames).filter((name) => {
+      const configuredToolNames = options.enabledToolNames ?? cfg.enabledToolNames;
+      const enabledToolNames = [...new Set([...configuredToolNames, ...pluginMentions.enabledToolNames])].filter((name) => {
         if (!memoryEnabled && name === 'memory') return false;
         if (!skillsEnabled && (name === 'skill_view' || name === 'skill_manage')) return false;
         return true;
@@ -719,8 +894,11 @@ export class AgentLoop {
       let stopReason: 'final' | 'empty' | 'repeated-tool' | 'reasoning-loop' | 'iteration-limit' | undefined;
       let iterations = 0;
       let skillDeliveryRepairCount = 0;
-      let updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
-      options.onSessionUpdated?.(updatedSession);
+      let updatedSession = session;
+      if (options.persistUserMessage !== false) {
+        updatedSession = this.deps.sessions.appendMessages(session.id, [userMessage], [], execution);
+        options.onSessionUpdated?.(updatedSession);
+      }
       const visibleAssistantId = createId('msg');
       const visibleAssistantCreatedAt = nowIso();
       let accumulatedReasoning = '';
@@ -1091,6 +1269,10 @@ export class AgentLoop {
             assistant.content = finalResponse;
           }
           assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
+          if (assistant.hidden !== true) {
+            const artifacts = buildArtifactRefs(collectGeneratedArtifactPaths(toolEvents), execution.workspaceDir, 'terminal');
+            assistant.artifacts = artifacts.length > 0 ? artifacts : undefined;
+          }
           if (stopReason === 'final' && isDeliveryValidationNeeded(options.userInput, toolEvents)) {
             const validation = await validateSkillDelivery(finalResponse);
             if (!validation.ok) {

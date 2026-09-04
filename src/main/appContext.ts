@@ -28,6 +28,9 @@ import { PersonalKnowledgeBase } from './knowledge/personalKnowledgeBase.js';
 import { createPersonalKnowledgeKeywordExtractor } from './knowledge/keywordExtractor.js';
 import { SessionDocumentContextStore } from './knowledge/sessionDocumentContextStore.js';
 import type { BrowserAutomation } from './tools/browserAutomation.js';
+import { DshSidecarManager } from './plugins/dshSidecarManager.js';
+import { DshPluginMarketplaceManager } from './plugins/dshPluginMarketplaceManager.js';
+import { DshSidecarRuntimeBridge } from './plugins/dshSidecarRuntimeBridge.js';
 
 const electronRequire = createRequire(import.meta.url);
 const { app } = electronRequire('electron/main') as typeof import('electron/main');
@@ -103,6 +106,9 @@ export class AppContext {
   readonly browserExecutionLogger: BrowserExecutionLogger;
   readonly personalKnowledgeBase: PersonalKnowledgeBase;
   readonly sessionDocumentContextStore: SessionDocumentContextStore;
+  readonly dshSidecarManager: DshSidecarManager;
+  readonly dshPluginMarketplaceManager: DshPluginMarketplaceManager;
+  readonly dshSidecarRuntimeBridge: DshSidecarRuntimeBridge;
   private readonly browserClosePolicies = new Map<string, { policy: BrowserClosePolicy; reason?: string; updatedAt: string }>();
 
   constructor(home = process.env.TASI_HARNESS_HOME || DEFAULT_HOME) {
@@ -132,10 +138,13 @@ export class AppContext {
       keywordExtractor: createPersonalKnowledgeKeywordExtractor(() => this.getConfig())
     });
     this.sessionDocumentContextStore = new SessionDocumentContextStore(this.harnessHome);
+    this.dshSidecarManager = new DshSidecarManager(this.harnessHome);
+    this.dshPluginMarketplaceManager = new DshPluginMarketplaceManager(this.dshSidecarManager);
     const resourcesRoot = findResourcesRoot();
     this.marketplaceManager = new MarketplaceManager(resourcesRoot, this.skillManager, () => this.getConfig().skillMarketSources);
     this.toolRegistry = new ToolRegistry();
     for (const tool of this.createTools()) this.toolRegistry.register(tool);
+    this.dshSidecarRuntimeBridge = new DshSidecarRuntimeBridge(this.dshSidecarManager, this.toolRegistry, this.configStore, this.skillManager);
     this.promptBuilder = new PromptBuilder(
       this.memoryStore,
       this.skillManager,
@@ -149,7 +158,7 @@ export class AppContext {
       toolRegistry: this.toolRegistry,
       sessions: this.sessionStore,
       promptBuilder: this.promptBuilder,
-      prepareExecution: (mode, runId) => this.sandboxManager.prepare(mode ?? this.getConfig().defaultExecutionMode, this.getConfig().workspaceDir, runId),
+      prepareExecution: (mode, runId, workspaceDir) => this.sandboxManager.prepare(mode ?? this.getConfig().defaultExecutionMode, workspaceDir ?? this.getConfig().workspaceDir, runId),
       beginDeferredMemory: (sessionId) => this.memoryStore.beginDeferredSession(sessionId),
       commitDeferredMemory: (sessionId) => {
         const result = this.memoryStore.commitDeferredSession(sessionId);

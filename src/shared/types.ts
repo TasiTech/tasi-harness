@@ -33,6 +33,7 @@ export interface AgentMessage {
   id?: string;
   role: AgentRole;
   content: string;
+  external?: ExternalConversationMetadata;
   hidden?: boolean;
   contentOmitted?: boolean;
   contentLength?: number;
@@ -45,6 +46,36 @@ export interface AgentMessage {
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
+  artifacts?: AgentArtifactRef[];
+  createdAt?: string;
+}
+
+export type AgentArtifactKind =
+  | 'text'
+  | 'markdown'
+  | 'image'
+  | 'pdf'
+  | 'model3d'
+  | 'media'
+  | 'office'
+  | 'archive'
+  | 'executable'
+  | 'database'
+  | 'unknown';
+
+export type AgentArtifactPreviewMode = 'text' | 'code' | 'markdown' | 'image' | 'pdf' | 'model3d' | 'media' | 'office' | 'external' | 'none';
+
+export interface AgentArtifactRef {
+  id: string;
+  name: string;
+  path: string;
+  absPath: string;
+  ext: string;
+  kind: AgentArtifactKind;
+  previewMode: AgentArtifactPreviewMode;
+  mimeType?: string;
+  sizeBytes?: number;
+  source: 'file_write' | 'terminal' | 'dsh-sidecar' | 'assistant-link';
   createdAt?: string;
 }
 
@@ -388,7 +419,7 @@ export interface SkillMetadata {
   displayCategory?: string;
   path: string;
   readonly: boolean;
-  source: 'bundled' | 'local';
+  source: 'bundled' | 'local' | 'dsh';
   updatedAt?: string;
   bundledPath?: string;
   bundledUpdatedAt?: string;
@@ -402,6 +433,23 @@ export interface SkillDocument extends SkillMetadata {
   frontmatter: Record<string, string | string[] | boolean | number>;
 }
 
+export interface DshSidecarRuntimeSkill {
+  name: string;
+  description: string;
+  pluginId: string;
+  packageName: string;
+  provider?: string;
+  path?: string;
+  content?: string;
+  category?: string;
+  source?: string;
+  invocation?: {
+    modelInvocable?: boolean;
+    userInvocable?: boolean;
+  };
+  updatedAt?: string;
+}
+
 export interface SessionSummary {
   id: string;
   title: string;
@@ -409,6 +457,27 @@ export interface SessionSummary {
   updatedAt: string;
   messageCount: number;
   domain?: MemoryDomain | string;
+  origin?: 'desktop' | 'external-im';
+  external?: ExternalConversationMetadata;
+}
+
+export type SessionHistoryCategory = MemoryDomain | 'all' | 'wechat-clawbot' | 'external-im';
+
+export interface SessionListPageRequest {
+  page?: number;
+  pageSize?: number;
+  query?: string;
+  category?: SessionHistoryCategory;
+  wechatSessionId?: string;
+}
+
+export interface SessionListPageResult {
+  sessions: SessionSummary[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  categoryCounts: Partial<Record<SessionHistoryCategory, number>>;
 }
 
 export interface SessionSystemPromptRecord {
@@ -424,6 +493,17 @@ export interface SessionRecord extends SessionSummary {
   lastExecution?: AgentExecutionDetails;
   lastUsage?: LlmUsage;
   totalUsage?: LlmUsage;
+}
+
+export interface ExternalConversationMetadata {
+  provider: string;
+  pluginId?: string;
+  botId?: string;
+  scope?: 'private' | 'group' | 'channel' | 'unknown';
+  externalConversationId?: string;
+  senderId?: string;
+  senderName?: string;
+  displayName?: string;
 }
 
 export interface SessionOptimizationContextRequest {
@@ -462,6 +542,22 @@ export interface SessionToolEventContentResult {
   args: unknown;
 }
 
+export interface ArtifactPathRequest {
+  path: string;
+  absPath?: string;
+  sessionId?: string;
+}
+
+export interface ArtifactPreviewRequest extends ArtifactPathRequest {
+  maxBytes?: number;
+}
+
+export interface ArtifactPreviewResult {
+  artifact: AgentArtifactRef;
+  content?: string;
+  dataBase64?: string;
+}
+
 export interface SessionUpdateEvent {
   sessionId: string;
   source: 'chat' | 'scheduled' | 'external';
@@ -481,6 +577,7 @@ export interface AgentRunOptions {
   userInput: string;
   attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
+  workspaceDir?: string;
   usePersonalKnowledgeBase?: boolean;
   useMemory?: boolean;
   memoryDomains?: MemoryDomain[];
@@ -690,9 +787,20 @@ export interface MarketplaceSkill {
   installedSkillName?: string;
 }
 
+export interface MarketplaceBrowseRequest {
+  query?: string;
+  page?: number;
+  pageSize?: number;
+}
+
 export interface MarketplaceBrowseResult {
   sources: SkillMarketplaceSource[];
   skills: MarketplaceSkill[];
+  page?: number;
+  pageSize?: number;
+  total?: number;
+  loaded?: number;
+  hasMore?: boolean;
 }
 
 export interface MarketplaceSkillSnapshot {
@@ -760,6 +868,258 @@ export interface WechatChannelLoginStatusPayload {
   userId?: string;
   baseUrl?: string;
   fetchedAt: string;
+}
+
+export type DshSidecarPluginStatus = 'installed' | 'enabled' | 'disabled' | 'failed' | 'incompatible' | 'uninstalled';
+
+export interface DshSidecarPluginRecord {
+  id: string;
+  packageName: string;
+  source: string;
+  version?: string;
+  enabled: boolean;
+  status: DshSidecarPluginStatus;
+  dshBundlePatch?: string;
+  profileName: string;
+  installedAt: string;
+  updatedAt: string;
+  lastError?: string;
+}
+
+export interface DshSidecarStatus {
+  available: boolean;
+  running: boolean;
+  pid?: number;
+  protocolVersion: number;
+  home: string;
+  profileName: string;
+  profileDir: string;
+  nodeVersion?: string;
+  lastError?: string;
+}
+
+export interface DshSidecarPluginInstallRequest {
+  source: string;
+  packageName?: string;
+  profileName?: string;
+  packageManager?: 'pnpm';
+}
+
+export interface DshSidecarPluginUploadRequest {
+  filename: string;
+  contentBase64: string;
+  packageName?: string;
+  profileName?: string;
+  enable?: boolean;
+}
+
+export interface DshSidecarPluginActionRequest {
+  id: string;
+  packageName?: string;
+  source?: string;
+  profileName?: string;
+}
+
+export interface DshSidecarPluginListResult {
+  status: DshSidecarStatus;
+  plugins: DshSidecarPluginRecord[];
+}
+
+export type DshSidecarClientMountPoint =
+  | 'sidebar'
+  | 'main-panel'
+  | 'right-panel'
+  | 'settings'
+  | 'floating'
+  | 'desktop-companion'
+  | 'command-palette'
+  | 'status-bar';
+
+export interface DshSidecarClientMount {
+  id: string;
+  pluginId: string;
+  packageName: string;
+  title: string;
+  mountPoint: DshSidecarClientMountPoint;
+  url: string;
+  icon?: string;
+  description?: string;
+  permissions?: string[];
+}
+
+export interface DshSidecarClientMountOpenRequest {
+  id: string;
+  pluginId?: string;
+  mode?: 'panel' | 'window' | 'desktop-companion';
+}
+
+export interface DshSidecarRuntimePlugin {
+  id: string;
+  packageName: string;
+  version?: string;
+  enabled: boolean;
+  status: 'loaded' | 'partial' | 'failed' | 'skipped';
+  packageRoot?: string;
+  patchPath?: string;
+  moduleEntry?: string;
+  tools: string[];
+  skills?: string[];
+  settingsEntries?: string[];
+  commands?: string[];
+  webRoutes?: string[];
+  clientMounts?: DshSidecarClientMount[];
+  lastError?: string;
+}
+
+export interface DshSidecarRuntimeStatus {
+  status: DshSidecarStatus;
+  plugins: DshSidecarRuntimePlugin[];
+  tools: ToolDefinition[];
+  skills?: DshSidecarRuntimeSkill[];
+  clientMounts?: DshSidecarClientMount[];
+}
+
+export type DshSidecarInputPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; name?: string; mime: string; data?: string; path?: string }
+  | { type: 'video'; name?: string; mime: string; data?: string; path?: string }
+  | { type: 'audio'; name?: string; mime: string; data?: string; path?: string }
+  | { type: 'file'; name: string; mime?: string; data?: string; path?: string }
+  | { type: 'directory'; name?: string; path: string }
+  | { type: 'selection'; source: 'editor' | 'chat' | 'browser' | 'file'; text: string; metadata?: Record<string, unknown> }
+  | { type: 'url'; url: string; title?: string }
+  | { type: 'json'; name?: string; value: unknown };
+
+export type DshSidecarOutputPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; name: string; path: string; mime: string }
+  | { type: 'file'; name: string; path: string; mime?: string }
+  | { type: 'json'; name?: string; value: unknown };
+
+export interface DshSidecarChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  name?: string;
+}
+
+export interface DshSidecarChatRunRequest {
+  pluginRef: string;
+  sessionId: string;
+  workspaceDir: string;
+  input: {
+    parts: DshSidecarInputPart[];
+  };
+  context?: {
+    historySummary?: string;
+    recentMessages?: DshSidecarChatMessage[];
+    allowedRoots?: string[];
+    locale?: string;
+    timezone?: string;
+    llm?: {
+      provider?: string;
+      model?: string;
+      reasoningEffort?: string;
+    };
+  };
+  options?: {
+    stream?: boolean;
+    timeoutMs?: number;
+  };
+}
+
+export interface DshSidecarChatRunResult {
+  ok: boolean;
+  content?: string;
+  messages?: DshSidecarChatMessage[];
+  parts?: DshSidecarOutputPart[];
+  artifacts?: Array<{
+    name: string;
+    path: string;
+    mime?: string;
+  }>;
+  diagnostics?: {
+    plugin: string;
+    runtime: DshSidecarRuntimePlugin['status'] | 'missing';
+    command?: string;
+    toolCalls?: string[];
+    agents?: string[];
+    durationMs?: number;
+    note?: string;
+  };
+  error?: string;
+}
+
+export interface DshSidecarToolCallRequest {
+  name: string;
+  args?: unknown;
+  context: {
+    sessionId: string;
+    workspaceDir: string;
+    requestId: string;
+    llm?: {
+      provider?: string;
+      model?: string;
+      reasoningEffort?: string;
+    };
+  };
+}
+
+export interface DshMarketplacePlugin {
+  id: string;
+  sourceId: 'skillhub';
+  owner?: string;
+  slug: string;
+  name: string;
+  description: string;
+  version: string;
+  homepage: string;
+  packageName?: string;
+  installSource: string;
+  readme?: string;
+  tags?: string[];
+  downloads?: number;
+  installed: boolean;
+  installedPluginId?: string;
+  enabled?: boolean;
+  status?: DshSidecarPluginStatus;
+}
+
+export interface DshMarketplacePluginVersion {
+  version: string;
+  createdAt?: string;
+  yanked?: boolean;
+}
+
+export interface DshMarketplacePluginDetail extends DshMarketplacePlugin {
+  versions: DshMarketplacePluginVersion[];
+  manifestPreview?: string;
+  mcpPreview?: string;
+}
+
+export interface DshMarketplaceBrowseRequest {
+  query?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+export interface DshMarketplaceBrowseResult {
+  source: {
+    id: 'skillhub';
+    name: string;
+    homepage: string;
+  };
+  plugins: DshMarketplacePlugin[];
+  page?: number;
+  pageSize?: number;
+  total?: number;
+  loaded?: number;
+  hasMore?: boolean;
+}
+
+export interface DshMarketplacePluginInstallRequest {
+  plugin: DshMarketplacePlugin;
+  version?: string;
+  enable?: boolean;
 }
 
 export interface ScheduledTask {

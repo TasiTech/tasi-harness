@@ -1,9 +1,14 @@
 ﻿import { memo, startTransition, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
 import type { CSSProperties } from 'react';
+import type { ClipboardEvent as ReactClipboardEvent } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { WheelEvent as ReactWheelEvent } from 'react';
 import type {
   AgentMessage,
+  AgentArtifactRef,
   AgentMessageDeltaStream,
   AgentMessageAttachment,
+  ArtifactPreviewResult,
   AppInfo,
   BrowserCoachRecordedEvent,
   BrowserCoachRecording,
@@ -12,6 +17,14 @@ import type {
   DreamSkinGalleryResult,
   DreamSkinGallerySort,
   DreamSkinGalleryTheme,
+  DshMarketplaceBrowseResult,
+  DshMarketplacePlugin,
+  DshMarketplacePluginDetail,
+  DshSidecarClientMount,
+  DshSidecarPluginRecord,
+  DshSidecarRuntimePlugin,
+  DshSidecarRuntimeStatus,
+  DshSidecarStatus,
   LlmUsage,
   MarketplaceBrowseResult,
   MarketplaceSkill,
@@ -23,13 +36,14 @@ import type {
   PublicAppConfig,
   ScheduledTask,
   SessionDocumentContext,
+  SessionListPageResult,
   SessionSummary,
   SkillDocument,
   SkillMetadata,
   ToolApprovalRequest,
   ToolEvent
 } from '../shared/types.js';
-import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
+import { EMBEDDED_BROWSER_PREVIEW_PARTITION } from '../shared/browserConstants.js';
 import { DEFAULT_OMNI_SYSTEM_PROMPT } from '../shared/defaultPrompts.js';
 import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS, prepareReasoningDeltaForDisplay, reasoningPanelText } from '../shared/reasoningPreview.js';
 import {
@@ -48,14 +62,165 @@ import {
 import { extractCitationLinks, type CitationLink } from './citations.js';
 import { LiveAgentPage, type LiveAgentOutboundMessage } from './LiveAgentPage.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
+import { ARTIFACT_EXTENSIONS, previewModeForArtifact } from '../shared/artifacts.js';
 import * as QRCode from 'qrcode';
 import JSZip from 'jszip';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url';
 
-export { reasoningPanelText };
-
-type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'tasks' | 'sessions' | 'settings' | 'about';
+type Page = 'chat' | 'knowledge' | 'memory' | 'skills' | 'plugins' | 'tasks' | 'sessions' | 'settings' | 'about';
 type UiLanguage = 'zh' | 'en';
 type TranslateFn = (en: string, zh: string) => string;
+const MARKET_PAGE_SIZE = 24;
+const HISTORY_PAGE_SIZE = 24;
+const PLUGIN_MENTION_STATUS_CACHE_MS = 60_000;
+const ARTIFACT_SELECTION_CONTEXT_MAX_CHARS = 6000;
+let pluginMentionRuntimeStatusCache: { status: DshSidecarRuntimeStatus; loadedAt: number } | null = null;
+let pluginMentionRuntimeStatusPromise: Promise<DshSidecarRuntimeStatus> | null = null;
+
+interface PluginMentionTrigger {
+  start: number;
+  end: number;
+  query: string;
+}
+
+interface PluginMentionItem {
+  plugin: DshSidecarRuntimePlugin;
+  token: string;
+  label: string;
+  detail: string;
+  status: string;
+  aliases: string[];
+}
+
+function findPluginMentionTrigger(value: string, cursor: number): PluginMentionTrigger | null {
+  const beforeCursor = value.slice(0, Math.max(0, cursor));
+  const match = /(^|[\s,，;；。！？!?])@([a-zA-Z0-9_.-]*(?:\/[a-zA-Z0-9_.-]*)?)$/.exec(beforeCursor);
+  if (!match) return null;
+  const query = match[2] ?? '';
+  const start = beforeCursor.length - query.length - 1;
+  return { start, end: cursor, query };
+}
+
+function dshPluginAliases(plugin: DshSidecarRuntimePlugin): string[] {
+  const aliases = new Set<string>();
+  const add = (value?: string) => {
+    const clean = value?.trim().replace(/^@/, '').toLowerCase();
+    if (clean) aliases.add(clean);
+  };
+  add(plugin.id);
+  add(plugin.packageName);
+  const packageParts = plugin.packageName.replace(/^@/, '').split('/');
+  if (packageParts.length > 1) {
+    add(packageParts.join('/'));
+    add(packageParts.at(-1));
+  }
+  for (const command of plugin.commands ?? []) add(command.replace(/^\//, ''));
+  return [...aliases];
+}
+
+function pluginMentionToken(plugin: DshSidecarRuntimePlugin): string {
+  const packageName = plugin.packageName.trim();
+  if (packageName.startsWith('@')) return packageName.slice(1);
+  return packageName || plugin.id;
+}
+
+function pluginMentionItems(status: DshSidecarRuntimeStatus | null, query = ''): PluginMentionItem[] {
+  const cleanQuery = query.trim().replace(/^@/, '').toLowerCase();
+  if (!status) return [];
+  return status.plugins
+    .filter((plugin) => plugin.enabled && (plugin.status === 'loaded' || plugin.status === 'partial'))
+    .map((plugin): PluginMentionItem => {
+      const aliases = dshPluginAliases(plugin);
+      const capabilities = [
+        plugin.tools.length > 0 ? `${plugin.tools.length} tools` : '',
+        (plugin.commands ?? []).length > 0 ? `${(plugin.commands ?? []).length} commands` : ''
+      ].filter(Boolean);
+      return {
+        plugin,
+        token: pluginMentionToken(plugin),
+        label: plugin.packageName,
+        detail: [plugin.id, plugin.version ?? 'unknown', capabilities.join(', ') || 'skill provider'].join(' | '),
+        status: plugin.enabled ? plugin.status : 'disabled',
+        aliases
+      };
+    })
+    .filter((item) => !cleanQuery || item.aliases.some((alias) => alias.includes(cleanQuery)))
+    .sort((left, right) => {
+      const leftReady = left.plugin.enabled && (left.plugin.status === 'loaded' || left.plugin.status === 'partial');
+      const rightReady = right.plugin.enabled && (right.plugin.status === 'loaded' || right.plugin.status === 'partial');
+      if (leftReady !== rightReady) return leftReady ? -1 : 1;
+      return left.label.localeCompare(right.label);
+    })
+    .slice(0, 8);
+}
+
+type ArtifactTextSelection = {
+  artifact: AgentArtifactRef;
+  text: string;
+  x: number;
+  y: number;
+};
+
+function normalizeArtifactSelectionText(text: string): string {
+  const clean = text.replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+  if (clean.length <= ARTIFACT_SELECTION_CONTEXT_MAX_CHARS) return clean;
+  return `${clean.slice(0, ARTIFACT_SELECTION_CONTEXT_MAX_CHARS).trimEnd()}\n\n[selection truncated]`;
+}
+
+function artifactLabelForPrompt(artifact: AgentArtifactRef): string {
+  return artifact.name || artifact.path || artifact.absPath || 'artifact';
+}
+
+function artifactSelectionQuestionPrompt(artifact: AgentArtifactRef, text: string): string {
+  const path = artifact.absPath || artifact.path || artifact.name;
+  return [
+    '请基于下面选中的文件内容回答我的问题。',
+    '',
+    `文件：${artifactLabelForPrompt(artifact)}`,
+    path ? `路径：${path}` : undefined,
+    '',
+    '选中内容：',
+    '```text',
+    normalizeArtifactSelectionText(text),
+    '```',
+    '',
+    '问题：'
+  ].filter((line): line is string => line !== undefined).join('\n');
+}
+
+function artifactSelectionContextPrompt(artifact: AgentArtifactRef, text: string): string {
+  const path = artifact.absPath || artifact.path || artifact.name;
+  return [
+    '下面是我从文件预览中选中的内容，请作为上下文参考：',
+    '',
+    `文件：${artifactLabelForPrompt(artifact)}`,
+    path ? `路径：${path}` : undefined,
+    '',
+    '```text',
+    normalizeArtifactSelectionText(text),
+    '```'
+  ].filter((line): line is string => line !== undefined).join('\n');
+}
+
+function cachedPluginMentionRuntimeStatus(force = false): Promise<DshSidecarRuntimeStatus> {
+  const now = Date.now();
+  if (!force && pluginMentionRuntimeStatusCache && now - pluginMentionRuntimeStatusCache.loadedAt < PLUGIN_MENTION_STATUS_CACHE_MS) {
+    return Promise.resolve(pluginMentionRuntimeStatusCache.status);
+  }
+  if (!force && pluginMentionRuntimeStatusPromise) return pluginMentionRuntimeStatusPromise;
+  pluginMentionRuntimeStatusPromise = window.tasiHarness.dshSidecar.runtimeStatus()
+    .then((status) => {
+      pluginMentionRuntimeStatusCache = { status, loadedAt: Date.now() };
+      return status;
+    })
+    .finally(() => {
+      pluginMentionRuntimeStatusPromise = null;
+    });
+  return pluginMentionRuntimeStatusPromise;
+}
 
 const SKILL_CATEGORIES = [
   { value: 'local', en: 'Local', zh: '本地' },
@@ -160,6 +325,7 @@ const defaultConfig: PublicAppConfig = {
 };
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024 * 1024;
 const MESSAGE_DELTA_FLUSH_MS = 33;
 const REASONING_DELTA_FLUSH_MS = 180;
 const UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS = 450;
@@ -194,7 +360,7 @@ function appendPreviewText(current: string | undefined, delta: string | undefine
 const PERCENT_ENCODED_UTF8_RUN = /(?:%[0-9A-Fa-f]{2}){2,}/g;
 const CJK_TEXT = /[\u3400-\u9fff\uf900-\ufaff]/;
 
-export function decodeLikelyPercentEncodedChineseText(content: string): string {
+function decodeLikelyPercentEncodedChineseText(content: string): string {
   if (!content.includes('%')) return content;
   let decodedAny = false;
   const decoded = content.replace(PERCENT_ENCODED_UTF8_RUN, (match) => {
@@ -213,6 +379,38 @@ export function decodeLikelyPercentEncodedChineseText(content: string): string {
 function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaStream): AgentMessage[] {
   const existingIndex = messages.findIndex((message) => message.id === payload.messageId);
   if (existingIndex < 0) {
+    if (payload.type === 'done') {
+      const payloadContent = (payload.content ?? '').trim();
+      const payloadReasoning = (payload.reasoning_content ?? '').trim();
+      const coalesceIndex = [...messages]
+        .map((message, index) => ({ message, index }))
+        .reverse()
+        .find(({ message }) => (
+          message.role === 'assistant'
+          && message.hidden !== true
+          && payloadContent.length > 0
+          && (message.content ?? '').trim() === payloadContent
+          && (!payloadReasoning || (message.reasoning_content ?? '').trim() === payloadReasoning)
+        ))?.index;
+      if (coalesceIndex !== undefined) {
+        return [
+          ...messages.slice(0, coalesceIndex),
+          {
+            ...messages[coalesceIndex],
+            content: payload.content ?? messages[coalesceIndex].content,
+            contentOmitted: payload.contentOmitted !== undefined ? payload.contentOmitted : messages[coalesceIndex].contentOmitted,
+            contentLength: payload.contentLength !== undefined ? payload.contentLength : messages[coalesceIndex].contentLength,
+            reasoning_content: payload.reasoning_content ?? messages[coalesceIndex].reasoning_content,
+            reasoningOmitted: payload.reasoningOmitted !== undefined ? payload.reasoningOmitted : messages[coalesceIndex].reasoningOmitted,
+            reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : messages[coalesceIndex].reasoningLength,
+            reasoning_parts: payload.reasoning_parts ?? messages[coalesceIndex].reasoning_parts,
+            content_parts: payload.content_parts ?? messages[coalesceIndex].content_parts,
+            createdAt: messages[coalesceIndex].createdAt ?? payload.createdAt
+          },
+          ...messages.slice(coalesceIndex + 1)
+        ];
+      }
+    }
     const content = payload.content ?? (payload.type === 'content' ? appendPreviewText('', payload.delta, CONTENT_STREAM_PREVIEW_CHARS) ?? '' : '');
     return [
       ...messages,
@@ -286,9 +484,9 @@ function mergeBufferedMessageDelta(
   };
 }
 
-export function isVisibleChatMessage(message: AgentMessage): boolean {
+function isVisibleChatMessage(message: AgentMessage): boolean {
+  if (message.hidden === true) return false;
   if (message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER) return false;
-  if (message.role === 'assistant' && message.hidden === true) return false;
   const isIntermediateToolAssistant = message.role === 'assistant'
     && !message.content?.trim()
     && (message.tool_calls?.length ?? 0) > 0;
@@ -751,6 +949,31 @@ function multimediaKind(mimeType: string): AgentMessageAttachment['kind'] | null
   return null;
 }
 
+function imageExtensionFromMimeType(mimeType: string): string {
+  const normalized = mimeType.toLowerCase();
+  if (normalized === 'image/jpeg' || normalized === 'image/jpg') return 'jpg';
+  if (normalized === 'image/png') return 'png';
+  if (normalized === 'image/gif') return 'gif';
+  if (normalized === 'image/webp') return 'webp';
+  if (normalized === 'image/bmp') return 'bmp';
+  if (normalized === 'image/svg+xml') return 'svg';
+  if (normalized === 'image/tiff') return 'tiff';
+  return 'png';
+}
+
+function pastedImageFilename(index: number, mimeType: string): string {
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-');
+  return `pasted-image-${stamp}${index > 0 ? `-${index + 1}` : ''}.${imageExtensionFromMimeType(mimeType)}`;
+}
+
+function normalizePastedImageFile(file: File, index: number): File {
+  if (file.name.trim()) return file;
+  return new File([file], pastedImageFilename(index, file.type), {
+    type: file.type || 'image/png',
+    lastModified: file.lastModified || Date.now()
+  });
+}
+
 function formatBytes(bytes?: number): string {
   const value = Number(bytes ?? 0);
   if (!Number.isFinite(value) || value <= 0) return '';
@@ -936,6 +1159,13 @@ function SidebarIcon(props: { kind: Page }): ReactElement {
           <path d="M4 10h3" />
         </svg>
       );
+    case 'plugins':
+      return (
+        <svg {...common}>
+          <path d="M8.5 4.5h7v4h4v7h-4v4h-7v-4h-4v-7h4z" />
+          <path d="M8.5 8.5h7v7h-7z" />
+        </svg>
+      );
     case 'tasks':
       return (
         <svg {...common}>
@@ -979,6 +1209,48 @@ function SidebarIcon(props: { kind: Page }): ReactElement {
   }
 }
 
+function BrowserToolbarIcon(props: { kind: 'back' | 'forward' | 'refresh' | 'open' }): ReactElement {
+  const common = {
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 2,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true
+  };
+  if (props.kind === 'back') {
+    return (
+      <svg {...common}>
+        <path d="M15 18l-6-6 6-6" />
+      </svg>
+    );
+  }
+  if (props.kind === 'forward') {
+    return (
+      <svg {...common}>
+        <path d="M9 6l6 6-6 6" />
+      </svg>
+    );
+  }
+  if (props.kind === 'refresh') {
+    return (
+      <svg {...common}>
+        <path d="M20 6v5h-5" />
+        <path d="M4 18v-5h5" />
+        <path d="M18.4 9A7 7 0 0 0 6.1 7.5L4 11" />
+        <path d="M5.6 15A7 7 0 0 0 17.9 16.5L20 13" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common}>
+      <path d="M5 12h13" />
+      <path d="M13 6l6 6-6 6" />
+    </svg>
+  );
+}
+
 export function App(): ReactElement {
   const [page, setPage] = useState<Page>('chat');
   const [language, setLanguage] = useState<UiLanguage>(() => {
@@ -1002,8 +1274,8 @@ export function App(): ReactElement {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [sessionId, setSessionId] = useState<string | undefined>();
   const [restoreLiveSession, setRestoreLiveSession] = useState<{ sessionId: string; token: number } | null>(null);
-  const [lastUsage, setLastUsage] = useState<LlmUsage | undefined>();
-  const [totalUsage, setTotalUsage] = useState<LlmUsage | undefined>();
+  const [, setLastUsage] = useState<LlmUsage | undefined>();
+  const [, setTotalUsage] = useState<LlmUsage | undefined>();
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [approvalRequest, setApprovalRequest] = useState<ToolApprovalRequest | null>(null);
   const [chatBusy, setChatBusy] = useState(false);
@@ -1014,24 +1286,12 @@ export function App(): ReactElement {
   const isWechatSessionActive = Boolean(sessionId && activeWechatSessionId && sessionId === activeWechatSessionId);
   const tr: TranslateFn = useMemo(() => (en: string, zh: string) => (language === 'zh' ? zh : en), [language]);
 
-  function formatTokensM(value?: number): string {
-    const tokens = Number(value ?? 0);
-    if (!Number.isFinite(tokens)) return '0.000M';
-    return `${(tokens / 1_000_000).toFixed(3)}M`;
-  }
-
-  function usageLabel(usage?: LlmUsage): string {
-    if (!usage) return '-';
-    const prompt = usage.promptTokens ?? 0;
-    const completion = usage.completionTokens ?? 0;
-    const total = usage.totalTokens ?? prompt + completion;
-    return `P:${formatTokensM(prompt)} C:${formatTokensM(completion)} T:${formatTokensM(total)}`;
-  }
   const nav = useMemo<Array<{ page: Page; icon: ReactElement; label: string }>>(
     () => [
       { page: 'chat', icon: <SidebarIcon kind="chat" />, label: tr('Chat', '对话') },
       { page: 'memory', icon: <SidebarIcon kind="memory" />, label: tr('Memory', '记忆') },
       { page: 'skills', icon: <SidebarIcon kind="skills" />, label: tr('Skills', '技能') },
+      { page: 'plugins', icon: <SidebarIcon kind="plugins" />, label: tr('Plugins', '插件') },
       { page: 'tasks', icon: <SidebarIcon kind="tasks" />, label: tr('Tasks', '任务') },
       { page: 'sessions', icon: <SidebarIcon kind="sessions" />, label: tr('History', '历史') },
       { page: 'settings', icon: <SidebarIcon kind="settings" />, label: tr('Settings', '设置') },
@@ -1047,7 +1307,6 @@ export function App(): ReactElement {
       ...nav.slice(1)
     ];
   }, [nav, tr]);
-
   useEffect(() => {
     void window.tasiHarness.config.get().then((cfg) => {
       setConfig(cfg);
@@ -1168,7 +1427,7 @@ export function App(): ReactElement {
         executionMode
       });
       setSessionId(result.sessionId);
-      setMessages(result.messages.filter((m) => m.role !== 'system'));
+      setMessages(result.messages.filter((m) => m.role !== 'system' && m.hidden !== true));
       setLastUsage(result.usage);
       setTotalUsage(result.totalUsage);
       setToolEvents(result.toolEvents);
@@ -1203,9 +1462,6 @@ export function App(): ReactElement {
           <div className="logo-copy">
             <div className="logo-head">
               <div className="logo-text">{config.branding.productName || 'Tasi Harness'}</div>
-              <button className="lang-toggle" onClick={() => setLanguage((current) => (current === 'zh' ? 'en' : 'zh'))}>
-                {language === 'zh' ? 'EN' : '中文'}
-              </button>
             </div>
             <div className="logo-sub">{tr('Desktop Agent', '桌面智能体')}</div>
           </div>
@@ -1235,12 +1491,6 @@ export function App(): ReactElement {
             </button>
           ))}
         </div>
-        <div className="sidebar-footer">
-          <div className="meta-row wrap">
-            <span className="soft-badge">{tr('Last', '本次')}: {usageLabel(lastUsage)}</span>
-            <span className="soft-badge">{tr('Total', '累计')}: {usageLabel(totalUsage)}</span>
-          </div>
-        </div>
       </aside>
       <main className="main-pane">
         {page === 'chat' && (
@@ -1248,14 +1498,14 @@ export function App(): ReactElement {
             tr={tr}
             config={config}
             setConfig={setConfig}
+            language={language}
+            setLanguage={setLanguage}
             messages={messages}
             setMessages={setMessages}
             sessionId={sessionId}
             setSessionId={setSessionId}
             restoreLiveSession={restoreLiveSession}
-            lastUsage={lastUsage}
             setLastUsage={setLastUsage}
-            totalUsage={totalUsage}
             setTotalUsage={setTotalUsage}
             toolEvents={toolEvents}
             setToolEvents={setToolEvents}
@@ -1282,6 +1532,9 @@ export function App(): ReactElement {
             optimizeBusy={chatBusy}
             onOptimizeSession={startSkillOptimization}
           />
+        )}
+        {page === 'plugins' && (
+          <PluginsPage tr={tr} />
         )}
         {page === 'tasks' && <TasksPage tr={tr} tasks={tasks} refreshTasks={refreshTasks} refreshSessions={refreshSessions} />}
         {page === 'sessions' && (
@@ -1413,10 +1666,8 @@ interface PreviewWebviewElement extends HTMLElement {
   executeJavaScript?: (code: string, userGesture?: boolean) => Promise<unknown>;
   setZoomFactor?: (factor: number) => void;
   setZoomLevel?: (level: number) => void;
+  setVisualZoomLevelLimits?: (minimumLevel: number, maximumLevel: number) => Promise<void>;
 }
-
-const PREVIEW_MIN_ZOOM_FACTOR = 0.08;
-const PREVIEW_ZOOM_LEVEL_BASE = 1.2;
 
 function normalizePreviewUrlInput(raw: string): string | undefined {
   const value = raw.trim();
@@ -1481,14 +1732,14 @@ function ChatPage(props: {
   tr: TranslateFn;
   config: PublicAppConfig;
   setConfig: (cfg: PublicAppConfig) => void;
+  language: UiLanguage;
+  setLanguage: Dispatch<SetStateAction<UiLanguage>>;
   messages: AgentMessage[];
   setMessages: Dispatch<SetStateAction<AgentMessage[]>>;
   sessionId?: string;
   setSessionId: (id?: string) => void;
   restoreLiveSession?: { sessionId: string; token: number } | null;
-  lastUsage?: LlmUsage;
   setLastUsage: (usage?: LlmUsage) => void;
-  totalUsage?: LlmUsage;
   setTotalUsage: (usage?: LlmUsage) => void;
   toolEvents: ToolEvent[];
   setToolEvents: Dispatch<SetStateAction<ToolEvent[]>>;
@@ -1518,12 +1769,21 @@ function ChatPage(props: {
   const [sessionDocError, setSessionDocError] = useState('');
   const [multimediaAttachments, setMultimediaAttachments] = useState<AgentMessageAttachment[]>([]);
   const [multimediaError, setMultimediaError] = useState('');
+  const [pluginMentionStatus, setPluginMentionStatus] = useState<DshSidecarRuntimeStatus | null>(() => pluginMentionRuntimeStatusCache?.status ?? null);
+  const [pluginMentionTrigger, setPluginMentionTrigger] = useState<PluginMentionTrigger | null>(null);
+  const [pluginMentionActiveIndex, setPluginMentionActiveIndex] = useState(0);
+  const [pluginMentionLoading, setPluginMentionLoading] = useState(false);
+  const [pluginMentionError, setPluginMentionError] = useState('');
   const [wechatChipClearedAt, setWechatChipClearedAt] = useState(() => new Date().toISOString());
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
-  const [toolPanelTab, setToolPanelTab] = useState<'tools' | 'sources'>('tools');
+  const [toolPanelTab, setToolPanelTab] = useState<'artifacts' | 'browser' | 'tools'>('tools');
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const [chatSplitPercent, setChatSplitPercent] = useState(33.333);
+  const [artifactPreview, setArtifactPreview] = useState<ArtifactPreviewResult | null>(null);
+  const [artifactTextSelection, setArtifactTextSelection] = useState<ArtifactTextSelection | null>(null);
   const [webPreviewExpanded, setWebPreviewExpanded] = useState(false);
   const [webPreviewRect, setWebPreviewRect] = useState<PreviewRect | null>(null);
+  const [activePreviewUrl, setActivePreviewUrl] = useState('');
   const [previewAddress, setPreviewAddress] = useState('');
   const [previewCanGoBack, setPreviewCanGoBack] = useState(false);
   const [previewCanGoForward, setPreviewCanGoForward] = useState(false);
@@ -1534,13 +1794,10 @@ function ChatPage(props: {
   const chatContentGridRef = useRef<HTMLDivElement | null>(null);
   const previewBodyRef = useRef<HTMLDivElement | null>(null);
   const previewWebviewRef = useRef<PreviewWebviewElement | null>(null);
+  const chatTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const uploadSessionDocInputRef = useRef<HTMLInputElement | null>(null);
   const uploadMultimediaInputRef = useRef<HTMLInputElement | null>(null);
-  const previewZoomFactorRef = useRef(1);
   const previewZoomSyncIdRef = useRef(0);
-  const previewContentMetricsRef = useRef<{ contentWidth: number; contentHeight: number } | null>(null);
-  const previewMeasuredViewportRef = useRef<{ width: number; height: number } | null>(null);
-  const previewNeedsMeasurementRef = useRef(true);
   const externalPreviewOpenUrlRef = useRef('');
   const messageDeltaBufferRef = useRef<Map<string, AgentMessageDeltaStream>>(new Map());
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
@@ -1555,6 +1812,7 @@ function ChatPage(props: {
   const previewDraggingRef = useRef(false);
   const previewDragRafRef = useRef<number | null>(null);
   const previewDragNextRectRef = useRef<PreviewRect | null>(null);
+
   const uiInteractionActiveRef = useRef(false);
   const uiInteractionReleaseTimerRef = useRef<number | null>(null);
   const dragStateRef = useRef<{
@@ -1566,18 +1824,12 @@ function ChatPage(props: {
   const [previewDragging, setPreviewDragging] = useState(false);
   const visibleMessages = useMemo(() => props.messages.filter(isVisibleChatMessage), [props.messages]);
   const latestVisibleMessage = visibleMessages[visibleMessages.length - 1];
-  const previewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
+  const latestToolPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
+  const previewUrl = activePreviewUrl || latestToolPreviewUrl;
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
   const shouldShowWebPreview = showEmbeddedWebPreview && Boolean(previewUrl);
   const personalKnowledgeEnabled = usePersonalKnowledgeBase && props.personalKnowledgeDocCount > 0;
-  const latestAssistantContent = useMemo(() => {
-    if (props.busy && toolPanelTab !== 'sources') return '';
-    const latest = [...visibleMessages].reverse().find((message) => message.role === 'assistant' && message.content.trim());
-    if (!latest) return '';
-    return [...(latest.content_parts ?? []), latest.content].filter((item) => item.trim()).join('\n\n');
-  }, [visibleMessages, props.busy, toolPanelTab]);
-  const referencedPages = useMemo(() => extractCitationLinks(latestAssistantContent), [latestAssistantContent]);
   const isWechatSession = Boolean(
     props.sessionId
       && props.config.wechatChannel.sessionId
@@ -1585,6 +1837,9 @@ function ChatPage(props: {
   );
   const wechatBusy = isWechatSession && props.messages.some((message) => message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER);
   const runBusy = props.busy || wechatBusy;
+  const chatGridStyle = useMemo(() => ({
+    '--chat-history-width': `${chatSplitPercent}%`
+  }) as CSSProperties, [chatSplitPercent]);
   const visibleToolEvents = useMemo(
     () => runBusy ? props.toolEvents.slice(-MAX_LIVE_RENDERED_TOOL_EVENTS) : props.toolEvents,
     [props.toolEvents, runBusy]
@@ -1616,6 +1871,77 @@ function ChatPage(props: {
     isWechatSession ? wechatSessionAttachments.slice(-3) : wechatSessionAttachments
   ), [isWechatSession, wechatSessionAttachments]);
   const hiddenWechatAttachmentCount = Math.max(0, wechatSessionAttachments.length - visibleWechatSessionAttachments.length);
+  const pluginMentionOptions = useMemo(
+    () => pluginMentionItems(pluginMentionStatus, pluginMentionTrigger?.query ?? ''),
+    [pluginMentionStatus, pluginMentionTrigger?.query]
+  );
+  const showPluginMentionMenu = Boolean(pluginMentionTrigger) && (pluginMentionLoading || pluginMentionError || Boolean(pluginMentionStatus));
+
+  function updatePluginMentionForTextarea(text: string, cursor: number): void {
+    const trigger = findPluginMentionTrigger(text, cursor);
+    setPluginMentionTrigger(trigger);
+    setPluginMentionActiveIndex(0);
+    if (!trigger) setPluginMentionError('');
+  }
+
+  function insertPluginMention(item: PluginMentionItem): void {
+    const textarea = chatTextareaRef.current;
+    const trigger = pluginMentionTrigger;
+    if (!trigger) return;
+    const replacement = `@${item.token} `;
+    const next = `${input.slice(0, trigger.start)}${replacement}${input.slice(trigger.end)}`;
+    const cursor = trigger.start + replacement.length;
+    setInput(next);
+    setPluginMentionTrigger(null);
+    setPluginMentionActiveIndex(0);
+    requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  useEffect(() => {
+    if (pluginMentionStatus) return;
+    let cancelled = false;
+    setPluginMentionLoading(true);
+    cachedPluginMentionRuntimeStatus()
+      .then((status) => {
+        if (!cancelled) setPluginMentionStatus(status);
+      })
+      .catch(() => {
+        // Keep background prefetch quiet; the explicit @ flow reports errors.
+      })
+      .finally(() => {
+        if (!cancelled) setPluginMentionLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pluginMentionStatus]);
+
+  useEffect(() => {
+    if (!pluginMentionTrigger || pluginMentionStatus || pluginMentionLoading) return;
+    let cancelled = false;
+    setPluginMentionLoading(true);
+    setPluginMentionError('');
+    cachedPluginMentionRuntimeStatus()
+      .then((status) => {
+        if (!cancelled) setPluginMentionStatus(status);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setPluginMentionError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setPluginMentionLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pluginMentionTrigger, pluginMentionStatus, pluginMentionLoading]);
+
+  useEffect(() => {
+    if (pluginMentionActiveIndex >= pluginMentionOptions.length) setPluginMentionActiveIndex(0);
+  }, [pluginMentionActiveIndex, pluginMentionOptions.length]);
 
   useEffect(() => {
     previewDraggingRef.current = previewDragging;
@@ -1913,21 +2239,17 @@ function ChatPage(props: {
     if (!shouldShowWebPreview) {
       setWebPreviewExpanded(false);
       setWebPreviewRect(null);
-      setPreviewAddress('');
       setPreviewCanGoBack(false);
       setPreviewCanGoForward(false);
       setPreviewLoading(false);
-      previewZoomFactorRef.current = 1;
       previewZoomSyncIdRef.current += 1;
-      previewContentMetricsRef.current = null;
-      previewMeasuredViewportRef.current = null;
-      previewNeedsMeasurementRef.current = true;
     }
   }, [shouldShowWebPreview]);
   useEffect(() => {
-    if (!previewUrl) return;
-    setPreviewAddress(previewUrl);
-  }, [previewUrl]);
+    if (!latestToolPreviewUrl) return;
+    setActivePreviewUrl(latestToolPreviewUrl);
+    setPreviewAddress(latestToolPreviewUrl);
+  }, [latestToolPreviewUrl]);
   useEffect(() => {
     if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !props.busy) {
       externalPreviewOpenUrlRef.current = '';
@@ -1945,11 +2267,8 @@ function ChatPage(props: {
   }, [showEmbeddedWebPreview, externalFallbackPreviewUrl, props.busy]);
   useEffect(() => {
     if (!shouldShowWebPreview) return;
-    previewContentMetricsRef.current = null;
-    previewMeasuredViewportRef.current = null;
-    previewNeedsMeasurementRef.current = true;
     previewZoomSyncIdRef.current += 1;
-    setPreviewZoomFactor(1, true);
+    resetPreviewWebviewZoom(true);
   }, [previewUrl, shouldShowWebPreview]);
   useEffect(() => {
     if (!webPreviewExpanded) return;
@@ -1992,28 +2311,30 @@ function ChatPage(props: {
     });
     return () => window.cancelAnimationFrame(rafId);
   }, [visibleToolEvents.length, toolPanelCollapsed, toolPanelTab, runBusy]);
-  useEffect(() => {
-    const off = window.tasiHarness.agent.onToolEvent((payload) => {
-      if (props.sessionId && payload.sessionId !== props.sessionId) return;
-      enqueueToolEvent(payload.event);
-    });
+	  useEffect(() => {
+	    const off = window.tasiHarness.agent.onToolEvent((payload) => {
+	      if (isExternalImSessionId(payload.sessionId) && props.sessionId !== payload.sessionId) return;
+	      if (props.sessionId && payload.sessionId !== props.sessionId) return;
+	      enqueueToolEvent(payload.event);
+	    });
     return () => {
       off();
       clearPendingToolEvents();
     };
   }, [props.sessionId, props.setToolEvents]);
-  useEffect(() => {
-    const off = window.tasiHarness.agent.onMessageDelta((payload) => {
-      if (props.sessionId && payload.sessionId !== props.sessionId) return;
-      enqueueMessageDelta(payload);
-    });
+	  useEffect(() => {
+	    const off = window.tasiHarness.agent.onMessageDelta((payload) => {
+	      if (isExternalImSessionId(payload.sessionId) && props.sessionId !== payload.sessionId) return;
+	      if (props.sessionId && payload.sessionId !== props.sessionId) return;
+	      enqueueMessageDelta(payload);
+	    });
     return () => {
       off();
       clearPendingMessageDeltas();
     };
   }, [props.sessionId, props.setMessages]);
   useEffect(() => {
-    if (!showEmbeddedWebPreview) {
+    if (!showEmbeddedWebPreview || !shouldShowWebPreview) {
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
       return;
     }
@@ -2023,6 +2344,7 @@ function ChatPage(props: {
       try {
         const id = typeof webview.getWebContentsId === 'function' ? webview.getWebContentsId() : null;
         if (typeof id !== 'number' || !Number.isFinite(id) || id <= 0) return;
+        resetPreviewWebviewZoom(true);
         void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(id);
       } catch {
         // Ignore transient webview readiness errors.
@@ -2034,7 +2356,7 @@ function ChatPage(props: {
       webview.removeEventListener('dom-ready', syncBinding as EventListener);
       void window.tasiHarness.app.setEmbeddedPreviewWebContentsId(null);
     };
-  }, [showEmbeddedWebPreview]);
+  }, [showEmbeddedWebPreview, shouldShowWebPreview, previewUrl]);
   useEffect(() => {
     if (!shouldShowWebPreview) return;
     const webview = previewWebviewRef.current;
@@ -2105,124 +2427,18 @@ function ChatPage(props: {
     }
   }
 
-  function zoomLevelFromFactor(factor: number): number {
-    if (!Number.isFinite(factor) || factor <= 0) return 0;
-    return Math.log(factor) / Math.log(PREVIEW_ZOOM_LEVEL_BASE);
-  }
-
-  function setPreviewZoomFactor(factor: number, force = false): void {
+  function resetPreviewWebviewZoom(force = false): void {
     const webview = previewWebviewRef.current;
     if (!webview) return;
-    const nextFactor = Math.min(1, Math.max(PREVIEW_MIN_ZOOM_FACTOR, factor));
-    if (!force && Math.abs(previewZoomFactorRef.current - nextFactor) < 0.005) return;
-    previewZoomFactorRef.current = nextFactor;
+    if (!force && previewZoomSyncIdRef.current > 0) return;
     try {
-      webview.setZoomFactor?.(nextFactor);
-      webview.setZoomLevel?.(zoomLevelFromFactor(nextFactor));
+      webview.style.zoom = '1';
+      webview.setZoomFactor?.(1);
+      webview.setZoomLevel?.(0);
+      void webview.setVisualZoomLevelLimits?.(1, 1);
     } catch {
       // Ignore transient zoom update failures while page is changing.
     }
-  }
-
-  function applyPreviewContentZoom(force = false): void {
-    const body = previewBodyRef.current;
-    const metrics = previewContentMetricsRef.current;
-    if (!body || !metrics) return;
-
-    const viewportWidth = Math.max(1, Math.round(body.clientWidth));
-    const viewportHeight = Math.max(1, Math.round(body.clientHeight));
-    if (viewportWidth < 2 || viewportHeight < 2) return;
-
-    const widthFactor = viewportWidth / Math.max(metrics.contentWidth, 1);
-    const heightFactor = viewportHeight / Math.max(metrics.contentHeight, 1);
-    setPreviewZoomFactor(Math.min(1, widthFactor, heightFactor), force);
-  }
-
-  function currentPreviewViewport(): { width: number; height: number } | null {
-    const body = previewBodyRef.current;
-    if (!body) return null;
-    const width = Math.max(1, Math.round(body.clientWidth));
-    const height = Math.max(1, Math.round(body.clientHeight));
-    if (width < 2 || height < 2) return null;
-    return { width, height };
-  }
-
-  function shouldRemeasurePreviewMetrics(): boolean {
-    const viewport = currentPreviewViewport();
-    if (!viewport) return false;
-    if (!previewContentMetricsRef.current) return true;
-    const measured = previewMeasuredViewportRef.current;
-    if (!measured) return true;
-    const widthRatio = viewport.width / Math.max(1, measured.width);
-    const heightRatio = viewport.height / Math.max(1, measured.height);
-    return (
-      Math.abs(viewport.width - measured.width) >= 72 ||
-      Math.abs(viewport.height - measured.height) >= 72 ||
-      Math.abs(widthRatio - 1) >= 0.12 ||
-      Math.abs(heightRatio - 1) >= 0.12
-    );
-  }
-
-  async function readPreviewContentMetrics(syncId: number): Promise<{ contentWidth: number; contentHeight: number } | null> {
-    const webview = previewWebviewRef.current;
-    if (!webview) return null;
-
-    try {
-      const result = await webview.executeJavaScript?.(
-        `new Promise((resolve) => {
-          const collect = () => {
-            const doc = document.documentElement;
-            const body = document.body;
-            const contentWidth = Math.max(
-              doc ? doc.scrollWidth : 0,
-              doc ? doc.offsetWidth : 0,
-              doc ? doc.clientWidth : 0,
-              body ? body.scrollWidth : 0,
-              body ? body.offsetWidth : 0,
-              body ? body.clientWidth : 0,
-              window.innerWidth || 0
-            );
-            const contentHeight = Math.max(
-              doc ? doc.scrollHeight : 0,
-              doc ? doc.offsetHeight : 0,
-              doc ? doc.clientHeight : 0,
-              body ? body.scrollHeight : 0,
-              body ? body.offsetHeight : 0,
-              body ? body.clientHeight : 0,
-              window.innerHeight || 0
-            );
-            resolve({ contentWidth, contentHeight });
-          };
-          requestAnimationFrame(() => requestAnimationFrame(collect));
-        })`,
-        true
-      );
-      if (syncId !== previewZoomSyncIdRef.current) return null;
-      const metrics = result as { contentWidth?: unknown; contentHeight?: unknown } | undefined;
-      const contentWidth = typeof metrics?.contentWidth === 'number' && Number.isFinite(metrics.contentWidth) ? metrics.contentWidth : 0;
-      const contentHeight = typeof metrics?.contentHeight === 'number' && Number.isFinite(metrics.contentHeight) ? metrics.contentHeight : 0;
-      return { contentWidth, contentHeight };
-    } catch {
-      return null;
-    }
-  }
-
-  async function refreshPreviewNaturalMetrics(force = false): Promise<void> {
-    if (!force && !previewNeedsMeasurementRef.current && !shouldRemeasurePreviewMetrics()) {
-      applyPreviewContentZoom();
-      return;
-    }
-
-    const syncId = previewZoomSyncIdRef.current + 1;
-    previewZoomSyncIdRef.current = syncId;
-    const metrics = await readPreviewContentMetrics(syncId);
-    if (syncId !== previewZoomSyncIdRef.current || !metrics) return;
-    if (metrics.contentWidth < 1 || metrics.contentHeight < 1) return;
-
-    previewContentMetricsRef.current = metrics;
-    previewMeasuredViewportRef.current = currentPreviewViewport();
-    previewNeedsMeasurementRef.current = false;
-    applyPreviewContentZoom(true);
   }
 
   useEffect(() => {
@@ -2232,23 +2448,11 @@ function ChatPage(props: {
     if (!webview || !body) return;
     let disposed = false;
     let rafId = 0;
-    let measurementTimeoutId = 0;
 
     const syncHostSize = () => {
       if (disposed) return;
       syncPreviewWebviewHostSize();
-    };
-
-    const scheduleNaturalMeasurement = (delay = webPreviewExpanded ? 90 : 140) => {
-      if (disposed) return;
-      if (!shouldRemeasurePreviewMetrics()) return;
-      previewNeedsMeasurementRef.current = true;
-      if (measurementTimeoutId) window.clearTimeout(measurementTimeoutId);
-      measurementTimeoutId = window.setTimeout(() => {
-        measurementTimeoutId = 0;
-        if (disposed) return;
-        void refreshPreviewNaturalMetrics(true);
-      }, delay);
+      resetPreviewWebviewZoom(true);
     };
 
     const schedulePreviewSync = () => {
@@ -2256,8 +2460,6 @@ function ChatPage(props: {
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
         syncHostSize();
-        applyPreviewContentZoom();
-        scheduleNaturalMeasurement();
       });
     };
 
@@ -2273,7 +2475,6 @@ function ChatPage(props: {
     return () => {
       disposed = true;
       for (const timeoutId of syncTimeouts) window.clearTimeout(timeoutId);
-      if (measurementTimeoutId) window.clearTimeout(measurementTimeoutId);
       if (rafId) cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
       webview.removeEventListener('dom-ready', schedulePreviewSync as EventListener);
@@ -2290,55 +2491,29 @@ function ChatPage(props: {
 
     let disposed = false;
     let rafId = 0;
-    const measurementTimeouts: number[] = [];
-
-    const clearPreviewMeasurement = () => {
-      previewContentMetricsRef.current = null;
-      previewMeasuredViewportRef.current = null;
-      previewNeedsMeasurementRef.current = true;
-      previewZoomSyncIdRef.current += 1;
-      setPreviewZoomFactor(1, true);
+    const reset = () => {
+      if (disposed) return;
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => resetPreviewWebviewZoom(true));
     };
 
-    const scheduleMeasurement = (delay = 0) => {
-      const run = () => {
-        if (disposed) return;
-        if (rafId) cancelAnimationFrame(rafId);
-        rafId = requestAnimationFrame(() => {
-          void refreshPreviewNaturalMetrics();
-        });
-      };
-      if (delay <= 0) {
-        run();
-        return;
-      }
-      measurementTimeouts.push(window.setTimeout(run, delay));
-    };
-
-    const onStartLoading = () => clearPreviewMeasurement();
-    const onReadyToMeasure = () => {
-      if (!previewNeedsMeasurementRef.current) return;
-      scheduleMeasurement();
-      scheduleMeasurement(120);
-      scheduleMeasurement(320);
-    };
-
-    webview.addEventListener('did-start-loading', onStartLoading as EventListener);
-    webview.addEventListener('dom-ready', onReadyToMeasure as EventListener);
-    webview.addEventListener('did-stop-loading', onReadyToMeasure as EventListener);
-    webview.addEventListener('did-navigate', onReadyToMeasure as EventListener);
-    webview.addEventListener('did-navigate-in-page', onReadyToMeasure as EventListener);
-    onReadyToMeasure();
+    webview.addEventListener('did-start-loading', reset as EventListener);
+    webview.addEventListener('dom-ready', reset as EventListener);
+    webview.addEventListener('did-stop-loading', reset as EventListener);
+    webview.addEventListener('did-navigate', reset as EventListener);
+    webview.addEventListener('did-navigate-in-page', reset as EventListener);
+    reset();
+    const resetTimeouts = [60, 180, 420, 900].map((delay) => window.setTimeout(reset, delay));
 
     return () => {
       disposed = true;
       if (rafId) cancelAnimationFrame(rafId);
-      for (const timeoutId of measurementTimeouts) window.clearTimeout(timeoutId);
-      webview.removeEventListener('did-start-loading', onStartLoading as EventListener);
-      webview.removeEventListener('dom-ready', onReadyToMeasure as EventListener);
-      webview.removeEventListener('did-stop-loading', onReadyToMeasure as EventListener);
-      webview.removeEventListener('did-navigate', onReadyToMeasure as EventListener);
-      webview.removeEventListener('did-navigate-in-page', onReadyToMeasure as EventListener);
+      for (const timeoutId of resetTimeouts) window.clearTimeout(timeoutId);
+      webview.removeEventListener('did-start-loading', reset as EventListener);
+      webview.removeEventListener('dom-ready', reset as EventListener);
+      webview.removeEventListener('did-stop-loading', reset as EventListener);
+      webview.removeEventListener('did-navigate', reset as EventListener);
+      webview.removeEventListener('did-navigate-in-page', reset as EventListener);
     };
   }, [shouldShowWebPreview, previewUrl]);
 
@@ -2381,6 +2556,8 @@ function ChatPage(props: {
     const outgoingAttachments = multimediaAttachments;
     if ((!text && outgoingAttachments.length === 0) || props.busy) return;
     setInput('');
+    setArtifactTextSelection(null);
+    setPluginMentionTrigger(null);
     setError('');
     setMultimediaError('');
     setMultimediaAttachments([]);
@@ -2393,9 +2570,10 @@ function ChatPage(props: {
     props.setMessages([...props.messages, { role: 'user', content: text, attachments: outgoingAttachments.length > 0 ? outgoingAttachments : undefined, createdAt: new Date().toISOString() }]);
     try {
       const result = await window.tasiHarness.agent.chat(text, props.sessionId, props.executionMode, personalKnowledgeEnabled, outgoingAttachments);
+      clearPendingMessageDeltas();
       clearPendingToolEvents();
       props.setSessionId(result.sessionId);
-      props.setMessages(result.messages.filter((m) => m.role !== 'system'));
+      props.setMessages(result.messages.filter((m) => m.role !== 'system' && m.hidden !== true));
       props.setLastUsage(result.usage);
       props.setTotalUsage(result.totalUsage);
       props.setToolEvents(result.toolEvents);
@@ -2420,6 +2598,8 @@ function ChatPage(props: {
     const outgoingDocuments = activeSessionDocs;
     if ((!text && outgoingAttachments.length === 0 && outgoingDocuments.length === 0) || !liveInputReady) return;
     setInput('');
+    setArtifactTextSelection(null);
+    setPluginMentionTrigger(null);
     setError('');
     setMultimediaError('');
     setMultimediaAttachments([]);
@@ -2436,11 +2616,18 @@ function ChatPage(props: {
     props.setStopping(true);
     setError('');
     try {
-      await window.tasiHarness.agent.stop();
+      await Promise.race([
+        window.tasiHarness.agent.stop(),
+        new Promise((resolve) => window.setTimeout(resolve, 1800))
+      ]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      if (!props.busy) props.setStopping(false);
+      clearPendingMessageDeltas();
+      clearPendingToolEvents();
+      props.setStopping(false);
+      props.setBusy(false);
+      props.setMessages((old) => old.filter((message) => !(message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER)));
     }
   }
 
@@ -2456,14 +2643,13 @@ function ChatPage(props: {
     if (!webPreviewExpanded) {
       const bounds = previewViewportBounds();
       setWebPreviewRect(clampPreviewRect(buildDefaultPreviewRect(bounds), bounds));
-      previewNeedsMeasurementRef.current = true;
       setWebPreviewExpanded(true);
       window.requestAnimationFrame(() => {
         const webview = previewWebviewRef.current;
         if (!webview) return;
         try {
           syncPreviewWebviewHostSize();
-          void refreshPreviewNaturalMetrics(true);
+          resetPreviewWebviewZoom(true);
         } catch {
           // Ignore transient readiness failures.
         }
@@ -2585,10 +2771,12 @@ function ChatPage(props: {
       setError(props.tr('Invalid URL. Please input a valid http(s) address.', 'URL 无效，请输入有效的 http(s) 地址。'));
       return;
     }
+    setError('');
+    setToolPanelTab('browser');
+    setActivePreviewUrl(normalized);
+    setPreviewAddress(normalized);
     const webview = previewWebviewRef.current;
     if (!webview || typeof webview.loadURL !== 'function') return;
-    setError('');
-    setPreviewAddress(normalized);
     try {
       await webview.loadURL(normalized);
       syncPreviewNavigationState();
@@ -2699,6 +2887,43 @@ function ChatPage(props: {
     if (failures.length > 0) setMultimediaError(failures.join('\n'));
   }
 
+  function handleTextareaPaste(event: ReactClipboardEvent<HTMLTextAreaElement>): void {
+    const clipboard = event.clipboardData;
+    const imageFiles: File[] = [];
+    const seen = new Set<string>();
+    const addImageFile = (file: File | null) => {
+      if (!file || !file.type.startsWith('image/')) return;
+      const key = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      imageFiles.push(normalizePastedImageFile(file, imageFiles.length));
+    };
+
+    for (const item of Array.from(clipboard.items ?? [])) {
+      if (item.kind !== 'file') continue;
+      addImageFile(item.getAsFile());
+    }
+    for (const file of Array.from(clipboard.files ?? [])) addImageFile(file);
+    if (imageFiles.length === 0) return;
+
+    const pastedText = clipboard.getData('text/plain');
+    event.preventDefault();
+    if (pastedText) {
+      const textarea = event.currentTarget;
+      const start = textarea.selectionStart ?? input.length;
+      const end = textarea.selectionEnd ?? start;
+      const nextInput = `${input.slice(0, start)}${pastedText}${input.slice(end)}`;
+      const cursor = start + pastedText.length;
+      setInput(nextInput);
+      updatePluginMentionForTextarea(nextInput, cursor);
+      requestAnimationFrame(() => {
+        textarea.focus();
+        textarea.setSelectionRange(cursor, cursor);
+      });
+    }
+    void addMultimediaAttachments(imageFiles);
+  }
+
   function removeMultimediaAttachment(id: string | undefined): void {
     if (!id) return;
     setMultimediaAttachments((old) => old.filter((item) => item.id !== id));
@@ -2790,11 +3015,78 @@ function ChatPage(props: {
     setLiveRealtimeMessage('');
   }
 
+  function showArtifactPreview(preview: ArtifactPreviewResult): void {
+    setArtifactPreview(preview);
+    setArtifactTextSelection(null);
+    setToolPanelCollapsed(false);
+    setToolPanelTab('artifacts');
+  }
+
+  function appendArtifactSelectionToComposer(value: string): void {
+    const insert = value.trim();
+    if (!insert) return;
+    setInput((old) => old.trim() ? `${old.trimEnd()}\n\n${insert}` : insert);
+    setPluginMentionTrigger(null);
+    setArtifactTextSelection(null);
+    window.requestAnimationFrame(() => {
+      const textarea = chatTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      const end = textarea.value.length;
+      textarea.setSelectionRange(end, end);
+    });
+  }
+
+  function askAboutArtifactSelection(selection: ArtifactTextSelection): void {
+    appendArtifactSelectionToComposer(artifactSelectionQuestionPrompt(selection.artifact, selection.text));
+  }
+
+  function addArtifactSelectionContext(selection: ArtifactTextSelection): void {
+    appendArtifactSelectionToComposer(artifactSelectionContextPrompt(selection.artifact, selection.text));
+  }
+
+  function startChatSplitResize(event: {
+    clientX: number;
+    pointerId: number;
+    currentTarget: HTMLDivElement;
+    preventDefault: () => void;
+  }): void {
+    if (toolPanelCollapsed) return;
+    const grid = chatContentGridRef.current;
+    if (!grid) return;
+    const rect = grid.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const updateSplit = (clientX: number): void => {
+      const next = ((clientX - rect.left) / rect.width) * 100;
+      setChatSplitPercent(Math.min(72, Math.max(22, next)));
+    };
+    updateSplit(event.clientX);
+    const handlePointerMove = (moveEvent: PointerEvent): void => {
+      updateSplit(moveEvent.clientX);
+    };
+    const stopResize = (): void => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', stopResize);
+      window.removeEventListener('pointercancel', stopResize);
+    };
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', stopResize);
+    window.addEventListener('pointercancel', stopResize);
+  }
+
   return (
     <section className="page chat-page">
       <div className="chat-header">
         <div className="chat-session-title">{props.tr('Assistant Chat', '助手对话')}</div>
         <div className="chat-actions">
+          <button
+            className="lang-toggle chat-lang-toggle"
+            onClick={() => props.setLanguage((current) => (current === 'zh' ? 'en' : 'zh'))}
+          >
+            {props.language === 'zh' ? 'EN' : '中文'}
+          </button>
           <label
             className={`toggle-line chat-control chat-toggle live-mode-toggle ${liveModeActive ? 'active' : ''} ${liveModeToggleDisabled ? 'disabled' : ''}`}
             title={liveModeToggleTitle}
@@ -2880,7 +3172,7 @@ function ChatPage(props: {
           />
         </div>
       ) : (
-      <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef}>
+      <div className={`chat-content-grid ${toolPanelCollapsed ? 'tool-panel-collapsed' : ''}`} ref={chatContentGridRef} style={chatGridStyle}>
         <div className="chat-messages" ref={chatMessagesRef}>
           {visibleMessages.length === 0 && (
             <div className="empty-state">
@@ -2898,6 +3190,7 @@ function ChatPage(props: {
               productName={props.config.branding.productName || 'Tasi Harness'}
               liveContentPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && m.content.trim().length > 0}
               liveReasoningPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && Boolean(m.reasoning_content?.trim())}
+              onPreviewArtifact={showArtifactPreview}
             />
           ))}
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
@@ -2915,6 +3208,16 @@ function ChatPage(props: {
           )}
           <div ref={endRef} />
         </div>
+        {!toolPanelCollapsed && (
+          <div
+            className="chat-split-resizer"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label={props.tr('Resize chat and side panel', '调整对话和右侧面板宽度')}
+            title={props.tr('Drag to resize chat and side panel', '拖动调整对话和右侧面板宽度')}
+            onPointerDown={startChatSplitResize}
+          />
+        )}
         <div className={`tool-panel ${toolPanelCollapsed ? 'collapsed' : ''} ${webPreviewExpanded ? 'web-preview-floating' : ''}`}>
           {toolPanelCollapsed ? (
             <button
@@ -2939,51 +3242,157 @@ function ChatPage(props: {
             </button>
             <div className="tool-panel-tabs" role="tablist" aria-label={props.tr('Side panel', '侧边栏')}>
               <button
+                className={`tool-panel-tab ${toolPanelTab === 'artifacts' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'artifacts'}
+                onClick={() => setToolPanelTab('artifacts')}
+              >
+                <span className="tool-panel-tab-icon" aria-hidden="true">□</span>
+                <span className="tool-panel-tab-label">{props.tr('File Preview', '文件预览')}</span>
+                <span className="tool-panel-tab-count">{artifactPreview ? 1 : 0}</span>
+              </button>
+              <button
+                className={`tool-panel-tab ${toolPanelTab === 'browser' ? 'active' : ''}`}
+                role="tab"
+                aria-selected={toolPanelTab === 'browser'}
+                onClick={() => setToolPanelTab('browser')}
+              >
+                <span className="tool-panel-tab-icon" aria-hidden="true">⌂</span>
+                <span className="tool-panel-tab-label">{props.tr('Browser', '内部浏览器')}</span>
+                <span className="tool-panel-tab-count">{shouldShowWebPreview ? 1 : 0}</span>
+              </button>
+              <button
                 className={`tool-panel-tab ${toolPanelTab === 'tools' ? 'active' : ''}`}
                 role="tab"
                 aria-selected={toolPanelTab === 'tools'}
                 onClick={() => setToolPanelTab('tools')}
               >
-                {props.tr('Tool Trace', '工具轨迹')}
-                <span>{props.toolEvents.length}</span>
-              </button>
-              <button
-                className={`tool-panel-tab ${toolPanelTab === 'sources' ? 'active' : ''}`}
-                role="tab"
-                aria-selected={toolPanelTab === 'sources'}
-                onClick={() => setToolPanelTab('sources')}
-              >
-                {props.tr('Referenced Pages', '引用网页')}
-                <span>{referencedPages.length}</span>
+                <span className="tool-panel-tab-icon" aria-hidden="true">⚙</span>
+                <span className="tool-panel-tab-label">{props.tr('Tool Trace', '工具轨迹')}</span>
+                <span className="tool-panel-tab-count">{props.toolEvents.length}</span>
               </button>
             </div>
           </div>
-          <div className="tool-panel-body" ref={toolPanelBodyRef}>
-            {toolPanelTab === 'sources' ? (
-              referencedPages.length === 0 ? (
-                <div className="tool-empty">{props.tr('Referenced webpages from the latest answer will appear here.', '最新回复中的引用网页会显示在这里。')}</div>
-              ) : (
-                <div className="reference-panel">
-                  <div className="reference-summary">
-                    <strong>{props.tr(`Read ${referencedPages.length} webpages`, `已引用 ${referencedPages.length} 个网页`)}</strong>
-                    <div className="reference-favicons">
-                      {referencedPages.slice(0, 5).map((page) => (
-                        <ReferenceFavicon key={page.href} page={page} compact />
-                      ))}
+          <div className={`tool-panel-body ${toolPanelTab === 'browser' ? 'browser-preview-body' : ''} ${toolPanelTab === 'artifacts' ? 'artifact-preview-body' : ''}`} ref={toolPanelBodyRef}>
+            {toolPanelTab === 'artifacts' ? (
+              artifactPreview ? (
+                <div className="artifact-side-preview">
+                  <div className="artifact-side-preview-head">
+                    <div>
+                      <strong>{artifactPreview.artifact.name}</strong>
+                      <p>{artifactPreview.artifact.kind} | {formatBytes(artifactPreview.artifact.sizeBytes)}</p>
+                    </div>
+                    <div className="artifact-side-preview-actions">
+                      <button className="mini-button" onClick={() => void window.tasiHarness.app.openArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
+                        {props.tr('Open', '打开')}
+                      </button>
+                      <button className="mini-button" onClick={() => void window.tasiHarness.app.revealArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
+                        {props.tr('Folder', '目录')}
+                      </button>
                     </div>
                   </div>
-                  {referencedPages.map((page) => (
-                    <button key={`${page.label}-${page.href}`} className="reference-card" onClick={() => void window.tasiHarness.app.openExternalUrl(page.href, { system: true })}>
-                      <div className="reference-card-top">
-                        <span className="reference-index">{page.label}</span>
-                        <ReferenceFavicon page={page} />
-                        <strong>{page.host}</strong>
-                      </div>
-                      {page.excerpt && <p>{page.excerpt}</p>}
-                      <span>{page.href}</span>
-                    </button>
-                  ))}
+                  <ArtifactPreviewContent preview={artifactPreview} onTextSelection={setArtifactTextSelection} />
+                  {artifactTextSelection && artifactTextSelection.artifact.id === artifactPreview.artifact.id && (
+                    <div
+                      className="artifact-selection-toolbar"
+                      style={{ left: artifactTextSelection.x, top: artifactTextSelection.y }}
+                      onMouseDown={(event) => event.preventDefault()}
+                    >
+                      <button type="button" className="mini-button" onClick={() => askAboutArtifactSelection(artifactTextSelection)}>
+                        {props.tr('Ask', '提问')}
+                      </button>
+                      <button type="button" className="mini-button" onClick={() => addArtifactSelectionContext(artifactTextSelection)}>
+                        {props.tr('Add', '加入')}
+                      </button>
+                      <button type="button" className="mini-button" onClick={() => setArtifactTextSelection(null)}>
+                        x
+                      </button>
+                    </div>
+                  )}
                 </div>
+              ) : (
+                <div className="tool-empty">{props.tr('Previewable files from assistant replies will appear here after you click Preview.', '点击回复中文件的“预览”后，会在这里显示可预览文件。')}</div>
+              )
+            ) : toolPanelTab === 'browser' ? (
+              showEmbeddedWebPreview ? (
+                <div
+                  className={`tool-web-preview ${webPreviewExpanded ? 'expanded' : ''} ${previewDragging ? 'dragging' : ''}`}
+                  style={webPreviewExpanded && webPreviewRect ? {
+                    left: 0,
+                    top: 0,
+                    width: webPreviewRect.width,
+                    height: webPreviewRect.height,
+                    transform: `translate3d(${webPreviewRect.x}px, ${webPreviewRect.y}px, 0)`
+                  } : undefined}
+                >
+                  <div className="tool-web-preview-toolbar">
+                    <button
+                      className="mini-button tool-web-preview-icon-button"
+                      onClick={handlePreviewBack}
+                      disabled={!previewCanGoBack}
+                      title={props.tr('Back', '后退')}
+                      aria-label={props.tr('Back', '后退')}
+                    >
+                      <BrowserToolbarIcon kind="back" />
+                    </button>
+                    <button
+                      className="mini-button tool-web-preview-icon-button"
+                      onClick={handlePreviewForward}
+                      disabled={!previewCanGoForward}
+                      title={props.tr('Forward', '前进')}
+                      aria-label={props.tr('Forward', '前进')}
+                    >
+                      <BrowserToolbarIcon kind="forward" />
+                    </button>
+                    <button
+                      className={`mini-button tool-web-preview-icon-button ${previewLoading ? 'loading' : ''}`}
+                      onClick={handlePreviewRefresh}
+                      title={props.tr('Refresh', '刷新')}
+                      aria-label={props.tr('Refresh', '刷新')}
+                    >
+                      <BrowserToolbarIcon kind="refresh" />
+                    </button>
+                    <input
+                      className="tool-web-preview-address"
+                      value={previewAddress}
+                      onChange={(event) => setPreviewAddress(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') {
+                          event.preventDefault();
+                          void navigatePreviewToAddress();
+                        }
+                      }}
+                      placeholder={props.tr('Enter URL and press Enter', '输入网址后按回车')}
+                    />
+                    <button
+                      type="button"
+                      className="mini-button tool-web-preview-open tool-web-preview-icon-button"
+                      onClick={() => void navigatePreviewToAddress()}
+                      title={props.tr('Go to address', '进入地址')}
+                      aria-label={props.tr('Go to address', '进入地址')}
+                    >
+                      <BrowserToolbarIcon kind="open" />
+                    </button>
+                  </div>
+                  {shouldShowWebPreview ? (
+                    <div className="tool-web-preview-body" ref={previewBodyRef}>
+                      <webview
+                        ref={previewWebviewRef}
+                        key={`${EMBEDDED_BROWSER_PREVIEW_PARTITION}:${previewUrl || 'blank'}`}
+                        className="tool-web-preview-frame"
+                        src={previewUrl || 'about:blank'}
+                        partition={EMBEDDED_BROWSER_PREVIEW_PARTITION}
+                        webpreferences="zoomFactor=1"
+                      />
+                    </div>
+                  ) : (
+                    <div className="tool-web-preview-empty">
+                      {props.tr('Browser pages opened by tools will appear here.', '工具打开的网页会显示在这里。')}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="tool-empty">{props.tr('Built-in browser mode is disabled. Switch Browser Mode to Built-in browser to preview pages here.', '内部浏览器模式未启用。将浏览器模式切换为“内部浏览器”后，网页会在这里预览。')}</div>
               )
             ) : props.toolEvents.length === 0 ? (
               <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
@@ -2993,90 +3402,6 @@ function ChatPage(props: {
               ))
             )}
           </div>
-          {false && (
-            <div className="tool-web-preview tool-web-preview-external">
-              <div className="tool-web-preview-head">
-                <strong>{props.tr('External Browser', '外部浏览器')}</strong>
-              </div>
-              <div className="tool-web-preview-toolbar">
-                <input
-                  className="tool-web-preview-address"
-                  value={previewUrl ?? ''}
-                  readOnly
-                  placeholder={props.tr('Waiting for a browsable page URL...', '等待可打开的网页地址...')}
-                />
-                <button className="mini-button tool-web-preview-open" onClick={() => void window.tasiHarness.app.openExternalUrl(previewUrl ?? '')} disabled={!previewUrl}>
-                  {props.tr('Open', '打开')}
-                </button>
-              </div>
-              <div className="tool-web-preview-empty">
-                {previewUrl
-                  ? props.tr(
-                      'The latest browsable page has been detected. If your system browser did not appear automatically, use Open to launch it again.',
-                      '已经识别到最新网页地址；如果系统浏览器没有自动弹出，可以点上面的“打开”重新拉起。'
-                    )
-                  : props.tr(
-                      'External browser mode is active. A manual open button will appear here after the agent reaches a webpage.',
-                      '当前使用外部浏览器模式。等智能体拿到网页地址后，这里会出现可手动打开的入口。'
-                    )}
-              </div>
-            </div>
-          )}
-          {showEmbeddedWebPreview && (
-            <div
-              className={`tool-web-preview ${shouldShowWebPreview ? '' : 'hidden'} ${webPreviewExpanded ? 'expanded' : ''} ${previewDragging ? 'dragging' : ''}`}
-              style={webPreviewExpanded && webPreviewRect ? {
-                left: 0,
-                top: 0,
-                width: webPreviewRect.width,
-                height: webPreviewRect.height,
-                transform: `translate3d(${webPreviewRect.x}px, ${webPreviewRect.y}px, 0)`
-              } : undefined}
-            >
-              <div className={`tool-web-preview-head ${webPreviewExpanded ? 'draggable' : ''}`} onMouseDown={handlePreviewDragStart}>
-                <strong>{props.tr('Web Preview', '网页预览')}</strong>
-                {shouldShowWebPreview && (
-                  <button className="mini-button" onClick={toggleWebPreviewExpanded}>
-                    {webPreviewExpanded ? props.tr('Collapse', '收起') : props.tr('Pop out', '弹出')}
-                  </button>
-                )}
-              </div>
-              <div className="tool-web-preview-toolbar">
-                <button className="mini-button" onClick={handlePreviewBack} disabled={!previewCanGoBack} title={props.tr('Back', '后退')}>
-                  Back
-                </button>
-                <button className="mini-button" onClick={handlePreviewForward} disabled={!previewCanGoForward} title={props.tr('Forward', '前进')}>
-                  Forward
-                </button>
-                <button className="mini-button" onClick={handlePreviewRefresh} title={props.tr('Refresh', '刷新')}>
-                  {previewLoading ? '...' : 'Refresh'}
-                </button>
-                <input
-                  className="tool-web-preview-address"
-                  value={previewAddress}
-                  onChange={(event) => setPreviewAddress(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
-                      event.preventDefault();
-                      void navigatePreviewToAddress();
-                    }
-                  }}
-                  placeholder={props.tr('Enter URL and press Enter', '输入网址后按回车')}
-                />
-                <a className="mini-button tool-web-preview-open" href={previewAddress || previewUrl || 'about:blank'} target="_blank" rel="noreferrer">
-                  {props.tr('Open', '打开')}
-                </a>
-              </div>
-              <div className="tool-web-preview-body" ref={previewBodyRef}>
-                <webview
-                  ref={previewWebviewRef}
-                  className="tool-web-preview-frame"
-                  src={previewUrl || 'about:blank'}
-                  partition={EMBEDDED_BROWSER_PARTITION}
-                />
-              </div>
-            </div>
-          )}
             </>
           )}
         </div>
@@ -3172,6 +3497,7 @@ function ChatPage(props: {
           )}
           <div className={`chat-textarea-wrap ${liveModeActive ? 'has-phone' : ''}`}>
             <textarea
+              ref={chatTextareaRef}
               className="chat-textarea"
               placeholder={liveModeActive
                 ? liveRealtimeStatus === 'error'
@@ -3193,14 +3519,70 @@ function ChatPage(props: {
                 : props.tr('Configure your provider in Settings first.', '请先在设置中配置模型提供方。')}
               value={input}
               disabled={liveModeActive ? !liveInputReady : runBusy || !connected}
-              onChange={(e) => setInput(e.target.value)}
+              onChange={(e) => {
+                setInput(e.target.value);
+                updatePluginMentionForTextarea(e.target.value, e.target.selectionStart);
+              }}
+              onClick={(e) => updatePluginMentionForTextarea(e.currentTarget.value, e.currentTarget.selectionStart)}
+              onSelect={(e) => updatePluginMentionForTextarea(e.currentTarget.value, e.currentTarget.selectionStart)}
+              onPaste={handleTextareaPaste}
               onKeyDown={(e) => {
+                if (pluginMentionTrigger) {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault();
+                    setPluginMentionActiveIndex((index) => (index + 1) % Math.max(1, pluginMentionOptions.length));
+                    return;
+                  }
+                  if (e.key === 'ArrowUp') {
+                    e.preventDefault();
+                    setPluginMentionActiveIndex((index) => (index - 1 + Math.max(1, pluginMentionOptions.length)) % Math.max(1, pluginMentionOptions.length));
+                    return;
+                  }
+                  if ((e.key === 'Enter' || e.key === 'Tab') && pluginMentionOptions.length > 0) {
+                    e.preventDefault();
+                    insertPluginMention(pluginMentionOptions[pluginMentionActiveIndex] ?? pluginMentionOptions[0]);
+                    return;
+                  }
+                  if (e.key === 'Escape') {
+                    e.preventDefault();
+                    setPluginMentionTrigger(null);
+                    return;
+                  }
+                }
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   void send();
                 }
               }}
             />
+            {showPluginMentionMenu && (
+              <div className="plugin-mention-menu" role="listbox" aria-label={props.tr('Plugin mentions', '插件引用')}>
+                <div className="plugin-mention-header">{props.tr('Plugins', '插件')}</div>
+                {pluginMentionLoading && <div className="plugin-mention-empty">{props.tr('Loading plugins...', '正在加载插件...')}</div>}
+                {!pluginMentionLoading && pluginMentionError && <div className="plugin-mention-empty">{pluginMentionError}</div>}
+                {!pluginMentionLoading && !pluginMentionError && pluginMentionOptions.length === 0 && (
+                  <div className="plugin-mention-empty">{props.tr('No installed plugins matched.', '未匹配到已安装插件。')}</div>
+                )}
+                {!pluginMentionLoading && !pluginMentionError && pluginMentionOptions.map((item, index) => (
+                  <button
+                    key={item.plugin.id}
+                    type="button"
+                    className={`plugin-mention-item ${index === pluginMentionActiveIndex ? 'active' : ''}`}
+                    role="option"
+                    aria-selected={index === pluginMentionActiveIndex}
+                    onMouseEnter={() => setPluginMentionActiveIndex(index)}
+                    onMouseDown={(event) => {
+                      event.preventDefault();
+                      insertPluginMention(item);
+                    }}
+                  >
+                    <span className="plugin-mention-name">{item.label}</span>
+                    <span className={`plugin-mention-status ${item.status}`}>{item.status}</span>
+                    <span className="plugin-mention-detail">{item.detail}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="chat-attach-toolbar">
               <button
                 className="chat-attach-button"
@@ -3287,11 +3669,117 @@ function ChatPage(props: {
   );
 }
 
-function renderMarkdownContent(content: string, keyPrefix: string): ReactElement {
+function artifactFileName(value: string): string {
+  return value.trim().split(/[\\/]/).filter(Boolean).at(-1) ?? value.trim();
+}
+
+function normalizeArtifactClickText(value: string): string {
+  return decodeLikelyPercentEncodedChineseText(value)
+    .trim()
+    .replace(/^['"`<(\[]+/, '')
+    .replace(/['"`>)\].,;:，。；：]+$/, '');
+}
+
+function findClickedArtifact(value: string, artifacts?: AgentArtifactRef[]): AgentArtifactRef | null {
+  const candidate = normalizeArtifactClickText(value);
+  if (!candidate || !artifacts || artifacts.length === 0) return null;
+  const candidateName = artifactFileName(candidate).toLocaleLowerCase();
+  const candidateLower = candidate.toLocaleLowerCase();
+  return artifacts.find((artifact) => {
+    const values = [artifact.name, artifact.path, artifact.absPath ?? ''].filter(Boolean);
+    return values.some((item) => {
+      const normalized = normalizeArtifactClickText(item).toLocaleLowerCase();
+      return normalized === candidateLower || artifactFileName(normalized) === candidateName;
+    });
+  }) ?? null;
+}
+
+function artifactPathExtension(value: string): string {
+  const clean = normalizeArtifactClickText(value).replace(/[?#].*$/, '');
+  const filename = artifactFileName(clean);
+  const match = filename.match(/(\.[A-Za-z0-9]{1,12})$/);
+  return match?.[1]?.toLowerCase() ?? '';
+}
+
+function isFullArtifactPath(value: string): boolean {
+  const candidate = normalizeArtifactClickText(value);
+  if (!candidate) return false;
+  const hasAbsolutePrefix = /^[A-Za-z]:[\\/]/.test(candidate) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(candidate) || candidate.startsWith('/');
+  return hasAbsolutePrefix && ARTIFACT_EXTENSIONS.has(artifactPathExtension(candidate));
+}
+
+function isWorkspaceArtifactPath(value: string): boolean {
+  const candidate = normalizeArtifactClickText(value);
+  if (!candidate || isFullArtifactPath(candidate)) return false;
+  if (/^https?:\/\//i.test(candidate) || /^file:/i.test(candidate)) return false;
+  return ARTIFACT_EXTENSIONS.has(artifactPathExtension(candidate));
+}
+
+function isClickableArtifactReference(value: string, artifacts?: AgentArtifactRef[]): boolean {
+  return Boolean(findClickedArtifact(value, artifacts)) || isFullArtifactPath(value) || isWorkspaceArtifactPath(value);
+}
+
+function decodeHtmlText(value: string): string {
+  return value
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function markClickableArtifactCodes(html: string, artifacts?: AgentArtifactRef[]): string {
+  const codeBlocks: string[] = [];
+  const withoutCodeBlocks = html.replace(/<pre class="msg-code-block">[\s\S]*?<\/pre>/g, (match) => {
+    const index = codeBlocks.push(match) - 1;
+    return `@@ARTIFACT_CODE_BLOCK_${index}@@`;
+  });
+  return withoutCodeBlocks
+    .replace(/<code>([\s\S]*?)<\/code>/g, (match, encodedText: string) => {
+      const text = decodeHtmlText(encodedText);
+      if (!isClickableArtifactReference(text, artifacts)) return match;
+      return `<code class="artifact-link-code" data-artifact-ref="1" title="Open file">${encodedText}</code>`;
+    })
+    .replace(/@@ARTIFACT_CODE_BLOCK_(\d+)@@/g, (_match, indexText: string) => codeBlocks[Number(indexText)] ?? '');
+}
+
+function renderMarkdownContent(
+  content: string,
+  keyPrefix: string,
+  options?: {
+    artifacts?: AgentArtifactRef[];
+    sessionId?: string;
+    onPreviewArtifact?: (preview: ArtifactPreviewResult) => void;
+  }
+): ReactElement {
   const normalized = normalizeMarkdownForRender(content);
   const handleLinkClick = (event: ReactMouseEvent<HTMLDivElement>): void => {
     const target = event.target as Element | null;
     const anchor = target?.closest('a[href]') as HTMLAnchorElement | null;
+    const code = target?.closest('code[data-artifact-ref]') as HTMLElement | null;
+    const artifactText = anchor?.getAttribute('href') || code?.textContent || '';
+    const clickedArtifact = findClickedArtifact(artifactText, options?.artifacts);
+    if ((clickedArtifact || isFullArtifactPath(artifactText) || isWorkspaceArtifactPath(artifactText)) && options?.onPreviewArtifact) {
+      event.preventDefault();
+      event.stopPropagation();
+      const requestPath = clickedArtifact?.path ?? normalizeArtifactClickText(artifactText);
+      const requestAbsPath = clickedArtifact?.absPath;
+      void window.tasiHarness.app
+        .artifactPreview({ path: requestPath, absPath: requestAbsPath, sessionId: options.sessionId, maxBytes: ARTIFACT_PREVIEW_MAX_BYTES })
+        .then((preview) => {
+          if (preview.artifact.previewMode === 'external' || preview.artifact.previewMode === 'none') {
+            return window.tasiHarness.app.openArtifact({ path: requestPath, absPath: requestAbsPath, sessionId: options.sessionId }).then((result) => {
+              if (!result.ok) window.alert(result.content);
+            });
+          }
+          options.onPreviewArtifact?.(preview);
+          return undefined;
+        })
+        .catch((cause) => window.alert(cause instanceof Error ? cause.message : String(cause)));
+      return;
+    }
     if (!anchor) return;
     event.preventDefault();
     event.stopPropagation();
@@ -3304,7 +3792,7 @@ function renderMarkdownContent(content: string, keyPrefix: string): ReactElement
       key={`${keyPrefix}-md`}
       className="msg-markdown"
       onClick={handleLinkClick}
-      dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(normalized) }}
+      dangerouslySetInnerHTML={{ __html: markClickableArtifactCodes(renderMarkdownToHtml(normalized), options?.artifacts) }}
     />
   );
 }
@@ -3380,7 +3868,7 @@ function ReasoningListComponent({ content, parts, livePreview, tr }: { content: 
 
 const ReasoningList = memo(ReasoningListComponent);
 
-export function assistantContentListView(content: string, livePreview = false): { items: string[]; clipped: boolean } {
+function assistantContentListView(content: string, livePreview = false): { items: string[]; clipped: boolean } {
   const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const clipped = livePreview && normalized.length > CONTENT_STREAM_PREVIEW_CHARS;
   const preview = !clipped
@@ -3452,7 +3940,7 @@ function assistantContentPartsView(contents: string[], livePreview = false): { i
   return { items, clipped };
 }
 
-export function assistantLiveContentPreviewText(content: string, items?: string[]): { text: string; clipped: boolean } {
+function assistantLiveContentPreviewText(content: string, items?: string[]): { text: string; clipped: boolean } {
   const source = items && items.length > 0
     ? items.map((item) => item.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()).filter(Boolean).join('\n\n')
     : content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
@@ -3466,13 +3954,19 @@ function MessageContentListComponent({
   items: explicitItems,
   livePreview,
   tr,
-  title
+  title,
+  artifacts,
+  sessionId,
+  onPreviewArtifact
 }: {
   content: string;
   items?: string[];
   livePreview: boolean;
   tr: TranslateFn;
   title?: string;
+  artifacts?: AgentArtifactRef[];
+  sessionId?: string;
+  onPreviewArtifact?: (preview: ArtifactPreviewResult) => void;
 }): ReactElement | null {
   const liveView = useMemo(
     () => livePreview ? assistantLiveContentPreviewText(content, explicitItems) : undefined,
@@ -3514,7 +4008,7 @@ function MessageContentListComponent({
       <div className="msg-content-list">
         {items.map((item, index) => (
           <div className="msg-content-item" key={`${index}-${item.length}`}>
-            {renderMarkdownContent(item, `msg-content-${index}-${item.length}`)}
+            {renderMarkdownContent(item, `msg-content-${index}-${item.length}`, { artifacts, sessionId, onPreviewArtifact })}
           </div>
         ))}
       </div>
@@ -3552,48 +4046,6 @@ function CitationLinkStripComponent({ citations }: { citations: CitationLink[] }
 
 const CitationLinkStrip = memo(CitationLinkStripComponent);
 
-function faviconCandidates(page: CitationLink): string[] {
-  const candidates: string[] = [];
-  try {
-    const url = new URL(page.href);
-    candidates.push(`${url.origin}/favicon.ico`);
-    candidates.push(`https://www.google.com/s2/favicons?domain_url=${encodeURIComponent(page.href)}&sz=32`);
-  } catch {
-    // Fall back to host-based services below.
-  }
-  if (page.host) {
-    candidates.push(`https://www.google.com/s2/favicons?domain=${encodeURIComponent(page.host)}&sz=32`);
-    candidates.push(`https://icons.duckduckgo.com/ip3/${encodeURIComponent(page.host)}.ico`);
-  }
-  return [...new Set(candidates)];
-}
-
-function ReferenceFaviconComponent({ page, compact = false }: { page: CitationLink; compact?: boolean }): ReactElement {
-  const candidates = useMemo(() => faviconCandidates(page), [page]);
-  const [index, setIndex] = useState(0);
-  const src = candidates[index];
-  const fallbackText = (page.host || page.label || '?').replace(/^www\./, '').slice(0, 1).toUpperCase();
-
-  useEffect(() => {
-    setIndex(0);
-  }, [page.href]);
-
-  if (!src) {
-    return <span className={`reference-favicon-fallback ${compact ? 'compact' : ''}`}>{fallbackText}</span>;
-  }
-
-  return (
-    <img
-      className="reference-favicon"
-      src={src}
-      alt=""
-      onError={() => setIndex((old) => old + 1)}
-    />
-  );
-}
-
-const ReferenceFavicon = memo(ReferenceFaviconComponent);
-
 function assistantExportTitle(content: string): string {
   const lines = normalizeMarkdownForRender(content).split('\n');
   const heading = lines.find((line) => /^#{1,3}\s+\S/.test(line.trim()))?.replace(/^#{1,6}\s+/, '').trim();
@@ -3605,9 +4057,10 @@ function assistantExportTitle(content: string): string {
 function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const content = message.role === 'user' ? decodeLikelyPercentEncodedChineseText(message.content) : message.content;
+  const avatar = message.role === 'assistant' ? 'AI' : (message.external?.provider?.toUpperCase() || 'You');
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
+      <div className="msg-avatar">{avatar}</div>
       <div className="msg-bubble-wrap">
         <div className="msg-bubble">{renderMarkdownContent(content, `msg-${message.id ?? 'x'}`)}</div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
@@ -3633,13 +4086,1141 @@ function MessageAttachmentsComponent({ attachments }: { attachments?: AgentMessa
 
 const MessageAttachments = memo(MessageAttachmentsComponent);
 
+const PYTHON_KEYWORDS = new Set([
+  'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break',
+  'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally',
+  'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal',
+  'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield'
+]);
+
+const PYTHON_BUILTINS = new Set([
+  'abs', 'all', 'any', 'bool', 'bytes', 'dict', 'dir', 'enumerate', 'filter',
+  'float', 'format', 'getattr', 'hasattr', 'int', 'isinstance', 'len', 'list',
+  'map', 'max', 'min', 'open', 'print', 'range', 'repr', 'reversed', 'round',
+  'set', 'sorted', 'str', 'sum', 'super', 'tuple', 'type', 'zip'
+]);
+
+function highlightedPythonCode(content: string): Array<string | ReactElement> {
+  const tokens: Array<string | ReactElement> = [];
+  let index = 0;
+  const pushText = (value: string) => {
+    if (!value) return;
+    const last = tokens[tokens.length - 1];
+    if (typeof last === 'string') tokens[tokens.length - 1] = `${last}${value}`;
+    else tokens.push(value);
+  };
+  const pushSpan = (className: string, value: string) => {
+    if (value) tokens.push(<span key={tokens.length} className={className}>{value}</span>);
+  };
+
+  while (index < content.length) {
+    const rest = content.slice(index);
+    const char = content[index];
+    if (char === '#') {
+      const end = content.indexOf('\n', index);
+      const next = end < 0 ? content.length : end;
+      pushSpan('syntax-comment', content.slice(index, next));
+      index = next;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      const quote = char;
+      const isTriple = content.slice(index, index + 3) === quote.repeat(3);
+      let next = index + (isTriple ? 3 : 1);
+      while (next < content.length) {
+        if (!isTriple && content[next] === '\\') {
+          next += 2;
+          continue;
+        }
+        if (isTriple && content.slice(next, next + 3) === quote.repeat(3)) {
+          next += 3;
+          break;
+        }
+        if (!isTriple && content[next] === quote) {
+          next += 1;
+          break;
+        }
+        if (!isTriple && content[next] === '\n') break;
+        next += 1;
+      }
+      pushSpan('syntax-string', content.slice(index, next));
+      index = next;
+      continue;
+    }
+    const decorator = /^@[A-Za-z_][A-Za-z0-9_.]*/.exec(rest);
+    if (decorator) {
+      pushSpan('syntax-decorator', decorator[0]);
+      index += decorator[0].length;
+      continue;
+    }
+    const number = /^\b(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?j?)\b/.exec(rest);
+    if (number) {
+      pushSpan('syntax-number', number[0]);
+      index += number[0].length;
+      continue;
+    }
+    const identifier = /^[A-Za-z_][A-Za-z0-9_]*/.exec(rest);
+    if (identifier) {
+      const word = identifier[0];
+      if (PYTHON_KEYWORDS.has(word)) pushSpan('syntax-keyword', word);
+      else if (PYTHON_BUILTINS.has(word)) pushSpan('syntax-builtin', word);
+      else if (word === 'self' || word === 'cls') pushSpan('syntax-variable', word);
+      else pushText(word);
+      index += word.length;
+      continue;
+    }
+    pushText(char);
+    index += 1;
+  }
+  return tokens;
+}
+
+function selectionAnchorFromRange(range: Range, frameRect?: DOMRect): { x: number; y: number } {
+  const rect = range.getBoundingClientRect();
+  const offsetX = frameRect?.left ?? 0;
+  const offsetY = frameRect?.top ?? 0;
+  const x = offsetX + rect.left + Math.max(12, rect.width / 2);
+  const y = offsetY + rect.top - 10;
+  return {
+    x: Math.min(window.innerWidth - 12, Math.max(12, x)),
+    y: Math.min(window.innerHeight - 12, Math.max(12, y))
+  };
+}
+
+function reportArtifactSelection(
+  artifact: AgentArtifactRef,
+  selection: Selection | null,
+  onTextSelection?: (selection: ArtifactTextSelection | null) => void,
+  container?: HTMLElement,
+  frameRect?: DOMRect
+): void {
+  if (!onTextSelection) return;
+  const text = normalizeArtifactSelectionText(selection?.toString() ?? '');
+  if (!selection || selection.rangeCount === 0 || !text) {
+    onTextSelection(null);
+    return;
+  }
+  const range = selection.getRangeAt(0);
+  if (container && !container.contains(range.commonAncestorContainer)) {
+    onTextSelection(null);
+    return;
+  }
+  const anchor = selectionAnchorFromRange(range, frameRect);
+  onTextSelection({ artifact, text, x: anchor.x, y: anchor.y });
+}
+
+function HtmlArtifactPreview(props: {
+  artifact: AgentArtifactRef;
+  content: string;
+  onTextSelection?: (selection: ArtifactTextSelection | null) => void;
+}): ReactElement {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [loadTick, setLoadTick] = useState(0);
+
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    const doc = iframe?.contentDocument;
+    const win = iframe?.contentWindow;
+    if (!iframe || !doc || !win) return;
+    const capture = () => {
+      window.setTimeout(() => {
+        reportArtifactSelection(props.artifact, win.getSelection(), props.onTextSelection, undefined, iframe.getBoundingClientRect());
+      }, 0);
+    };
+    doc.addEventListener('mouseup', capture);
+    doc.addEventListener('keyup', capture);
+    doc.addEventListener('selectionchange', capture);
+    return () => {
+      doc.removeEventListener('mouseup', capture);
+      doc.removeEventListener('keyup', capture);
+      doc.removeEventListener('selectionchange', capture);
+    };
+  }, [loadTick, props.artifact, props.onTextSelection]);
+
+  return (
+    <iframe
+      ref={iframeRef}
+      className="artifact-html-preview"
+      srcDoc={props.content}
+      title={props.artifact.name}
+      sandbox="allow-same-origin allow-scripts"
+      onLoad={() => setLoadTick((value) => value + 1)}
+    />
+  );
+}
+
+function ArtifactPreviewContent({ preview, onTextSelection }: {
+  preview: ArtifactPreviewResult;
+  onTextSelection?: (selection: ArtifactTextSelection | null) => void;
+}): ReactElement {
+  const artifact = preview.artifact;
+  const dataUrl = preview.dataBase64 ? `data:${artifact.mimeType || 'application/octet-stream'};base64,${preview.dataBase64}` : '';
+  const isHtmlPreview = ['.html', '.htm'].includes(artifactPathExtension(artifact.name || artifact.path || artifact.absPath));
+  const handleSelection = (event: ReactMouseEvent<HTMLDivElement> | ReactKeyboardEvent<HTMLDivElement>) => {
+    reportArtifactSelection(artifact, window.getSelection(), onTextSelection, event.currentTarget);
+  };
+  return (
+    <div className="artifact-preview-content" onMouseUp={handleSelection} onKeyUp={handleSelection}>
+      {isHtmlPreview && (
+        <HtmlArtifactPreview artifact={artifact} content={preview.content ?? ''} onTextSelection={onTextSelection} />
+      )}
+      {artifact.previewMode === 'markdown' && (
+        <div className="artifact-text-preview">{renderMarkdownContent(preview.content ?? '', `artifact-${artifact.id}`)}</div>
+      )}
+      {artifact.previewMode === 'code' && !isHtmlPreview && (
+        <CodeArtifactPreview name={artifact.name || artifact.path} content={preview.content ?? ''} />
+      )}
+      {artifact.previewMode === 'office' && (
+        <OfficePreviewContent artifact={artifact} dataBase64={preview.dataBase64 ?? ''} />
+      )}
+      {artifact.previewMode === 'text' && !isHtmlPreview && (
+        <pre className="artifact-text-preview">{preview.content ?? ''}</pre>
+      )}
+      {artifact.previewMode === 'image' && (
+        <img className="artifact-image-preview" src={dataUrl} alt={artifact.name} />
+      )}
+      {artifact.previewMode === 'pdf' && (
+        <PdfPreviewContent dataBase64={preview.dataBase64 ?? ''} name={artifact.name} mimeType={artifact.mimeType || 'application/pdf'} />
+      )}
+      {artifact.previewMode === 'media' && artifact.mimeType?.startsWith('audio/') && (
+        <audio className="artifact-media-preview" controls src={dataUrl} />
+      )}
+      {artifact.previewMode === 'media' && !artifact.mimeType?.startsWith('audio/') && (
+        <video className="artifact-media-preview" controls src={dataUrl} />
+      )}
+      {artifact.previewMode === 'model3d' && (
+        <StlPreviewCanvas dataBase64={preview.dataBase64 ?? ''} name={artifact.name} />
+      )}
+    </div>
+  );
+}
+
+function codeLanguageFromFilename(name: string): string {
+  switch (artifactPathExtension(name).toLowerCase()) {
+    case '.py': return 'python';
+    case '.js': return 'javascript';
+    case '.jsx': return 'jsx';
+    case '.ts': return 'typescript';
+    case '.tsx': return 'tsx';
+    case '.json': return 'json';
+    case '.html':
+    case '.htm': return 'html';
+    case '.css': return 'css';
+    case '.xml': return 'xml';
+    case '.yaml':
+    case '.yml': return 'yaml';
+    case '.java': return 'java';
+    case '.go': return 'go';
+    case '.rs': return 'rust';
+    case '.c': return 'c';
+    case '.cpp':
+    case '.hpp': return 'cpp';
+    case '.h': return 'c/c++ header';
+    case '.cs': return 'csharp';
+    case '.php': return 'php';
+    case '.rb': return 'ruby';
+    case '.sh': return 'shell';
+    case '.sql': return 'sql';
+    case '.toml': return 'toml';
+    case '.ini': return 'ini';
+    case '.env': return 'env';
+    default: return 'code';
+  }
+}
+
+function CodeArtifactPreview({ name, content }: { name: string; content: string }): ReactElement {
+  const language = codeLanguageFromFilename(name);
+  const renderedContent = language === 'python' ? highlightedPythonCode(content) : content;
+  return (
+    <div className="artifact-code-preview">
+      <div className="artifact-code-preview-head">
+        <strong>{name}</strong>
+        <span>{language}</span>
+      </div>
+      <pre className="artifact-code-block">
+        <code className={`language-${language.replace(/[^a-z0-9_-]+/gi, '-')}`}>{renderedContent}</code>
+      </pre>
+    </div>
+  );
+}
+
+function ArtifactPreviewModal({ preview, tr, onClose }: { preview: ArtifactPreviewResult; tr: TranslateFn; onClose: () => void }): ReactElement {
+  const artifact = preview.artifact;
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card artifact-preview-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <strong>{artifact.name}</strong>
+            <p>{artifact.kind} | {formatBytes(artifact.sizeBytes)}</p>
+          </div>
+          <button className="mini-button" onClick={onClose}>{tr('Close', '关闭')}</button>
+        </div>
+        <ArtifactPreviewContent preview={preview} />
+      </div>
+    </div>
+  );
+}
+
+type PdfOutlineItem = {
+  title: string;
+  page?: number;
+  items: PdfOutlineItem[];
+};
+
+type PdfDocumentHandle = {
+  numPages: number;
+  getPage: (pageNumber: number) => Promise<unknown>;
+  getOutline: () => Promise<unknown[] | null>;
+  getDestination: (dest: string) => Promise<unknown>;
+  getPageIndex: (ref: unknown) => Promise<number>;
+  destroy: () => Promise<void>;
+};
+
+type PdfPageHandle = {
+  getViewport: (params: { scale: number }) => { width: number; height: number };
+  getTextContent: () => Promise<unknown>;
+  render: (params: { canvasContext: CanvasRenderingContext2D; viewport: unknown }) => { cancel: () => void; promise: Promise<unknown> };
+};
+
+type PdfTextLayerHandle = {
+  cancel: () => void;
+  render: () => Promise<unknown>;
+};
+
+function PdfPreviewContent({ dataBase64, name }: { dataBase64: string; name: string; mimeType: string }): ReactElement {
+  const pageHostRef = useRef<HTMLDivElement | null>(null);
+  const canvasHostRef = useRef<HTMLDivElement | null>(null);
+  const pdfRef = useRef<PdfDocumentHandle | null>(null);
+  const renderTaskRef = useRef<{ cancel: () => void; promise: Promise<unknown> } | null>(null);
+  const textLayerTaskRef = useRef<PdfTextLayerHandle | null>(null);
+  const wheelPageTurnAtRef = useRef(0);
+  const pendingScrollAnchorRef = useRef<'top' | 'bottom'>('top');
+  const manualScaleRef = useRef(false);
+  const [loading, setLoading] = useState(true);
+  const [rendering, setRendering] = useState(false);
+  const [error, setError] = useState('');
+  const [pageCount, setPageCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [scale, setScale] = useState(1.15);
+  const [outline, setOutline] = useState<PdfOutlineItem[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError('');
+    setPageCount(0);
+    setCurrentPage(1);
+    setOutline([]);
+
+    void (async () => {
+      try {
+        const pdfjs = await import('pdfjs-dist');
+        pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+        const loadingTask = pdfjs.getDocument({ data: base64ToUint8Array(dataBase64) });
+        const pdf = await loadingTask.promise;
+        if (cancelled) {
+          await pdf.destroy();
+          return;
+        }
+        pdfRef.current = pdf as PdfDocumentHandle;
+        setPageCount(pdf.numPages);
+        setOutline(await buildPdfOutline(pdf as PdfDocumentHandle));
+        setLoading(false);
+        manualScaleRef.current = false;
+      } catch (cause) {
+        if (!cancelled) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+          setLoading(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      renderTaskRef.current?.cancel();
+      renderTaskRef.current = null;
+      textLayerTaskRef.current?.cancel();
+      textLayerTaskRef.current = null;
+      const pdf = pdfRef.current;
+      pdfRef.current = null;
+      void pdf?.destroy();
+    };
+  }, [dataBase64]);
+
+  useEffect(() => {
+    const pdf = pdfRef.current;
+    const pageHost = pageHostRef.current;
+    if (!pdf || !pageHost || loading || pageCount <= 0 || manualScaleRef.current) return;
+    const pdfHandle = pdf;
+    const hostElement = pageHost;
+    let cancelled = false;
+
+    async function fitPageToHost(): Promise<void> {
+      const page = await pdfHandle.getPage(currentPage) as PdfPageHandle;
+      if (cancelled) return;
+      const viewport = page.getViewport({ scale: 1 });
+      const availableWidth = Math.max(240, hostElement.clientWidth - 36);
+      const availableHeight = Math.max(240, hostElement.clientHeight - 36);
+      const nextScale = Math.max(0.25, Math.min(2.4, Math.min(availableWidth / viewport.width, availableHeight / viewport.height)));
+      setScale(Number(nextScale.toFixed(2)));
+    }
+
+    void fitPageToHost().catch((cause) => {
+      if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+    });
+
+    const observer = new ResizeObserver(() => {
+      void fitPageToHost();
+    });
+    observer.observe(hostElement);
+    return () => {
+      cancelled = true;
+      observer.disconnect();
+    };
+  }, [currentPage, loading, pageCount]);
+
+  useEffect(() => {
+    const pdf = pdfRef.current;
+    const host = canvasHostRef.current;
+    if (!pdf || !host || loading || pageCount <= 0) return;
+    let cancelled = false;
+    setRendering(true);
+    renderTaskRef.current?.cancel();
+    renderTaskRef.current = null;
+    textLayerTaskRef.current?.cancel();
+    textLayerTaskRef.current = null;
+    host.innerHTML = '';
+
+    void (async () => {
+      try {
+        const pdfjs = await import('pdfjs-dist');
+        const page = await pdf.getPage(currentPage) as PdfPageHandle;
+        if (cancelled) return;
+        const viewport = page.getViewport({ scale });
+        const pageLayer = document.createElement('div');
+        pageLayer.className = 'artifact-pdf-page-layer';
+        pageLayer.style.width = `${Math.floor(viewport.width)}px`;
+        pageLayer.style.height = `${Math.floor(viewport.height)}px`;
+        pageLayer.style.setProperty('--total-scale-factor', String(scale));
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Cannot create PDF canvas context.');
+        const deviceScale = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * deviceScale);
+        canvas.height = Math.floor(viewport.height * deviceScale);
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+        context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
+        pageLayer.appendChild(canvas);
+        const textLayer = document.createElement('div');
+        textLayer.className = 'textLayer artifact-pdf-text-layer';
+        pageLayer.appendChild(textLayer);
+        host.appendChild(pageLayer);
+        const renderTask = page.render({ canvasContext: context, viewport });
+        renderTaskRef.current = renderTask;
+        const textContent = await page.getTextContent();
+        if (cancelled) return;
+        const PdfTextLayer = pdfjs.TextLayer as unknown as new (params: {
+          textContentSource: unknown;
+          container: HTMLElement;
+          viewport: unknown;
+        }) => PdfTextLayerHandle;
+        const textLayerTask = new PdfTextLayer({
+          textContentSource: textContent,
+          container: textLayer,
+          viewport
+        }) as PdfTextLayerHandle;
+        textLayerTaskRef.current = textLayerTask;
+        await Promise.all([renderTask.promise, textLayerTask.render()]);
+        const pageHost = pageHostRef.current;
+        if (pageHost && !cancelled) {
+          const top = pendingScrollAnchorRef.current === 'bottom' ? pageHost.scrollHeight : 0;
+          pageHost.scrollTo({ top, left: 0 });
+          pendingScrollAnchorRef.current = 'top';
+        }
+      } catch (cause) {
+        if (!cancelled && !(cause instanceof Error && cause.name === 'RenderingCancelledException')) {
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      } finally {
+        if (!cancelled) setRendering(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      renderTaskRef.current?.cancel();
+      renderTaskRef.current = null;
+      textLayerTaskRef.current?.cancel();
+      textLayerTaskRef.current = null;
+    };
+  }, [currentPage, loading, pageCount, scale]);
+
+  function goToPage(page: number, scrollAnchor: 'top' | 'bottom' = 'top'): void {
+    if (pageCount <= 0) return;
+    pendingScrollAnchorRef.current = scrollAnchor;
+    setCurrentPage(Math.min(pageCount, Math.max(1, page)));
+  }
+
+  function zoomBy(delta: number): void {
+    manualScaleRef.current = true;
+    setScale((old) => Math.min(2.8, Math.max(0.25, Number((old + delta).toFixed(2)))));
+  }
+
+  function handlePageWheel(event: ReactWheelEvent<HTMLDivElement>): void {
+    if (loading || rendering || pageCount <= 1 || Math.abs(event.deltaY) < 8) return;
+    const host = pageHostRef.current;
+    if (!host) return;
+    const now = Date.now();
+    if (now - wheelPageTurnAtRef.current < 360) return;
+    const maxScrollTop = Math.max(0, host.scrollHeight - host.clientHeight);
+    const atTop = host.scrollTop <= 2;
+    const atBottom = host.scrollTop >= maxScrollTop - 2;
+    const canTurnForward = event.deltaY > 0 && atBottom && currentPage < pageCount;
+    const canTurnBackward = event.deltaY < 0 && atTop && currentPage > 1;
+    if (!canTurnForward && !canTurnBackward) return;
+    if (event.cancelable) event.preventDefault();
+    wheelPageTurnAtRef.current = now;
+    goToPage(currentPage + (canTurnForward ? 1 : -1), canTurnForward ? 'top' : 'bottom');
+  }
+
+  const pdf = pdfRef.current;
+
+  return (
+    <div className="artifact-pdf-native" aria-label={name}>
+      <div className="artifact-office-toolbar">
+        <button className="mini-button" disabled={loading || currentPage <= 1} onClick={() => goToPage(currentPage - 1)}>{'<'}</button>
+        <span>{loading ? 'Loading...' : `${currentPage} / ${pageCount}`}</span>
+        <button className="mini-button" disabled={loading || currentPage >= pageCount} onClick={() => goToPage(currentPage + 1)}>{'>'}</button>
+        <button className="mini-button" disabled={scale <= 0.3} onClick={() => zoomBy(-0.15)}>-</button>
+        <button className="mini-button" disabled={scale >= 2.6} onClick={() => zoomBy(0.15)}>+</button>
+      </div>
+      {error && <div className="tool-empty">{error}</div>}
+      <div className="artifact-pdf-body">
+        {!loading && pdf && pageCount > 0 && (
+          <PdfThumbnailSidebar pdf={pdf} pageCount={pageCount} currentPage={currentPage} outline={outline} onGoToPage={goToPage} />
+        )}
+        <div ref={pageHostRef} className="artifact-pdf-page-host" onWheel={handlePageWheel}>
+          {loading && <div className="tool-empty">Loading PDF preview...</div>}
+          {rendering && !loading && <div className="artifact-pdf-rendering">Rendering page...</div>}
+          <div ref={canvasHostRef} className="artifact-pdf-canvas-host" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PdfThumbnailSidebar({
+  pdf,
+  pageCount,
+  currentPage,
+  outline,
+  onGoToPage
+}: {
+  pdf: PdfDocumentHandle;
+  pageCount: number;
+  currentPage: number;
+  outline: PdfOutlineItem[];
+  onGoToPage: (page: number) => void;
+}): ReactElement {
+  return (
+    <aside className="artifact-pdf-sidebar">
+      <div className="artifact-pdf-thumbnail-list">
+        {Array.from({ length: pageCount }, (_unused, index) => {
+          const pageNumber = index + 1;
+          return (
+            <PdfPageThumbnail
+              key={pageNumber}
+              pdf={pdf}
+              pageNumber={pageNumber}
+              active={pageNumber === currentPage}
+              onClick={() => onGoToPage(pageNumber)}
+            />
+          );
+        })}
+      </div>
+      {outline.length > 0 && (
+        <div className="artifact-pdf-outline">
+          <strong>Outline</strong>
+          {renderPdfOutline(outline, onGoToPage)}
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function PdfPageThumbnail({
+  pdf,
+  pageNumber,
+  active,
+  onClick
+}: {
+  pdf: PdfDocumentHandle;
+  pageNumber: number;
+  active: boolean;
+  onClick: () => void;
+}): ReactElement {
+  const itemRef = useRef<HTMLButtonElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [visible, setVisible] = useState(false);
+  const [error, setError] = useState(false);
+
+  useEffect(() => {
+    const item = itemRef.current;
+    if (!item) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setVisible(true);
+        observer.disconnect();
+      }
+    }, { rootMargin: '240px 0px' });
+    observer.observe(item);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (active) itemRef.current?.scrollIntoView({ block: 'nearest' });
+  }, [active]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !visible || error) return;
+    let cancelled = false;
+    let renderTask: { cancel: () => void; promise: Promise<unknown> } | null = null;
+
+    void (async () => {
+      try {
+        const page = await pdf.getPage(pageNumber) as PdfPageHandle;
+        if (cancelled) return;
+        const baseViewport = page.getViewport({ scale: 1 });
+        const targetWidth = 58;
+        const viewport = page.getViewport({ scale: targetWidth / Math.max(1, baseViewport.width) });
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Cannot create thumbnail canvas context.');
+        const deviceScale = Math.min(2, window.devicePixelRatio || 1);
+        canvas.width = Math.floor(viewport.width * deviceScale);
+        canvas.height = Math.floor(viewport.height * deviceScale);
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+        context.setTransform(deviceScale, 0, 0, deviceScale, 0, 0);
+        renderTask = page.render({ canvasContext: context, viewport });
+        await renderTask.promise;
+      } catch (cause) {
+        if (!cancelled && !(cause instanceof Error && cause.name === 'RenderingCancelledException')) {
+          setError(true);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      renderTask?.cancel();
+    };
+  }, [error, pageNumber, pdf, visible]);
+
+  return (
+    <button ref={itemRef} className={`artifact-pdf-thumbnail ${active ? 'active' : ''}`} onClick={onClick} title={`Page ${pageNumber}`}>
+      <span>{pageNumber}</span>
+      <canvas ref={canvasRef} aria-hidden="true" />
+    </button>
+  );
+}
+
+async function buildPdfOutline(pdf: PdfDocumentHandle): Promise<PdfOutlineItem[]> {
+  const rawOutline = await pdf.getOutline().catch(() => null);
+  async function mapItems(items: unknown[] | null): Promise<PdfOutlineItem[]> {
+    const mapped: PdfOutlineItem[] = [];
+    for (const item of items ?? []) {
+      const record = item as { title?: string; dest?: unknown; items?: unknown[] };
+      let page: number | undefined;
+      try {
+        const dest = typeof record.dest === 'string' ? await pdf.getDestination(record.dest) : record.dest;
+        const ref = Array.isArray(dest) ? dest[0] : null;
+        if (ref) page = (await pdf.getPageIndex(ref)) + 1;
+      } catch {
+        page = undefined;
+      }
+      mapped.push({
+        title: record.title?.trim() || `Page ${page ?? '?'}`,
+        page,
+        items: await mapItems(record.items ?? [])
+      });
+    }
+    return mapped;
+  }
+  return mapItems(rawOutline);
+}
+
+function renderPdfOutline(items: PdfOutlineItem[], goToPage: (page: number) => void): ReactElement {
+  return (
+    <div className="artifact-pdf-outline-list">
+      {items.map((item, index) => (
+        <div key={`${item.title}-${item.page ?? 'x'}-${index}`} className="artifact-pdf-outline-item">
+          <button disabled={!item.page} onClick={() => item.page && goToPage(item.page)} title={item.title}>
+            {item.title}
+          </button>
+          {item.items.length > 0 && renderPdfOutline(item.items, goToPage)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+}
+
+function OfficePreviewContent({ artifact, dataBase64 }: { artifact: AgentArtifactRef; dataBase64: string }): ReactElement {
+  const ext = artifactPathExtension(artifact.name || artifact.path);
+  if (!dataBase64) return <div className="tool-empty">Office preview data is empty.</div>;
+  if (artifact.mimeType === 'application/pdf') return <PdfPreviewContent dataBase64={dataBase64} name={artifact.name} mimeType="application/pdf" />;
+  if (ext === '.docx') return <DocxOfficePreview dataBase64={dataBase64} name={artifact.name} />;
+  if (ext === '.xlsx') return <XlsxOfficePreview dataBase64={dataBase64} />;
+  if (ext === '.pptx') return <PptxOfficePreview dataBase64={dataBase64} />;
+  return <div className="tool-empty">This Office format is not supported by the built-in previewer.</div>;
+}
+
+function DocxOfficePreview({ dataBase64, name }: { dataBase64: string; name: string }): ReactElement {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let cancelled = false;
+    container.innerHTML = '';
+    setError('');
+
+    void (async () => {
+      try {
+        const docx = await import('docx-preview');
+        if (cancelled) return;
+        await docx.renderAsync(arrayBufferFromBytes(base64ToUint8Array(dataBase64)), container, container, {
+          className: 'docx',
+          inWrapper: true,
+          ignoreWidth: false,
+          ignoreHeight: false,
+          ignoreFonts: false,
+          breakPages: true,
+          renderHeaders: true,
+          renderFooters: true,
+          renderFootnotes: true,
+          renderEndnotes: true,
+          useBase64URL: true
+        });
+      } catch (cause) {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      container.innerHTML = '';
+    };
+  }, [dataBase64]);
+
+  return (
+    <div className="artifact-office-native artifact-docx-native" aria-label={name}>
+      {error && <div className="tool-empty">{error}</div>}
+      <div ref={containerRef} className="artifact-docx-container" />
+    </div>
+  );
+}
+
+function XlsxOfficePreview({ dataBase64 }: { dataBase64: string }): ReactElement {
+  const [state, setState] = useState<{ loading: boolean; error: string; sheetNames: string[]; htmlBySheet: Record<string, string> }>({
+    loading: true,
+    error: '',
+    sheetNames: [],
+    htmlBySheet: {}
+  });
+  const [activeSheet, setActiveSheet] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ loading: true, error: '', sheetNames: [], htmlBySheet: {} });
+    setActiveSheet('');
+
+    void (async () => {
+      try {
+        const XLSX = await import('xlsx');
+        const workbook = XLSX.read(base64ToUint8Array(dataBase64), { type: 'array', cellDates: true, cellStyles: true });
+        const htmlBySheet: Record<string, string> = {};
+        for (const sheetName of workbook.SheetNames) {
+          const sheet = workbook.Sheets[sheetName];
+          if (!sheet) continue;
+          htmlBySheet[sheetName] = XLSX.utils.sheet_to_html(sheet, { id: `sheet-${sheetName.replace(/[^a-z0-9_-]+/gi, '-')}` });
+        }
+        if (!cancelled) {
+          setState({ loading: false, error: '', sheetNames: workbook.SheetNames, htmlBySheet });
+          setActiveSheet(workbook.SheetNames[0] ?? '');
+        }
+      } catch (cause) {
+        if (!cancelled) setState({ loading: false, error: cause instanceof Error ? cause.message : String(cause), sheetNames: [], htmlBySheet: {} });
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [dataBase64]);
+
+  if (state.loading) return <div className="tool-empty">Loading spreadsheet preview...</div>;
+  if (state.error) return <div className="tool-empty">{state.error}</div>;
+  if (state.sheetNames.length === 0) return <div className="tool-empty">No worksheet found.</div>;
+
+  const activeHtml = state.htmlBySheet[activeSheet] ?? '';
+  return (
+    <div className="artifact-office-native artifact-xlsx-native">
+      <div className="artifact-sheet-tabs">
+        {state.sheetNames.map((sheetName) => (
+          <button
+            key={sheetName}
+            className={`artifact-sheet-tab ${sheetName === activeSheet ? 'active' : ''}`}
+            onClick={() => setActiveSheet(sheetName)}
+            title={sheetName}
+          >
+            {sheetName}
+          </button>
+        ))}
+      </div>
+      <div className="artifact-xlsx-grid" dangerouslySetInnerHTML={{ __html: activeHtml }} />
+    </div>
+  );
+}
+
+function PptxOfficePreview({ dataBase64 }: { dataBase64: string }): ReactElement {
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const viewerRef = useRef<ReturnType<(typeof import('pptx-preview'))['init']> | null>(null);
+  const [width, setWidth] = useState(960);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [slideCount, setSlideCount] = useState(0);
+  const [currentSlide, setCurrentSlide] = useState(0);
+
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    const observer = new ResizeObserver((entries) => {
+      const nextWidth = Math.floor(entries[0]?.contentRect.width ?? 0);
+      if (nextWidth > 0) setWidth(nextWidth);
+    });
+    observer.observe(shell);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let cancelled = false;
+    let viewer: ReturnType<(typeof import('pptx-preview'))['init']> | null = null;
+    viewerRef.current?.destroy?.();
+    viewerRef.current = null;
+    container.innerHTML = '';
+    setLoading(true);
+    setError('');
+    setSlideCount(0);
+    setCurrentSlide(0);
+
+    void (async () => {
+      try {
+        const pptx = await import('pptx-preview');
+        if (cancelled) return;
+        const viewportWidth = Math.max(360, width - 20);
+        viewer = pptx.init(container, { width: viewportWidth, height: Math.round((viewportWidth * 9) / 16), mode: 'slide' });
+        viewerRef.current = viewer;
+        await viewer.load(arrayBufferFromBytes(base64ToUint8Array(dataBase64)));
+        if (cancelled) return;
+        const count = Number(viewer.slideCount) || 0;
+        setSlideCount(count);
+        if (count > 0) {
+          viewer.renderSingleSlide(0);
+          setCurrentSlide(0);
+        }
+        setLoading(false);
+      } catch (cause) {
+        if (!cancelled) {
+          setLoading(false);
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      viewer?.destroy?.();
+      if (viewerRef.current === viewer) viewerRef.current = null;
+      container.innerHTML = '';
+    };
+  }, [dataBase64, width]);
+
+  function goToSlide(nextSlide: number): void {
+    const viewer = viewerRef.current;
+    if (!viewer || slideCount <= 0) return;
+    const normalized = (nextSlide + slideCount) % slideCount;
+    viewer.renderSingleSlide(normalized);
+    setCurrentSlide(normalized);
+  }
+
+  return (
+    <div ref={shellRef} className="artifact-office-native artifact-pptx-native">
+      <div className="artifact-office-toolbar">
+        <button className="mini-button" disabled={loading || slideCount <= 1} onClick={() => goToSlide(currentSlide - 1)}>{'<'}</button>
+        <span>{loading ? 'Loading...' : `${slideCount > 0 ? currentSlide + 1 : 0} / ${slideCount}`}</span>
+        <button className="mini-button" disabled={loading || slideCount <= 1} onClick={() => goToSlide(currentSlide + 1)}>{'>'}</button>
+      </div>
+      {error && <div className="tool-empty">{error}</div>}
+      <div ref={containerRef} className="artifact-pptx-container" />
+    </div>
+  );
+}
+
+function StlPreviewCanvas({ dataBase64, name }: { dataBase64: string; name: string }): ReactElement {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || !dataBase64) return;
+    setError('');
+
+    let animationId = 0;
+    let renderer: THREE.WebGLRenderer | null = null;
+    let controls: OrbitControls | null = null;
+    let geometry: THREE.BufferGeometry | null = null;
+    let material: THREE.MeshStandardMaterial | null = null;
+    let edgeGeometry: THREE.EdgesGeometry | null = null;
+    let edgeMaterial: THREE.LineBasicMaterial | null = null;
+    const scene = new THREE.Scene();
+
+    try {
+      const bytes = base64ToUint8Array(dataBase64);
+      const sourceBuffer = new Uint8Array(bytes).buffer;
+      geometry = new STLLoader().parse(sourceBuffer);
+      geometry.computeBoundingBox();
+      geometry.computeVertexNormals();
+      const box = geometry.boundingBox ?? new THREE.Box3().setFromBufferAttribute(geometry.getAttribute('position') as THREE.BufferAttribute);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      geometry.translate(-center.x, -center.y, -center.z);
+
+      const width = Math.max(320, container.clientWidth || 640);
+      const height = Math.max(320, container.clientHeight || 520);
+      const maxDim = Math.max(size.x, size.y, size.z, 1);
+      const distance = (maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(45) / 2))) * 1.65;
+      const camera = new THREE.PerspectiveCamera(45, width / height, Math.max(0.01, maxDim / 1000), distance * 8);
+      camera.position.set(distance, -distance * 1.15, distance * 0.65);
+      camera.up.set(0, 0, 1);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setClearColor(0x071018, 1);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(width, height, false);
+      renderer.domElement.className = 'artifact-model-canvas';
+      container.replaceChildren(renderer.domElement);
+
+      const ambient = new THREE.HemisphereLight(0xd8f3ff, 0x24313f, 1.4);
+      const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+      keyLight.position.set(distance, -distance, distance * 1.6);
+      const fillLight = new THREE.DirectionalLight(0x66ccff, 0.8);
+      fillLight.position.set(-distance, distance, distance * 0.5);
+      scene.add(ambient, keyLight, fillLight);
+
+      material = new THREE.MeshStandardMaterial({
+        color: 0x83d9ff,
+        roughness: 0.48,
+        metalness: 0.12,
+        side: THREE.DoubleSide
+      });
+      const mesh = new THREE.Mesh(geometry, material);
+      scene.add(mesh);
+
+      const vertexCount = geometry.getAttribute('position')?.count ?? 0;
+      if (vertexCount < 180_000) {
+        edgeGeometry = new THREE.EdgesGeometry(geometry, 28);
+        edgeMaterial = new THREE.LineBasicMaterial({ color: 0x133241, transparent: true, opacity: 0.32 });
+        scene.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+      }
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+      controls.screenSpacePanning = true;
+      controls.target.set(0, 0, 0);
+      controls.minDistance = Math.max(0.01, distance * 0.08);
+      controls.maxDistance = distance * 5;
+      controls.update();
+
+      const resize = (): void => {
+        if (!renderer) return;
+        const nextWidth = Math.max(320, container.clientWidth || width);
+        const nextHeight = Math.max(320, container.clientHeight || height);
+        camera.aspect = nextWidth / nextHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(nextWidth, nextHeight, false);
+      };
+      const resizeObserver = new ResizeObserver(resize);
+      resizeObserver.observe(container);
+
+      const render = (): void => {
+        if (!renderer || !controls) return;
+        controls.update();
+        renderer.render(scene, camera);
+        animationId = window.requestAnimationFrame(render);
+      };
+      render();
+
+      return () => {
+        resizeObserver.disconnect();
+        window.cancelAnimationFrame(animationId);
+        controls?.dispose();
+        geometry?.dispose();
+        material?.dispose();
+        edgeGeometry?.dispose();
+        edgeMaterial?.dispose();
+        renderer?.dispose();
+        renderer?.domElement.remove();
+      };
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      return () => {
+        window.cancelAnimationFrame(animationId);
+        controls?.dispose();
+        geometry?.dispose();
+        material?.dispose();
+        edgeGeometry?.dispose();
+        edgeMaterial?.dispose();
+        renderer?.dispose();
+        renderer?.domElement.remove();
+      };
+    }
+  }, [dataBase64]);
+
+  return (
+    <div ref={containerRef} className="artifact-model-preview" aria-label={name}>
+      {error && <div className="tool-empty">{error}</div>}
+    </div>
+  );
+}
+
+function base64ToUint8Array(input: string): Uint8Array {
+  const binary = atob(input);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function MessageArtifactsComponent({ artifacts, sessionId, tr, onPreviewArtifact }: { artifacts?: AgentArtifactRef[]; sessionId?: string; tr: TranslateFn; onPreviewArtifact?: (preview: ArtifactPreviewResult) => void }): ReactElement | null {
+  const [preview, setPreview] = useState<ArtifactPreviewResult | null>(null);
+  const [busyId, setBusyId] = useState('');
+  const [error, setError] = useState('');
+  if (!artifacts || artifacts.length === 0) return null;
+
+  async function openArtifact(artifact: AgentArtifactRef): Promise<void> {
+    setBusyId(`open:${artifact.id}`);
+    setError('');
+    try {
+      const result = await window.tasiHarness.app.openArtifact({ path: artifact.path, absPath: artifact.absPath, sessionId });
+      if (!result.ok) setError(result.content);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyId('');
+    }
+  }
+
+  async function revealArtifact(artifact: AgentArtifactRef): Promise<void> {
+    setBusyId(`reveal:${artifact.id}`);
+    setError('');
+    try {
+      const result = await window.tasiHarness.app.revealArtifact({ path: artifact.path, absPath: artifact.absPath, sessionId });
+      if (!result.ok) setError(result.content);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyId('');
+    }
+  }
+
+  async function previewArtifact(artifact: AgentArtifactRef): Promise<void> {
+    setBusyId(`preview:${artifact.id}`);
+    setError('');
+    try {
+      const result = await window.tasiHarness.app.artifactPreview({ path: artifact.path, absPath: artifact.absPath, sessionId, maxBytes: ARTIFACT_PREVIEW_MAX_BYTES });
+      if (result.artifact.previewMode === 'external' || result.artifact.previewMode === 'none') {
+        const opened = await window.tasiHarness.app.openArtifact({ path: artifact.path, absPath: artifact.absPath, sessionId });
+        if (!opened.ok) setError(opened.content);
+      } else if (onPreviewArtifact) {
+        onPreviewArtifact(result);
+      } else {
+        setPreview(result);
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusyId('');
+    }
+  }
+
+  function canPreviewArtifact(artifact: AgentArtifactRef): boolean {
+    const ext = artifact.ext || artifactPathExtension(artifact.name || artifact.path);
+    const mode = previewModeForArtifact(ext);
+    return mode !== 'external' && mode !== 'none';
+  }
+
+  return (
+    <>
+      <div className="artifact-list">
+        {artifacts.map((artifact) => (
+            <div className="artifact-card" key={artifact.id}>
+              <div className="artifact-main">
+              <button
+                className="artifact-name-button"
+                disabled={busyId === `preview:${artifact.id}` || busyId === `open:${artifact.id}`}
+                onClick={() => void previewArtifact(artifact)}
+                title={tr('Preview file', '预览文件')}
+              >
+                {artifact.name}
+              </button>
+              <span>{artifact.kind} | {formatBytes(artifact.sizeBytes)}</span>
+              <code>{artifact.path}</code>
+            </div>
+            <div className="artifact-actions">
+              {canPreviewArtifact(artifact) && (
+                <button className="mini-button" disabled={busyId === `preview:${artifact.id}`} onClick={() => void previewArtifact(artifact)}>
+                  {tr('Preview', '预览')}
+                </button>
+              )}
+              <button className="mini-button" disabled={busyId === `open:${artifact.id}`} onClick={() => void openArtifact(artifact)}>
+                {tr('Open', '打开')}
+              </button>
+              <button className="mini-button" disabled={busyId === `reveal:${artifact.id}`} onClick={() => void revealArtifact(artifact)}>
+                {tr('Folder', '目录')}
+              </button>
+              <button className="mini-button" onClick={() => void copyTextToClipboard(artifact.absPath || artifact.path)}>
+                {tr('Copy', '复制')}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {error && <div className="error-box">{error}</div>}
+      {preview && <ArtifactPreviewModal preview={preview} tr={tr} onClose={() => setPreview(null)} />}
+    </>
+  );
+}
+
+const MessageArtifacts = memo(MessageArtifactsComponent);
+
 function MessageBubbleComponent({
   message,
   sessionId,
   tr,
   productName,
   liveContentPreview,
-  liveReasoningPreview
+  liveReasoningPreview,
+  onPreviewArtifact
 }: {
   message: AgentMessage;
   sessionId?: string;
@@ -3647,9 +5228,11 @@ function MessageBubbleComponent({
   productName: string;
   liveContentPreview: boolean;
   liveReasoningPreview: boolean;
+  onPreviewArtifact?: (preview: ArtifactPreviewResult) => void;
 }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
+  const avatar = message.role === 'assistant' ? 'AI' : (message.external?.provider?.toUpperCase() || 'You');
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullReasoning, setFullReasoning] = useState<string | undefined>();
   const [fullContentParts, setFullContentParts] = useState<string[] | undefined>();
@@ -3683,9 +5266,13 @@ function MessageBubbleComponent({
   const renderedMarkdown = useMemo(
     () => {
       const markdownContent = message.role === 'assistant' ? finalAssistantContent : content;
-      return markdownContent.trim() ? renderMarkdownContent(markdownContent, `msg-${message.id ?? 'x'}`) : null;
+      return markdownContent.trim() ? renderMarkdownContent(markdownContent, `msg-${message.id ?? 'x'}`, {
+        artifacts: message.artifacts,
+        sessionId,
+        onPreviewArtifact
+      }) : null;
     },
-    [content, finalAssistantContent, message.id, message.role]
+    [content, finalAssistantContent, message.artifacts, message.id, message.role, onPreviewArtifact]
   );
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
@@ -3752,7 +5339,7 @@ function MessageBubbleComponent({
 
   return (
     <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{message.role === 'assistant' ? 'AI' : 'You'}</div>
+      <div className="msg-avatar">{avatar}</div>
       <div className="msg-bubble-wrap">
         <div className="msg-bubble">
           {isWechatPending ? (
@@ -3764,14 +5351,15 @@ function MessageBubbleComponent({
             <>
               <CitationLinkStrip citations={citations} />
               <MessageAttachments attachments={message.attachments} />
+              <MessageArtifacts artifacts={message.artifacts} sessionId={sessionId} tr={tr} onPreviewArtifact={onPreviewArtifact} />
               {completedAssistantContent.trim()
-                ? <MessageContentList content={completedAssistantContent} items={completedAssistantItems} livePreview={false} tr={tr} title={tr('Assistant content', '回复内容')} />
+                ? <MessageContentList content={completedAssistantContent} items={completedAssistantItems} livePreview={false} tr={tr} title={tr('Assistant content', '回复内容')} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
                 : null}
               {message.role === 'assistant' && reasoningContent?.trim()
                 ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} livePreview={liveReasoningPreview} tr={tr} />
                 : null}
               {currentLiveAssistantContent.trim()
-                ? <MessageContentList content={currentLiveAssistantContent} livePreview={true} tr={tr} title={tr('Current reply', '当前回复')} />
+                ? <MessageContentList content={currentLiveAssistantContent} livePreview={true} tr={tr} title={tr('Current reply', '当前回复')} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
                 : null}
               {renderedMarkdown}
               {canLoadFull && (
@@ -4389,6 +5977,499 @@ function draftToCoachEvent(event: BrowserCoachRecordedEvent, draft: CoachEventDr
   };
 }
 
+function PaginationControls(props: {
+  tr: TranslateFn;
+  page: number;
+  pageSize: number;
+  total?: number;
+  loaded?: number;
+  hasMore?: boolean;
+  disabled?: boolean;
+  onPageChange: (page: number) => void;
+}): ReactElement {
+  const pageCount = props.total !== undefined ? Math.max(1, Math.ceil(props.total / props.pageSize)) : undefined;
+  const hasPrevious = props.page > 1;
+  const hasNext = pageCount !== undefined ? props.page < pageCount : Boolean(props.hasMore ?? ((props.loaded ?? 0) >= props.pageSize));
+  const pageLabel = pageCount
+    ? props.tr(`Page ${props.page} / ${pageCount}`, `第 ${props.page} / ${pageCount} 页`)
+    : props.tr(`Page ${props.page}`, `第 ${props.page} 页`);
+  return (
+    <div className="pagination-controls">
+      <button className="ghost-button compact-button" disabled={props.disabled || !hasPrevious} onClick={() => props.onPageChange(Math.max(1, props.page - 1))}>
+        {props.tr('Previous', '上一页')}
+      </button>
+      <span className="soft-badge">{pageLabel}</span>
+      <span className="soft-badge">
+        {props.tr('Page size', '每页')}: {props.pageSize}
+      </span>
+      <button className="ghost-button compact-button" disabled={props.disabled || !hasNext} onClick={() => props.onPageChange(props.page + 1)}>
+        {props.tr('Next', '下一页')}
+      </button>
+    </div>
+  );
+}
+
+function pluginErrorMessage(error: unknown, tr: TranslateFn): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/No handler registered for ['"]plugins:market:browse['"]|No handler registered for ['"]dsh-sidecar:plugins:upload['"]/i.test(message)) {
+    return tr(
+      'The current main process has not loaded the plugin handlers yet. Restart Tasi Harness once, then open Plugins again.',
+      '当前主进程尚未加载插件处理器。请重启一次 Tasi Harness，然后重新打开插件页。'
+    );
+  }
+  return message;
+}
+
+function isFloatingClientMount(mount: DshSidecarClientMount): boolean {
+  return mount.mountPoint === 'desktop-companion' || mount.mountPoint === 'floating';
+}
+
+function isVisibleClientMount(mount: DshSidecarClientMount): boolean {
+  if (!mount.url.trim()) return false;
+  return mount.mountPoint === 'sidebar'
+    || mount.mountPoint === 'main-panel'
+    || mount.mountPoint === 'right-panel'
+    || mount.mountPoint === 'settings'
+    || mount.mountPoint === 'floating'
+    || mount.mountPoint === 'desktop-companion';
+}
+
+function visiblePluginClientMounts(mounts: DshSidecarClientMount[]): DshSidecarClientMount[] {
+  return mounts.filter(isVisibleClientMount);
+}
+
+function primaryPluginClientMount(mounts: DshSidecarClientMount[]): DshSidecarClientMount | undefined {
+  const priority = new Map<string, number>([
+    ['desktop-companion', 0],
+    ['floating', 1],
+    ['main-panel', 2],
+    ['right-panel', 3],
+    ['sidebar', 4],
+    ['settings', 5]
+  ]);
+  return [...mounts]
+    .filter(isVisibleClientMount)
+    .sort((left, right) => (priority.get(left.mountPoint) ?? 99) - (priority.get(right.mountPoint) ?? 99))[0];
+}
+
+function PluginsPage({ tr }: { tr: TranslateFn }): ReactElement {
+  const [activeTab, setActiveTab] = useState<'marketplace' | 'installed' | 'upload'>('marketplace');
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [marketPage, setMarketPage] = useState(1);
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketplace, setMarketplace] = useState<DshMarketplaceBrowseResult>({
+    source: { id: 'skillhub', name: 'SkillHub', homepage: 'https://skillhub.cn/plugins' },
+    plugins: [],
+    page: 1,
+    pageSize: MARKET_PAGE_SIZE
+  });
+  const [installed, setInstalled] = useState<DshSidecarPluginRecord[]>([]);
+  const [sidecarStatus, setSidecarStatus] = useState<DshSidecarStatus | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<DshSidecarRuntimeStatus | null>(null);
+  const [selectedDetail, setSelectedDetail] = useState<DshMarketplacePluginDetail | null>(null);
+  const [busyKey, setBusyKey] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadPackageName, setUploadPackageName] = useState('');
+  const [uploadEnable, setUploadEnable] = useState(true);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(query.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    setMarketPage(1);
+  }, [debouncedQuery]);
+
+  async function refreshInstalled(): Promise<void> {
+    const result = await window.tasiHarness.dshSidecar.listPlugins();
+    setSidecarStatus(result.status);
+    setInstalled(result.plugins);
+    try {
+      const runtime = await window.tasiHarness.dshSidecar.runtimeStatus();
+      setRuntimeStatus(runtime);
+      const repaired = await window.tasiHarness.dshSidecar.listPlugins();
+      setSidecarStatus(repaired.status);
+      setInstalled(repaired.plugins);
+    } catch {
+      setRuntimeStatus(null);
+    }
+  }
+
+  async function refreshMarketplace(): Promise<void> {
+    try {
+      setError('');
+      setMarketLoading(true);
+      const result = await window.tasiHarness.plugins.browseMarketplace({ query: debouncedQuery, page: marketPage, pageSize: MARKET_PAGE_SIZE });
+      setMarketplace(result);
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+      setMarketplace({
+        source: { id: 'skillhub', name: 'SkillHub', homepage: 'https://skillhub.cn/plugins' },
+        plugins: [],
+        page: marketPage,
+        pageSize: MARKET_PAGE_SIZE
+      });
+    } finally {
+      setMarketLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshInstalled();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'marketplace') return;
+    void refreshMarketplace();
+  }, [activeTab, debouncedQuery, marketPage]);
+
+  async function openDetail(plugin: DshMarketplacePlugin): Promise<void> {
+    setBusyKey(`detail:${plugin.id}`);
+    setError('');
+    try {
+      setSelectedDetail(await window.tasiHarness.plugins.readMarketplacePlugin(plugin.id));
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+      setSelectedDetail({
+        ...plugin,
+        versions: [],
+        manifestPreview: undefined,
+        mcpPreview: undefined
+      });
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function installPlugin(plugin: DshMarketplacePlugin): Promise<void> {
+    setBusyKey(`install:${plugin.id}`);
+    setError('');
+    setNotice('');
+    try {
+      const record = await window.tasiHarness.plugins.installFromMarketplace({ plugin, enable: true });
+      setNotice(record.status === 'enabled'
+        ? tr(`Installed and enabled ${record.packageName}.`, `已安装并启用 ${record.packageName}。`)
+        : tr(`Installed ${record.packageName}: ${record.status}.`, `已安装 ${record.packageName}：${record.status}。`));
+      await refreshInstalled();
+      await refreshMarketplace();
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function setPluginEnabled(plugin: DshSidecarPluginRecord, enabled: boolean): Promise<void> {
+    setBusyKey(`${enabled ? 'enable' : 'disable'}:${plugin.id}`);
+    setError('');
+    setNotice('');
+    try {
+      const record = enabled
+        ? await window.tasiHarness.dshSidecar.enablePlugin({ id: plugin.id, packageName: plugin.packageName, source: plugin.source })
+        : await window.tasiHarness.dshSidecar.disablePlugin({ id: plugin.id, packageName: plugin.packageName, source: plugin.source });
+      setNotice(enabled
+        ? tr(`Enabled ${record.packageName}.`, `已启用 ${record.packageName}。`)
+        : tr(`Disabled ${record.packageName}.`, `已禁用 ${record.packageName}。`));
+      await refreshInstalled();
+      await refreshMarketplace();
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function uninstallPlugin(plugin: DshSidecarPluginRecord): Promise<void> {
+    setBusyKey(`uninstall:${plugin.id}`);
+    setError('');
+    setNotice('');
+    try {
+      const ok = await window.tasiHarness.dshSidecar.uninstallPlugin({ id: plugin.id, packageName: plugin.packageName, source: plugin.source });
+      setNotice(ok
+        ? tr(`Uninstalled ${plugin.packageName}.`, `已卸载 ${plugin.packageName}。`)
+        : tr(`Plugin was not installed: ${plugin.packageName}.`, `插件未安装：${plugin.packageName}。`));
+      await refreshInstalled();
+      await refreshMarketplace();
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function uploadPlugin(): Promise<void> {
+    if (!uploadFile) {
+      setError(tr('Choose a plugin ZIP package first.', '请先选择插件 ZIP 包。'));
+      return;
+    }
+    setBusyKey('upload');
+    setError('');
+    setNotice('');
+    try {
+      const contentBase64 = await fileToBase64(uploadFile);
+      const record = await window.tasiHarness.dshSidecar.uploadPlugin({
+        filename: uploadFile.name,
+        contentBase64,
+        packageName: uploadPackageName.trim() || undefined,
+        enable: uploadEnable
+      });
+      setNotice(record.enabled
+        ? tr(`Uploaded, installed, and enabled ${record.packageName}.`, `已上传、安装并启用 ${record.packageName}。`)
+        : tr(`Uploaded and installed ${record.packageName}: ${record.status}.`, `已上传并安装 ${record.packageName}：${record.status}。`));
+      setUploadFile(null);
+      setUploadPackageName('');
+      await refreshInstalled();
+      await refreshMarketplace();
+      setActiveTab('installed');
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  async function openClientMount(mount: DshSidecarClientMount): Promise<void> {
+    setBusyKey(`client:${mount.pluginId}:${mount.id}`);
+    setError('');
+    setNotice('');
+    try {
+      const opened = await window.tasiHarness.dshSidecar.openClientMount({
+        id: mount.id,
+        pluginId: mount.pluginId,
+        mode: isFloatingClientMount(mount) ? 'desktop-companion' : 'window'
+      });
+      setNotice(tr(`Showing ${opened.title}.`, `已显示 ${opened.title}。`));
+    } catch (err) {
+      setError(pluginErrorMessage(err, tr));
+    } finally {
+      setBusyKey(null);
+    }
+  }
+
+  const statusText = sidecarStatus?.running ? tr('Sidecar running', 'Sidecar 运行中') : tr('Sidecar idle', 'Sidecar 未启动');
+
+  return (
+    <section className="page">
+      <PageHeader
+        title={tr('Plugins', '插件')}
+        subtitle={tr('Browse SkillHub DSH plugins, preview metadata, and manage the local sidecar install state.', '浏览 SkillHub DSH 插件，预览元数据，并管理本机 sidecar 安装状态。')}
+        action={<button className="ghost-button" onClick={() => void refreshInstalled()}>{tr('Refresh', '刷新')}</button>}
+      />
+      <div className="card">
+        <div className="skill-tabs">
+          <button className={`skill-tab ${activeTab === 'marketplace' ? 'active' : ''}`} onClick={() => setActiveTab('marketplace')}>
+            {tr('Marketplace', '插件市场')}
+          </button>
+          <button className={`skill-tab ${activeTab === 'installed' ? 'active' : ''}`} onClick={() => setActiveTab('installed')}>
+            {tr('Installed', '已安装')}
+          </button>
+          <button className={`skill-tab ${activeTab === 'upload' ? 'active' : ''}`} onClick={() => setActiveTab('upload')}>
+            {tr('Upload', '上传')}
+          </button>
+        </div>
+        <div className="meta-row wrap">
+          <span className="soft-badge">{marketplace.source.name}</span>
+          <span className="soft-badge">{statusText}</span>
+          <span className="soft-badge">{tr('Installed', '已安装')}: {installed.length}</span>
+          {runtimeStatus && <span className="soft-badge">{tr('Runtime tools', '运行工具')}: {runtimeStatus.tools.length}</span>}
+        </div>
+        {notice && <div className="notice-box">{notice}</div>}
+        {error && <div className="error-box market-error">{error}</div>}
+
+        {activeTab === 'marketplace' && (
+          <>
+            <label>{tr('Search SkillHub plugins', '搜索 SkillHub 插件')}</label>
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={tr('plugin name, owner/slug, or SkillHub plugin URL', '插件名、owner/slug，或 SkillHub 插件 URL')}
+            />
+            <div className="meta-row wrap">
+              <span className="soft-badge">
+                {tr('Results', '结果')}: {marketplace.loaded ?? marketplace.plugins.length}{marketplace.total ? ` / ${marketplace.total}` : ''}
+              </span>
+              {marketLoading && <span className="soft-badge">{tr('Loading', '加载中')}</span>}
+              {debouncedQuery && <span className="soft-badge">{tr('Query', '检索')}: {debouncedQuery}</span>}
+              <button className="ghost-button compact-button" onClick={() => void window.tasiHarness.app.openExternalUrl(marketplace.source.homepage, { system: true })}>
+                {tr('Open SkillHub', '打开 SkillHub')}
+              </button>
+            </div>
+            <PaginationControls
+              tr={tr}
+              page={marketplace.page ?? marketPage}
+              pageSize={marketplace.pageSize ?? MARKET_PAGE_SIZE}
+              total={marketplace.total}
+              loaded={marketplace.loaded ?? marketplace.plugins.length}
+              hasMore={marketplace.hasMore}
+              disabled={busyKey !== null || marketLoading}
+              onPageChange={setMarketPage}
+            />
+            <div className="marketplace-list">
+              {marketplace.plugins.map((plugin) => {
+                const installKey = `install:${plugin.id}`;
+                const detailKey = `detail:${plugin.id}`;
+                return (
+                  <div key={plugin.id} className="marketplace-card">
+                    <div className="marketplace-card-top">
+                      <div>
+                        <strong>{plugin.name}</strong>
+                        <div className="card-subtle">{plugin.owner ? `${plugin.owner} / ` : ''}{plugin.slug} | v{plugin.version}</div>
+                      </div>
+                      <div className="button-row compact">
+                        <button className="ghost-button" disabled={busyKey === detailKey} onClick={() => void openDetail(plugin)}>
+                          {busyKey === detailKey ? tr('Loading...', '加载中...') : tr('Preview', '预览')}
+                        </button>
+                        {plugin.installed ? (
+                          <span className={`soft-badge ${plugin.enabled ? 'ok' : ''}`}>{plugin.enabled ? tr('Enabled', '已启用') : tr('Installed', '已安装')}</span>
+                        ) : (
+                          <button className="primary-button" disabled={busyKey !== null} onClick={() => void installPlugin(plugin)}>
+                            {busyKey === installKey ? tr('Installing...', '安装中...') : tr('Install', '安装')}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <p>{plugin.description}</p>
+                    <div className="plugin-meta-grid">
+                      <span>{tr('Source', '来源')}: {plugin.installSource}</span>
+                      {plugin.packageName && <span>{tr('Package', '包名')}: {plugin.packageName}</span>}
+                      {plugin.status && <span>{tr('Status', '状态')}: {plugin.status}</span>}
+                    </div>
+                  </div>
+                );
+              })}
+              {marketplace.plugins.length === 0 && <div className="tool-empty">{tr('No SkillHub plugins matched. Paste a plugin URL such as https://skillhub.cn/plugins/owner/slug to install directly.', '未匹配到 SkillHub 插件。可粘贴类似 https://skillhub.cn/plugins/owner/slug 的插件 URL 直接安装。')}</div>}
+            </div>
+          </>
+        )}
+
+        {activeTab === 'installed' && (
+          <div className="marketplace-list">
+            {installed.map((plugin) => {
+              const runtimePlugin = runtimeStatus?.plugins.find((item) => item.id === plugin.id);
+              const visibleError = runtimePlugin ? runtimePlugin.lastError : plugin.lastError;
+              const uiClientMounts = visiblePluginClientMounts(runtimePlugin?.clientMounts ?? []);
+              const canShowClientUi = plugin.enabled && runtimePlugin !== undefined && (runtimePlugin.status === 'loaded' || runtimePlugin.status === 'partial');
+              const primaryClientMount = canShowClientUi ? primaryPluginClientMount(uiClientMounts) : undefined;
+              return (
+                <div key={plugin.id} className="marketplace-card">
+                  <div className="marketplace-card-top">
+                    <div>
+                      <strong>{plugin.packageName}</strong>
+                      <div className="card-subtle">{plugin.id} | {plugin.version ?? 'unknown'} | {plugin.status}</div>
+                    </div>
+                    <div className="button-row compact">
+                      {primaryClientMount && (
+                        <button
+                          className="ghost-button"
+                          disabled={busyKey !== null}
+                          onClick={() => void openClientMount(primaryClientMount)}
+                          title={primaryClientMount.title}
+                        >
+                          {busyKey === `client:${primaryClientMount.pluginId}:${primaryClientMount.id}` ? tr('Opening...', '打开中...') : tr('Show', '显示')}
+                        </button>
+                      )}
+                      <button className="ghost-button" disabled={busyKey !== null || plugin.status === 'incompatible'} onClick={() => void setPluginEnabled(plugin, !plugin.enabled)}>
+                        {busyKey === `enable:${plugin.id}` || busyKey === `disable:${plugin.id}`
+                          ? tr('Updating...', '更新中...')
+                          : plugin.enabled ? tr('Disable', '禁用') : tr('Enable', '启用')}
+                      </button>
+                      <button className="danger-button" disabled={busyKey !== null} onClick={() => void uninstallPlugin(plugin)}>
+                        {busyKey === `uninstall:${plugin.id}` ? tr('Uninstalling...', '卸载中...') : tr('Uninstall', '卸载')}
+                      </button>
+                    </div>
+                  </div>
+                  <p>{plugin.source}</p>
+                  <div className="plugin-meta-grid">
+                    <span>{tr('Profile', 'Profile')}: {plugin.profileName}</span>
+                    <span>{tr('Bundle patch', 'Bundle patch')}: {plugin.dshBundlePatch ?? tr('missing', '缺失')}</span>
+                    <span>{tr('Updated', '更新时间')}: {plugin.updatedAt}</span>
+                    {runtimePlugin && <span>{tr('Runtime', '运行时')}: {runtimePlugin.status}</span>}
+                    {runtimePlugin && runtimePlugin.tools.length > 0 && <span>{tr('Tools', '工具')}: {runtimePlugin.tools.join(', ')}</span>}
+                    {runtimePlugin?.commands && runtimePlugin.commands.length > 0 && <span>{tr('Commands', '命令')}: {runtimePlugin.commands.join(', ')}</span>}
+                    {uiClientMounts.length > 0 && <span>{tr('Client UI', '客户端 UI')}: {uiClientMounts.map((mount) => mount.mountPoint).join(', ')}</span>}
+                  </div>
+                  {visibleError && <pre className="code-block small">{visibleError}</pre>}
+                </div>
+              );
+            })}
+            {installed.length === 0 && <div className="tool-empty">{tr('No DSH sidecar plugins installed yet.', '暂无已安装的 DSH sidecar 插件。')}</div>}
+          </div>
+        )}
+
+        {activeTab === 'upload' && (
+          <>
+            <h2>{tr('Upload Plugin ZIP', '上传插件 ZIP')}</h2>
+            <label>{tr('Plugin ZIP package', '插件 ZIP 包')}</label>
+            <input
+              type="file"
+              accept=".zip,application/zip"
+              onChange={(event) => {
+                setUploadFile(event.target.files?.[0] ?? null);
+                setError('');
+                setNotice('');
+              }}
+            />
+            <label>{tr('Package name override', '包名覆盖')}</label>
+            <input
+              value={uploadPackageName}
+              onChange={(event) => setUploadPackageName(event.target.value)}
+              placeholder={tr('optional, e.g. @owner/plugin-name', '可选，例如 @owner/plugin-name')}
+            />
+            <label className="toggle-line overwrite-toggle">
+              <input type="checkbox" checked={uploadEnable} onChange={(event) => setUploadEnable(event.target.checked)} />
+              {tr('Enable immediately after install', '安装后立即启用')}
+            </label>
+            <div className="meta-row wrap">
+              {uploadFile && <span className="soft-badge">{uploadFile.name}</span>}
+              <span className="soft-badge">{tr('Requires package.json with dsh.bundle.patch', '需要 package.json 声明 dsh.bundle.patch')}</span>
+            </div>
+            <div className="button-row">
+              <button className="primary-button" disabled={busyKey !== null || !uploadFile} onClick={() => void uploadPlugin()}>
+                {busyKey === 'upload' ? tr('Installing...', '安装中...') : tr('Upload and Install', '上传并安装')}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      {selectedDetail && (
+        <div className="modal-backdrop" onClick={() => setSelectedDetail(null)}>
+          <div className="modal-card plugin-preview-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-head">
+              <div>
+                <h2>{selectedDetail.name}</h2>
+                <p>{selectedDetail.homepage}</p>
+              </div>
+              <button className="ghost-button" onClick={() => setSelectedDetail(null)}>{tr('Close', '关闭')}</button>
+            </div>
+            <p>{selectedDetail.description}</p>
+            <div className="plugin-meta-grid">
+              <span>{tr('Install source', '安装源')}: {selectedDetail.installSource}</span>
+              <span>{tr('Package', '包名')}: {selectedDetail.packageName ?? selectedDetail.slug}</span>
+              <span>{tr('Versions', '版本')}: {selectedDetail.versions.map((version) => version.version).slice(0, 6).join(', ') || selectedDetail.version}</span>
+            </div>
+            {selectedDetail.readme && <pre className="code-block small">{selectedDetail.readme}</pre>}
+            {selectedDetail.manifestPreview && <pre className="code-block small">{selectedDetail.manifestPreview}</pre>}
+            {selectedDetail.mcpPreview && <pre className="code-block small">{selectedDetail.mcpPreview}</pre>}
+            <div className="button-row">
+              <button className="ghost-button" onClick={() => void window.tasiHarness.app.openExternalUrl(selectedDetail.homepage, { system: true })}>{tr('Open Source Page', '打开来源页')}</button>
+              {!selectedDetail.installed && (
+                <button className="primary-button" disabled={busyKey !== null} onClick={() => void installPlugin(selectedDetail)}>
+                  {tr('Install and Enable', '安装并启用')}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function SkillsPage({
   tr,
   skills,
@@ -4409,7 +6490,9 @@ function SkillsPage({
   const [activeTab, setActiveTab] = useState<'installed' | 'marketplace' | 'upload' | 'coach' | 'optimize'>('installed');
   const [query, setQuery] = useState('');
   const [debouncedQuery, setDebouncedQuery] = useState('');
-  const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [] });
+  const [marketPage, setMarketPage] = useState(1);
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketplace, setMarketplace] = useState<MarketplaceBrowseResult>({ sources: [], skills: [], page: 1, pageSize: MARKET_PAGE_SIZE });
   const [marketError, setMarketError] = useState('');
   const [marketActionKey, setMarketActionKey] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
@@ -4460,18 +6543,26 @@ function SkillsPage({
   }, [query]);
 
   useEffect(() => {
+    setMarketPage(1);
+  }, [debouncedQuery]);
+
+  useEffect(() => {
     if (activeTab !== 'marketplace') return;
+    setMarketLoading(true);
     void window.tasiHarness.skills
-      .browseMarketplace(debouncedQuery)
+      .browseMarketplace({ query: debouncedQuery, page: marketPage, pageSize: MARKET_PAGE_SIZE })
       .then((result) => {
         setMarketplace(result);
         setMarketError('');
       })
       .catch((error) => {
-        setMarketplace({ sources: [], skills: [] });
+        setMarketplace({ sources: [], skills: [], page: marketPage, pageSize: MARKET_PAGE_SIZE });
         setMarketError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        setMarketLoading(false);
       });
-  }, [debouncedQuery, skills, activeTab]);
+  }, [debouncedQuery, skills, activeTab, marketPage]);
 
   useEffect(() => {
     if (activeTab !== 'coach') return;
@@ -4558,7 +6649,7 @@ function SkillsPage({
 
   async function refreshMarketplaceSnapshot(): Promise<void> {
     try {
-      const latest = await window.tasiHarness.skills.browseMarketplace(debouncedQuery);
+      const latest = await window.tasiHarness.skills.browseMarketplace({ query: debouncedQuery, page: marketPage, pageSize: MARKET_PAGE_SIZE });
       setMarketplace(latest);
       setMarketError('');
     } catch (error) {
@@ -5138,12 +7229,25 @@ function SkillsPage({
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder={tr('search ClawHub, SkillHub, and more', '搜索 ClawHub、SkillHub 等')} />
             {marketError && <div className="error-box market-error">{marketError}</div>}
             <div className="meta-row wrap">
-              <span className="soft-badge">{tr('Results', '结果')}: {marketplace.skills.length}</span>
+              <span className="soft-badge">
+                {tr('Results', '结果')}: {marketplace.loaded ?? marketplace.skills.length}{marketplace.total ? ` / ${marketplace.total}` : ''}
+              </span>
+              {marketLoading && <span className="soft-badge">{tr('Loading', '加载中')}</span>}
               {debouncedQuery && <span className="soft-badge">{tr('Query', '检索')}: {debouncedQuery}</span>}
               {marketplace.sources.filter((source) => source.enabled).map((source) => (
                 <span key={source.id} className="soft-badge">{source.name}</span>
               ))}
             </div>
+            <PaginationControls
+              tr={tr}
+              page={marketplace.page ?? marketPage}
+              pageSize={marketplace.pageSize ?? MARKET_PAGE_SIZE}
+              total={marketplace.total}
+              loaded={marketplace.loaded ?? marketplace.skills.length}
+              hasMore={marketplace.hasMore}
+              disabled={marketActionKey !== null || marketLoading}
+              onPageChange={setMarketPage}
+            />
             <div className="marketplace-list">
               {marketplace.skills.map((skill) => (
                 <div key={`${skill.sourceId}-${skill.id}`} className="marketplace-card">
@@ -5708,13 +7812,28 @@ function TasksPage(props: {
   );
 }
 
-type SessionHistoryCategory = MemoryDomain | 'all' | 'wechat-clawbot';
+type SessionHistoryCategory = MemoryDomain | 'all' | 'wechat-clawbot' | 'external-im';
 
 function isWechatClawBotSession(session: SessionSummary, wechatSessionId?: string): boolean {
   const configuredId = wechatSessionId?.trim();
   if (configuredId && session.id === configuredId) return true;
   const title = session.title.trim().toLowerCase();
   return title === 'wechat session' || title.startsWith('wechat clawbot') || title.startsWith('[wechat:');
+}
+
+function isExternalImSession(session: SessionSummary): boolean {
+  return session.origin === 'external-im' || isExternalImSessionId(session.id);
+}
+
+function isExternalImSessionId(sessionId?: string): boolean {
+  return Boolean(sessionId && (sessionId.startsWith('im_') || sessionId.startsWith('dsh-im-')));
+}
+
+function externalImLabel(session: SessionSummary, tr: TranslateFn): string {
+  const provider = session.external?.provider?.trim();
+  if (provider) return provider.toUpperCase();
+  if (session.id.startsWith('im_')) return session.id.split('_')[1]?.toUpperCase() || tr('IM', 'IM');
+  return tr('IM', 'IM');
 }
 
 function SessionsPage({
@@ -5733,50 +7852,70 @@ function SessionsPage({
   const [query, setQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<SessionHistoryCategory>('all');
   const [deletingCategory, setDeletingCategory] = useState(false);
-  const categoryCounts = useMemo(() => {
-    const counts = new Map<SessionHistoryCategory, number>([
-      ['all', sessions.length],
-      ['wechat-clawbot', 0]
-    ]);
-    for (const session of sessions) {
-      if (isWechatClawBotSession(session, wechatSessionId)) {
-        counts.set('wechat-clawbot', (counts.get('wechat-clawbot') ?? 0) + 1);
-        continue;
-      }
-      const domain = knownMemoryDomain(session.domain);
-      counts.set(domain, (counts.get(domain) ?? 0) + 1);
-    }
-    return counts;
-  }, [sessions, wechatSessionId]);
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return sessions.filter((s) => {
-      const isWechat = isWechatClawBotSession(s, wechatSessionId);
-      if (activeCategory === 'wechat-clawbot' && !isWechat) return false;
-      if (activeCategory !== 'all' && activeCategory !== 'wechat-clawbot' && (isWechat || knownMemoryDomain(s.domain) !== activeCategory)) return false;
-      if (!needle) return true;
-      return s.title.toLowerCase().includes(needle);
-    });
-  }, [sessions, query, activeCategory, wechatSessionId]);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const historyLoadSeq = useRef(0);
+  const [historyResult, setHistoryResult] = useState<SessionListPageResult>({
+    sessions: [],
+    page: 1,
+    pageSize: HISTORY_PAGE_SIZE,
+    total: 0,
+    totalPages: 1,
+    categoryCounts: { all: 0, 'wechat-clawbot': 0, 'external-im': 0 }
+  });
+  const categoryCounts = historyResult.categoryCounts;
   const activeCategoryLabel = useMemo(() => {
     if (activeCategory === 'all') return tr('All', '全部');
+    if (activeCategory === 'external-im') return tr('External IM', '外接 IM');
     if (activeCategory === 'wechat-clawbot') return tr('WeChat', '微信');
     const domain = MEMORY_DOMAINS.find((item) => item.value === activeCategory);
     return domain ? tr(domain.labelEn, domain.labelZh) : activeCategory;
   }, [activeCategory, tr]);
-  const activeCategoryDeleteCount = categoryCounts.get(activeCategory) ?? 0;
+  const activeCategoryDeleteCount = categoryCounts[activeCategory] ?? 0;
+
+  async function loadHistoryPage(pageNumber = historyPage): Promise<void> {
+    const seq = historyLoadSeq.current + 1;
+    historyLoadSeq.current = seq;
+    setHistoryLoading(true);
+    try {
+      const result = await window.tasiHarness.sessions.listPage({
+        page: pageNumber,
+        pageSize: HISTORY_PAGE_SIZE,
+        query,
+        category: activeCategory,
+        wechatSessionId
+      });
+      if (seq !== historyLoadSeq.current) return;
+      setHistoryResult(result);
+      setHistoryPage(result.page);
+    } finally {
+      if (seq === historyLoadSeq.current) setHistoryLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setHistoryPage(1);
+  }, [query, activeCategory, wechatSessionId]);
+
+  useEffect(() => {
+    void loadHistoryPage(historyPage);
+  }, [historyPage, query, activeCategory, wechatSessionId]);
 
   async function remove(id: string): Promise<void> {
     await window.tasiHarness.sessions.delete(id);
+    await loadHistoryPage(historyPage);
     await refreshSessions();
   }
 
   async function removeActiveCategory(): Promise<void> {
+    const allSessions = sessions.length > 0 ? sessions : await window.tasiHarness.sessions.list();
     const targets = activeCategory === 'all'
-      ? sessions
+      ? allSessions
       : activeCategory === 'wechat-clawbot'
-        ? sessions.filter((session) => isWechatClawBotSession(session, wechatSessionId))
-        : sessions.filter((session) => !isWechatClawBotSession(session, wechatSessionId) && knownMemoryDomain(session.domain) === activeCategory);
+        ? allSessions.filter((session) => isWechatClawBotSession(session, wechatSessionId))
+        : activeCategory === 'external-im'
+          ? allSessions.filter((session) => isExternalImSession(session))
+          : allSessions.filter((session) => !isWechatClawBotSession(session, wechatSessionId) && !isExternalImSession(session) && knownMemoryDomain(session.domain) === activeCategory);
     if (targets.length === 0 || deletingCategory) return;
     const confirmed = window.confirm(
       activeCategory === 'all'
@@ -5793,6 +7932,7 @@ function SessionsPage({
     setDeletingCategory(true);
     try {
       await Promise.all(targets.map((session) => window.tasiHarness.sessions.delete(session.id)));
+      await loadHistoryPage(1);
       await refreshSessions();
     } finally {
       setDeletingCategory(false);
@@ -5801,12 +7941,12 @@ function SessionsPage({
 
   return (
     <section className="page">
-      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by memory domain, with WeChat separated for quick access.', '本地 JSON 会话历史，按记忆分类展示，并单独列出微信，方便快速查找。')} />
+      <PageHeader title={tr('History', '历史')} subtitle={tr('Local JSON session history grouped by memory domain, with external IM separated for quick access.', '本地 JSON 会话历史，按记忆分类展示，并单独列出外接 IM，方便快速查找。')} />
       <div className="card">
         <input className="wide-input" placeholder={tr('Filter history', '筛选历史')} value={query} onChange={(e) => setQuery(e.target.value)} />
         <div className="history-actions">
           <div className="card-subtle">
-            {tr('Current category', '当前分类')}: {activeCategoryLabel} · {activeCategoryDeleteCount} {tr('sessions', '个会话')}
+            {tr('Current category', '当前分类')}: {activeCategoryLabel} · {historyResult.total} / {activeCategoryDeleteCount} {tr('sessions', '个会话')}
           </div>
           <button className="danger-button" disabled={deletingCategory || activeCategoryDeleteCount === 0} onClick={() => void removeActiveCategory()}>
             {deletingCategory
@@ -5820,11 +7960,15 @@ function SessionsPage({
           <div className="memory-category-list">
             <button className={`memory-category-item ${activeCategory === 'all' ? 'active' : ''}`} onClick={() => setActiveCategory('all')}>
               <span>{tr('All', '全部')}</span>
-              <span className="soft-badge">{categoryCounts.get('all') ?? 0}</span>
+              <span className="soft-badge">{categoryCounts.all ?? 0}</span>
             </button>
             <button className={`memory-category-item ${activeCategory === 'wechat-clawbot' ? 'active' : ''}`} onClick={() => setActiveCategory('wechat-clawbot')}>
               <span>{tr('WeChat', '微信')}</span>
-              <span className="soft-badge">{categoryCounts.get('wechat-clawbot') ?? 0}</span>
+              <span className="soft-badge">{categoryCounts['wechat-clawbot'] ?? 0}</span>
+            </button>
+            <button className={`memory-category-item ${activeCategory === 'external-im' ? 'active' : ''}`} onClick={() => setActiveCategory('external-im')}>
+              <span>{tr('External IM', '外接 IM')}</span>
+              <span className="soft-badge">{categoryCounts['external-im'] ?? 0}</span>
             </button>
             {MEMORY_DOMAINS.map((category) => (
               <button
@@ -5833,13 +7977,25 @@ function SessionsPage({
                 onClick={() => setActiveCategory(category.value)}
               >
                 <span>{tr(category.labelEn, category.labelZh)}</span>
-                <span className="soft-badge">{categoryCounts.get(category.value) ?? 0}</span>
+                <span className="soft-badge">{categoryCounts[category.value] ?? 0}</span>
               </button>
             ))}
           </div>
           <div className="session-list">
-            {filtered.map((s) => {
+            <div className="history-pager">
+              <span>{tr('Page', '页码')}: {historyResult.page} / {historyResult.totalPages}</span>
+              <span>{tr('Per page', '每页')}: {historyResult.pageSize}</span>
+              <button className="mini-button" disabled={historyLoading || historyResult.page <= 1} onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}>
+                {tr('Previous', '上一页')}
+              </button>
+              <button className="mini-button" disabled={historyLoading || historyResult.page >= historyResult.totalPages} onClick={() => setHistoryPage((page) => page + 1)}>
+                {tr('Next', '下一页')}
+              </button>
+            </div>
+            {historyLoading && <div className="tool-empty">{tr('Loading sessions...', '正在加载会话...')}</div>}
+            {!historyLoading && historyResult.sessions.map((s) => {
               const isWechat = isWechatClawBotSession(s, wechatSessionId);
+              const isExternal = isExternalImSession(s);
               const domain = MEMORY_DOMAINS.find((item) => item.value === knownMemoryDomain(s.domain)) ?? MEMORY_DOMAINS.at(-1);
               return (
                 <div className="session-card" key={s.id}>
@@ -5847,6 +8003,7 @@ function SessionsPage({
                     <strong>{decodeLikelyPercentEncodedChineseText(s.title)}</strong>
                     <p>{s.messageCount} {tr('messages', '条消息')} | {prettyDate(s.updatedAt)}</p>
                     <div className="session-card-badges">
+                      {isExternal && <span className="soft-badge">{externalImLabel(s, tr)}</span>}
                       {isWechat && <span className="soft-badge">{tr('WeChat', '微信')}</span>}
                       {domain && <span className="soft-badge">{tr(domain.labelEn, domain.labelZh)}</span>}
                     </div>
@@ -5858,7 +8015,7 @@ function SessionsPage({
                 </div>
               );
             })}
-            {filtered.length === 0 && (
+            {!historyLoading && historyResult.sessions.length === 0 && (
               <div className="tool-empty">
                 {tr('No sessions matched this category or filter.', '没有匹配该分类或筛选条件的会话。')}
               </div>

@@ -5,6 +5,16 @@ function render(input: string): string {
   return renderMarkdownToHtml(normalizeMarkdownForRender(input));
 }
 
+describe('renderer markdown images', () => {
+  it('renders data-url markdown images for document previews', () => {
+    const html = render('![chart](data:image/png;base64,ZmFrZQ==)');
+
+    expect(html).toContain('class="msg-inline-image"');
+    expect(html).toContain('src="data:image/png;base64,ZmFrZQ=="');
+    expect(html).toContain('alt="chart"');
+  });
+});
+
 describe('renderer markdown math', () => {
   it('renders dollar-delimited inline LaTeX with KaTeX', () => {
     const html = render('Arrhenius damage: $\\Omega = \\int_0^t A \\exp(-\\frac{\\Delta E}{RT}) dt$.');

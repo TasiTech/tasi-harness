@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SessionStore } from '../src/main/storage/sessionStore.js';
@@ -17,6 +17,68 @@ describe('SessionStore', () => {
 
       expect(store.read(session.id)?.domain).toBe('travel');
       expect(store.list()[0]?.domain).toBe('travel');
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('lists session history in pages with query and category counts', () => {
+    const env = tempHome();
+    try {
+      const store = new SessionStore(env.home);
+      for (let index = 0; index < 30; index += 1) {
+        const session = store.create(index % 2 === 0 ? `Travel item ${index}` : `Work item ${index}`);
+        store.appendMessages(session.id, [
+          {
+            id: `m${index}`,
+            role: 'user',
+            content: index % 2 === 0 ? 'Plan a travel itinerary with hotels.' : 'Prepare a work project update.',
+            createdAt: `2026-01-01T00:00:${String(index).padStart(2, '0')}.000Z`
+          }
+        ]);
+      }
+      const wechat = store.create('WeChat ClawBot');
+
+      const page = store.listPage({ page: 2, pageSize: 10 });
+      const travel = store.listPage({ page: 1, pageSize: 5, query: 'item', category: 'travel' });
+      const wechatPage = store.listPage({ page: 1, pageSize: 10, category: 'wechat-clawbot', wechatSessionId: wechat.id });
+
+      expect(page.total).toBe(31);
+      expect(page.sessions).toHaveLength(10);
+      expect(page.totalPages).toBe(4);
+      expect(page.categoryCounts.all).toBe(31);
+      expect(page.categoryCounts.travel).toBe(15);
+      expect(page.categoryCounts.work).toBe(15);
+      expect(page.categoryCounts['wechat-clawbot']).toBe(1);
+      expect(travel.total).toBe(15);
+      expect(travel.sessions).toHaveLength(5);
+      expect(travel.sessions.every((session) => session.title.toLowerCase().includes('travel item'))).toBe(true);
+      expect(wechatPage.total).toBe(1);
+      expect(wechatPage.sessions[0]?.id).toBe(wechat.id);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('keeps the session summary index current for fast list loading', () => {
+    const env = tempHome();
+    try {
+      const store = new SessionStore(env.home);
+      const session = store.create('Indexed session');
+      store.appendMessages(session.id, [
+        { id: 'm1', role: 'user', content: 'Prepare a work update.', createdAt: '2026-01-01T00:00:00.000Z' }
+      ]);
+
+      expect(store.listPage({ page: 1, pageSize: 10 }).sessions[0]?.title).toBe('Indexed session');
+      expect(existsSync(join(env.home, 'sessions-index.json'))).toBe(true);
+
+      store.rename(session.id, 'Renamed indexed session');
+      expect(store.list()[0]?.title).toBe('Renamed indexed session');
+
+      store.delete(session.id);
+      expect(store.listPage({ page: 1, pageSize: 10 }).total).toBe(0);
+      const indexRaw = readFileSync(join(env.home, 'sessions-index.json'), 'utf8');
+      expect(indexRaw).not.toContain(session.id);
     } finally {
       env.cleanup();
     }
@@ -110,6 +172,40 @@ describe('SessionStore', () => {
       expect(display?.toolEvents[0]?.contentOmitted).toBe(true);
       expect(full?.messages[0]?.content.length).toBe(hugeMessage.length);
       expect(full?.messages[0]?.attachments?.[0]?.contentBase64.length).toBe(10000);
+    } finally {
+      env.cleanup();
+    }
+  });
+
+  it('rebuilds hidden sidecar tool audit messages as tool events without showing them as chat messages', () => {
+    const env = tempHome();
+    try {
+      const store = new SessionStore(env.home);
+      const session = store.create('DSH sidecar run');
+      store.appendMessages(session.id, [
+        {
+          id: 'toolevent_sidecar',
+          role: 'tool',
+          name: 'dsh_sidecar_chat',
+          hidden: true,
+          content: '{"plugin":"@nanmicoder/dsh-agent-teams"}',
+          createdAt: '2026-09-02T00:00:00.000Z'
+        },
+        {
+          id: 'msg_answer',
+          role: 'assistant',
+          content: 'Done.',
+          createdAt: '2026-09-02T00:00:01.000Z'
+        }
+      ]);
+
+      const full = store.read(session.id);
+      const display = store.readForDisplay(session.id);
+
+      expect(full?.toolEvents).toHaveLength(1);
+      expect(full?.toolEvents[0]?.toolName).toBe('dsh_sidecar_chat');
+      expect(display?.messages.map((message) => message.id)).toEqual(['msg_answer']);
+      expect(display?.toolEvents).toHaveLength(1);
     } finally {
       env.cleanup();
     }
