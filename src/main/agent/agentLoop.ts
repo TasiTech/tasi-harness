@@ -238,7 +238,8 @@ async function resolvePluginMentions(
     .flatMap(({ plugin }) => plugin.tools);
   const lines = [
     '## DSH Plugin References',
-    'The user referenced plugin(s) with @ syntax. Prefer the referenced plugin tools when they fit the task. If a referenced plugin is disabled, failed, or exposes no agent-callable tools, state that limitation plainly.'
+    'The user referenced plugin(s) with @ syntax. Prefer the referenced plugin tools when they fit the task. If a referenced plugin exposes Skills, call skill_view for the relevant listed skill before other task work so the plugin workflow is actually applied. If a referenced plugin is disabled, failed, or exposes no agent-callable tools or skills, state that limitation plainly.',
+    'If the same user message includes an http:// or https:// URL, open or inspect that exact URL instead of reusing an older browser page from prior turns.'
   ];
   for (const { mention, plugin } of resolved) {
     lines.push(`- @${mention} -> ${plugin.packageName} (${pluginMentionStatusText(plugin)})`);

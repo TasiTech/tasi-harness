@@ -43,7 +43,7 @@ import type {
   ToolApprovalRequest,
   ToolEvent
 } from '../shared/types.js';
-import { EMBEDDED_BROWSER_PREVIEW_PARTITION } from '../shared/browserConstants.js';
+import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
 import { DEFAULT_OMNI_SYSTEM_PROMPT } from '../shared/defaultPrompts.js';
 import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS, prepareReasoningDeltaForDisplay, reasoningPanelText } from '../shared/reasoningPreview.js';
 import {
@@ -1825,6 +1825,13 @@ function ChatPage(props: {
   const visibleMessages = useMemo(() => props.messages.filter(isVisibleChatMessage), [props.messages]);
   const latestVisibleMessage = visibleMessages[visibleMessages.length - 1];
   const latestToolPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents), [props.toolEvents]);
+  const latestBrowserToolEventId = useMemo(() => {
+    for (let i = props.toolEvents.length - 1; i >= 0; i--) {
+      const event = props.toolEvents[i];
+      if (event.toolName.startsWith('browser_')) return event.id;
+    }
+    return '';
+  }, [props.toolEvents]);
   const previewUrl = activePreviewUrl || latestToolPreviewUrl;
   const externalFallbackPreviewUrl = useMemo(() => latestWebPreviewUrl(props.toolEvents, true), [props.toolEvents]);
   const showEmbeddedWebPreview = props.config.browserMode === 'embedded';
@@ -2250,6 +2257,11 @@ function ChatPage(props: {
     setActivePreviewUrl(latestToolPreviewUrl);
     setPreviewAddress(latestToolPreviewUrl);
   }, [latestToolPreviewUrl]);
+  useEffect(() => {
+    if (!latestBrowserToolEventId || props.config.browserMode !== 'embedded') return;
+    setToolPanelCollapsed(false);
+    setToolPanelTab('browser');
+  }, [latestBrowserToolEventId, props.config.browserMode]);
   useEffect(() => {
     if (showEmbeddedWebPreview || !externalFallbackPreviewUrl || !props.busy) {
       externalPreviewOpenUrlRef.current = '';
@@ -3378,10 +3390,10 @@ function ChatPage(props: {
                     <div className="tool-web-preview-body" ref={previewBodyRef}>
                       <webview
                         ref={previewWebviewRef}
-                        key={`${EMBEDDED_BROWSER_PREVIEW_PARTITION}:${previewUrl || 'blank'}`}
+                        key={`${EMBEDDED_BROWSER_PARTITION}:${previewUrl || 'blank'}`}
                         className="tool-web-preview-frame"
                         src={previewUrl || 'about:blank'}
-                        partition={EMBEDDED_BROWSER_PREVIEW_PARTITION}
+                        partition={EMBEDDED_BROWSER_PARTITION}
                         webpreferences="zoomFactor=1"
                       />
                     </div>

@@ -243,6 +243,7 @@ describe('AgentLoop', () => {
         enabled: true,
         status: 'loaded',
         tools: ['demo_plugin_tool'],
+        skills: ['superdesign'],
         commands: ['/demo-plugin'],
         settingsEntries: ['Demo Plugin']
       }],
@@ -266,12 +267,15 @@ describe('AgentLoop', () => {
       getDshRuntimeStatus: async () => runtimeStatus
     });
 
-    await loop.run({ userInput: '@demo-plugin handle this', stream: false });
+    await loop.run({ userInput: '@demo-plugin inspect https://example.com and handle this', stream: false });
 
     expect(requests[0]?.tools?.map((tool) => tool.function.name)).toEqual(['demo_plugin_tool']);
     expect(requests[0]?.messages.at(-1)?.content).toContain('## DSH Plugin References');
     expect(requests[0]?.messages.at(-1)?.content).toContain('@demo-plugin -> @owner/demo-plugin (loaded)');
     expect(requests[0]?.messages.at(-1)?.content).toContain('Tools: demo_plugin_tool');
+    expect(requests[0]?.messages.at(-1)?.content).toContain('Skills: superdesign');
+    expect(requests[0]?.messages.at(-1)?.content).toContain('call skill_view for the relevant listed skill before other task work');
+    expect(requests[0]?.messages.at(-1)?.content).toContain('open or inspect that exact URL');
   });
 
   it('repairs a skill-driven final answer when delivery validation fails', async () => {

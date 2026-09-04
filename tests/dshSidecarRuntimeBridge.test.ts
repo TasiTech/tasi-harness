@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { join } from 'node:path';
 import type { DshSidecarRuntimeSkill, DshSidecarToolCallRequest, ToolDefinition, ToolExecutionResult } from '../src/shared/types.js';
 import { ConfigStore } from '../src/main/storage/configStore.js';
 import { SkillManager } from '../src/main/skills/skillManager.js';
@@ -86,5 +87,45 @@ describe('DshSidecarRuntimeBridge', () => {
     });
     expect(skillManager.renderPromptIndex()).toContain('superdesign [DSH (superdesign-dsh) (dsh)]');
     expect(skillManager.read('superdesign')?.content).toContain('Use Superdesign for UI work.');
+  });
+
+  it('resolves path-like runtime tool args against the workspace', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    const registry = new ToolRegistry();
+    const calls: DshSidecarToolCallRequest[] = [];
+    const tool: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'modlens_read_image',
+        description: 'Read an image.',
+        parameters: { type: 'object', properties: {} }
+      }
+    };
+    const sidecar = {
+      runtimeTools: async () => [tool],
+      runtimeSkills: async () => [],
+      callRuntimeTool: async (req: DshSidecarToolCallRequest): Promise<ToolExecutionResult> => {
+        calls.push(req);
+        return { ok: true, content: 'read' };
+      }
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore);
+    await bridge.sync();
+    await registry.execute('modlens_read_image', {
+      path: 'screenshots/01-chat.png',
+      source_url: 'https://example.com/image.png'
+    }, {
+      sessionId: 'session-1',
+      workspaceDir: env.home,
+      requestId: 'call-1'
+    });
+
+    expect(calls[0]?.args).toMatchObject({
+      path: join(env.home, 'screenshots/01-chat.png'),
+      source_url: 'https://example.com/image.png'
+    });
   });
 });

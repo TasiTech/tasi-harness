@@ -2,11 +2,13 @@
 
 [English](ARCHITECTURE.en.md) | [简体中文](ARCHITECTURE.zh-CN.md)
 
-This document reflects the current Tasi Harness implementation as of v1.4.0.
+This document reflects the current Tasi Harness implementation as of v1.7.0.
 
 ## Code Architecture Diagram
 
 ![Tasi Harness architecture](architechcture.png)
+
+Draw.io source: [architechcture.drawio](architechcture.drawio).
 
 The diagram keeps the existing `architechcture.png` filename for compatibility with older documentation links.
 
