@@ -899,12 +899,27 @@ function safeExternalSegment(value: string): string {
   return value.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'im';
 }
 
+function externalProviderTitle(provider: string): string {
+  const clean = provider.trim();
+  const lower = clean.toLowerCase().replace(/^@/, '');
+  if (!lower || lower === 'dsh-im' || lower === 'xmanrui/dsh-im' || lower === 'xmanrui-dsh-im') return 'IM';
+  if (lower === 'wechat' || lower === 'weixin' || lower === 'wx') return 'WeChat';
+  if (lower === 'lark' || lower === 'feishu') return 'Feishu';
+  if (lower === 'dingding' || lower === 'dingtalk') return 'DingTalk';
+  if (lower === 'qq') return 'QQ';
+  return clean
+    .split(/[-_\s/]+/g)
+    .filter(Boolean)
+    .map((part) => /^[a-z0-9]+$/i.test(part) ? `${part.slice(0, 1).toUpperCase()}${part.slice(1)}` : part)
+    .join(' ') || 'IM';
+}
+
 function externalImSessionTitle(external: ExternalConversationMetadata, input: string): string {
-  const provider = external.provider.toUpperCase();
+  const provider = externalProviderTitle(external.provider);
   const scope = external.scope && external.scope !== 'unknown' ? ` ${external.scope}` : '';
   const name = external.displayName || external.senderName || external.externalConversationId || 'conversation';
   const preview = input.trim().slice(0, 36);
-  return `[${provider}${scope}] ${name}${preview ? ` - ${preview}` : ''}`.slice(0, 96);
+  return `${provider}${scope} / ${name}${preview ? ` - ${preview}` : ''}`.slice(0, 96);
 }
 
 function externalImWorkspaceDir(sessionId: string): string {

@@ -62,6 +62,7 @@ import {
 import { extractCitationLinks, type CitationLink } from './citations.js';
 import { LiveAgentPage, type LiveAgentOutboundMessage } from './LiveAgentPage.js';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from './markdown.js';
+import { assignToolEventsToVisibleMessages, currentTurnPendingToolEvents, externalMessageDisplay } from './appHelpers.js';
 import { ARTIFACT_EXTENSIONS, previewModeForArtifact } from '../shared/artifacts.js';
 import * as QRCode from 'qrcode';
 import JSZip from 'jszip';
@@ -333,6 +334,7 @@ const TOOL_EVENT_FLUSH_MS = 220;
 const MAX_LIVE_RENDERED_TOOL_EVENTS = 60;
 const LIVE_CONTENT_ITEM_CHARS = 2_000;
 const EMPTY_STRING_ARRAY: string[] = [];
+const EMPTY_TOOL_EVENTS: ToolEvent[] = [];
 
 type SettingsDraft = PublicAppConfig & {
   apiKey?: string;
@@ -1251,6 +1253,36 @@ function BrowserToolbarIcon(props: { kind: 'back' | 'forward' | 'refresh' | 'ope
   );
 }
 
+function SidePanelIcon(props: { kind: 'file' | 'browser' }): ReactElement {
+  const common = {
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.9,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true
+  };
+  if (props.kind === 'file') {
+    return (
+      <svg {...common}>
+        <path d="M14 3.5H7.5A2.5 2.5 0 0 0 5 6v12a2.5 2.5 0 0 0 2.5 2.5h9A2.5 2.5 0 0 0 19 18V8.5z" />
+        <path d="M14 3.5v5h5" />
+        <path d="M8.5 13h7" />
+        <path d="M8.5 16h5" />
+      </svg>
+    );
+  }
+  return (
+    <svg {...common}>
+      <rect x="4" y="5" width="16" height="14" rx="2.5" />
+      <path d="M4 9h16" />
+      <path d="M8 7h.01" />
+      <path d="M11 7h.01" />
+    </svg>
+  );
+}
+
 export function App(): ReactElement {
   const [page, setPage] = useState<Page>('chat');
   const [language, setLanguage] = useState<UiLanguage>(() => {
@@ -1776,7 +1808,7 @@ function ChatPage(props: {
   const [pluginMentionError, setPluginMentionError] = useState('');
   const [wechatChipClearedAt, setWechatChipClearedAt] = useState(() => new Date().toISOString());
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
-  const [toolPanelTab, setToolPanelTab] = useState<'artifacts' | 'browser' | 'tools'>('tools');
+  const [toolPanelTab, setToolPanelTab] = useState<'artifacts' | 'browser'>('artifacts');
   const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
   const [chatSplitPercent, setChatSplitPercent] = useState(33.333);
   const [artifactPreview, setArtifactPreview] = useState<ArtifactPreviewResult | null>(null);
@@ -1847,9 +1879,24 @@ function ChatPage(props: {
   const chatGridStyle = useMemo(() => ({
     '--chat-history-width': `${chatSplitPercent}%`
   }) as CSSProperties, [chatSplitPercent]);
-  const visibleToolEvents = useMemo(
-    () => runBusy ? props.toolEvents.slice(-MAX_LIVE_RENDERED_TOOL_EVENTS) : props.toolEvents,
-    [props.toolEvents, runBusy]
+  const pendingLiveToolEvents = useMemo(
+    () => currentTurnPendingToolEvents(visibleMessages, props.toolEvents, runBusy, MAX_LIVE_RENDERED_TOOL_EVENTS),
+    [visibleMessages, props.toolEvents, runBusy]
+  );
+  const pendingLiveToolEventIds = useMemo(
+    () => new Set(pendingLiveToolEvents.map((event) => event.id)),
+    [pendingLiveToolEvents]
+  );
+  const messageToolEventGroups = useMemo(
+    () => assignToolEventsToVisibleMessages(
+      visibleMessages,
+      pendingLiveToolEventIds.size > 0
+        ? props.toolEvents.filter((event) => !pendingLiveToolEventIds.has(event.id))
+        : props.toolEvents,
+      runBusy,
+      MAX_LIVE_RENDERED_TOOL_EVENTS
+    ),
+    [visibleMessages, props.toolEvents, runBusy, pendingLiveToolEventIds]
   );
   const wechatSessionAttachments = useMemo(() => {
     if (!isWechatSession) return [];
@@ -2311,18 +2358,7 @@ function ChatPage(props: {
       endRef.current?.scrollIntoView({ behavior: runBusy ? 'auto' : 'smooth', block: 'end' });
     });
     return () => window.cancelAnimationFrame(rafId);
-  }, [visibleMessages.length, latestVisibleMessage?.id, latestVisibleMessage?.content, latestVisibleMessage?.reasoning_content, runBusy, previewDragging]);
-  useEffect(() => {
-    if (toolPanelCollapsed || toolPanelTab !== 'tools') return;
-    const panel = toolPanelBodyRef.current;
-    if (!panel) return;
-    const distanceFromBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight;
-    if (distanceFromBottom > 260) return;
-    const rafId = window.requestAnimationFrame(() => {
-      panel.scrollTo({ top: panel.scrollHeight, behavior: runBusy ? 'auto' : 'smooth' });
-    });
-    return () => window.cancelAnimationFrame(rafId);
-  }, [visibleToolEvents.length, toolPanelCollapsed, toolPanelTab, runBusy]);
+  }, [visibleMessages.length, latestVisibleMessage?.id, latestVisibleMessage?.content, latestVisibleMessage?.reasoning_content, props.toolEvents.length, runBusy, previewDragging]);
 	  useEffect(() => {
 	    const off = window.tasiHarness.agent.onToolEvent((payload) => {
 	      if (isExternalImSessionId(payload.sessionId) && props.sessionId !== payload.sessionId) return;
@@ -3190,7 +3226,7 @@ function ChatPage(props: {
             <div className="empty-state">
               <div className="empty-icon">AI</div>
               <div className="empty-title">{props.tr('Start a local agent session', '开始一个本地智能体会话')}</div>
-              <div className="empty-desc">{props.tr('Main chat only shows your messages and the final assistant replies. Tool calls and tool outputs now stream in the side panel.', '主聊天区仅展示你的消息和助手最终回复，工具调用与输出会显示在右侧面板。')}</div>
+              <div className="empty-desc">{props.tr('Tool calls and outputs appear inline inside assistant replies, with file and browser previews still available on the side.', '工具调用与输出会合并显示在助手回复里，文件和浏览器预览仍保留在侧边栏。')}</div>
             </div>
           )}
           {visibleMessages.map((m, idx) => (
@@ -3202,9 +3238,11 @@ function ChatPage(props: {
               productName={props.config.branding.productName || 'Tasi Harness'}
               liveContentPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && m.content.trim().length > 0}
               liveReasoningPreview={runBusy && m.role === 'assistant' && idx === visibleMessages.length - 1 && Boolean(m.reasoning_content?.trim())}
+              toolEvents={messageToolEventGroups[idx] ?? EMPTY_TOOL_EVENTS}
               onPreviewArtifact={showArtifactPreview}
             />
           ))}
+          <InlineToolActivityBubble events={pendingLiveToolEvents} sessionId={props.sessionId} tr={props.tr} />
           {runBusy && <div className="typing-indicator"><span /> <span /> <span /></div>}
           {followUpQuestions.length > 0 && !runBusy && (
             <div className="follow-up-panel">
@@ -3239,7 +3277,7 @@ function ChatPage(props: {
               aria-label={props.tr('Expand side panel', '展开侧边栏')}
             >
               <span>‹</span>
-              <strong>{props.tr('Trace', '轨迹')}</strong>
+              <strong>{props.tr('Preview', '预览')}</strong>
             </button>
           ) : (
             <>
@@ -3257,9 +3295,11 @@ function ChatPage(props: {
                 className={`tool-panel-tab ${toolPanelTab === 'artifacts' ? 'active' : ''}`}
                 role="tab"
                 aria-selected={toolPanelTab === 'artifacts'}
+                title={props.tr('File Preview', '文件预览')}
+                aria-label={props.tr('File Preview', '文件预览')}
                 onClick={() => setToolPanelTab('artifacts')}
               >
-                <span className="tool-panel-tab-icon" aria-hidden="true">□</span>
+                <span className="tool-panel-tab-icon"><SidePanelIcon kind="file" /></span>
                 <span className="tool-panel-tab-label">{props.tr('File Preview', '文件预览')}</span>
                 <span className="tool-panel-tab-count">{artifactPreview ? 1 : 0}</span>
               </button>
@@ -3267,21 +3307,13 @@ function ChatPage(props: {
                 className={`tool-panel-tab ${toolPanelTab === 'browser' ? 'active' : ''}`}
                 role="tab"
                 aria-selected={toolPanelTab === 'browser'}
+                title={props.tr('Browser', '内部浏览器')}
+                aria-label={props.tr('Browser', '内部浏览器')}
                 onClick={() => setToolPanelTab('browser')}
               >
-                <span className="tool-panel-tab-icon" aria-hidden="true">⌂</span>
+                <span className="tool-panel-tab-icon"><SidePanelIcon kind="browser" /></span>
                 <span className="tool-panel-tab-label">{props.tr('Browser', '内部浏览器')}</span>
                 <span className="tool-panel-tab-count">{shouldShowWebPreview ? 1 : 0}</span>
-              </button>
-              <button
-                className={`tool-panel-tab ${toolPanelTab === 'tools' ? 'active' : ''}`}
-                role="tab"
-                aria-selected={toolPanelTab === 'tools'}
-                onClick={() => setToolPanelTab('tools')}
-              >
-                <span className="tool-panel-tab-icon" aria-hidden="true">⚙</span>
-                <span className="tool-panel-tab-label">{props.tr('Tool Trace', '工具轨迹')}</span>
-                <span className="tool-panel-tab-count">{props.toolEvents.length}</span>
               </button>
             </div>
           </div>
@@ -3323,9 +3355,9 @@ function ChatPage(props: {
                   )}
                 </div>
               ) : (
-                <div className="tool-empty">{props.tr('Previewable files from assistant replies will appear here after you click Preview.', '点击回复中文件的“预览”后，会在这里显示可预览文件。')}</div>
+                <div className="tool-empty artifact-empty" aria-hidden="true" />
               )
-            ) : toolPanelTab === 'browser' ? (
+            ) : (
               showEmbeddedWebPreview ? (
                 <div
                   className={`tool-web-preview ${webPreviewExpanded ? 'expanded' : ''} ${previewDragging ? 'dragging' : ''}`}
@@ -3406,12 +3438,6 @@ function ChatPage(props: {
               ) : (
                 <div className="tool-empty">{props.tr('Built-in browser mode is disabled. Switch Browser Mode to Built-in browser to preview pages here.', '内部浏览器模式未启用。将浏览器模式切换为“内部浏览器”后，网页会在这里预览。')}</div>
               )
-            ) : props.toolEvents.length === 0 ? (
-              <div className="tool-empty">{props.tr('Tool requests and results will appear here in a separate scrollable pane.', '工具请求和结果会显示在这里。')}</div>
-            ) : (
-              visibleToolEvents.map((event) => (
-                <ToolEventCard key={event.id} event={event} sessionId={props.sessionId} tr={props.tr} />
-              ))
             )}
           </div>
             </>
@@ -3809,6 +3835,22 @@ function renderMarkdownContent(
   );
 }
 
+function stringifyToolValue(value: unknown): string {
+  if (value === undefined) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function toolEventOneLine(text: string, maxChars = 180): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars).trimEnd()}...`;
+}
+
 function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; sessionId?: string; tr: TranslateFn }): ReactElement {
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullArgs, setFullArgs] = useState<unknown | null>(null);
@@ -3816,7 +3858,12 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
   const [error, setError] = useState('');
   const content = fullContent ?? event.content;
   const args = fullArgs ?? event.args;
-  const argsPreview = useMemo(() => JSON.stringify(args, null, 2), [args]);
+  const argsPreview = useMemo(() => stringifyToolValue(args), [args]);
+  const summaryPreview = useMemo(() => {
+    const argsLine = argsPreview && argsPreview !== '{}' ? argsPreview : '';
+    const contentLine = content.trim();
+    return toolEventOneLine([argsLine, contentLine].filter(Boolean).join(' -> '));
+  }, [argsPreview, content]);
   const canLoadFull = Boolean(sessionId && event.id && (event.contentOmitted || event.argsOmitted) && fullContent === null);
 
   async function loadFull(): Promise<void> {
@@ -3835,24 +3882,65 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
   }
 
   return (
-    <div className={`tool-event-card ${event.ok ? 'ok' : 'fail'}`}>
-      <div className="tool-event-top">
-        <strong>{event.toolName}</strong>
-        <span>{prettyDate(event.createdAt)}</span>
+    <details className={`tool-event-card ${event.ok ? 'ok' : 'fail'}`} open={!event.ok}>
+      <summary className="tool-event-summary">
+        <span className="tool-event-status">{event.ok ? 'OK' : 'ERR'}</span>
+        <strong className="tool-event-name">{event.toolName}</strong>
+        <span className="tool-event-preview">{summaryPreview || tr('No output', '无输出')}</span>
+        <span className="tool-event-time">{prettyDate(event.createdAt)}</span>
+      </summary>
+      <div className="tool-event-detail">
+        <div className="tool-event-section-label">{tr('Arguments', '参数')}</div>
+        <pre className="code-block small">{argsPreview || '{}'}</pre>
+        <div className="tool-event-section-label">{tr('Result', '结果')}</div>
+        <pre className="code-block small">{content}</pre>
       </div>
-      <pre className="code-block small">{argsPreview}</pre>
-      <pre className="code-block small">{content}</pre>
       {canLoadFull && (
         <button className="mini-button" disabled={loading} onClick={() => void loadFull()}>
           {loading ? '...' : tr('Load full tool output', '加载完整工具输出')}
         </button>
       )}
       {error && <div className="error-box">{error}</div>}
-    </div>
+    </details>
   );
 }
 
 const ToolEventCard = memo(ToolEventCardComponent);
+
+function MessageToolTraceComponent({ events, sessionId, tr }: { events: ToolEvent[]; sessionId?: string; tr: TranslateFn }): ReactElement | null {
+  if (events.length === 0) return null;
+  const failedCount = events.filter((event) => !event.ok).length;
+  return (
+    <div className="msg-tool-trace">
+      <div className="msg-tool-trace-head">
+        <span>{tr(`Tool trace (${events.length})`, `工具轨迹（${events.length}）`)}</span>
+        {failedCount > 0 && <strong>{tr(`${failedCount} failed`, `${failedCount} 个失败`)}</strong>}
+      </div>
+      <div className="msg-tool-trace-list">
+        {events.map((event) => (
+          <ToolEventCard key={event.id} event={event} sessionId={sessionId} tr={tr} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const MessageToolTrace = memo(MessageToolTraceComponent);
+
+function InlineToolActivityBubble({ events, sessionId, tr }: { events: ToolEvent[]; sessionId?: string; tr: TranslateFn }): ReactElement | null {
+  if (events.length === 0) return null;
+  return (
+    <div className="msg-row ai live-tool-row">
+      <div className="msg-avatar">AI</div>
+      <div className="msg-bubble-wrap">
+        <div className="msg-bubble">
+          <MessageToolTrace events={events} sessionId={sessionId} tr={tr} />
+        </div>
+        <div className="msg-time">{tr('Working', '执行中')}</div>
+      </div>
+    </div>
+  );
+}
 
 function ReasoningListComponent({ content, parts, livePreview, tr }: { content: string; parts?: string[]; livePreview: boolean; tr: TranslateFn }): ReactElement | null {
   const panelRef = useRef<HTMLDivElement | null>(null);
@@ -4069,11 +4157,13 @@ function assistantExportTitle(content: string): string {
 function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const content = message.role === 'user' ? decodeLikelyPercentEncodedChineseText(message.content) : message.content;
-  const avatar = message.role === 'assistant' ? 'AI' : (message.external?.provider?.toUpperCase() || 'You');
+  const externalDisplay = message.role === 'user' ? externalMessageDisplay(message.external) : null;
+  const avatar = message.role === 'assistant' ? 'AI' : (externalDisplay?.avatarLabel || 'You');
   return (
     <div className={`msg-row ${role}`}>
       <div className="msg-avatar">{avatar}</div>
       <div className="msg-bubble-wrap">
+        {externalDisplay && <div className="msg-sender">{externalDisplay.senderLabel}</div>}
         <div className="msg-bubble">{renderMarkdownContent(content, `msg-${message.id ?? 'x'}`)}</div>
         <div className="msg-time">{prettyDate(message.createdAt)}</div>
       </div>
@@ -5232,6 +5322,7 @@ function MessageBubbleComponent({
   productName,
   liveContentPreview,
   liveReasoningPreview,
+  toolEvents,
   onPreviewArtifact
 }: {
   message: AgentMessage;
@@ -5240,11 +5331,13 @@ function MessageBubbleComponent({
   productName: string;
   liveContentPreview: boolean;
   liveReasoningPreview: boolean;
+  toolEvents: ToolEvent[];
   onPreviewArtifact?: (preview: ArtifactPreviewResult) => void;
 }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
-  const avatar = message.role === 'assistant' ? 'AI' : (message.external?.provider?.toUpperCase() || 'You');
+  const externalDisplay = message.role === 'user' ? externalMessageDisplay(message.external) : null;
+  const avatar = message.role === 'assistant' ? 'AI' : (externalDisplay?.avatarLabel || 'You');
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullReasoning, setFullReasoning] = useState<string | undefined>();
   const [fullContentParts, setFullContentParts] = useState<string[] | undefined>();
@@ -5353,6 +5446,7 @@ function MessageBubbleComponent({
     <div className={`msg-row ${role}`}>
       <div className="msg-avatar">{avatar}</div>
       <div className="msg-bubble-wrap">
+        {externalDisplay && <div className="msg-sender">{externalDisplay.senderLabel}</div>}
         <div className="msg-bubble">
           {isWechatPending ? (
             <div>
@@ -5364,6 +5458,7 @@ function MessageBubbleComponent({
               <CitationLinkStrip citations={citations} />
               <MessageAttachments attachments={message.attachments} />
               <MessageArtifacts artifacts={message.artifacts} sessionId={sessionId} tr={tr} onPreviewArtifact={onPreviewArtifact} />
+              {message.role === 'assistant' && <MessageToolTrace events={toolEvents} sessionId={sessionId} tr={tr} />}
               {completedAssistantContent.trim()
                 ? <MessageContentList content={completedAssistantContent} items={completedAssistantItems} livePreview={false} tr={tr} title={tr('Assistant content', '回复内容')} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
                 : null}

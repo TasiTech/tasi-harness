@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DshSidecarManager } from '../src/main/plugins/dshSidecarManager.js';
-import { clientMountShellHtml, clientMountsFromManifest, dshFindInstalledPackage, dshPluginInstallSourceCandidates, listWorkspaceDirectory, moduleEntryPath, prereleaseFallbackSpecifier } from '../src/main/plugins/dshSidecarProcess.js';
+import { clientMountBootstrapScript, clientMountShellHtml, clientMountsFromManifest, dshFindInstalledPackage, dshPluginInstallSourceCandidates, listWorkspaceDirectory, moduleEntryPath, prereleaseFallbackSpecifier } from '../src/main/plugins/dshSidecarProcess.js';
 import { DshSidecarStore } from '../src/main/plugins/dshSidecarStore.js';
 import type { DshSidecarPluginRecord } from '../src/shared/types.js';
 import { tempHome } from './helpers.js';
@@ -278,10 +278,22 @@ describe('DshSidecarManager', () => {
     }, 'liustack-modlens', 'client', undefined, '/client-asset/liustack-modlens/dsh/client.js');
 
     expect(html).toContain('__ModuleLoader__');
+    expect(html).toContain('inject: function (services, callback)');
+    expect(html).toContain('getSnapshot: function ()');
+    expect(html).toContain("name === '@deepseek-ai/dsh-client-store'");
+    expect(html).toContain("name === '@deepseek-ai/dsh-client-connection/client'");
+    expect(html).toContain('provide: provideService');
+    expect(html).toContain('renderSlotChain');
     expect(html).toContain('settings.plugin.item');
     expect(html).toContain('consumeEffectResult(callback())');
     expect(html).toContain("@deepseek-ai/dsh-client-ui-primitives");
     expect(html).toContain('React.createElement(active.component');
+  });
+
+  it('emits parseable DSH client bootstrap JavaScript', () => {
+    const script = clientMountBootstrapScript(JSON.stringify({ pluginId: 'demo', mountId: 'client' }));
+
+    expect(() => new Function(script)).not.toThrow();
   });
 
   it('lists workspace directories for client mounted plugin pickers', () => {

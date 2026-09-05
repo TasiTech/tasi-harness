@@ -1309,8 +1309,20 @@ export function clientMountBootstrapScript(payload: string): string {
       var dictionaries = {};
       var slotEntries = [];
       var disposers = [];
+      var services = {};
+      var eventListeners = {};
+      var serviceListeners = {};
+      var slotsRoot = {};
+      var slotScopes = {};
+      var slotVersions = {};
       var activeSlotId = '';
       var renderTimer = 0;
+      var localeRevision = 0;
+      var localeActive = (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+      var localeCatalog = [
+        { id: 'zh', label: '中文', fallback: 'en' },
+        { id: 'en', label: 'English' }
+      ];
 
       function showError(error) {
         var message = error && error.stack ? error.stack : error && error.message ? error.message : String(error);
@@ -1610,22 +1622,156 @@ export function clientMountBootstrapScript(payload: string): string {
         };
       })();
 
-      function translate(namespace, key) {
-        var language = (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+      function emit(name) {
+        var args = Array.prototype.slice.call(arguments, 1);
+        (eventListeners[name] || []).slice().forEach(function (listener) {
+          try { listener.apply(null, args); } catch (error) { console.error('[dsh-client-shell] event listener failed:', error); }
+        });
+      }
+
+      function on(name, listener) {
+        if (typeof listener !== 'function') return function unsubscribe() {};
+        eventListeners[name] = eventListeners[name] || [];
+        eventListeners[name].push(listener);
+        return function unsubscribe() {
+          eventListeners[name] = (eventListeners[name] || []).filter(function (item) { return item !== listener; });
+        };
+      }
+
+      function provideService(name, value) {
+        if (!name) return function unsubscribe() {};
+        services[name] = value;
+        (serviceListeners[name] || []).slice().forEach(function (listener) {
+          try { listener(value); } catch (error) { console.error('[dsh-client-shell] service listener failed:', error); }
+        });
+        return function disposeService() {
+          if (services[name] === value) delete services[name];
+        };
+      }
+
+      function serviceScope() {
+        var scope = {
+          mount: mountPayload.mount,
+          app: 'tasi-harness',
+          sidecar: true,
+          provide: provideService,
+          on: on,
+          off: function (name, listener) {
+            eventListeners[name] = (eventListeners[name] || []).filter(function (item) { return item !== listener; });
+          },
+          once: function (name, listener) {
+            var off = on(name, function () {
+              off();
+              listener.apply(null, arguments);
+            });
+            return off;
+          },
+          emit: emit,
+          effect: context.effect,
+          inject: context.inject,
+          reflect: context.reflect
+        };
+        Object.keys(services).forEach(function (key) { scope[key] = services[key]; });
+        return scope;
+      }
+
+      function notifyService(name, listener) {
+        serviceListeners[name] = serviceListeners[name] || [];
+        serviceListeners[name].push(listener);
+        return function unsubscribe() {
+          serviceListeners[name] = (serviceListeners[name] || []).filter(function (item) { return item !== listener; });
+        };
+      }
+
+      function notifySlot(name) {
+        slotVersions[name] = (slotVersions[name] || 0) + 1;
+        emit('slots/' + name, slots.entries(name));
+      }
+
+      function interpolateLocaleText(template, params) {
+        if (!params) return template;
+        return String(template).replace(/\\{(\\w+)\\}/g, function (match, name) {
+          return Object.prototype.hasOwnProperty.call(params, name) ? String(params[name]) : match;
+        });
+      }
+
+      function localeKey(value) {
+        return String(value || '').toLowerCase();
+      }
+
+      function localeSnapshot() {
+        return { active: localeActive, locales: localeCatalog.slice(), options: localeCatalog.slice(), revision: localeRevision };
+      }
+
+      function notifyLocale(localeChanged) {
+        localeRevision += 1;
+        if (document && document.documentElement) document.documentElement.lang = localeActive === 'zh' ? 'zh-CN' : localeActive;
+        if (localeChanged) emit('locale/change', localeSnapshot());
+        (eventListeners['locale/snapshot'] || []).slice().forEach(function (listener) {
+          try { listener(); } catch (error) { console.error('[dsh-client-shell] locale subscriber failed:', error); }
+        });
+        scheduleRenderSlots();
+      }
+
+      function translate(namespace, key, params) {
         var table = dictionaries[namespace] || {};
-        var bundle = table[language] || table.en || table.zh || {};
-        return typeof bundle[key] === 'string' ? bundle[key] : key;
+        var bundle = table[localeActive] || table[localeKey(localeActive)] || table.en || table.zh || {};
+        var common = dictionaries.common || {};
+        var commonBundle = common[localeActive] || common[localeKey(localeActive)] || common.en || common.zh || {};
+        return interpolateLocaleText(typeof bundle[key] === 'string' ? bundle[key] : typeof commonBundle[key] === 'string' ? commonBundle[key] : key, params);
       }
 
       var locale = {
-        register: function (namespace, table) {
-          dictionaries[namespace] = table || {};
-          scheduleRenderSlots();
-          return function () { delete dictionaries[namespace]; scheduleRenderSlots(); };
+        register: function (namespace, localeOrTable, maybeDict) {
+          var ns = String(namespace || '').trim();
+          if (!ns) throw new Error('locale.register requires a namespace.');
+          var pairs = typeof localeOrTable === 'string'
+            ? [[localeOrTable, maybeDict || {}]]
+            : Object.entries(localeOrTable || {});
+          dictionaries[ns] = dictionaries[ns] || {};
+          pairs.forEach(function (pair) {
+            dictionaries[ns][localeKey(pair[0])] = pair[1] || {};
+          });
+          notifyLocale(false);
+          return function () {
+            pairs.forEach(function (pair) {
+              if (dictionaries[ns]) delete dictionaries[ns][localeKey(pair[0])];
+            });
+            notifyLocale(false);
+          };
         },
         bind: function (namespace) {
-          return function (key) { return translate(namespace, key); };
-        }
+          return function (key, params) { return translate(namespace, key, params); };
+        },
+        t: function (namespace, key, params) {
+          return translate(namespace, key, params);
+        },
+        addLanguage: function (language) {
+          var input = language || {};
+          var id = String(input.id || '').trim();
+          if (!id) throw new Error('locale.addLanguage requires an id.');
+          var entry = { id: id, label: String(input.label || id), fallback: input.fallback || 'en' };
+          localeCatalog.push(entry);
+          notifyLocale(false);
+          return function () {
+            localeCatalog = localeCatalog.filter(function (item) { return item !== entry; });
+            if (localeActive === id) localeActive = 'en';
+            notifyLocale(false);
+          };
+        },
+        setLocale: function (localeId) {
+          var next = String(localeId || '').trim();
+          if (!next) return Promise.resolve(localeSnapshot());
+          var found = localeCatalog.find(function (item) { return localeKey(item.id) === localeKey(next); });
+          localeActive = found ? found.id : next;
+          notifyLocale(true);
+          return Promise.resolve(localeSnapshot());
+        },
+        getLocale: localeSnapshot,
+        getSnapshot: localeSnapshot,
+        subscribe: function (fn) {
+          return on('locale/snapshot', fn);
+        },
       };
 
       function rpcCall(channel, endpoint, payload, signal) {
@@ -1703,19 +1849,20 @@ export function clientMountBootstrapScript(payload: string): string {
 
       function renderSlots() {
         if (!rootEl) return;
-        var settingsEntries = slotEntries.filter(function (entry) {
-          return entry.meta && (entry.meta.name === 'settings.section' || entry.meta.name === 'settings.plugin.item');
+        var mountPoint = mountPayload.mount && mountPayload.mount.mountPoint ? mountPayload.mount.mountPoint : 'right-panel';
+        var preferredNames = mountPoint === 'settings'
+          ? ['settings.section', 'settings.plugin.item', 'settings.general.item', 'settings.plugins.item']
+          : [mountPoint, mountPoint + '.item', 'settings.plugin.item', 'settings.section'];
+        var visibleEntries = slotEntries.filter(function (entry) {
+          return preferredNames.indexOf(entry.name) >= 0 || preferredNames.indexOf(entry.meta && entry.meta.name) >= 0;
         });
-        if (settingsEntries.length === 0) {
-          if (mountPayload.mount && mountPayload.mount.mountPoint !== 'settings') {
-            rootEl.innerHTML = '';
-            return;
-          }
-          rootEl.innerHTML = '<div class="client-loading">Client loaded. No standalone settings UI was registered.</div>';
+        if (visibleEntries.length === 0 && slotEntries.length > 0) visibleEntries = slotEntries.slice();
+        if (visibleEntries.length === 0) {
+          rootEl.innerHTML = '<div class="client-loading">Client loaded. No standalone UI was registered for this mount.</div>';
           return;
         }
-        if (!activeSlotId || !settingsEntries.some(function (entry) { return entry.id === activeSlotId; })) activeSlotId = settingsEntries[0].id;
-        var active = settingsEntries.find(function (entry) { return entry.id === activeSlotId; }) || settingsEntries[0];
+        if (!activeSlotId || !visibleEntries.some(function (entry) { return entry.id === activeSlotId; })) activeSlotId = visibleEntries[0].id;
+        var active = visibleEntries.find(function (entry) { return entry.id === activeSlotId; }) || visibleEntries[0];
 
         function currentLanguage() {
           return (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
@@ -1731,24 +1878,24 @@ export function clientMountBootstrapScript(payload: string): string {
         }
 
         function Shell() {
-          var pluginNavLabel = entryLabel(active) || label('IM 机器人', 'IM Bots');
-          var navItems = [
+          var isSettings = visibleEntries.some(function (entry) { return /^settings\\./.test(entry.name || (entry.meta && entry.meta.name) || ''); });
+          var navItems = isSettings ? [
             { id: 'general', icon: 'G', text: label('通用设置', 'General') },
             { id: 'models', icon: 'M', text: label('模型', 'Models') },
             { id: 'plugins', icon: 'P', text: label('插件', 'Plugins') },
             { id: 'presets', icon: 'A', text: label('Agent 预设', 'Agent Presets') }
-          ];
+          ] : [];
           return React.createElement('div', { className: 'dsh-client-shell' },
             React.createElement('aside', { className: 'dsh-settings-rail' },
-              React.createElement('h1', { className: 'dsh-settings-title' }, label('设置', 'Settings')),
-              React.createElement('nav', { className: 'dsh-settings-nav', 'aria-label': label('设置导航', 'Settings navigation') },
+              React.createElement('h1', { className: 'dsh-settings-title' }, isSettings ? label('设置', 'Settings') : (mountPayload.mount && mountPayload.mount.title || label('插件', 'Plugin'))),
+              React.createElement('nav', { className: 'dsh-settings-nav', 'aria-label': isSettings ? label('设置导航', 'Settings navigation') : label('插件导航', 'Plugin navigation') },
                 navItems.map(function (item) {
                   return React.createElement('div', { key: item.id, className: 'dsh-settings-nav-item' },
                     React.createElement('span', { className: 'dsh-settings-nav-icon', 'aria-hidden': 'true' }, item.icon),
                     React.createElement('span', null, item.text)
                   );
                 }),
-                settingsEntries.map(function (entry) {
+                visibleEntries.map(function (entry) {
                   var itemLabel = entryLabel(entry);
                   return React.createElement('button', {
                     key: entry.id,
@@ -1756,8 +1903,8 @@ export function clientMountBootstrapScript(payload: string): string {
                     className: 'dsh-settings-nav-item selectable' + (entry.id === activeSlotId ? ' active' : ''),
                     onClick: function () { activeSlotId = entry.id; scheduleRenderSlots(); }
                   },
-                    React.createElement('span', { className: 'dsh-settings-nav-icon', 'aria-hidden': 'true' }, 'IM'),
-                    React.createElement('span', null, itemLabel || pluginNavLabel)
+                    React.createElement('span', { className: 'dsh-settings-nav-icon', 'aria-hidden': 'true' }, itemLabel ? itemLabel.slice(0, 2).toUpperCase() : 'UI'),
+                    React.createElement('span', null, itemLabel || entry.id)
                   );
                 })
               )
@@ -1766,7 +1913,9 @@ export function clientMountBootstrapScript(payload: string): string {
               React.createElement('div', { className: 'dsh-client-content' },
                 React.createElement(active.component, Object.assign({
                   t: locale.bind(active.meta.locale || ''),
-                  rpcCall: function (endpoint, payload, signal) { return rpcCall('/dsh-plugin/' + mountPayload.pluginId, endpoint, payload, signal); }
+                  rpcCall: function (endpoint, payload, signal) { return rpcCall('/dsh-plugin/' + mountPayload.pluginId, endpoint, payload, signal); },
+                  renderSlot: function (name, props) { return slots.renderSlot(name, props || {}); },
+                  renderSlotChain: function (name, props) { return slots.renderSlotChain(name, props || {}); }
                 }, typeof active.meta.inject === 'function' ? active.meta.inject() || {} : {}))
               )
             )
@@ -1781,17 +1930,75 @@ export function clientMountBootstrapScript(payload: string): string {
           return undefined;
         },
         register: function (meta, component) {
+          var slotName = meta && (meta.name || meta.slot) ? String(meta.name || meta.slot) : 'default';
           var entry = {
             id: meta && meta.id ? String(meta.id) : 'slot-' + slotEntries.length,
+            name: slotName,
             meta: meta || {},
-            component: component
+            component: component,
+            store: meta && meta.store,
+            inject: meta && meta.inject,
+            locale: meta && meta.locale
           };
           slotEntries.push(entry);
+          notifySlot(slotName);
           scheduleRenderSlots();
           return function () {
             slotEntries = slotEntries.filter(function (item) { return item !== entry; });
+            notifySlot(slotName);
             scheduleRenderSlots();
           };
+        },
+        entries: function (name) {
+          var clean = name === undefined ? '' : String(name);
+          return clean ? slotEntries.filter(function (entry) { return entry.name === clean; }) : slotEntries.slice();
+        },
+        entriesOfSlot: function (name) {
+          return slots.entries(name);
+        },
+        subscribe: function (name, fn) {
+          return on('slots/' + String(name), fn);
+        },
+        provideRoot: function (value) {
+          Object.assign(slotsRoot, value || {});
+          scheduleRenderSlots();
+          return function () {};
+        },
+        root: function () {
+          return Object.assign({}, slotsRoot);
+        },
+        installScope: function (name, value) {
+          slotScopes[String(name)] = value;
+          return function () {
+            if (slotScopes[String(name)] === value) delete slotScopes[String(name)];
+          };
+        },
+        bindStoreScope: function (value) { return value; },
+        installLocale: function (value) {
+          slotsRoot.locale = value;
+          provideService('locale', value);
+          return function () {
+            if (slotsRoot.locale === value) delete slotsRoot.locale;
+          };
+        },
+        renderSlot: function (name, props) {
+          var entries = slots.entriesOfSlot(name);
+          if (entries.length === 0) return null;
+          return entries.map(function (entry) {
+            return React.createElement(entry.component, Object.assign({
+              key: entry.id,
+              t: locale.bind(entry.locale || entry.meta.locale || '')
+            }, props || {}, typeof entry.inject === 'function' ? entry.inject() || {} : {}));
+          });
+        },
+        renderSlotChain: function (name, props) {
+          return slots.renderSlot(name, props);
+        },
+        getVersion: function (name) {
+          return slotVersions[String(name)] || 0;
+        },
+        snapshot: function () {
+          return slotEntries.map(function (entry) { return { name: entry.name, id: entry.id, order: entry.meta && entry.meta.order }; });
         }
       };
 
@@ -1799,6 +2006,32 @@ export function clientMountBootstrapScript(payload: string): string {
         mount: mountPayload.mount,
         app: 'tasi-harness',
         sidecar: true,
+        provide: provideService,
+        on: on,
+        off: function (name, listener) {
+          eventListeners[name] = (eventListeners[name] || []).filter(function (item) { return item !== listener; });
+        },
+        once: function (name, listener) {
+          var off = on(name, function () {
+            off();
+            listener.apply(null, arguments);
+          });
+          return off;
+        },
+        emit: emit,
+        reflect: {
+          provide: provideService,
+          get: function (name) { return services[String(name)]; },
+          has: function (name) { return Object.prototype.hasOwnProperty.call(services, String(name)); }
+        },
+        inject: function (services, callback) {
+          var names = Array.isArray(services) ? services : [services];
+          var scope = serviceScope();
+          for (var i = 0; i < names.length; i += 1) {
+            if (!Object.prototype.hasOwnProperty.call(scope, String(names[i]))) return undefined;
+          }
+          return consumeEffectResult(typeof callback === 'function' ? callback(scope) : undefined);
+        },
         effect: function (factory) {
           return consumeEffectResult(typeof factory === 'function' ? factory() : undefined);
         },
@@ -1814,6 +2047,192 @@ export function clientMountBootstrapScript(payload: string): string {
           }
         }
       };
+
+      var settingsMemory = {};
+      var settingsScope = {
+        bind: function (options) {
+          var namespace = String(options && (options.namespace || options.name) || 'default');
+          settingsMemory[namespace] = settingsMemory[namespace] || {};
+          var listeners = [];
+          var handle = {
+            getSnapshot: function () { return { namespace: namespace, value: Object.assign({}, settingsMemory[namespace]), revision: localeRevision }; },
+            subscribe: function (fn) {
+              listeners.push(fn);
+              return function () { listeners = listeners.filter(function (item) { return item !== fn; }); };
+            },
+            get: function (key) { return settingsMemory[namespace][key]; },
+            set: function (key, value) {
+              settingsMemory[namespace][key] = value;
+              listeners.slice().forEach(function (fn) { try { fn(); } catch (_) {} });
+              return Promise.resolve();
+            },
+            update: function (patch) {
+              Object.assign(settingsMemory[namespace], patch || {});
+              listeners.slice().forEach(function (fn) { try { fn(); } catch (_) {} });
+              return Promise.resolve();
+            }
+          };
+          return handle;
+        }
+      };
+
+      var connection = createConnectionService();
+      var remote = createRemoteService();
+      context.connection = connection;
+      context.remote = remote;
+      context.settingsScope = settingsScope;
+      provideService('locale', locale);
+      provideService('slots', slots);
+      provideService('workspaces', context.workspaces);
+      provideService('connection', connection);
+      provideService('remote', remote);
+      provideService('settingsScope', settingsScope);
+      provideService('theme', createObservable({ mode: 'light', revision: 0 }));
+      provideService('modules', createModulesService());
+
+      function createObservable(initial) {
+        var snapshot = initial;
+        var listeners = [];
+        return {
+          getSnapshot: function () { return snapshot; },
+          subscribe: function (fn) {
+            listeners.push(fn);
+            return function () { listeners = listeners.filter(function (item) { return item !== fn; }); };
+          },
+          setSnapshot: function (next) {
+            if (Object.is(snapshot, next)) return;
+            snapshot = next;
+            listeners.slice().forEach(function (fn) { try { fn(); } catch (error) { console.error('[dsh-client-shell] observable subscriber failed:', error); } });
+          }
+        };
+      }
+
+      function cloneJson(value) {
+        if (value === undefined || value === null) return value;
+        try { return JSON.parse(JSON.stringify(value)); } catch (_) { return value; }
+      }
+
+      function defineStore(spec) {
+        return {
+          spec: spec,
+          create: function (scopeKey) {
+            var storageKey = spec && spec.persist ? 'tasi:dsh-store:' + spec.persist + ':' + (scopeKey || 'root') : '';
+            var state;
+            if (storageKey) {
+              try { state = JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch (_) { state = null; }
+            }
+            if (state === undefined || state === null) state = typeof spec.init === 'function' ? spec.init() : {};
+            var source = createObservable(Object.freeze(cloneJson(state)));
+            function publish(next) {
+              state = next;
+              if (storageKey) {
+                try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch (_) {}
+              }
+              source.setSnapshot(Object.freeze(cloneJson(state)));
+            }
+            var actions = {};
+            Object.keys(spec.actions || {}).forEach(function (name) {
+              actions[name] = function () {
+                var draft = cloneJson(state);
+                spec.actions[name].apply(null, [draft].concat(Array.prototype.slice.call(arguments)));
+                publish(draft);
+              };
+            });
+            return {
+              actions: actions,
+              getSnapshot: source.getSnapshot,
+              subscribe: source.subscribe,
+              clearPersisted: function () {
+                if (storageKey) localStorage.removeItem(storageKey);
+              }
+            };
+          }
+        };
+      }
+
+      function createStoreModule() {
+        return {
+          defineStore: defineStore,
+          createObservable: createObservable,
+          observable: createObservable
+        };
+      }
+
+      function createConnectionService() {
+        var generationSource;
+        var generationId = 0;
+        var generation = createObservable(undefined);
+        var state = createObservable(undefined);
+        var rpc = {
+          call: rpcCall,
+          request: function (channel, endpoint, payload, signal) { return rpcCall(channel, endpoint, payload, signal); },
+          fetch: function (path, options) { return fetch(path, options); }
+        };
+        return {
+          isLoopback: true,
+          generation: generation,
+          state: state,
+          rpc: rpc,
+          reconnect: function () { state.setSnapshot('connecting'); state.setSnapshot('connected'); },
+          registerGenerationSource: function (source) {
+            if (generationSource) throw new Error('connection: a generation source is already registered');
+            generationSource = source;
+            return function () {
+              if (generationSource === source) {
+                generationSource = undefined;
+                generation.setSnapshot(undefined);
+              }
+            };
+          },
+          start: function (sinks) {
+            state.setSnapshot('connected');
+            var host = { home: 'tasi-harness', profileName: 'default', loopback: true };
+            var next = { id: ++generationId, host: host };
+            generation.setSnapshot(next);
+            if (sinks && typeof sinks.onConnected === 'function') sinks.onConnected(host);
+            if (sinks && typeof sinks.onStateChange === 'function') sinks.onStateChange('connected');
+            return {
+              stop: function () {
+                state.setSnapshot(undefined);
+                generation.setSnapshot(undefined);
+              }
+            };
+          }
+        };
+      }
+
+      function createRemoteService() {
+        var cache = {};
+        return new Proxy({
+          $mounted: function () { return undefined; }
+        }, {
+          get: function (target, prop) {
+            if (typeof prop !== 'string') return undefined;
+            if (prop in target) return target[prop];
+            if (!cache[prop]) {
+              cache[prop] = new Proxy({ $name: prop }, {
+                get: function (namespaceTarget, method) {
+                  if (typeof method !== 'string') return undefined;
+                  if (method in namespaceTarget) return namespaceTarget[method];
+                  return function () {
+                    return rpcCall('/dsh-remote/' + prop, method, Array.prototype.slice.call(arguments));
+                  };
+                }
+              });
+            }
+            return cache[prop];
+          }
+        });
+      }
+
+      function createModulesService() {
+        return {
+          version: 'tasi-client-shell',
+          import: function (specifier) { return Promise.resolve(moduleRequire(specifier)); },
+          prefetch: function () { return Promise.resolve(); },
+          invalidate: function () {}
+        };
+      }
 
       function moduleRequire(name) {
         if (name === 'react') return React;
@@ -1831,8 +2250,54 @@ export function clientMountBootstrapScript(payload: string): string {
             jsxs: function (type, props) { return React.createElement(type, props); }
           };
         }
-        if (name === '@deepseek-ai/dsh-client-ui-primitives') {
+        if (name === '@deepseek-ai/dsh-client-ui-primitives' || name === '@deepseek-ai/dsh-client-ui-primitives/client') {
           return clientUiPrimitives();
+        }
+        if (name === '@deepseek-ai/dsh-client-store') return createStoreModule();
+        if (name === '@deepseek-ai/dsh-client-ui-slots' || name === '@deepseek-ai/dsh-client-ui-slots/client') {
+          return {
+            SlotCore: function () { return slots; },
+            slots: slots,
+            standardHookPropName: function (value) { return 'use' + String(value || '').charAt(0).toUpperCase() + String(value || '').slice(1); }
+          };
+        }
+        if (name === '@deepseek-ai/dsh-client-connection/client' || name === '@deepseek-ai/dsh-client-connection') {
+          return Object.assign({ apply: function (ctx) { ctx.provide('connection', connection); } }, connection);
+        }
+        if (name === '@deepseek-ai/dsh-client-locale/client' || name === '@deepseek-ai/dsh-client-locale') {
+          return Object.assign({ apply: function (ctx) { ctx.provide('locale', locale); ctx.slots && ctx.slots.installLocale && ctx.slots.installLocale(locale); } }, locale);
+        }
+        if (name === '@deepseek-ai/dsh-client-modules/client' || name === '@deepseek-ai/dsh-client-modules') {
+          return {
+            apply: function (ctx) { ctx.provide('modules', services.modules); },
+            createClientModuleSystem: function () { return services.modules; },
+            ClientModuleSystem: function () { return services.modules; },
+            parseBootManifest: function (value) { return value || { modules: [], plugins: [] }; },
+            stripClientSuffix: function (value) { return String(value || '').replace(/\\/client$/, ''); }
+          };
+        }
+        if (name === '@deepseek-ai/dsh-client-ui-renderer/client' || name === '@deepseek-ai/dsh-client-ui-renderer') {
+          return {
+            apply: function (ctx) { ctx.provide('slots', slots); },
+            renderSlot: slots.renderSlot,
+            renderSlotChain: slots.renderSlotChain
+          };
+        }
+        if (name === '@deepseek-ai/dsh-client-ui-settings/client' || name === '@deepseek-ai/dsh-client-ui-settings') {
+          return {
+            apply: function (ctx) { ctx.provide('settingsScope', settingsScope); },
+            settingsScope: settingsScope
+          };
+        }
+        if (name === '@deepseek-ai/dsh-client-ui-workspace/client' || name === '@deepseek-ai/dsh-client-ui-workspace') {
+          return Object.assign({ apply: function (ctx) { ctx.provide('workspaces', ctx.workspaces || context.workspaces); } }, context.workspaces);
+        }
+        if (/^@deepseek-ai\\/dsh-client-ui-/.test(name) || /^@deepseek-ai\\/dsh-client-/.test(name)) {
+          return {
+            inject: [],
+            apply: function () {},
+            default: function EmptyDshClientComponent() { return null; }
+          };
         }
         throw new Error('Plugin client module require("' + name + '") is not available in the Tasi sidecar shell.');
       }
@@ -1851,7 +2316,67 @@ export function clientMountBootstrapScript(payload: string): string {
       }
 
       function clientUiPrimitives() {
+        function Box(tag, baseStyle) {
+          return function Primitive(props) {
+            return React.createElement(tag, mergePropsStyle(props, primitiveStyle(baseStyle)), props && props.children);
+          };
+        }
+        function TextBlock(props) {
+          return React.createElement('pre', mergePropsStyle(props, primitiveStyle({
+            whiteSpace: 'pre-wrap',
+            overflow: 'auto',
+            margin: 0,
+            padding: '10px',
+            border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
+            borderRadius: '8px',
+            background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.08))'
+          })), props && props.children !== undefined ? props.children : JSON.stringify(props && (props.value || props.data || props.lines) || '', null, 2));
+        }
+        function JsonTree(props) {
+          return React.createElement(TextBlock, props, JSON.stringify(props && (props.value || props.data) || {}, null, 2));
+        }
+        function Modal(props) {
+          if (props && (props.open === false || props.visible === false)) return null;
+          return React.createElement('div', mergePropsStyle(props, primitiveStyle({
+            position: 'fixed',
+            inset: '10%',
+            zIndex: 1000,
+            overflow: 'auto',
+            padding: '16px',
+            border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.35))',
+            borderRadius: '12px',
+            background: 'var(--dsw-alias-bg-layer-1, #fff)',
+            boxShadow: '0 18px 60px rgba(0,0,0,.22)'
+          })), props && props.children);
+        }
+        function StateDot(props) {
+          var state = props && props.state;
+          var color = state === 'error' ? '#ef4444' : state === 'running' || state === 'connected' || state === 'ok' ? '#22c55e' : '#94a3b8';
+          return React.createElement('span', mergePropsStyle(props, primitiveStyle({ display: 'inline-block', width: '8px', height: '8px', borderRadius: '999px', background: color })));
+        }
+        function DisclosureRow(props) {
+          return React.createElement('details', mergePropsStyle(props, primitiveStyle({ borderTop: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.2))', padding: '8px 0' })),
+            React.createElement('summary', null, props && (props.title || props.label || props.summary || 'Details')),
+            props && props.children);
+        }
+        function writeClipboard(value) {
+          if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(String(value || ''));
+          return Promise.resolve();
+        }
+        function relativeTime(value) {
+          if (!value) return '';
+          var date = new Date(value);
+          if (Number.isNaN(date.getTime())) return String(value);
+          var minutes = Math.round((Date.now() - date.getTime()) / 60000);
+          if (Math.abs(minutes) < 1) return 'just now';
+          if (Math.abs(minutes) < 60) return minutes + 'm ago';
+          var hours = Math.round(minutes / 60);
+          if (Math.abs(hours) < 24) return hours + 'h ago';
+          return date.toLocaleString();
+        }
         return {
+          StateDot: StateDot,
+          DisclosureRow: DisclosureRow,
           Input: function Input(props) {
             return React.createElement('input', mergePropsStyle(props, primitiveStyle({
               width: '100%',
@@ -1892,7 +2417,64 @@ export function clientMountBootstrapScript(payload: string): string {
               borderRadius: '8px',
               background: 'transparent'
             })));
-          }
+          },
+          Pill: Box('span', {
+            display: 'inline-flex',
+            alignItems: 'center',
+            minHeight: '22px',
+            padding: '2px 8px',
+            border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
+            borderRadius: '999px',
+            fontSize: '12px'
+          }),
+          Menu: Box('div', {
+            display: 'grid',
+            gap: '4px',
+            padding: '6px',
+            border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
+            borderRadius: '8px',
+            background: 'var(--dsw-alias-bg-layer-1, #fff)'
+          }),
+          HoverCard: Box('div', {
+            padding: '10px',
+            border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.25))',
+            borderRadius: '8px',
+            background: 'var(--dsw-alias-bg-layer-1, #fff)'
+          }),
+          Modal: Modal,
+          Tooltip: Box('span', { display: 'inline-flex' }),
+          Toast: Box('div', { padding: '8px 10px', borderRadius: '8px', background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.1))' }),
+          JsonTree: JsonTree,
+          TerminalBlock: TextBlock,
+          ReadBlock: TextBlock,
+          DiffBlock: TextBlock,
+          SearchBlock: TextBlock,
+          WebBlock: TextBlock,
+          CodeBlock: TextBlock,
+          JsonBlock: JsonTree,
+          MarkdownText: function MarkdownText(props) { return React.createElement('div', mergePropsStyle(props, primitiveStyle({ whiteSpace: 'pre-wrap' })), props && (props.children || props.text || props.markdown || '')); },
+          MessageText: function MessageText(props) { return React.createElement('div', mergePropsStyle(props, primitiveStyle({ whiteSpace: 'pre-wrap' })), props && (props.children || props.text || '')); },
+          ConnectionIndicator: function ConnectionIndicator(props) { return React.createElement('span', mergePropsStyle(props, primitiveStyle({ display: 'inline-flex', alignItems: 'center', gap: '6px' })), React.createElement(StateDot, { state: props && (props.state || 'connected') }), props && (props.label || props.state) || 'connected'); },
+          BrandWordmark: function BrandWordmark(props) { return React.createElement('strong', props, props && props.children || 'Tasi Harness'); },
+          FishLogo: function FishLogo(props) { return React.createElement('span', props, 'DSH'); },
+          ReferenceIcon: function ReferenceIcon(props) { return React.createElement('span', props, props && props.children || '#'); },
+          FoldToggle: function FoldToggle(props) { return React.createElement('button', props, props && props.open ? '^' : 'v'); },
+          OnboardingSurface: Box('div', { padding: '16px' }),
+          RiskConfirmation: Box('div', { padding: '12px', border: '1px solid #f59e0b', borderRadius: '8px' }),
+          writeClipboard: writeClipboard,
+          relativeTime: relativeTime,
+          projectUserText: function (value) { return String(value || ''); },
+          useAnchoredMaxHeight: function () { return undefined; },
+          useAnchoredPosition: function () { return { style: {}, placement: 'bottom' }; },
+          useDismissOnOutsidePointer: function () {},
+          extractMarkdownPlainText: function (value) { return String(value || ''); },
+          diffTotals: function () { return { added: 0, removed: 0 }; },
+          DEFAULT_TERMINAL_MAX_LINES: 200,
+          DEFAULT_READ_MAX_LINES: 200,
+          DEFAULT_DIFF_MAX_LINES: 200,
+          DEFAULT_SEARCH_MAX_LINES: 200,
+          FISH_LOGO_PATH: '',
+          FISH_LOGO_VIEWBOX: '0 0 1 1'
         };
       }
 
@@ -1902,10 +2484,24 @@ export function clientMountBootstrapScript(payload: string): string {
       window.ReactDOM = window.ReactDOM || moduleRequire('react-dom');
       window.dsh = {
         call: rpcCall,
-        on: function () { return function unsubscribe() {}; },
+        on: on,
+        off: context.off,
+        emit: emit,
+        connection: connection,
+        remote: remote,
+        workspaces: context.workspaces,
         settings: {
-          get: function () { return Promise.resolve({}); },
-          set: function () { return Promise.resolve({}); }
+          get: function (namespace, key) {
+            var data = settingsMemory[String(namespace || 'default')] || {};
+            return Promise.resolve(key === undefined ? Object.assign({}, data) : data[key]);
+          },
+          set: function (namespace, key, value) {
+            var ns = String(namespace || 'default');
+            settingsMemory[ns] = settingsMemory[ns] || {};
+            if (typeof key === 'object' && key !== null) Object.assign(settingsMemory[ns], key);
+            else settingsMemory[ns][key] = value;
+            return Promise.resolve();
+          }
         },
         agent: {
           ask: function (_prompt) { return Promise.reject(new Error('agent bridge is not connected yet.')); }
@@ -1914,8 +2510,13 @@ export function clientMountBootstrapScript(payload: string): string {
       window.__ModuleLoader__ = window.__ModuleLoader__ || {
         load: function (definition) {
           try {
-            var exports = definition && typeof definition.factory === 'function' ? definition.factory(moduleRequire) : undefined;
+            var module = { exports: {} };
+            var exports = definition && typeof definition.factory === 'function'
+              ? (definition.factory.length >= 3 ? definition.factory(moduleRequire, module.exports, module) || module.exports : definition.factory(moduleRequire))
+              : undefined;
+            if (exports === undefined) exports = module.exports;
             var apply = exports && typeof exports.apply === 'function' ? exports.apply : undefined;
+            if (!apply && exports && exports.default && typeof exports.default.apply === 'function') apply = exports.default.apply;
             if (apply) apply(context);
             scheduleRenderSlots();
             return exports;

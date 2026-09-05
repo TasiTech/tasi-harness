@@ -1,8 +1,42 @@
 import type { ConfigStore } from '../storage/configStore.js';
 import type { ToolRegistry } from '../tools/toolRegistry.js';
+import { resolveToolPath } from '../tools/toolRegistry.js';
 import type { RegisteredTool, ToolDefinition } from '../../shared/types.js';
 import type { DshSidecarManager } from './dshSidecarManager.js';
 import type { SkillManager } from '../skills/skillManager.js';
+
+function isPathLikeKey(key: string): boolean {
+  const clean = key.trim();
+  const lower = clean.toLowerCase();
+  return lower === 'path'
+    || lower === 'file'
+    || lower === 'filename'
+    || lower === 'filepath'
+    || lower === 'file_path'
+    || lower === 'imagepath'
+    || lower === 'image_path'
+    || lower === 'inputpath'
+    || lower === 'input_path'
+    || clean.endsWith('Path');
+}
+
+function isUrlLike(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(value.trim());
+}
+
+function resolveRuntimeToolArgs(value: unknown, workspaceDir: string, key = ''): unknown {
+  if (typeof value === 'string') {
+    const clean = value.trim();
+    return clean && isPathLikeKey(key) && !isUrlLike(clean) ? resolveToolPath(workspaceDir, clean) : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => resolveRuntimeToolArgs(item, workspaceDir, key));
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [entryKey, entryValue] of Object.entries(value)) {
+    out[entryKey] = resolveRuntimeToolArgs(entryValue, workspaceDir, entryKey);
+  }
+  return out;
+}
 
 export class DshSidecarRuntimeBridge {
   private readonly disposers = new Map<string, () => void>();
@@ -53,7 +87,7 @@ export class DshSidecarRuntimeBridge {
         const cfg = this.configStore.get();
         return await this.sidecar.callRuntimeTool({
           name,
-          args,
+          args: resolveRuntimeToolArgs(args, context.workspaceDir),
           context: {
             sessionId: context.sessionId,
             workspaceDir: context.workspaceDir,

@@ -3,7 +3,9 @@ import type {
   AgentMessage,
   AgentMessageDeltaStream,
   DshSidecarRuntimePlugin,
-  DshSidecarRuntimeStatus
+  DshSidecarRuntimeStatus,
+  ExternalConversationMetadata,
+  ToolEvent
 } from '../shared/types.js';
 import { CONTENT_STREAM_PREVIEW_CHARS, REASONING_STREAM_PREVIEW_CHARS } from '../shared/reasoningPreview.js';
 
@@ -28,6 +30,12 @@ export interface PluginMentionItem {
   aliases: string[];
 }
 
+export interface ExternalMessageDisplay {
+  channelLabel: string;
+  senderLabel: string;
+  avatarLabel: string;
+}
+
 export function findPluginMentionTrigger(value: string, cursor: number): PluginMentionTrigger | null {
   const beforeCursor = value.slice(0, Math.max(0, cursor));
   const match = /(^|[\s,，;；。！？!?])@([a-zA-Z0-9_.-]*(?:\/[a-zA-Z0-9_.-]*)?)$/.exec(beforeCursor);
@@ -35,6 +43,55 @@ export function findPluginMentionTrigger(value: string, cursor: number): PluginM
   const query = match[2] ?? '';
   const start = beforeCursor.length - query.length - 1;
   return { start, end: cursor, query };
+}
+
+function cleanDisplayText(value: string | undefined): string {
+  return value?.trim().replace(/\s+/g, ' ') ?? '';
+}
+
+export function externalChannelLabel(external?: Pick<ExternalConversationMetadata, 'provider'>): string {
+  const provider = cleanDisplayText(external?.provider);
+  const lower = provider.toLowerCase().replace(/^@/, '');
+  if (!lower || lower === 'dsh-im' || lower === 'xmanrui/dsh-im' || lower === 'xmanrui-dsh-im') return 'IM';
+  if (lower === 'wechat' || lower === 'weixin' || lower === 'wx') return 'WeChat';
+  if (lower === 'lark' || lower === 'feishu') return 'Feishu';
+  if (lower === 'qq') return 'QQ';
+  if (lower === 'dingding' || lower === 'dingtalk') return 'DingTalk';
+  return provider
+    .split(/[-_\s/]+/g)
+    .filter(Boolean)
+    .map((part) => /^[a-z0-9]+$/i.test(part) ? `${part.slice(0, 1).toUpperCase()}${part.slice(1)}` : part)
+    .join(' ');
+}
+
+function avatarFromLabel(value: string): string {
+  const text = cleanDisplayText(value);
+  if (!text) return 'You';
+  const cjk = [...text].filter((char) => /[\u3400-\u9fff\uf900-\ufaff]/.test(char)).slice(0, 2).join('');
+  if (cjk) return cjk;
+  const words = text.split(/[\s_\-/]+/g).filter(Boolean);
+  const initials = words.length > 1
+    ? words.map((word) => word[0]).join('')
+    : text.replace(/[^a-z0-9]/gi, '');
+  return (initials || text).slice(0, 3).toUpperCase();
+}
+
+export function externalMessageDisplay(external?: ExternalConversationMetadata): ExternalMessageDisplay {
+  if (!external) return { channelLabel: 'You', senderLabel: 'You', avatarLabel: 'You' };
+  const channelLabel = externalChannelLabel(external);
+  const sender = cleanDisplayText(external.senderName);
+  const display = cleanDisplayText(external.displayName);
+  const conversation = cleanDisplayText(external.externalConversationId);
+  const actor = sender || display || conversation || channelLabel;
+  const hasConversationContext = Boolean(sender && display && sender !== display);
+  const senderLabel = hasConversationContext
+    ? `${channelLabel} / ${display} / ${sender}`
+    : actor === channelLabel ? channelLabel : `${channelLabel} / ${actor}`;
+  return {
+    channelLabel,
+    senderLabel,
+    avatarLabel: avatarFromLabel(sender || display || channelLabel)
+  };
 }
 
 function dshPluginAliases(plugin: DshSidecarRuntimePlugin): string[] {
@@ -238,6 +295,75 @@ export function isVisibleChatMessage(message: AgentMessage): boolean {
     || message.reasoning_content?.trim()
     || (message.content_parts?.some((part) => part.trim()) ?? false)
   ));
+}
+
+function eventTimeMs(value: string | undefined): number {
+  if (!value) return Number.NaN;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : Number.NaN;
+}
+
+export function assignToolEventsToVisibleMessages(
+  messages: AgentMessage[],
+  toolEvents: ToolEvent[],
+  running = false,
+  maxLiveEvents = Number.POSITIVE_INFINITY
+): ToolEvent[][] {
+  const groups = messages.map((): ToolEvent[] => []);
+  const assistantIndexes = messages
+    .map((message, index) => ({ message, index }))
+    .filter(({ message }) => message.role === 'assistant')
+    .map(({ index }) => index);
+  if (assistantIndexes.length === 0 || toolEvents.length === 0) return groups;
+
+  const renderedToolEvents = running && Number.isFinite(maxLiveEvents)
+    ? toolEvents.slice(-Math.max(0, maxLiveEvents))
+    : toolEvents;
+  const fallbackIndex = assistantIndexes[assistantIndexes.length - 1];
+
+  for (const event of renderedToolEvents) {
+    const eventTime = eventTimeMs(event.createdAt);
+    let targetIndex = -1;
+    if (Number.isFinite(eventTime)) {
+      for (const assistantIndex of assistantIndexes) {
+        const assistantTime = eventTimeMs(messages[assistantIndex].createdAt);
+        if (Number.isFinite(assistantTime) && assistantTime >= eventTime) {
+          targetIndex = assistantIndex;
+          break;
+        }
+      }
+    }
+    groups[targetIndex >= 0 ? targetIndex : fallbackIndex].push(event);
+  }
+
+  return groups;
+}
+
+export function currentTurnPendingToolEvents(
+  messages: AgentMessage[],
+  toolEvents: ToolEvent[],
+  running = false,
+  maxLiveEvents = Number.POSITIVE_INFINITY
+): ToolEvent[] {
+  if (!running || toolEvents.length === 0) return [];
+  let latestUserIndex = -1;
+  let latestAssistantIndex = -1;
+  for (let index = 0; index < messages.length; index += 1) {
+    const role = messages[index].role;
+    if (role === 'user') latestUserIndex = index;
+    if (role === 'assistant') latestAssistantIndex = index;
+  }
+  if (latestUserIndex < 0 || latestAssistantIndex > latestUserIndex) return [];
+  const userTime = eventTimeMs(messages[latestUserIndex].createdAt);
+  const currentTurnEvents = Number.isFinite(userTime)
+    ? toolEvents.filter((event) => {
+      const toolTime = eventTimeMs(event.createdAt);
+      return !Number.isFinite(toolTime) || toolTime >= userTime;
+    })
+    : toolEvents;
+  return Number.isFinite(maxLiveEvents)
+    ? currentTurnEvents.slice(-Math.max(0, maxLiveEvents))
+    : currentTurnEvents;
 }
 
 export function assistantContentListView(content: string, livePreview = false): { items: string[]; clipped: boolean } {

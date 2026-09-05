@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { extractCitationLinks, normalizeCitationHref } from '../src/renderer/citations';
 import { normalizeMarkdownForRender, renderMarkdownToHtml } from '../src/renderer/markdown';
 import { reasoningPanelText } from '../src/shared/reasoningPreview';
-import { artifactSelectionContextPrompt, artifactSelectionQuestionPrompt, assistantContentListView, assistantLiveContentPreviewText, decodeLikelyPercentEncodedChineseText, findPluginMentionTrigger, isVisibleChatMessage, mergeMessageDelta, pluginMentionItems, pluginMentionToken } from '../src/renderer/appHelpers';
+import { assignToolEventsToVisibleMessages, artifactSelectionContextPrompt, artifactSelectionQuestionPrompt, assistantContentListView, assistantLiveContentPreviewText, currentTurnPendingToolEvents, decodeLikelyPercentEncodedChineseText, externalMessageDisplay, findPluginMentionTrigger, isVisibleChatMessage, mergeMessageDelta, pluginMentionItems, pluginMentionToken } from '../src/renderer/appHelpers';
 import type { AgentArtifactRef, DshSidecarRuntimeStatus } from '../src/shared/types';
 
 function escapeAttr(value: string): string {
@@ -195,6 +195,81 @@ describe('isVisibleChatMessage', () => {
       content_parts: ['I will inspect first.'],
       createdAt: '2026-08-28T00:00:00.000Z'
     })).toBe(true);
+  });
+});
+
+describe('assignToolEventsToVisibleMessages', () => {
+  it('attaches tool events to the next assistant reply by timestamp', () => {
+    const groups = assignToolEventsToVisibleMessages([
+      { id: 'u1', role: 'user', content: 'one', createdAt: '2026-09-05T00:00:00.000Z' },
+      { id: 'a1', role: 'assistant', content: 'answer one', createdAt: '2026-09-05T00:00:10.000Z' },
+      { id: 'u2', role: 'user', content: 'two', createdAt: '2026-09-05T00:01:00.000Z' },
+      { id: 'a2', role: 'assistant', content: 'answer two', createdAt: '2026-09-05T00:01:10.000Z' }
+    ], [
+      { id: 't1', toolName: 'file_read', args: { path: 'a.txt' }, ok: true, content: 'a', createdAt: '2026-09-05T00:00:05.000Z' },
+      { id: 't2', toolName: 'terminal', args: { command: 'npm test' }, ok: true, content: 'ok', createdAt: '2026-09-05T00:01:05.000Z' }
+    ]);
+
+    expect(groups.map((group) => group.map((event) => event.id))).toEqual([[], ['t1'], [], ['t2']]);
+  });
+
+  it('keeps only the newest live tool events while a run is streaming', () => {
+    const events = Array.from({ length: 5 }, (_, index) => ({
+      id: `t${index}`,
+      toolName: 'terminal',
+      args: {},
+      ok: true,
+      content: String(index),
+      createdAt: `2026-09-05T00:00:0${index}.000Z`
+    }));
+
+    const groups = assignToolEventsToVisibleMessages([
+      { id: 'a1', role: 'assistant', content: 'streaming', createdAt: '2026-09-05T00:00:10.000Z' }
+    ], events, true, 2);
+
+    expect(groups[0]?.map((event) => event.id)).toEqual(['t3', 't4']);
+  });
+});
+
+describe('currentTurnPendingToolEvents', () => {
+  it('returns live tool events after the latest user when no assistant bubble exists yet', () => {
+    const events = [
+      { id: 'old', toolName: 'terminal', args: {}, ok: true, content: 'old', createdAt: '2026-09-05T00:00:05.000Z' },
+      { id: 'new', toolName: 'terminal', args: {}, ok: true, content: 'new', createdAt: '2026-09-05T00:01:05.000Z' }
+    ];
+
+    expect(currentTurnPendingToolEvents([
+      { id: 'u1', role: 'user', content: 'one', createdAt: '2026-09-05T00:00:00.000Z' },
+      { id: 'a1', role: 'assistant', content: 'answer one', createdAt: '2026-09-05T00:00:10.000Z' },
+      { id: 'u2', role: 'user', content: 'two', createdAt: '2026-09-05T00:01:00.000Z' }
+    ], events, true).map((event) => event.id)).toEqual(['new']);
+  });
+});
+
+describe('externalMessageDisplay', () => {
+  it('does not expose the dsh-im bridge name as the visible sender', () => {
+    expect(externalMessageDisplay({
+      provider: 'dsh-im',
+      pluginId: '@xmanrui/dsh-im',
+      externalConversationId: 'conv-1'
+    })).toEqual({
+      channelLabel: 'IM',
+      senderLabel: 'IM / conv-1',
+      avatarLabel: 'IM'
+    });
+  });
+
+  it('shows the channel and sender name when both are available', () => {
+    expect(externalMessageDisplay({
+      provider: 'wechat',
+      externalConversationId: 'group-1',
+      displayName: '项目群',
+      senderName: '张三'
+    })).toEqual({
+      channelLabel: 'WeChat',
+      senderLabel: 'WeChat / 项目群 / 张三',
+      avatarLabel: '张三'
+    });
   });
 });
 
