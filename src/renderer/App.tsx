@@ -4648,6 +4648,7 @@ function HtmlArtifactPreview(props: {
   onTextSelection?: (selection: ArtifactTextSelection | null) => void;
 }): ReactElement {
   const webviewRef = useRef<PreviewWebviewElement | null>(null);
+  const lastSelectionKeyRef = useRef('');
   const [previewUrl, setPreviewUrl] = useState('');
 
   useEffect(() => {
@@ -4665,6 +4666,78 @@ function HtmlArtifactPreview(props: {
       URL.revokeObjectURL(url);
     };
   }, [props.artifact.absPath, props.artifact.path, props.content]);
+
+  useEffect(() => {
+    if (!props.onTextSelection || !previewUrl) return;
+    let stopped = false;
+    let busy = false;
+    const readSelection = async (): Promise<void> => {
+      const webview = webviewRef.current;
+      if (!webview?.executeJavaScript || busy || stopped) return;
+      busy = true;
+      try {
+        const result = await webview.executeJavaScript(`(() => {
+          const selection = window.getSelection && window.getSelection();
+          const text = selection ? selection.toString() : '';
+          if (!selection || selection.rangeCount === 0 || !text.trim()) return { text: '' };
+          const range = selection.getRangeAt(0);
+          const rects = Array.from(range.getClientRects()).filter((rect) => rect.width || rect.height);
+          const rect = rects[0] || range.getBoundingClientRect();
+          return {
+            text,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height
+          };
+        })()`);
+        if (stopped) return;
+        const payload = result && typeof result === 'object' ? result as {
+          text?: unknown;
+          left?: unknown;
+          top?: unknown;
+          width?: unknown;
+          height?: unknown;
+        } : {};
+        const text = normalizeArtifactSelectionText(typeof payload.text === 'string' ? payload.text : '');
+        if (!text) {
+          if (lastSelectionKeyRef.current) {
+            lastSelectionKeyRef.current = '';
+            props.onTextSelection?.(null);
+          }
+          return;
+        }
+        const frameRect = webview.getBoundingClientRect();
+        const left = Number(payload.left ?? 0);
+        const top = Number(payload.top ?? 0);
+        const width = Number(payload.width ?? 0);
+        const x = frameRect.left + left + Math.max(12, width / 2);
+        const y = frameRect.top + top - 10;
+        const key = `${text}:${Math.round(x)}:${Math.round(y)}`;
+        if (key === lastSelectionKeyRef.current) return;
+        lastSelectionKeyRef.current = key;
+        props.onTextSelection?.({
+          artifact: props.artifact,
+          text,
+          x: Math.min(window.innerWidth - 12, Math.max(12, x)),
+          y: Math.min(window.innerHeight - 12, Math.max(12, y))
+        });
+      } catch {
+        if (lastSelectionKeyRef.current) {
+          lastSelectionKeyRef.current = '';
+          props.onTextSelection?.(null);
+        }
+      } finally {
+        busy = false;
+      }
+    };
+    const intervalId = window.setInterval(() => void readSelection(), 350);
+    void readSelection();
+    return () => {
+      stopped = true;
+      window.clearInterval(intervalId);
+    };
+  }, [previewUrl, props.artifact, props.onTextSelection]);
 
   return (
     <webview
