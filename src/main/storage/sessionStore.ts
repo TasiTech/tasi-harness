@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type {
   AgentExecutionDetails,
   AgentMessage,
+  AgentMessageDisplayItem,
   LlmUsage,
   MemoryDomain,
   SearchResult,
@@ -49,7 +50,11 @@ export class SessionStore {
   private readonly dir: string;
   private readonly indexFile: string;
   private readonly maxSystemPromptHistory = 1;
-  private readonly contentPartsCache = new Map<string, { signature: string; partsByMessageId: Map<string, string[]> }>();
+  private readonly contentPartsCache = new Map<string, {
+    signature: string;
+    partsByMessageId: Map<string, string[]>;
+    timelineByMessageId: Map<string, AgentMessageDisplayItem[]>;
+  }>();
 
   constructor(harnessHome: string) {
     this.dir = join(harnessHome, 'sessions');
@@ -101,7 +106,7 @@ export class SessionStore {
   readForDisplay(id: string): SessionRecord | null {
     const record = this.read(id);
     if (!record) return null;
-    const contentPartsByMessageId = this.contentPartsForRecord(record);
+    const contentDisplay = this.contentDisplayForRecord(record);
     return {
       ...record,
       systemPrompt: record.systemPrompt ? this.clipText(record.systemPrompt, DISPLAY_MESSAGE_CHARS) : undefined,
@@ -111,7 +116,11 @@ export class SessionStore {
       })),
       messages: record.messages
         .filter((message) => message.hidden !== true)
-        .map((message) => this.compactMessageForDisplay(message, contentPartsByMessageId.get(message.id ?? ''))),
+        .map((message) => this.compactMessageForDisplay(
+          message,
+          contentDisplay.partsByMessageId.get(message.id ?? ''),
+          contentDisplay.timelineByMessageId.get(message.id ?? '')
+        )),
       toolEvents: record.toolEvents.map((event) => this.compactToolEventForDisplay(event))
     };
   }
@@ -120,7 +129,7 @@ export class SessionStore {
     const record = this.read(sessionId);
     const message = record?.messages.find((item) => item.id === messageId);
     if (!message) return null;
-    const contentParts = record ? this.contentPartsForRecord(record).get(messageId) : undefined;
+    const contentParts = record ? this.contentDisplayForRecord(record).partsByMessageId.get(messageId) : undefined;
     return {
       content: message.content,
       reasoning_content: message.reasoning_content,
@@ -367,7 +376,7 @@ export class SessionStore {
     return messages.map((message) => ({ ...message, createdAt: message.createdAt ?? nowIso() }));
   }
 
-  private compactMessageForDisplay(message: AgentMessage, derivedContentParts?: string[]): AgentMessage {
+  private compactMessageForDisplay(message: AgentMessage, derivedContentParts?: string[], derivedTimeline?: AgentMessageDisplayItem[]): AgentMessage {
     const content = this.compactTextForDisplay(message.content, DISPLAY_MESSAGE_CHARS);
     const reasoning = message.reasoning_content ? this.compactTextForDisplay(message.reasoning_content, DISPLAY_REASONING_CHARS) : undefined;
     return {
@@ -380,6 +389,7 @@ export class SessionStore {
       reasoningLength: reasoning?.omitted ? reasoning.length : undefined,
       reasoning_parts: message.reasoning_parts?.map((part) => this.clipText(part, 1000)),
       content_parts: derivedContentParts?.map((part) => this.clipText(part, 2000)) ?? message.content_parts?.map((part) => this.clipText(part, 2000)),
+      displayTimeline: derivedTimeline ?? message.displayTimeline,
       attachments: message.attachments?.map((attachment) => ({
         ...attachment,
         contentBase64: DISPLAY_ATTACHMENT_BASE64_CHARS > 0
@@ -500,40 +510,80 @@ export class SessionStore {
     const next = { ...message };
     delete next.reasoning_parts;
     delete next.content_parts;
+    delete next.displayTimeline;
     return next;
   }
 
-  private contentPartsForRecord(record: SessionRecord): Map<string, string[]> {
+  private contentDisplayForRecord(record: SessionRecord): {
+    partsByMessageId: Map<string, string[]>;
+    timelineByMessageId: Map<string, AgentMessageDisplayItem[]>;
+  } {
     const signature = this.contentPartsSignature(record);
     const cached = this.contentPartsCache.get(record.id);
-    if (cached?.signature === signature) return cached.partsByMessageId;
+    if (cached?.signature === signature) {
+      return {
+        partsByMessageId: cached.partsByMessageId,
+        timelineByMessageId: cached.timelineByMessageId
+      };
+    }
 
     const partsByMessageId = new Map<string, string[]>();
+    const timelineByMessageId = new Map<string, AgentMessageDisplayItem[]>();
     let pendingParts: string[] = [];
+    let pendingTimeline: AgentMessageDisplayItem[] = [];
+    let toolEventCursor = 0;
     for (const message of record.messages ?? []) {
       if (message.role === 'user') {
         pendingParts = [];
+        pendingTimeline = [];
+        continue;
+      }
+      if (message.role === 'tool') {
+        const event = record.toolEvents?.[toolEventCursor];
+        toolEventCursor += 1;
+        if (event) pendingTimeline.push({ type: 'tool', toolEventId: event.id });
         continue;
       }
       if (message.role !== 'assistant') continue;
 
       const content = message.content.trim();
       if (message.hidden === true) {
-        if (content) pendingParts.push(content);
+        if (content) {
+          const contentIndex = pendingParts.length;
+          pendingParts.push(content);
+          const timeline = message.displayTimeline ?? [];
+          const hasTimelineContent = timeline.some((item) => item.type === 'content');
+          if (timeline.length > 0) {
+            for (const item of timeline) {
+              if (item.type === 'content') pendingTimeline.push({ type: 'content', index: contentIndex });
+              if (item.type === 'tool') pendingTimeline.push(item);
+            }
+          }
+          if (!hasTimelineContent) pendingTimeline.push({ type: 'content', index: contentIndex });
+        }
         continue;
       }
       if (content && pendingParts.length > 0 && message.id) {
         partsByMessageId.set(message.id, [...pendingParts]);
+        const ownTimeline = message.displayTimeline ?? [];
+        const timeline = ownTimeline.length > 0
+          ? ownTimeline
+          : [
+              ...pendingTimeline,
+              ...(content ? [{ type: 'content', index: pendingParts.length } satisfies AgentMessageDisplayItem] : [])
+            ];
+        if (timeline.length > 0) timelineByMessageId.set(message.id, timeline);
       }
       if (content) pendingParts = [];
+      if (content) pendingTimeline = [];
     }
 
-    this.contentPartsCache.set(record.id, { signature, partsByMessageId });
+    this.contentPartsCache.set(record.id, { signature, partsByMessageId, timelineByMessageId });
     if (this.contentPartsCache.size > CONTENT_PARTS_CACHE_LIMIT) {
       const oldestKey = this.contentPartsCache.keys().next().value;
       if (oldestKey) this.contentPartsCache.delete(oldestKey);
     }
-    return partsByMessageId;
+    return { partsByMessageId, timelineByMessageId };
   }
 
   private contentPartsSignature(record: SessionRecord): string {
@@ -546,7 +596,8 @@ export class SessionStore {
         message.content.length,
         message.hidden === true ? message.content : ''
       ].join(':'))
-      .join('|');
+      .join('|')
+      + `::tools:${(record.toolEvents ?? []).map((event) => `${event.id}:${event.createdAt}`).join('|')}`;
   }
 
   private ensureValidProvidedId(id: string): string {
@@ -801,13 +852,17 @@ export class SessionStore {
     for (const message of messages) {
       if (message.role !== 'tool') continue;
       const content = message.content ?? '';
+      const ok = !/\b(error|failed?|exception)\b/i.test(content);
+      const createdAt = message.createdAt ?? nowIso();
       events.push({
         id: message.id || createId('toolevent'),
         toolName: message.name || 'tool',
         args: {},
-        ok: !/\b(error|failed?|exception)\b/i.test(content),
+        status: ok ? 'completed' : 'failed',
+        ok,
         content,
-        createdAt: message.createdAt ?? nowIso()
+        createdAt,
+        completedAt: createdAt
       });
     }
     return events;

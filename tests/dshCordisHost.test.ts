@@ -336,6 +336,81 @@ describe('DshCordisHost', () => {
     expect(state.tools).toEqual(['subagent_setup_ready']);
   });
 
+  it('registers a native spawn subagent provider when a main bridge is available', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const plugin = writePlugin(env.home, 'spawn-plugin', `
+      export function apply(ctx) {
+        ctx.tools.register({
+          name: 'subagent_spawn_probe',
+          description: 'Spawns a subagent through the native provider.',
+          parameters: { type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] },
+          async execute(args, exec) {
+            const provider = ctx.subagents.getProvider('spawn')
+            const result = await provider.spawn({
+              name: 'Researcher',
+              role: 'Research specialist',
+              parentSession: exec.agent.sessionId,
+              workspaceDir: exec.agent.workspaceDir,
+              prompt: args.prompt
+            })
+            return { providers: ctx.subagents.list(), result }
+          }
+        })
+      }
+    `);
+    const host = new DshCordisHost({
+      sidecarHome: env.home,
+      profileName: 'default',
+      mainRequest: async (method, params) => {
+        calls.push({ method, params });
+        return { ok: true, sessionId: 'sub_s1_Researcher_test', finalResponse: 'subagent done' };
+      }
+    });
+
+    const state = await host.loadPlugin({
+      record: pluginRecord('spawn-plugin'),
+      packageRoot: plugin.root,
+      patchPath: plugin.patch,
+      moduleEntry: plugin.entry
+    });
+    const result = await host.callTool({
+      name: 'subagent_spawn_probe',
+      args: { prompt: 'inspect the outline' },
+      context: {
+        sessionId: 's1',
+        workspaceDir: env.home,
+        requestId: 'r1',
+        llm: { provider: 'openai', model: 'gpt-test', reasoningEffort: 'high' }
+      }
+    });
+
+    expect(state.status).toBe('loaded');
+    expect(calls[0]?.method).toBe('main.chat.run');
+    expect(calls[0]?.params).toMatchObject({
+      source: 'dsh-subagent',
+      parentSession: 's1',
+      workspaceDir: env.home,
+      provider: 'openai',
+      model: 'gpt-test',
+      reasoningEffort: 'high'
+    });
+    expect(JSON.stringify(calls[0]?.params)).toContain('Research specialist');
+    expect(result?.data).toMatchObject({
+      providers: ['spawn'],
+      result: {
+        ok: true,
+        provider: 'spawn',
+        name: 'Researcher',
+        role: 'Research specialist',
+        parentSession: 's1',
+        sessionId: 'sub_s1_Researcher_test',
+        content: 'subagent done'
+      }
+    });
+  });
+
   it('passes the service-aware context into inject callbacks', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

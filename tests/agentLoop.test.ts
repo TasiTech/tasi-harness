@@ -11,7 +11,7 @@ import { SkillManager } from '../src/main/skills/skillManager.js';
 import { defaultConfig, ensureDir } from '../src/main/storage/pathUtils.js';
 import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
 import { createBuiltinTools } from '../src/main/tools/builtinTools.js';
-import type { AgentMessageDeltaStream, DshSidecarRuntimeStatus, LlmCompletion, LlmRequest, RegisteredTool } from '../src/shared/types.js';
+import type { AgentMessageDeltaStream, DshSidecarRuntimeStatus, LlmCompletion, LlmRequest, RegisteredTool, ToolEvent } from '../src/shared/types.js';
 import { tempHome } from './helpers.js';
 
 let cleanup = () => {};
@@ -86,6 +86,473 @@ describe('AgentLoop', () => {
     expect(Object.prototype.hasOwnProperty.call(rawSession, 'toolEvents')).toBe(false);
     const rawMessages = Array.isArray(rawSession.messages) ? rawSession.messages : [];
     expect(rawMessages.some((message) => message && typeof message === 'object' && (message as { role?: string }).role === 'tool')).toBe(true);
+  });
+
+  it('recovers textual tool-call summaries emitted by the model and continues', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const scripts: string[] = [];
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'browser_eval',
+          description: 'Evaluate JavaScript in the browser.',
+          parameters: {
+            type: 'object',
+            properties: {
+              script: { type: 'string' }
+            },
+            required: ['script']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async (args) => {
+        const script = typeof args === 'object' && args && 'script' in args ? String((args as { script?: unknown }).script ?? '') : '';
+        scripts.push(script);
+        return { ok: true, content: 'clicked' };
+      }
+    });
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'The page script ran successfully. Let me test navigation by clicking a sidebar item directly.',
+            '',
+            'Assistant requested tool calls:',
+            '',
+            '- browser_eval: {"script":"location.hash"}'
+          ].join('\n')
+        }
+      },
+      { message: { role: 'assistant', content: 'Navigation works.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'test navigation' });
+    const finalAssistant = result.messages.at(-1);
+
+    expect(result.finalResponse).toBe('Navigation works.');
+    expect(scripts).toEqual(['location.hash']);
+    expect(result.toolEvents).toHaveLength(1);
+    expect(finalAssistant?.content_parts?.[0]).toBe('The page script ran successfully. Let me test navigation by clicking a sidebar item directly.');
+    expect(result.messages.some((message) => message.content.includes('Assistant requested tool calls'))).toBe(false);
+  });
+
+  it('recovers markdown-escaped textual file tool calls', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const paths: string[] = [];
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'file_read',
+          description: 'Read a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }
+            },
+            required: ['path']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async (args) => {
+        const path = typeof args === 'object' && args && 'path' in args ? String((args as { path?: unknown }).path ?? '') : '';
+        paths.push(path);
+        return { ok: true, content: 'file content' };
+      }
+    });
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'Let me read the remaining subpages.',
+            '',
+            'Assistant requested tool calls:',
+            '',
+            String.raw`- file\_read: {"path":".build\\\11\_view\_qc\_trace\_deviation.html"}`,
+            String.raw`- file\_read: {"path":".build\\\12\_view\_qc\_trend\_optimization.html"}`
+          ].join('\n')
+        }
+      },
+      { message: { role: 'assistant', content: 'Review complete.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'review pages' });
+
+    expect(result.finalResponse).toBe('Review complete.');
+    expect(paths).toEqual([
+      '.build\\11_view_qc_trace_deviation.html',
+      '.build\\12_view_qc_trend_optimization.html'
+    ]);
+    expect(result.toolEvents).toHaveLength(2);
+  });
+
+  it('recovers copied historical tool-use records as textual tool calls', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const commands: string[] = [];
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'terminal',
+          description: 'Run a command.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' }
+            },
+            required: ['command']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async (args) => {
+        const command = typeof args === 'object' && args && 'command' in args ? String((args as { command?: unknown }).command ?? '') : '';
+        commands.push(command);
+        return { ok: true, content: 'done' };
+      }
+    });
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'Historical assistant tool-use record (not a current tool-call request):',
+            '- terminal: {"command":"python3 inspect3.py"}'
+          ].join('\n')
+        }
+      },
+      { message: { role: 'assistant', content: 'Inspection continued.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'run inspection' });
+    const visibleMessages = result.messages.filter((message) => message.hidden !== true);
+
+    expect(result.finalResponse).toBe('Inspection continued.');
+    expect(commands).toEqual(['python3 inspect3.py']);
+    expect(result.toolEvents).toHaveLength(1);
+    expect(visibleMessages.some((message) => message.content.includes('Historical assistant tool-use record'))).toBe(false);
+  });
+
+  it('retries when a textual tool-call summary is malformed', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 5 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const paths: string[] = [];
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'file_read',
+          description: 'Read a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }
+            },
+            required: ['path']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async (args) => {
+        const path = typeof args === 'object' && args && 'path' in args ? String((args as { path?: unknown }).path ?? '') : '';
+        paths.push(path);
+        return { ok: true, content: 'file content' };
+      }
+    });
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'I need one file.',
+            '',
+            'Assistant requested tool calls:',
+            '',
+            '- file_read: {"path":'
+          ].join('\n')
+        }
+      },
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'Assistant requested tool calls:',
+            '',
+            '- file_read: {"path":"ok.txt"}'
+          ].join('\n')
+        }
+      },
+      { message: { role: 'assistant', content: 'Recovered.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'read file' });
+    const visibleMessages = result.messages.filter((message) => message.hidden !== true);
+
+    expect(result.finalResponse).toBe('Recovered.');
+    expect(paths).toEqual(['ok.txt']);
+    expect(result.toolEvents).toHaveLength(1);
+    expect(visibleMessages.some((message) => message.content.includes('Assistant requested tool calls'))).toBe(false);
+  });
+
+  it('recovers markdown-escaped textual terminal tool calls with nested quotes', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    const commands: string[] = [];
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'terminal',
+          description: 'Run a command.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string' }
+            },
+            required: ['command']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async (args) => {
+        const command = typeof args === 'object' && args && 'command' in args ? String((args as { command?: unknown }).command ?? '') : '';
+        commands.push(command);
+        return { ok: true, content: 'command output' };
+      }
+    });
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: [
+            'The browser is showing stale cached content. Let me verify the file on disk and force a fresh load.',
+            '',
+            'Assistant requested tool calls:',
+            '',
+            String.raw`- terminal: {"command":"cd C:\\\Users\\\hujuntao\\\\.tasi-harness\\\workspace && python -c \"import io,re; s=io.open('航材院智能体统一平台.html',encoding='utf-8').read(); print('kpi in home:', s.count('kpi ')); print('home actions:', re.findall(r'data-actions=\\'([^\\']+)\\'', s[:8000])[0] if 'view-home' in s[:8000] else 'n/a')\""}`,
+            String.raw`- browser\_eval: {"script":"location.reload(); 'reloading'"}`
+          ].join('\n')
+        }
+      },
+      { message: { role: 'assistant', content: 'Fresh load verified.' } }
+    ]);
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'browser_eval',
+          description: 'Evaluate JavaScript in the browser.',
+          parameters: {
+            type: 'object',
+            properties: {
+              script: { type: 'string' }
+            },
+            required: ['script']
+          }
+        }
+      },
+      safety: 'read-only',
+      execute: async () => ({ ok: true, content: 'reloading' })
+    });
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'verify stale cache' });
+
+    expect(result.finalResponse).toBe('Fresh load verified.');
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain('cd C:\\Users\\hujuntao\\\\.tasi-harness\\workspace');
+    expect(commands[0]).toContain('python -c "import io,re;');
+    expect(commands[0]).toContain("s.count('kpi ')");
+    expect(result.toolEvents.map((event) => event.toolName)).toEqual(['terminal', 'browser_eval']);
+  });
+
+  it('emits a running tool event as soon as the model requests a tool call', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    for (const tool of createBuiltinTools({ getConfig: () => cfg, memoryStore: memory, sessionStore: sessions, skillManager: skills })) registry.register(tool);
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'file_write', arguments: JSON.stringify({ path: 'answer.txt', content: '42' }) }
+          }]
+        }
+      },
+      { message: { role: 'assistant', content: 'Done.' } }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+    const streamedToolEvents: ToolEvent[] = [];
+
+    const result = await loop.run({
+      userInput: 'write a file',
+      onToolEvent: (_sessionId, event) => streamedToolEvents.push(event)
+    });
+
+    expect(streamedToolEvents.map((event) => event.status)).toEqual(['running', 'completed']);
+    expect(streamedToolEvents[0]?.id).toBe(streamedToolEvents[1]?.id);
+    expect(streamedToolEvents[0]).toMatchObject({
+      toolName: 'file_write',
+      ok: true,
+      content: ''
+    });
+    expect(streamedToolEvents[1]).toMatchObject({
+      toolName: 'file_write',
+      ok: true,
+      content: 'Wrote answer.txt.'
+    });
+    expect(streamedToolEvents[1]?.completedAt).toBeTruthy();
+    expect(result.toolEvents).toHaveLength(1);
+    expect(result.toolEvents[0]?.status).toBe('completed');
+    expect(sessions.read(result.sessionId)?.toolEvents).toHaveLength(1);
+    expect(sessions.read(result.sessionId)?.toolEvents[0]?.status).toBe('completed');
   });
 
   it('orders messages so stable prompt and previous history remain prefix-cache friendly', async () => {
@@ -675,6 +1142,14 @@ describe('AgentLoop', () => {
     expect(assistantMessages[0]?.tool_calls?.[0]?.function.name).toBe('file_write');
     expect(assistantMessages[1]?.content).toBe('Done.');
     expect(stored?.messages.some((message) => message.content === 'I will check that now. Please wait.')).toBe(true);
+    const display = sessions.readForDisplay(result.sessionId);
+    const displayAssistant = display?.messages.find((message) => message.role === 'assistant' && message.content === 'Done.');
+    expect(displayAssistant?.content_parts).toEqual(['I will check that now. Please wait.']);
+    expect(displayAssistant?.displayTimeline).toEqual([
+      { type: 'content', index: 0 },
+      { type: 'tool', toolEventId: display?.toolEvents[0]?.id },
+      { type: 'content', index: 1 }
+    ]);
   });
 
   it('emits streamed assistant deltas when the client supports streaming', async () => {
@@ -1101,6 +1576,76 @@ describe('AgentLoop', () => {
     expect(sessions.read(result.sessionId)?.messages.at(-1)?.content).toBe(result.finalResponse);
   });
 
+  it('includes recent tool context when non-streamed reasoning exceeds the safety limit', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const cfg = { ...defaultConfig(), workspaceDir: join(env.home, 'workspace'), maxIterations: 4 };
+    ensureDir(cfg.workspaceDir);
+    const memory = new MemoryStore(env.home);
+    const personalKnowledgeBase = new PersonalKnowledgeBase(env.home);
+    const skills = new SkillManager(env.home);
+    const sessions = new SessionStore(env.home);
+    const registry = new ToolRegistry();
+    registry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'inspect_headings',
+          description: 'Inspect generated headings.',
+          parameters: { type: 'object', properties: {} }
+        }
+      },
+      safety: 'read-only',
+      async execute() {
+        return { ok: true, content: 'Wrote 137 headings' };
+      }
+    });
+    const longReasoning = Array.from({ length: 1000 }, (_value, index) => `Planning automatic numbering step ${index}.`).join('\n');
+    const mock = new MockLlmClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'inspect_headings', arguments: '{}' }
+          }]
+        }
+      },
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          reasoning_content: longReasoning
+        }
+      }
+    ]);
+    const loop = new AgentLoop({
+      getConfig: () => cfg,
+      createClient: () => mock,
+      toolRegistry: registry,
+      sessions,
+      promptBuilder: new PromptBuilder(memory, skills, personalKnowledgeBase),
+      prepareExecution: () => ({ mode: 'workspace', workspaceDir: cfg.workspaceDir }),
+      beginDeferredMemory: (sessionId) => memory.beginDeferredSession(sessionId),
+      commitDeferredMemory: (sessionId) => {
+        void memory.commitDeferredSession(sessionId);
+      },
+      discardDeferredMemory: (sessionId) => memory.discardDeferredSession(sessionId),
+      syncSessionMemory: (session) => {
+        void memory.syncSessionMemory(session);
+      }
+    });
+
+    const result = await loop.run({ userInput: 'make heading numbering automatic', enabledToolNames: ['inspect_headings'], stream: false });
+
+    expect(result.finalResponse).toContain('Stopped because the model reasoning exceeded the safety limit for one run.');
+    expect(result.finalResponse).toContain('Recent completed tool context:');
+    expect(result.finalResponse).toContain('inspect_headings: ok: Wrote 137 headings');
+    expect(result.finalResponse).toContain('Suggested next step: continue from the last completed tool result');
+  });
+
   it('returns log probabilities from the final completion when requested', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
@@ -1205,6 +1750,11 @@ describe('AgentLoop', () => {
       typeof message === 'object' &&
       Object.prototype.hasOwnProperty.call(message, 'reasoning_parts')
     ))).toBe(false);
+    expect(rawMessages.some((message) => (
+      message &&
+      typeof message === 'object' &&
+      Object.prototype.hasOwnProperty.call(message, 'displayTimeline')
+    ))).toBe(false);
   });
 
   it('replaces streamed reasoning with the current iteration instead of accumulating tool-call reasoning', async () => {
@@ -1274,6 +1824,13 @@ describe('AgentLoop', () => {
     expect(doneDelta?.content).toBe('Done.');
     expect(doneDelta?.reasoning_parts).toEqual(['Ready to answer.']);
     expect(doneDelta?.content_parts).toEqual(['I will inspect first.']);
+    expect(doneDelta?.displayTimeline).toEqual([
+      { type: 'reasoning_content', index: 0 },
+      { type: 'content', index: 0 },
+      { type: 'tool', toolEventId: result.toolEvents[0]?.id },
+      { type: 'reasoning_content', index: 2 },
+      { type: 'content', index: 1 }
+    ]);
     const finalAssistant = [...result.messages].reverse().find((message) => message.role === 'assistant' && message.content === 'Done.');
     expect(finalAssistant?.reasoning_content).toBe('Ready to answer.');
     expect(finalAssistant?.reasoning_parts).toEqual(['Ready to answer.']);

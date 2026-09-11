@@ -154,7 +154,7 @@ export class AppContext {
     );
     this.agentLoop = new AgentLoop({
       getConfig: () => this.getConfig(),
-      createClient: () => createLlmClient(this.getConfig()),
+      createClient: (config) => createLlmClient(config),
       toolRegistry: this.toolRegistry,
       sessions: this.sessionStore,
       promptBuilder: this.promptBuilder,

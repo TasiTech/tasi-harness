@@ -30,12 +30,14 @@ const CONTEXT_COMPRESSION_THRESHOLD = 0.8;
 const MODEL_CONTEXT_LOOKUP_TOKEN_FLOOR = 1024;
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000;
 const INTERACTIVE_CONTEXT_SOFT_BUDGET_TOKENS = 96_000;
+const INTERACTIVE_CONTEXT_SOFT_BUDGET_WINDOW_TOKENS = DEFAULT_CONTEXT_WINDOW_TOKENS;
 const MIN_CONTEXT_SUMMARY_TOKENS = 512;
 const MAX_CONTEXT_SUMMARY_TOKENS = 24_000;
 const RECENT_CONTEXT_BLOCKS = 6;
 const CONTEXT_RETRY_COMPRESSION_RATIO = 0.65;
 const MODEL_CONTEXT_PROBE_MAX_TOKENS = 99_999_999;
 const MODEL_CONTEXT_PROBE_TIMEOUT_MS = 5000;
+const VLLM_HISTORY_TEXT_PREVIEW_CHARS = 8000;
 const MODEL_CONTEXT_WINDOW_CACHE = new Map<string, number | undefined>();
 type ContextCompressionMode = 'turn_boundary' | 'iteration' | 'provider_retry';
 
@@ -98,8 +100,10 @@ function effectiveContextBudget(
   mode: ContextCompressionMode = 'turn_boundary'
 ): { budgetTokens: number; windowBudgetTokens: number; softBudgetTokens: number; budgetSource: string } {
   const windowBudgetTokens = Math.max(256, Math.floor(contextWindowTokens * budgetRatio));
-  const softBudgetTokens = Math.min(INTERACTIVE_CONTEXT_SOFT_BUDGET_TOKENS, windowBudgetTokens);
-  const useSoftBudget = mode === 'turn_boundary';
+  const useSoftBudget = mode === 'turn_boundary' && contextWindowTokens <= INTERACTIVE_CONTEXT_SOFT_BUDGET_WINDOW_TOKENS;
+  const softBudgetTokens = useSoftBudget
+    ? Math.min(INTERACTIVE_CONTEXT_SOFT_BUDGET_TOKENS, windowBudgetTokens)
+    : windowBudgetTokens;
   return {
     budgetTokens: useSoftBudget ? softBudgetTokens : windowBudgetTokens,
     windowBudgetTokens,
@@ -831,8 +835,53 @@ function anthropicTextBlock(text: string): AnthropicContentBlock {
   return { type: 'text', text: text.trim() || ' ' };
 }
 
+function attachmentBase64(attachment: AgentMessageAttachment): string {
+  const value = attachment.contentBase64.trim();
+  const dataUrl = value.match(/^data:[^;,]+;base64,(.+)$/i);
+  return (dataUrl?.[1] ?? value).replace(/\s+/g, '');
+}
+
 function attachmentDataUrl(attachment: AgentMessageAttachment): string {
-  return `data:${attachment.mimeType};base64,${attachment.contentBase64}`;
+  return `data:${attachment.mimeType};base64,${attachmentBase64(attachment)}`;
+}
+
+function redactInlineBase64Payloads(text: string): string {
+  return text
+    .replace(/(data:[^;,\s"]*;base64,)[A-Za-z0-9+/=_-]{80,}/gi, '$1[base64 omitted from history]')
+    .replace(
+      /("(?:contentBase64|content_base64|fileBase64|file_base64|mediaBase64|media_base64|base64|data)"\s*:\s*")([A-Za-z0-9+/=_-]{160,})(")/gi,
+      '$1[base64 omitted from history]$3'
+    );
+}
+
+function vllmHistoryText(text: string): string {
+  return valuePreview(redactInlineBase64Payloads(text), VLLM_HISTORY_TEXT_PREVIEW_CHARS);
+}
+
+function attachmentSizeLabel(sizeBytes?: number): string {
+  if (!Number.isFinite(sizeBytes) || !sizeBytes || sizeBytes <= 0) return '';
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  if (sizeBytes < 1024 * 1024) return `${Math.round(sizeBytes / 1024)} KB`;
+  return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function historicalAttachmentSummary(attachments?: AgentMessageAttachment[]): string {
+  const items = (attachments ?? []).map((attachment) => {
+    const details = [
+      attachment.filename,
+      attachment.mimeType,
+      attachmentSizeLabel(attachment.sizeBytes)
+    ].filter(Boolean).join(', ');
+    return `- ${attachment.kind}: ${details || 'attachment'}`;
+  });
+  return items.length > 0 ? `Historical attachments omitted:\n${items.join('\n')}` : '';
+}
+
+function openAiTextOnlyUserContent(message: AgentMessage, provider: AppConfig['provider']): string {
+  const content = provider === 'vllm'
+    ? redactInlineBase64Payloads(String(message.content ?? ''))
+    : String(message.content ?? '');
+  return [content.trim(), historicalAttachmentSummary(message.attachments)].filter(Boolean).join('\n\n') || ' ';
 }
 
 function audioFormat(attachment: AgentMessageAttachment): string {
@@ -844,8 +893,9 @@ function audioFormat(attachment: AgentMessageAttachment): string {
   return value;
 }
 
-function openAiContentParts(message: AgentMessage, provider: AppConfig['provider']): string | Array<Record<string, unknown>> {
+function openAiContentParts(message: AgentMessage, includeAttachments = true): string | Array<Record<string, unknown>> {
   const attachments = message.attachments ?? [];
+  if (!includeAttachments) return openAiTextOnlyUserContent(message, 'vllm');
   if (attachments.length === 0) return String(message.content ?? '');
   const parts: Array<Record<string, unknown>> = [];
   if (message.content.trim()) parts.push({ type: 'text', text: message.content });
@@ -858,7 +908,7 @@ function openAiContentParts(message: AgentMessage, provider: AppConfig['provider
       parts.push({
         type: 'input_audio',
         input_audio: {
-          data: provider === 'openai' ? attachment.contentBase64 : attachmentDataUrl(attachment),
+          data: attachmentBase64(attachment),
           format: audioFormat(attachment)
         }
       });
@@ -879,7 +929,7 @@ function anthropicImageBlocks(attachments: AgentMessageAttachment[]): AnthropicC
       source: {
         type: 'base64' as const,
         media_type: attachment.mimeType,
-        data: attachment.contentBase64
+        data: attachmentBase64(attachment)
       }
     }));
 }
@@ -1015,15 +1065,152 @@ function finalizeStreamingToolCalls(acc: OpenAiStreamingToolCall[]): ToolCall[] 
   return calls.length > 0 ? calls : undefined;
 }
 
+function shouldFlattenHistoricalToolMessages(provider: AppConfig['provider']): boolean {
+  return provider === 'vllm';
+}
+
+const HISTORICAL_TOOL_CALL_HEADER = 'Historical assistant tool-use record (not a current tool-call request):';
+
+function flattenedToolCallText(call: ToolCall): string {
+  const name = String(call.function?.name ?? 'tool').trim() || 'tool';
+  const args = valuePreview(normalizeToolArgumentsForRequest(call.function?.arguments), 1200);
+  return `- ${name}: ${args}`;
+}
+
+function flattenedAssistantToolContent(message: AgentMessage, toolCalls: ToolCall[]): string {
+  const content = vllmHistoryText(String(message.content ?? '')).trim();
+  const calls = toolCalls.map(flattenedToolCallText).join('\n');
+  return [content, `${HISTORICAL_TOOL_CALL_HEADER}\n${calls}`].filter(Boolean).join('\n\n');
+}
+
+function flattenedToolResultContent(message: AgentMessage): string {
+  const name = String(message.name ?? 'tool').trim() || 'tool';
+  const id = String(message.tool_call_id ?? '').trim();
+  const label = id ? `Tool result from ${name} (${id})` : `Tool result from ${name}`;
+  const content = vllmHistoryText(String(message.content ?? '')).trim() || '(empty result)';
+  return `${label}:\n${content}`;
+}
+
+function normalizedToolCalls(message: Record<string, unknown>): Array<Record<string, any>> {
+  return Array.isArray(message.tool_calls) ? message.tool_calls as Array<Record<string, any>> : [];
+}
+
+function normalizedToolCallId(call: Record<string, unknown>): string {
+  return String(call.id ?? '').trim();
+}
+
+function flattenedNormalizedAssistantToolContent(message: Record<string, unknown>, toolCalls: Array<Record<string, any>>): string {
+  const content = contentToText(message.content).trim();
+  const calls = toolCalls
+    .map((call) => {
+      const fn = call.function && typeof call.function === 'object' ? call.function as Record<string, unknown> : {};
+      const name = String(fn.name ?? 'tool').trim() || 'tool';
+      const args = valuePreview(fn.arguments ?? {}, 1200);
+      return `- ${name}: ${args}`;
+    })
+    .join('\n');
+  return [content, `${HISTORICAL_TOOL_CALL_HEADER}\n${calls}`].filter(Boolean).join('\n\n');
+}
+
+function flattenedNormalizedToolResultContent(message: Record<string, unknown>): string {
+  const name = String(message.name ?? 'tool').trim() || 'tool';
+  const id = String(message.tool_call_id ?? '').trim();
+  const label = id ? `Tool result from ${name} (${id})` : `Tool result from ${name}`;
+  const content = contentToText(message.content).trim() || '(empty result)';
+  return `${label}:\n${content}`;
+}
+
+function userMessageFromNormalizedToolResult(message: Record<string, unknown>): Record<string, unknown> {
+  return {
+    role: 'user',
+    content: flattenedNormalizedToolResultContent(message)
+  };
+}
+
+function flattenPendingToolCallBlock(
+  result: Array<Record<string, unknown>>,
+  pending: { assistantIndex: number; unansweredIds: Set<string>; toolCalls: Array<Record<string, any>>; toolResultIndexes: number[] } | undefined
+): void {
+  if (!pending || pending.unansweredIds.size === 0) return;
+  const assistant = result[pending.assistantIndex];
+  result[pending.assistantIndex] = {
+    ...assistant,
+    content: flattenedNormalizedAssistantToolContent(assistant, pending.toolCalls),
+    tool_calls: undefined
+  };
+  delete result[pending.assistantIndex].tool_calls;
+  for (const index of pending.toolResultIndexes) {
+    result[index] = userMessageFromNormalizedToolResult(result[index]);
+  }
+}
+
+function repairOpenAiCompatibleToolPairs(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const result: Array<Record<string, unknown>> = [];
+  let pending: { assistantIndex: number; unansweredIds: Set<string>; toolCalls: Array<Record<string, any>>; toolResultIndexes: number[] } | undefined;
+
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      const toolCallId = String(message.tool_call_id ?? '').trim();
+      if (pending?.unansweredIds.has(toolCallId)) {
+        pending.unansweredIds.delete(toolCallId);
+        pending.toolResultIndexes.push(result.length);
+        result.push(message);
+        continue;
+      }
+      flattenPendingToolCallBlock(result, pending);
+      pending = undefined;
+      result.push(userMessageFromNormalizedToolResult(message));
+      continue;
+    }
+
+    flattenPendingToolCallBlock(result, pending);
+    pending = undefined;
+
+    if (message.role === 'assistant') {
+      const toolCalls = normalizedToolCalls(message);
+      const ids = toolCalls.map(normalizedToolCallId).filter(Boolean);
+      if (ids.length > 0) {
+        result.push(message);
+        pending = {
+          assistantIndex: result.length - 1,
+          unansweredIds: new Set(ids),
+          toolCalls,
+          toolResultIndexes: []
+        };
+        continue;
+      }
+    }
+
+    result.push(message);
+  }
+
+  flattenPendingToolCallBlock(result, pending);
+  return result.map((message) => {
+    if (message.role !== 'tool' || !('name' in message)) return message;
+    const rest = { ...message };
+    delete rest.name;
+    return rest;
+  });
+}
+
 function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: AppConfig['provider']): Array<Record<string, unknown>> {
   const normalized: Array<Record<string, unknown>> = [];
   const droppedToolCallIds = new Set<string>();
+  const flattenHistoricalTools = shouldFlattenHistoricalToolMessages(provider);
+  const lastUserIndex = (() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].role === 'user') return index;
+    }
+    return -1;
+  })();
 
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
     if (message.role === 'system' || message.role === 'user') {
+      const includeAttachments = provider !== 'vllm' || message.role !== 'user' || index === lastUserIndex;
       const next: Record<string, unknown> = {
         role: message.role,
-        content: message.role === 'user' ? openAiContentParts(message, provider) : String(message.content ?? '')
+        content: message.role === 'user' ? openAiContentParts(message, includeAttachments) : String(message.content ?? '')
       };
       if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
       normalized.push(next);
@@ -1031,17 +1218,24 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
     }
 
     if (message.role === 'assistant') {
-      const next: Record<string, unknown> = {
-        role: 'assistant',
-        content: String(message.content ?? '')
-      };
-      if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
-      if (typeof message.reasoning_content === 'string') {
-        if (provider === 'vllm') next.reasoning = message.reasoning_content;
-        else next.reasoning_content = message.reasoning_content;
+      const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (flattenHistoricalTools && rawToolCalls.length > 0) {
+        normalized.push({
+          role: 'assistant',
+          content: flattenedAssistantToolContent(message, rawToolCalls)
+        });
+        continue;
       }
 
-      const rawToolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      const next: Record<string, unknown> = {
+        role: 'assistant',
+        content: provider === 'vllm' ? vllmHistoryText(String(message.content ?? '')) : String(message.content ?? '')
+      };
+      if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
+      if (typeof message.reasoning_content === 'string' && provider !== 'vllm') {
+        next.reasoning_content = message.reasoning_content;
+      }
+
       const toolCalls = rawToolCalls
         .map((call) => ({
           id: String(call.id ?? createId('toolcall')),
@@ -1066,16 +1260,25 @@ function normalizeOpenAiCompatibleMessages(messages: AgentMessage[], provider: A
     }
 
     const toolCallId = String(message.tool_call_id ?? '').trim();
+    if (flattenHistoricalTools) {
+      normalized.push({
+        role: 'user',
+        content: flattenedToolResultContent(message)
+      });
+      continue;
+    }
     if (!toolCallId) continue;
     if (droppedToolCallIds.has(toolCallId)) continue;
-    normalized.push({
+    const next: Record<string, unknown> = {
       role: 'tool',
       tool_call_id: toolCallId,
       content: String(message.content ?? '')
-    });
+    };
+    if (typeof message.name === 'string' && message.name.trim()) next.name = message.name.trim();
+    normalized.push(next);
   }
 
-  return normalized;
+  return repairOpenAiCompatibleToolPairs(normalized);
 }
 
 function vllmReasoningRequestParams(config: AppConfig): Record<string, unknown> {
@@ -1701,7 +1904,7 @@ class ModelClient implements LlmClient {
       messages: request.messages.map((message) => ({
         role: message.role === 'tool' ? 'user' : message.role,
         content: message.content,
-        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
+        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachmentBase64(attachment))
       })),
       stream: false,
       options: { temperature: request.temperature ?? this.config.temperature },
@@ -1726,7 +1929,7 @@ class ModelClient implements LlmClient {
       messages: request.messages.map((message) => ({
         role: message.role === 'tool' ? 'user' : message.role,
         content: message.content,
-        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachment.contentBase64)
+        images: message.attachments?.filter((attachment) => attachment.kind === 'image').map((attachment) => attachmentBase64(attachment))
       })),
       stream: true,
       options: { temperature: request.temperature ?? this.config.temperature },

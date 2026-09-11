@@ -1,7 +1,7 @@
 import type { AgentMessageDeltaStream } from './types.js';
 
 export const REASONING_STREAM_PREVIEW_CHARS = 3000;
-export const CONTENT_STREAM_PREVIEW_CHARS = 5000;
+export const CONTENT_STREAM_PREVIEW_CHARS = 3200;
 const CONTENT_PART_PREVIEW_CHARS = 2000;
 const CONTENT_PART_PREVIEW_ITEMS = 8;
 const STREAM_DELTA_PREVIEW_CHARS = 1000;

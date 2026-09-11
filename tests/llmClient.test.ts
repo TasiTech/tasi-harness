@@ -166,6 +166,81 @@ describe('llmClient', () => {
     expect(result.message.content).toBe('vLLM response.');
   });
 
+  it('flattens historical tool traces for vLLM requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'continued' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    await client.complete({
+      messages: [
+        {
+          role: 'user',
+          content: 'look at this image',
+          attachments: [
+            {
+              kind: 'image',
+              filename: 'image.png',
+              mimeType: 'image/png',
+              sizeBytes: 2485,
+              contentBase64: 'iVBORw0KGgoAAAANSUhEUgAA'
+            }
+          ]
+        },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'chatcmpl-tool-abc123',
+              type: 'function',
+              function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+            }
+          ]
+        },
+        {
+          role: 'tool',
+          name: 'browser_open',
+          tool_call_id: 'chatcmpl-tool-abc123',
+          content: `{"ok":true,"contentBase64":"${'A'.repeat(240)}"}`
+        },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(typeof body.messages[0].content).toBe('string');
+    expect(body.messages[0].content).toContain('Historical attachments omitted');
+    expect(body.messages[0].content).toContain('image.png');
+    expect(body.messages[1].tool_calls).toBeUndefined();
+    expect(body.messages[1].content).toContain('Historical assistant tool-use record');
+    expect(body.messages[1].content).not.toContain('Assistant requested tool calls');
+    expect(body.messages[2].content).toContain('Tool result from browser_open');
+    expect(body.messages[2].content).toContain('[base64 omitted from history]');
+    expect(body.messages[2].content).not.toContain('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+    expect(body.tools).toEqual([browserOpenTool]);
+  });
+
   it('uses a chat completions probe to compress oversized OpenAI-compatible prompts', async () => {
     const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
     const fetchMock = vi
@@ -408,7 +483,7 @@ describe('llmClient', () => {
     expect(body.max_tokens).not.toBe(99999999);
   });
 
-  it('uses an interactive soft budget even when the probed model context is very large', async () => {
+  it('uses the probed context-window budget when the model context is very large', async () => {
     const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
     const fetchMock = vi
       .fn()
@@ -428,7 +503,7 @@ describe('llmClient', () => {
           JSON.stringify({
             choices: [
               {
-                message: { role: 'assistant', content: 'soft-budget compressed ok' }
+                message: { role: 'assistant', content: 'large-context prompt ok' }
               }
             ]
           }),
@@ -445,7 +520,7 @@ describe('llmClient', () => {
       model: 'qwen3.8-27b-nvfp4'
     });
 
-    const oldText = 'x'.repeat(330_000);
+    const oldText = 'x'.repeat(290_000);
     const result = await client.complete({
       messages: [
         { role: 'system', content: 'You are helpful.' },
@@ -455,14 +530,12 @@ describe('llmClient', () => {
       ]
     });
 
-    expect(result.message.content).toBe('soft-budget compressed ok');
+    expect(result.message.content).toBe('large-context prompt ok');
     const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
     const body = JSON.parse(String(init.body));
-    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user']);
-    expect(body.messages[0].content).toContain('Earlier conversation history was compressed');
-    const logLine = String(infoSpy.mock.calls[0]?.[0] ?? '');
-    expect(logLine).toContain('"budget_tokens":96000');
-    expect(logLine).toContain('"budget_source":"interactive_soft_budget"');
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(infoSpy).not.toHaveBeenCalled();
   });
 
   it('uses the context-window budget for intra-turn iteration requests', async () => {
@@ -1099,9 +1172,9 @@ describe('llmClient', () => {
           role: 'user',
           content: 'Describe these files.',
           attachments: [
-            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'aW1hZ2U=' },
+            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'data:image/png;base64,aW1hZ2U=' },
             { kind: 'video', filename: 'clip.mp4', mimeType: 'video/mp4', contentBase64: 'dmlkZW8=' },
-            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'YXVkaW8=' }
+            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'data:audio/mpeg;base64,YXVkaW8=' }
           ]
         }
       ]
@@ -1114,7 +1187,7 @@ describe('llmClient', () => {
       { type: 'text', text: 'Describe these files.' },
       { type: 'image_url', image_url: { url: 'data:image/png;base64,aW1hZ2U=' } },
       { type: 'video_url', video_url: { url: 'data:video/mp4;base64,dmlkZW8=' } },
-      { type: 'input_audio', input_audio: { data: 'data:audio/mpeg;base64,YXVkaW8=', format: 'mp3' } }
+      { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'mp3' } }
     ]);
   });
 
@@ -1165,6 +1238,104 @@ describe('llmClient', () => {
     const body = JSON.parse(String(init.body));
     expect(body.messages[1].tool_calls[0].function.arguments).toBe('{"raw":"url=https://example.com"}');
     expect(() => JSON.parse(body.messages[1].tool_calls[0].function.arguments)).not.toThrow();
+  });
+
+  it('converts orphan historical tool messages before sending OpenAI-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'soildapi',
+      baseUrl: 'https://api.soildapi.test/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash-0731'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'question 1' },
+        { role: 'tool', name: 'terminal', tool_call_id: 'call_hidden', content: 'ran npm test' },
+        { role: 'assistant', content: 'old final answer' },
+        { role: 'user', content: 'question 2' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'user', 'assistant', 'user']);
+    expect(body.messages.some((message: any) => message.role === 'tool')).toBe(false);
+    expect(body.messages[2].content).toContain('Tool result from terminal (call_hidden)');
+  });
+
+  it('textifies incomplete tool-call blocks before sending OpenAI-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'user', content: 'run tools' },
+        {
+          role: 'assistant',
+          content: 'I will run both.',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+            },
+            {
+              id: 'call_2',
+              type: 'function',
+              function: { name: 'missing_tool', arguments: '{}' }
+            }
+          ]
+        },
+        { role: 'tool', name: 'browser_open', tool_call_id: 'call_1', content: 'opened' },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(body.messages[1].tool_calls).toBeUndefined();
+    expect(body.messages[1].content).toContain('Historical assistant tool-use record');
+    expect(body.messages[1].content).not.toContain('Assistant requested tool calls');
+    expect(body.messages[2].content).toContain('Tool result from browser_open (call_1)');
   });
 
   it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {

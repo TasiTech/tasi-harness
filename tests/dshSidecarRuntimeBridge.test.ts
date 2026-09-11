@@ -12,10 +12,13 @@ let cleanup = () => {};
 afterEach(() => cleanup());
 
 describe('DshSidecarRuntimeBridge', () => {
-  it('registers sidecar runtime tools and enables them for the agent loop', async () => {
+  it('registers sidecar runtime tools without enabling them globally', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const configStore = new ConfigStore(env.home);
+    configStore.update({
+      enabledToolNames: [...configStore.get().enabledToolNames, 'agent_teams_view']
+    });
     const registry = new ToolRegistry();
     const calls: DshSidecarToolCallRequest[] = [];
     const tool: ToolDefinition = {
@@ -39,7 +42,7 @@ describe('DshSidecarRuntimeBridge', () => {
 
     expect(result.toolNames).toEqual(['agent_teams_view']);
     expect(registry.names()).toContain('agent_teams_view');
-    expect(configStore.get().enabledToolNames).toContain('agent_teams_view');
+    expect(configStore.get().enabledToolNames).not.toContain('agent_teams_view');
     const executed = await registry.execute('agent_teams_view', { team_id: 'demo' }, {
       sessionId: 'session-1',
       workspaceDir: env.home,
@@ -127,5 +130,34 @@ describe('DshSidecarRuntimeBridge', () => {
       path: join(env.home, 'screenshots/01-chat.png'),
       source_url: 'https://example.com/image.png'
     });
+  });
+
+  it('prunes stale DSH IM runtime tools from global enabled tools on sync', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    configStore.update({
+      enabledToolNames: [...configStore.get().enabledToolNames, 'dsh_im_return_file']
+    });
+    const registry = new ToolRegistry();
+    const tool: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'dsh_im_return_file',
+        description: 'Return a file to the IM conversation.',
+        parameters: { type: 'object', properties: {} }
+      }
+    };
+    const sidecar = {
+      runtimeTools: async () => [tool],
+      runtimeSkills: async () => []
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore);
+    const result = await bridge.sync();
+
+    expect(result.toolNames).toEqual(['dsh_im_return_file']);
+    expect(registry.names()).toContain('dsh_im_return_file');
+    expect(configStore.get().enabledToolNames).not.toContain('dsh_im_return_file');
   });
 });

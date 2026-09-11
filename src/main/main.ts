@@ -15,6 +15,7 @@ import type {
   AgentArtifactRef,
   AgentMessage,
   AgentMessageAttachment,
+  AgentRunOptions,
   AgentRunResult,
   AssistantMessageExportRequest,
   AppConfig,
@@ -39,7 +40,9 @@ import type {
   LiveRealtimeEvent,
   LiveRealtimeStartRequest,
   PersonalKnowledgeUploadRequest,
+  ProviderKind,
   RegisteredTool,
+  ReasoningEffort,
   SessionDocumentUploadRequest,
   SessionListPageRequest,
   ScheduledTaskCreateRequest,
@@ -215,6 +218,12 @@ function canHandleDirectDshSidecarChat(plugin: DshSidecarRuntimePlugin): boolean
   return (plugin.commands ?? []).length > 0;
 }
 
+function normalizeAttachmentBase64Payload(value: string): string {
+  const clean = value.trim();
+  const dataUrl = clean.match(/^data:[^;,]+;base64,(.+)$/i);
+  return (dataUrl?.[1] ?? clean).replace(/\s+/g, '');
+}
+
 function dshInputParts(input: string, attachments?: AgentMessageAttachment[]): DshSidecarInputPart[] {
   const parts: DshSidecarInputPart[] = [];
   if (input.trim()) parts.push({ type: 'text', text: input });
@@ -222,7 +231,7 @@ function dshInputParts(input: string, attachments?: AgentMessageAttachment[]): D
     const base = {
       name: attachment.filename,
       mime: attachment.mimeType,
-      data: attachment.contentBase64
+      data: normalizeAttachmentBase64Payload(attachment.contentBase64)
     };
     if (attachment.kind === 'image') parts.push({ type: 'image', ...base });
     else if (attachment.kind === 'audio') parts.push({ type: 'audio', ...base });
@@ -690,6 +699,7 @@ async function executeDshSidecarMainChat(request: DshMainChatRequest): Promise<A
     sessionId: session.id,
     executionMode,
     workspaceDir,
+    llm: request.llm,
     origin: 'scheduled',
     persistUserMessage: false,
     omitHistoryMessageIds: userMessage.id ? [userMessage.id] : undefined,
@@ -725,6 +735,7 @@ interface DshMainChatRequest {
   input: string;
   sessionId: string;
   workspaceDir?: string;
+  llm?: AgentRunOptions['llm'];
   attachments: AgentMessageAttachment[];
   controller: AbortController;
   external: ExternalConversationMetadata;
@@ -736,10 +747,12 @@ function normalizeDshMainChatRequest(params: unknown): DshMainChatRequest {
   const directInput = typeof record.input === 'string' ? record.input.trim() : '';
   const input = directInput || dshMainInputText(parts) || 'Message from DSH plugin';
   const external = dshMainExternalMetadata(record);
+  const explicitSessionId = dshMainExplicitSessionId(record, external);
   return {
     input,
-    sessionId: dshMainSessionId(external),
+    sessionId: explicitSessionId ?? dshMainSessionId(external),
     workspaceDir: dshMainWorkspaceDir(typeof record.workspaceDir === 'string' ? record.workspaceDir : undefined),
+    llm: dshMainLlmOverride(record),
     attachments: dshMainAttachments(parts),
     controller: new AbortController(),
     external
@@ -810,7 +823,7 @@ function dshMainAttachments(parts: DshSidecarInputPart[]): AgentMessageAttachmen
       kind: part.type,
       filename: part.name || `${part.type}.${part.mime.split('/').pop() || 'bin'}`,
       mimeType: part.mime,
-      contentBase64: part.data
+      contentBase64: normalizeAttachmentBase64Payload(part.data)
     }];
   });
 }
@@ -828,8 +841,59 @@ function dshMainSessionId(external: ExternalConversationMetadata): string {
   return `im_${provider}_${hash}`;
 }
 
+function dshMainExplicitSessionId(record: Record<string, unknown>, external: ExternalConversationMetadata): string | undefined {
+  const source = typeof record.source === 'string' ? record.source.trim().toLowerCase() : '';
+  const provider = external.provider.trim().toLowerCase();
+  if (source !== 'dsh-subagent' && provider !== 'subagent') return undefined;
+  const candidates = dshMainObjectCandidates(record);
+  const sessionId = firstDshString(candidates, ['sessionId', 'session_id', 'childSessionId', 'child_session_id']);
+  if (!sessionId || /[^a-zA-Z0-9_.-]/.test(sessionId)) return undefined;
+  return sessionId;
+}
+
+function dshMainLlmOverride(record: Record<string, unknown>): AgentRunOptions['llm'] | undefined {
+  const candidates = dshMainObjectCandidates(record);
+  const llmCandidates = [dshMainRecordValue(record.llm), ...candidates];
+  const provider = dshMainProviderKind(firstDshString(llmCandidates, ['provider']));
+  const model = firstDshString(llmCandidates, ['model']);
+  const reasoningEffort = dshMainReasoningEffort(firstDshString(llmCandidates, ['reasoningEffort', 'reasoning_effort']));
+  if (!provider && !model && !reasoningEffort) return undefined;
+  return { provider, model, reasoningEffort };
+}
+
+function dshMainProviderKind(value?: string): ProviderKind | undefined {
+  if (!value) return undefined;
+  const clean = value.trim();
+  const allowed: ProviderKind[] = ['openai', 'openai-compatible', 'vllm', 'deepseek', 'qwen-bailian', 'soildapi', 'minimax', 'kimi', 'anthropic', 'anthropic-compatible', 'ollama', 'mock'];
+  return allowed.includes(clean as ProviderKind) ? clean as ProviderKind : undefined;
+}
+
+function dshMainReasoningEffort(value?: string): ReasoningEffort | undefined {
+  if (!value) return undefined;
+  const clean = value.trim();
+  const allowed: ReasoningEffort[] = ['auto', 'none', 'low', 'medium', 'xhigh'];
+  return allowed.includes(clean as ReasoningEffort) ? clean as ReasoningEffort : undefined;
+}
+
+function dshMainRecordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
 function dshMainExternalMetadata(record: Record<string, unknown>): ExternalConversationMetadata {
   const candidates = dshMainObjectCandidates(record);
+  if (typeof record.source === 'string' && record.source.trim().toLowerCase() === 'dsh-subagent') {
+    const sessionId = firstDshString(candidates, ['sessionId', 'session_id', 'childSessionId', 'child_session_id']);
+    const name = firstDshString(candidates, ['senderName', 'sender_name', 'name', 'agentName', 'agent_name', 'member']) || 'subagent';
+    return {
+      provider: 'subagent',
+      pluginId: firstDshString(candidates, ['pluginId', 'plugin_id']) || 'dsh-agent-teams',
+      scope: 'private',
+      externalConversationId: sessionId || firstDshString(candidates, ['parentSession', 'parentSessionId']) || 'default',
+      senderId: firstDshString(candidates, ['senderId', 'sender_id']) || name,
+      senderName: name,
+      displayName: firstDshString(candidates, ['displayName', 'display_name']) || name
+    };
+  }
   const provider = firstDshString(candidates, ['provider', 'channel', 'channelId', 'platform', 'platformId']) || 'dsh-im';
   const botId = firstDshString(candidates, ['botId', 'bot_id', 'agentId', 'agent_id', 'robotId', 'robot_id']);
   const conversationId = firstDshString(candidates, [
@@ -870,7 +934,7 @@ function dshMainObjectCandidates(value: unknown): Array<Record<string, unknown>>
     seen.add(item);
     const record = item as Record<string, unknown>;
     out.push(record);
-    for (const key of ['raw', 'payload', 'request', 'args', 'message', 'data', 'body', 'event', 'sender', 'conversation']) {
+    for (const key of ['raw', 'payload', 'request', 'args', 'message', 'data', 'body', 'event', 'sender', 'conversation', 'external', 'context', 'llm']) {
       visit(record[key], depth + 1);
     }
   };
@@ -3444,7 +3508,7 @@ function registerIpc(): void {
         completedToolEvents = sidecarResult.toolEvents;
         return sidecarResult;
       }
-      const sync = await context.dshSidecarRuntimeBridge.sync().catch((error) => ({
+      await context.dshSidecarRuntimeBridge.sync().catch((error) => ({
         toolNames: [] as string[],
         error: error instanceof Error ? error.message : String(error)
       }));
@@ -3454,7 +3518,7 @@ function registerIpc(): void {
         sessionId,
         executionMode,
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
-        enabledToolNames: [...new Set([...context.getConfig().enabledToolNames, ...sync.toolNames])],
+        enabledToolNames: context.getConfig().enabledToolNames,
         origin: 'chat',
         signal: controller.signal,
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),

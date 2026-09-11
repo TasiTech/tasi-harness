@@ -288,8 +288,15 @@ describe('SessionStore', () => {
       const fullMessage = store.readMessageContent(session.id, 'm4');
 
       expect(raw).not.toContain('content_parts');
+      expect(raw).not.toContain('displayTimeline');
       expect(full?.messages.find((message) => message.id === 'm4')?.content_parts).toBeUndefined();
+      expect(full?.messages.find((message) => message.id === 'm4')?.displayTimeline).toBeUndefined();
       expect(display?.messages.find((message) => message.id === 'm4')?.content_parts).toEqual(['I will inspect first.']);
+      expect(display?.messages.find((message) => message.id === 'm4')?.displayTimeline).toEqual([
+        { type: 'content', index: 0 },
+        { type: 'tool', toolEventId: 'm3' },
+        { type: 'content', index: 1 }
+      ]);
       expect(fullMessage?.content_parts).toEqual(['I will inspect first.']);
     } finally {
       env.cleanup();

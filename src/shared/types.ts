@@ -29,6 +29,12 @@ export interface ToolCall {
   function: ToolCallFunction;
 }
 
+export type AgentMessageDisplaySection = 'reasoning_content' | 'content';
+export type AgentMessageDisplayItem =
+  | { type: 'reasoning_content'; index?: number }
+  | { type: 'content'; index?: number }
+  | { type: 'tool'; toolEventId?: string };
+
 export interface AgentMessage {
   id?: string;
   role: AgentRole;
@@ -43,6 +49,8 @@ export interface AgentMessage {
   reasoningLength?: number;
   reasoning_parts?: string[];
   content_parts?: string[];
+  displaySectionOrder?: AgentMessageDisplaySection[];
+  displayTimeline?: AgentMessageDisplayItem[];
   name?: string;
   tool_call_id?: string;
   tool_calls?: ToolCall[];
@@ -578,6 +586,11 @@ export interface AgentRunOptions {
   attachments?: AgentMessageAttachment[];
   executionMode?: ExecutionMode;
   workspaceDir?: string;
+  llm?: {
+    provider?: ProviderKind;
+    model?: string;
+    reasoningEffort?: ReasoningEffort;
+  };
   usePersonalKnowledgeBase?: boolean;
   useMemory?: boolean;
   memoryDomains?: MemoryDomain[];
@@ -618,12 +631,14 @@ export interface ToolEvent {
   args: unknown;
   argsOmitted?: boolean;
   argsLength?: number;
+  status?: 'running' | 'completed' | 'failed' | 'cancelled';
   ok: boolean;
   content: string;
   contentOmitted?: boolean;
   contentLength?: number;
   approval?: ToolApprovalRecord;
   createdAt: string;
+  completedAt?: string;
 }
 
 export interface AgentToolEventStream {
@@ -645,6 +660,8 @@ export interface AgentMessageDeltaStream {
   reasoningLength?: number;
   reasoning_parts?: string[];
   content_parts?: string[];
+  displaySectionOrder?: AgentMessageDisplaySection[];
+  displayTimeline?: AgentMessageDisplayItem[];
   createdAt?: string;
 }
 

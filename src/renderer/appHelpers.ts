@@ -1,6 +1,8 @@
 import type {
   AgentArtifactRef,
   AgentMessage,
+  AgentMessageDisplayItem,
+  AgentMessageDisplaySection,
   AgentMessageDeltaStream,
   DshSidecarRuntimePlugin,
   DshSidecarRuntimeStatus,
@@ -194,6 +196,41 @@ function appendPreviewText(current: string | undefined, delta: string | undefine
   return combined.length > maxChars ? combined.slice(-maxChars).trimStart() : combined;
 }
 
+function mergeDisplaySectionOrder(
+  current: AgentMessageDisplaySection[] | undefined,
+  incoming: AgentMessageDisplaySection[] | undefined
+): AgentMessageDisplaySection[] | undefined {
+  if (!current || current.length === 0) return incoming;
+  if (!incoming || incoming.length === 0) return current;
+  const next = [...current];
+  for (const section of incoming) {
+    if (!next.includes(section)) next.push(section);
+  }
+  return next;
+}
+
+function displayTimelineItemKey(item: AgentMessageDisplayItem): string {
+  if (item.type === 'tool') return `tool:${item.toolEventId ?? ''}`;
+  return `${item.type}:${item.index ?? ''}`;
+}
+
+function mergeDisplayTimeline(
+  current: AgentMessageDisplayItem[] | undefined,
+  incoming: AgentMessageDisplayItem[] | undefined
+): AgentMessageDisplayItem[] | undefined {
+  if (!current || current.length === 0) return incoming;
+  if (!incoming || incoming.length === 0) return current;
+  const seen = new Set(current.map(displayTimelineItemKey));
+  const next = [...current];
+  for (const item of incoming) {
+    const key = displayTimelineItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(item);
+  }
+  return next;
+}
+
 export function decodeLikelyPercentEncodedChineseText(content: string): string {
   if (!content.includes('%')) return content;
   let decodedAny = false;
@@ -239,6 +276,8 @@ export function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessag
             reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : messages[coalesceIndex].reasoningLength,
             reasoning_parts: payload.reasoning_parts ?? messages[coalesceIndex].reasoning_parts,
             content_parts: payload.content_parts ?? messages[coalesceIndex].content_parts,
+            displaySectionOrder: mergeDisplaySectionOrder(messages[coalesceIndex].displaySectionOrder, payload.displaySectionOrder),
+            displayTimeline: mergeDisplayTimeline(messages[coalesceIndex].displayTimeline, payload.displayTimeline),
             createdAt: messages[coalesceIndex].createdAt ?? payload.createdAt
           },
           ...messages.slice(coalesceIndex + 1)
@@ -259,6 +298,8 @@ export function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessag
         reasoningLength: payload.reasoningLength,
         reasoning_parts: payload.reasoning_parts,
         content_parts: payload.content_parts,
+        displaySectionOrder: payload.displaySectionOrder,
+        displayTimeline: payload.displayTimeline,
         createdAt: payload.createdAt
       }
     ];
@@ -277,6 +318,8 @@ export function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessag
       reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : (payload.reasoningOmitted === false ? undefined : message.reasoningLength),
       reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
       content_parts: payload.content_parts ?? message.content_parts,
+      displaySectionOrder: mergeDisplaySectionOrder(message.displaySectionOrder, payload.displaySectionOrder),
+      displayTimeline: mergeDisplayTimeline(message.displayTimeline, payload.displayTimeline),
       createdAt: message.createdAt ?? payload.createdAt
     },
     ...messages.slice(existingIndex + 1)

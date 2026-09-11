@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type {
@@ -143,6 +144,7 @@ export class DshCordisHost {
   private readonly services = new Map<string, unknown>();
   private readonly listeners = new Map<string, CordisHandler[]>();
   private readonly disposers: Disposer[] = [];
+  private readonly activeAgents: JsonObject[] = [];
   private moduleLoadCounter = 0;
   private currentPluginId = '';
 
@@ -238,11 +240,18 @@ export class DshCordisHost {
       deferContext() {},
       concludeTurn() {}
     };
+    this.activeAgents.push(agent);
     try {
       const value = await execute.call(registered.raw, params.args ?? {}, exec);
       return normalizeToolResult(value, registered.raw, params.args ?? {});
     } catch (error) {
       return { ok: false, content: errorMessage(error) };
+    } finally {
+      if (this.activeAgents.at(-1) === agent) this.activeAgents.pop();
+      else {
+        const index = this.activeAgents.lastIndexOf(agent);
+        if (index >= 0) this.activeAgents.splice(index, 1);
+      }
     }
   }
 
@@ -295,6 +304,7 @@ export class DshCordisHost {
         }
       };
       try {
+        this.activeAgents.push(agent);
         const value = await command.handler(commandContext, request);
         const content = uniqueText([
           ...replies,
@@ -326,6 +336,12 @@ export class DshCordisHost {
             durationMs: Date.now() - startedAt
           }
         };
+      } finally {
+        if (this.activeAgents.at(-1) === agent) this.activeAgents.pop();
+        else {
+          const index = this.activeAgents.lastIndexOf(agent);
+          if (index >= 0) this.activeAgents.splice(index, 1);
+        }
       }
     }
     const toolNames = [...this.tools.values()]
@@ -1546,6 +1562,8 @@ export class DshCordisHost {
 
   private createSubagentsService(): JsonObject {
     const providers = new Map<string, unknown>();
+    const nativeSpawnProvider = this.createNativeSubagentSpawnProvider();
+    if (nativeSpawnProvider) providers.set('spawn', nativeSpawnProvider);
     const continuableSetups = new Set<CordisHandler>();
     const unavailable = async () => {
       throw new Error('Tasi DSH sidecar loaded the plugin, but no upstream subagent executor is connected to this standalone host yet.');
@@ -1577,8 +1595,90 @@ export class DshCordisHost {
       setups: () => [...continuableSetups],
       startContinuable: unavailable,
       followup: unavailable,
-      spawn: unavailable,
+      spawn: async (...values: unknown[]) => this.spawnNativeSubagent(values),
       interrupt: () => undefined
+    };
+  }
+
+  private createNativeSubagentSpawnProvider(): JsonObject | undefined {
+    if (!this.options.mainRequest) return undefined;
+    const run = async (...values: unknown[]) => this.spawnNativeSubagent(values);
+    return {
+      name: 'spawn',
+      provider: 'spawn',
+      spawn: run,
+      run,
+      start: run,
+      execute: run
+    };
+  }
+
+  private async spawnNativeSubagent(values: unknown[]): Promise<JsonObject> {
+    if (!this.options.mainRequest) {
+      throw new Error('Tasi DSH sidecar loaded the plugin, but no upstream subagent executor is connected to this standalone host yet.');
+    }
+    const raw = values.length <= 1 ? values[0] : { request: values[0], options: values[1], args: values };
+    const candidates = subagentPayloadCandidates(raw);
+    const activeAgent = this.activeAgents.at(-1);
+    const activeAgentOptions = objectValue(activeAgent?.options);
+    const parts = normalizePromptParts(candidates);
+    const name = firstStringField(candidates, ['name', 'agentName', 'agent_name', 'member', 'assignee']) ?? 'subagent';
+    const role = firstStringField(candidates, ['role', 'title', 'persona', 'specialty']);
+    const parentSession = firstStringField(candidates, ['parentSession', 'parentSessionId', 'parent_session', 'parent_session_id'])
+      ?? stringValue(activeAgent?.sessionId)
+      ?? 'dsh-sidecar';
+    const sessionId = firstStringField(candidates, ['sessionId', 'session_id', 'childSessionId', 'child_session_id'])
+      ?? nativeSubagentSessionId(parentSession, name);
+    const input = subagentPromptText(candidates, parts, name, role, parentSession);
+    if (!input.trim()) throw new Error('subagents.spawn requires a prompt, task, description, or input text.');
+    const llm = this.normalizeLlmConfig({
+      provider: firstStringField(candidates, ['provider'])
+        ?? firstStringField(candidates.map((item) => objectValue(item.llm)), ['provider'])
+        ?? stringValue(activeAgentOptions.provider),
+      model: firstStringField(candidates, ['model'])
+        ?? firstStringField(candidates.map((item) => objectValue(item.llm)), ['model'])
+        ?? stringValue(activeAgentOptions.model),
+      reasoningEffort: firstStringField(candidates, ['reasoningEffort', 'reasoning_effort'])
+        ?? firstStringField(candidates.map((item) => objectValue(item.llm)), ['reasoningEffort', 'reasoning_effort'])
+        ?? stringValue(activeAgentOptions.reasoningEffort)
+    });
+    const workspaceDir = firstStringField(candidates, ['workspaceDir', 'workspacePath', 'cwd', 'path', 'workingDirectory'])
+      ?? stringValue(activeAgent?.workspaceDir)
+      ?? resolve(process.cwd());
+    const value = await this.options.mainRequest('main.chat.run', {
+      source: 'dsh-subagent',
+      sessionId,
+      parentSession,
+      workspaceDir,
+      input,
+      parts: parts.length > 0 ? parts : [{ type: 'text', text: input }],
+      provider: llm.provider,
+      model: llm.model,
+      reasoningEffort: llm.reasoningEffort,
+      llm,
+      external: {
+        provider: 'subagent',
+        pluginId: firstStringField(candidates, ['pluginId', 'plugin_id']) ?? 'dsh-agent-teams',
+        scope: 'private',
+        externalConversationId: sessionId,
+        senderId: name,
+        senderName: name,
+        displayName: role ? `${name} (${role})` : name
+      },
+      raw
+    });
+    const result = normalizeMainChatRunResult(value);
+    const content = stringValue(result.content) || stringValue(result.finalResponse);
+    return {
+      ok: true,
+      provider: 'spawn',
+      name,
+      role,
+      sessionId: stringValue(result.sessionId, sessionId),
+      parentSession,
+      content,
+      finalResponse: content,
+      result: result.value ?? value
     };
   }
 
@@ -2530,6 +2630,65 @@ function promptPayloadCandidates(payload: unknown): JsonObject[] {
   };
   visit(payload);
   return candidates;
+}
+
+function subagentPayloadCandidates(payload: unknown): JsonObject[] {
+  const seen = new Set<JsonObject>();
+  const candidates: JsonObject[] = [];
+  const visit = (value: unknown, depth = 0) => {
+    if (depth > 4 || value === null || value === undefined) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    if (!isJsonObject(value) || seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+    for (const key of ['payload', 'request', 'args', 'input', 'message', 'data', 'body', 'task', 'options', 'agent', 'member', 'llm']) {
+      visit(value[key], depth + 1);
+    }
+  };
+  visit(payload);
+  return candidates;
+}
+
+function subagentPromptText(candidates: JsonObject[], parts: DshSidecarInputPart[], name: string, role?: string, parentSession?: string): string {
+  const body = uniqueText([
+    ...candidates.flatMap((item) => [
+      stringValue(item.prompt),
+      stringValue(item.instructions),
+      stringValue(item.input),
+      stringValue(item.text),
+      stringValue(item.content),
+      stringValue(item.description),
+      stringValue(item.task),
+      stringValue(item.goal),
+      stringValue(item.objective),
+      stringValue(item.query)
+    ]),
+    textFromInputParts(parts)
+  ]).join('\n\n').trim();
+  const header = [
+    `You are running as a Tasi subagent spawned by DSH Agent Teams.`,
+    `Subagent: ${name}`,
+    role ? `Role: ${role}` : '',
+    parentSession ? `Parent session: ${parentSession}` : ''
+  ].filter(Boolean).join('\n');
+  return uniqueText([header, body]).join('\n\n').trim();
+}
+
+function nativeSubagentSessionId(parentSession: string, name: string): string {
+  const parent = safeSessionIdSegment(parentSession || 'parent').slice(0, 48);
+  const agent = safeSessionIdSegment(name || 'subagent').slice(0, 32);
+  const hash = createHash('sha256')
+    .update(`${parentSession}\0${name}\0${Date.now()}\0${Math.random()}`)
+    .digest('hex')
+    .slice(0, 8);
+  return `sub_${parent}_${agent}_${hash}`;
+}
+
+function safeSessionIdSegment(value: string): string {
+  return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '') || 'subagent';
 }
 
 function normalizePromptParts(candidates: JsonObject[]): DshSidecarInputPart[] {

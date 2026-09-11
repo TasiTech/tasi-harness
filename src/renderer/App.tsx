@@ -1,11 +1,14 @@
 ﻿import { memo, startTransition, useEffect, useMemo, useRef, useState, type Dispatch, type MouseEvent as ReactMouseEvent, type ReactElement, type SetStateAction } from 'react';
 import type { CSSProperties } from 'react';
+import { useCallback } from 'react';
 import type { ClipboardEvent as ReactClipboardEvent } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { WheelEvent as ReactWheelEvent } from 'react';
 import type {
   AgentMessage,
   AgentArtifactRef,
+  AgentMessageDisplayItem,
+  AgentMessageDisplaySection,
   AgentMessageDeltaStream,
   AgentMessageAttachment,
   ArtifactPreviewResult,
@@ -327,12 +330,15 @@ const defaultConfig: PublicAppConfig = {
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
 const MAX_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const ARTIFACT_PREVIEW_MAX_BYTES = 256 * 1024 * 1024;
-const MESSAGE_DELTA_FLUSH_MS = 33;
-const REASONING_DELTA_FLUSH_MS = 180;
-const UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS = 450;
-const TOOL_EVENT_FLUSH_MS = 220;
-const MAX_LIVE_RENDERED_TOOL_EVENTS = 60;
-const LIVE_CONTENT_ITEM_CHARS = 2_000;
+const MESSAGE_DELTA_FLUSH_MS = 140;
+const REASONING_DELTA_FLUSH_MS = 420;
+const UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS = 650;
+const UI_INTERACTION_RELEASE_SETTLE_MS = 500;
+const UI_INTERACTION_RELEASE_FLUSH_MS = 80;
+const TOOL_EVENT_FLUSH_MS = 320;
+const ANSWER_STARTED_REASONING_DELTA_FLUSH_MS = 2_000;
+const MAX_LIVE_RENDERED_TOOL_EVENTS = 24;
+const LIVE_CONTENT_ITEM_CHARS = 1_200;
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_TOOL_EVENTS: ToolEvent[] = [];
 
@@ -357,6 +363,71 @@ function appendPreviewText(current: string | undefined, delta: string | undefine
   if (typeof delta !== 'string') return current;
   const combined = `${current ?? ''}${delta}`.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   return combined.length > maxChars ? combined.slice(-maxChars).trimStart() : combined;
+}
+
+function mergeDisplaySectionOrder(
+  current: AgentMessageDisplaySection[] | undefined,
+  incoming: AgentMessageDisplaySection[] | undefined
+): AgentMessageDisplaySection[] | undefined {
+  if (!current || current.length === 0) return incoming;
+  if (!incoming || incoming.length === 0) return current;
+  const next = [...current];
+  for (const section of incoming) {
+    if (!next.includes(section)) next.push(section);
+  }
+  return next;
+}
+
+function displayTimelineItemKey(item: AgentMessageDisplayItem): string {
+  if (item.type === 'tool') return `tool:${item.toolEventId ?? ''}`;
+  return `${item.type}:${item.index ?? ''}`;
+}
+
+function mergeDisplayTimeline(
+  current: AgentMessageDisplayItem[] | undefined,
+  incoming: AgentMessageDisplayItem[] | undefined
+): AgentMessageDisplayItem[] | undefined {
+  if (!current || current.length === 0) return incoming;
+  if (!incoming || incoming.length === 0) return current;
+  const seen = new Set(current.map(displayTimelineItemKey));
+  const next = [...current];
+  for (const item of incoming) {
+    const key = displayTimelineItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(item);
+  }
+  return next;
+}
+
+function displaySectionBefore(
+  order: AgentMessageDisplaySection[] | undefined,
+  left: AgentMessageDisplaySection,
+  right: AgentMessageDisplaySection,
+  fallback: boolean
+): boolean {
+  const leftIndex = order?.indexOf(left) ?? -1;
+  const rightIndex = order?.indexOf(right) ?? -1;
+  if (leftIndex < 0 && rightIndex < 0) return fallback;
+  if (leftIndex < 0) return false;
+  if (rightIndex < 0) return true;
+  return leftIndex < rightIndex;
+}
+
+function isUiInteractionTarget(event: Event): boolean {
+  const target = event.target;
+  if (!(target instanceof Node)) return false;
+  return document.getElementById('root')?.contains(target) ?? false;
+}
+
+function mergeToolEvent(events: ToolEvent[], incoming: ToolEvent): ToolEvent[] {
+  const existingIndex = events.findIndex((event) => event.id === incoming.id);
+  if (existingIndex < 0) return [...events, incoming];
+  return [
+    ...events.slice(0, existingIndex),
+    incoming,
+    ...events.slice(existingIndex + 1)
+  ];
 }
 
 const PERCENT_ENCODED_UTF8_RUN = /(?:%[0-9A-Fa-f]{2}){2,}/g;
@@ -407,6 +478,8 @@ function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaS
             reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : messages[coalesceIndex].reasoningLength,
             reasoning_parts: payload.reasoning_parts ?? messages[coalesceIndex].reasoning_parts,
             content_parts: payload.content_parts ?? messages[coalesceIndex].content_parts,
+            displaySectionOrder: mergeDisplaySectionOrder(messages[coalesceIndex].displaySectionOrder, payload.displaySectionOrder),
+            displayTimeline: mergeDisplayTimeline(messages[coalesceIndex].displayTimeline, payload.displayTimeline),
             createdAt: messages[coalesceIndex].createdAt ?? payload.createdAt
           },
           ...messages.slice(coalesceIndex + 1)
@@ -427,6 +500,8 @@ function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaS
         reasoningLength: payload.reasoningLength,
         reasoning_parts: payload.reasoning_parts,
         content_parts: payload.content_parts,
+        displaySectionOrder: payload.displaySectionOrder,
+        displayTimeline: payload.displayTimeline,
         createdAt: payload.createdAt
       }
     ];
@@ -445,6 +520,8 @@ function mergeMessageDelta(messages: AgentMessage[], payload: AgentMessageDeltaS
       reasoningLength: payload.reasoningLength !== undefined ? payload.reasoningLength : (payload.reasoningOmitted === false ? undefined : message.reasoningLength),
       reasoning_parts: payload.reasoning_parts ?? message.reasoning_parts,
       content_parts: payload.content_parts ?? message.content_parts,
+      displaySectionOrder: mergeDisplaySectionOrder(message.displaySectionOrder, payload.displaySectionOrder),
+      displayTimeline: mergeDisplayTimeline(message.displayTimeline, payload.displayTimeline),
       createdAt: message.createdAt ?? payload.createdAt
     },
     ...messages.slice(existingIndex + 1)
@@ -482,6 +559,8 @@ function mergeBufferedMessageDelta(
     reasoningLength: incoming.reasoningLength !== undefined ? incoming.reasoningLength : (incoming.reasoningOmitted === false ? undefined : current.reasoningLength),
     reasoning_parts: incoming.reasoning_parts !== undefined ? incoming.reasoning_parts : current.reasoning_parts,
     content_parts: incoming.content_parts !== undefined ? incoming.content_parts : current.content_parts,
+    displaySectionOrder: mergeDisplaySectionOrder(current.displaySectionOrder, incoming.displaySectionOrder),
+    displayTimeline: mergeDisplayTimeline(current.displayTimeline, incoming.displayTimeline),
     createdAt: current.createdAt ?? incoming.createdAt
   };
 }
@@ -783,6 +862,33 @@ function applyDocumentTheme(config: PublicAppConfig): void {
   applyTextBrightness(config, theme);
 }
 
+function activeThemeSignature(config: Pick<PublicAppConfig, 'theme' | 'textBrightness' | 'textColor' | 'customThemes'>): string {
+  const customId = customThemeId(config.theme);
+  const theme = customId ? (config.customThemes ?? []).find((item) => item.id === customId) : undefined;
+  return JSON.stringify({
+    theme: config.theme || 'dark',
+    textBrightness: config.textBrightness ?? 100,
+    textColor: config.textColor ?? '',
+    customId,
+    tokens: theme?.tokens ?? null,
+    backgroundDataUrl: theme?.backgroundDataUrl ?? '',
+    backgroundFocusX: theme?.backgroundFocusX ?? null,
+    backgroundFocusY: theme?.backgroundFocusY ?? null
+  });
+}
+
+function titleBarThemeSignature(config: Pick<PublicAppConfig, 'theme' | 'textColor' | 'customThemes'>): string {
+  const customId = customThemeId(config.theme);
+  const theme = customId ? (config.customThemes ?? []).find((item) => item.id === customId) : undefined;
+  return JSON.stringify({
+    theme: config.theme || 'dark',
+    textColor: config.textColor ?? '',
+    customId,
+    bgPrimary: theme?.tokens.bgPrimary ?? '',
+    textPrimary: theme?.tokens.textPrimary ?? ''
+  });
+}
+
 function getActiveCustomTheme(config: PublicAppConfig): CustomTheme | undefined {
   const id = customThemeId(config.theme);
   return id ? config.customThemes.find((theme) => theme.id === id) : undefined;
@@ -976,11 +1082,37 @@ function normalizePastedImageFile(file: File, index: number): File {
   });
 }
 
+function clipboardImageFiles(clipboard: DataTransfer): File[] {
+  const imageFiles: File[] = [];
+  const seen = new Set<string>();
+  const addImageFile = (file: File | null) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const key = `${file.type}:${file.size}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    imageFiles.push(normalizePastedImageFile(file, imageFiles.length));
+  };
+
+  for (const item of Array.from(clipboard.items ?? [])) {
+    if (item.kind !== 'file') continue;
+    addImageFile(item.getAsFile());
+  }
+  if (imageFiles.length > 0) return imageFiles;
+  for (const file of Array.from(clipboard.files ?? [])) addImageFile(file);
+  return imageFiles;
+}
+
 function formatBytes(bytes?: number): string {
   const value = Number(bytes ?? 0);
   if (!Number.isFinite(value) || value <= 0) return '';
   if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function attachmentDataUrl(attachment: Pick<AgentMessageAttachment, 'mimeType' | 'contentBase64'>): string {
+  if (!attachment.contentBase64) return '';
+  if (/^data:/i.test(attachment.contentBase64)) return attachment.contentBase64;
+  return `data:${attachment.mimeType};base64,${attachment.contentBase64}`;
 }
 
 function formatCount(value?: number): string {
@@ -1292,6 +1424,8 @@ export function App(): ReactElement {
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_sidebar_collapsed') === '1');
   const [config, setConfig] = useState<PublicAppConfig>(defaultConfig);
   const [themePreviewConfig, setThemePreviewConfig] = useState<PublicAppConfig | null>(null);
+  const appliedDocumentThemeSignatureRef = useRef('');
+  const appliedTitleBarThemeSignatureRef = useRef('');
   const [sessions, refreshSessions] = useAsyncData<SessionSummary[]>(() => window.tasiHarness.sessions.list(), []);
   const [tasks, refreshTasks] = useAsyncData<ScheduledTask[]>(() => window.tasiHarness.tasks.list(), []);
   const [memory, refreshMemory] = useAsyncData<MemoryState>(() => window.tasiHarness.memory.get(), { entries: [], usage: [], domains: [], rendered: '' });
@@ -1341,6 +1475,8 @@ export function App(): ReactElement {
   }, [nav, tr]);
   useEffect(() => {
     void window.tasiHarness.config.get().then((cfg) => {
+      const signature = activeThemeSignature(cfg);
+      appliedDocumentThemeSignatureRef.current = signature;
       setConfig(cfg);
       setExecutionMode(cfg.defaultExecutionMode);
       applyDocumentTheme(cfg);
@@ -1349,11 +1485,18 @@ export function App(): ReactElement {
   }, []);
 
   useEffect(() => {
-    applyDocumentTheme(themePreviewConfig ?? config);
+    const source = themePreviewConfig ?? config;
+    const signature = activeThemeSignature(source);
+    if (appliedDocumentThemeSignatureRef.current === signature) return;
+    appliedDocumentThemeSignatureRef.current = signature;
+    applyDocumentTheme(source);
   }, [config, themePreviewConfig]);
 
   useEffect(() => {
     const source = themePreviewConfig ?? config;
+    const signature = titleBarThemeSignature(source);
+    if (appliedTitleBarThemeSignatureRef.current === signature) return;
+    appliedTitleBarThemeSignatureRef.current = signature;
     void window.tasiHarness.app.setWindowTitleBarTheme({
       theme: source.theme,
       textColor: source.textColor,
@@ -1809,7 +1952,7 @@ function ChatPage(props: {
   const [wechatChipClearedAt, setWechatChipClearedAt] = useState(() => new Date().toISOString());
   const [usePersonalKnowledgeBase, setUsePersonalKnowledgeBase] = useState<boolean>(() => globalThis.localStorage?.getItem('tasi_harness_use_personal_kb') === '1');
   const [toolPanelTab, setToolPanelTab] = useState<'artifacts' | 'browser'>('artifacts');
-  const [toolPanelCollapsed, setToolPanelCollapsed] = useState(false);
+  const [toolPanelCollapsed, setToolPanelCollapsed] = useState(true);
   const [chatSplitPercent, setChatSplitPercent] = useState(33.333);
   const [artifactPreview, setArtifactPreview] = useState<ArtifactPreviewResult | null>(null);
   const [artifactTextSelection, setArtifactTextSelection] = useState<ArtifactTextSelection | null>(null);
@@ -1835,10 +1978,14 @@ function ChatPage(props: {
   const messageDeltaFlushTimerRef = useRef<number | null>(null);
   const messageDeltaFlushDueAtRef = useRef(0);
   const messageDeltaUrgentFlushRef = useRef(false);
+  const messagesRef = useRef(props.messages);
   const messageDeltaWorkerRef = useRef<Worker | null>(null);
   const messageDeltaWorkerSeqRef = useRef(0);
+  const answerStartedReasoningDeltaAtRef = useRef(0);
+  const messageDisplaySectionOrderRef = useRef<Map<string, AgentMessageDisplaySection[]>>(new Map());
   const toolEventBufferRef = useRef<ToolEvent[]>([]);
   const toolEventFlushTimerRef = useRef<number | null>(null);
+  const uiInteractionQuietUntilRef = useRef(0);
   const previousWechatBusyRef = useRef(false);
   const activeSessionIdRef = useRef(props.sessionId);
   const previewDraggingRef = useRef(false);
@@ -1879,9 +2026,12 @@ function ChatPage(props: {
   const chatGridStyle = useMemo(() => ({
     '--chat-history-width': `${chatSplitPercent}%`
   }) as CSSProperties, [chatSplitPercent]);
+  const visibleMessageTraceKey = useMemo(() => (
+    visibleMessages.map((message) => `${message.id}:${message.role}:${message.createdAt ?? ''}`).join('|')
+  ), [visibleMessages]);
   const pendingLiveToolEvents = useMemo(
     () => currentTurnPendingToolEvents(visibleMessages, props.toolEvents, runBusy, MAX_LIVE_RENDERED_TOOL_EVENTS),
-    [visibleMessages, props.toolEvents, runBusy]
+    [visibleMessageTraceKey, props.toolEvents, runBusy]
   );
   const pendingLiveToolEventIds = useMemo(
     () => new Set(pendingLiveToolEvents.map((event) => event.id)),
@@ -1896,7 +2046,7 @@ function ChatPage(props: {
       runBusy,
       MAX_LIVE_RENDERED_TOOL_EVENTS
     ),
-    [visibleMessages, props.toolEvents, runBusy, pendingLiveToolEventIds]
+    [visibleMessageTraceKey, props.toolEvents, runBusy, pendingLiveToolEventIds]
   );
   const wechatSessionAttachments = useMemo(() => {
     if (!isWechatSession) return [];
@@ -2010,6 +2160,10 @@ function ChatPage(props: {
   }, [props.sessionId]);
 
   useEffect(() => {
+    messagesRef.current = props.messages;
+  }, [props.messages]);
+
+  useEffect(() => {
     if (typeof Worker === 'undefined') return;
     let worker: Worker;
     try {
@@ -2036,41 +2190,77 @@ function ChatPage(props: {
   }, []);
 
   useEffect(() => {
-    const markActive = () => {
+    let releaseRafId: number | null = null;
+    const markActive = (event: PointerEvent) => {
+      if (!isUiInteractionTarget(event)) return;
       uiInteractionActiveRef.current = true;
+      if (releaseRafId != null) {
+        window.cancelAnimationFrame(releaseRafId);
+        releaseRafId = null;
+      }
       if (uiInteractionReleaseTimerRef.current != null) {
         window.clearTimeout(uiInteractionReleaseTimerRef.current);
         uiInteractionReleaseTimerRef.current = null;
       }
     };
-    const releaseSoon = () => {
+    const extendInteractionQuietWindow = (event: Event) => {
+      if (!isUiInteractionTarget(event)) return;
+      uiInteractionQuietUntilRef.current = Math.max(
+        uiInteractionQuietUntilRef.current,
+        Date.now() + UI_INTERACTION_RELEASE_SETTLE_MS
+      );
+    };
+    const releaseSoon = (event?: PointerEvent) => {
+      if (event && !isUiInteractionTarget(event)) return;
+      if (!uiInteractionActiveRef.current && uiInteractionReleaseTimerRef.current == null) return;
+      uiInteractionQuietUntilRef.current = Math.max(
+        uiInteractionQuietUntilRef.current,
+        Date.now() + UI_INTERACTION_RELEASE_SETTLE_MS
+      );
       if (uiInteractionReleaseTimerRef.current != null) {
         window.clearTimeout(uiInteractionReleaseTimerRef.current);
       }
       uiInteractionReleaseTimerRef.current = window.setTimeout(() => {
         uiInteractionActiveRef.current = false;
         uiInteractionReleaseTimerRef.current = null;
-        flushMessageDeltas();
-        flushToolEvents();
-      }, UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS);
+        releaseRafId = window.requestAnimationFrame(() => {
+          releaseRafId = null;
+          scheduleMessageDeltaFlush(0, messageDeltaUrgentFlushRef.current);
+          scheduleToolEventFlush(0);
+        });
+      }, UI_INTERACTION_RELEASE_FLUSH_MS);
     };
+    const handleBlur = () => releaseSoon();
 
     window.addEventListener('pointerdown', markActive, true);
     window.addEventListener('pointerup', releaseSoon, true);
     window.addEventListener('pointercancel', releaseSoon, true);
-    window.addEventListener('blur', releaseSoon);
+    window.addEventListener('click', extendInteractionQuietWindow, true);
+    window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('pointerdown', markActive, true);
       window.removeEventListener('pointerup', releaseSoon, true);
       window.removeEventListener('pointercancel', releaseSoon, true);
-      window.removeEventListener('blur', releaseSoon);
+      window.removeEventListener('click', extendInteractionQuietWindow, true);
+      window.removeEventListener('blur', handleBlur);
       if (uiInteractionReleaseTimerRef.current != null) {
         window.clearTimeout(uiInteractionReleaseTimerRef.current);
         uiInteractionReleaseTimerRef.current = null;
       }
+      if (releaseRafId != null) {
+        window.cancelAnimationFrame(releaseRafId);
+        releaseRafId = null;
+      }
       uiInteractionActiveRef.current = false;
+      uiInteractionQuietUntilRef.current = 0;
     };
   }, []);
+
+  function currentUiInteractionDelayMs(): number {
+    const quietDelayMs = Math.max(0, uiInteractionQuietUntilRef.current - Date.now());
+    const activeDelayMs = uiInteractionActiveRef.current ? UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS : 0;
+    return Math.max(activeDelayMs, quietDelayMs);
+  }
 
   function flushMessageDeltas(forceUrgent = false): void {
     if (messageDeltaFlushTimerRef.current != null) {
@@ -2079,14 +2269,15 @@ function ChatPage(props: {
     }
     messageDeltaFlushDueAtRef.current = 0;
     if (previewDraggingRef.current) return;
-    if (uiInteractionActiveRef.current) {
-      scheduleMessageDeltaFlush(UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS, messageDeltaUrgentFlushRef.current || forceUrgent);
+    const interactionDelayMs = currentUiInteractionDelayMs();
+    if (interactionDelayMs > 0) {
+      scheduleMessageDeltaFlush(interactionDelayMs, messageDeltaUrgentFlushRef.current || forceUrgent);
       return;
     }
     const pending = [...messageDeltaBufferRef.current.values()];
     messageDeltaBufferRef.current.clear();
     if (pending.length === 0) return;
-    const urgent = forceUrgent || messageDeltaUrgentFlushRef.current || pending.some((payload) => payload.type === 'content' || payload.type === 'done');
+    const urgent = forceUrgent || messageDeltaUrgentFlushRef.current || pending.some((payload) => payload.type === 'done');
     messageDeltaUrgentFlushRef.current = false;
     const applyDeltas = () => {
       props.setMessages((old) => pending.reduce((next, payload) => mergeMessageDelta(next, payload), old));
@@ -2105,6 +2296,9 @@ function ChatPage(props: {
     }
     messageDeltaFlushDueAtRef.current = 0;
     messageDeltaUrgentFlushRef.current = false;
+    answerStartedReasoningDeltaAtRef.current = 0;
+    uiInteractionQuietUntilRef.current = 0;
+    messageDisplaySectionOrderRef.current.clear();
     messageDeltaBufferRef.current.clear();
   }
 
@@ -2114,15 +2308,16 @@ function ChatPage(props: {
       toolEventFlushTimerRef.current = null;
     }
     if (previewDraggingRef.current) return;
-    if (uiInteractionActiveRef.current) {
-      scheduleToolEventFlush();
+    const interactionDelayMs = currentUiInteractionDelayMs();
+    if (interactionDelayMs > 0) {
+      scheduleToolEventFlush(interactionDelayMs);
       return;
     }
     const pending = toolEventBufferRef.current;
     toolEventBufferRef.current = [];
     if (pending.length === 0) return;
     startTransition(() => {
-      props.setToolEvents((old) => [...old, ...pending]);
+      props.setToolEvents((old) => pending.reduce((next, event) => mergeToolEvent(next, event), old));
     });
   }
 
@@ -2137,7 +2332,7 @@ function ChatPage(props: {
   function scheduleMessageDeltaFlush(delayMs = MESSAGE_DELTA_FLUSH_MS, urgent = false): void {
     if (previewDraggingRef.current) return;
     if (urgent) messageDeltaUrgentFlushRef.current = true;
-    const interactionDelayMs = uiInteractionActiveRef.current ? UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS : 0;
+    const interactionDelayMs = currentUiInteractionDelayMs();
     const nextDelayMs = Math.max(delayMs, interactionDelayMs);
     const nextDueAt = Date.now() + nextDelayMs;
     if (messageDeltaFlushTimerRef.current != null && messageDeltaFlushDueAtRef.current <= nextDueAt) return;
@@ -2152,32 +2347,72 @@ function ChatPage(props: {
   function scheduleToolEventFlush(delayMs = TOOL_EVENT_FLUSH_MS): void {
     if (previewDraggingRef.current) return;
     if (toolEventFlushTimerRef.current != null) return;
-    const interactionDelayMs = uiInteractionActiveRef.current ? UI_INTERACTION_MESSAGE_DELTA_FLUSH_MS : 0;
+    const interactionDelayMs = currentUiInteractionDelayMs();
     const nextDelayMs = Math.max(delayMs, interactionDelayMs);
     toolEventFlushTimerRef.current = window.setTimeout(flushToolEvents, nextDelayMs);
   }
 
   function enqueueToolEvent(event: ToolEvent): void {
-    toolEventBufferRef.current = [...toolEventBufferRef.current, event];
+    toolEventBufferRef.current.push(event);
     scheduleToolEventFlush();
+  }
+
+  function displaySectionOrderForDelta(payload: AgentMessageDeltaStream): AgentMessageDisplaySection[] | undefined {
+    const section = payload.type === 'content' || payload.type === 'reasoning_content' ? payload.type : undefined;
+    const hasVisibleDelta = Boolean(
+      payload.delta?.trim()
+      || (section === 'content' && payload.content?.trim())
+      || (section === 'content' && payload.content_parts?.some((part) => part.trim()))
+      || (section === 'reasoning_content' && payload.reasoning_content?.trim())
+      || (section === 'reasoning_content' && payload.reasoning_parts?.some((part) => part.trim()))
+    );
+    const existingMessageOrder = messagesRef.current.find((message) => message.id === payload.messageId)?.displaySectionOrder;
+    const existingOrder = messageDisplaySectionOrderRef.current.get(payload.messageId) ?? existingMessageOrder ?? [];
+    if (!section || !hasVisibleDelta) return existingOrder.length > 0 ? existingOrder : undefined;
+    if (existingOrder.includes(section)) return existingOrder;
+    const nextOrder = [...existingOrder, section];
+    messageDisplaySectionOrderRef.current.set(payload.messageId, nextOrder);
+    return nextOrder;
   }
 
   function processPreparedMessageDelta(payload: AgentMessageDeltaStream): void {
     if (activeSessionIdRef.current && payload.sessionId !== activeSessionIdRef.current) return;
-    messageDeltaBufferRef.current.set(
-      payload.messageId,
-      mergeBufferedMessageDelta(messageDeltaBufferRef.current.get(payload.messageId), payload)
+    const displaySectionOrder = displaySectionOrderForDelta(payload);
+    const orderedPayload = displaySectionOrder ? { ...payload, displaySectionOrder } : payload;
+    const buffered = messageDeltaBufferRef.current.get(payload.messageId);
+    const existing = messagesRef.current.find((message) => message.id === payload.messageId);
+    const answerStarted = Boolean(
+      existing?.content?.trim()
+      || existing?.content_parts?.some((part) => part.trim())
+      || buffered?.content?.trim()
+      || buffered?.content_parts?.some((part) => part.trim())
+      || (buffered?.type === 'content' && buffered.delta?.trim())
     );
+    const hiddenReasoningOnlyDelta = payload.type === 'reasoning_content'
+      && payload.content === undefined
+      && payload.content_parts === undefined
+      && answerStarted;
+    let deferHiddenReasoningFlush = false;
+    if (hiddenReasoningOnlyDelta) {
+      const now = Date.now();
+      deferHiddenReasoningFlush = now - answerStartedReasoningDeltaAtRef.current < ANSWER_STARTED_REASONING_DELTA_FLUSH_MS;
+      if (!deferHiddenReasoningFlush) answerStartedReasoningDeltaAtRef.current = now;
+    }
+    messageDeltaBufferRef.current.set(
+      orderedPayload.messageId,
+      mergeBufferedMessageDelta(buffered, orderedPayload)
+    );
+    if (deferHiddenReasoningFlush) return;
     if (previewDraggingRef.current) return;
     if (uiInteractionActiveRef.current) {
-      scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, payload.type === 'content');
+      scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, false);
       return;
     }
     if (payload.type === 'done') {
       flushMessageDeltas(true);
       return;
     }
-    scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, payload.type === 'content');
+    scheduleMessageDeltaFlush(payload.type === 'reasoning_content' ? REASONING_DELTA_FLUSH_MS : MESSAGE_DELTA_FLUSH_MS, false);
   }
 
   function enqueueMessageDelta(payload: AgentMessageDeltaStream): void {
@@ -2306,7 +2541,6 @@ function ChatPage(props: {
   }, [latestToolPreviewUrl]);
   useEffect(() => {
     if (!latestBrowserToolEventId || props.config.browserMode !== 'embedded') return;
-    setToolPanelCollapsed(false);
     setToolPanelTab('browser');
   }, [latestBrowserToolEventId, props.config.browserMode]);
   useEffect(() => {
@@ -2358,7 +2592,7 @@ function ChatPage(props: {
       endRef.current?.scrollIntoView({ behavior: runBusy ? 'auto' : 'smooth', block: 'end' });
     });
     return () => window.cancelAnimationFrame(rafId);
-  }, [visibleMessages.length, latestVisibleMessage?.id, latestVisibleMessage?.content, latestVisibleMessage?.reasoning_content, props.toolEvents.length, runBusy, previewDragging]);
+  }, [visibleMessages.length, latestVisibleMessage?.id, props.toolEvents.length, runBusy, previewDragging]);
 	  useEffect(() => {
 	    const off = window.tasiHarness.agent.onToolEvent((payload) => {
 	      if (isExternalImSessionId(payload.sessionId) && props.sessionId !== payload.sessionId) return;
@@ -2847,6 +3081,20 @@ function ChatPage(props: {
     uploadMultimediaInputRef.current.click();
   }
 
+  function openPluginMentionPicker(event?: ReactMouseEvent<HTMLButtonElement>): void {
+    event?.preventDefault();
+    if (liveModeActive ? !liveInputReady : runBusy || !connected) return;
+    const textarea = chatTextareaRef.current;
+    const cursor = textarea?.selectionStart ?? input.length;
+    setPluginMentionTrigger({ start: cursor, end: cursor, query: '' });
+    setPluginMentionActiveIndex(0);
+    setPluginMentionError('');
+    requestAnimationFrame(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(cursor, cursor);
+    });
+  }
+
   async function openWorkspaceDirectory(): Promise<void> {
     const workspaceDir = props.config.workspaceDir.trim();
     if (!workspaceDir) {
@@ -2937,21 +3185,7 @@ function ChatPage(props: {
 
   function handleTextareaPaste(event: ReactClipboardEvent<HTMLTextAreaElement>): void {
     const clipboard = event.clipboardData;
-    const imageFiles: File[] = [];
-    const seen = new Set<string>();
-    const addImageFile = (file: File | null) => {
-      if (!file || !file.type.startsWith('image/')) return;
-      const key = `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      imageFiles.push(normalizePastedImageFile(file, imageFiles.length));
-    };
-
-    for (const item of Array.from(clipboard.items ?? [])) {
-      if (item.kind !== 'file') continue;
-      addImageFile(item.getAsFile());
-    }
-    for (const file of Array.from(clipboard.files ?? [])) addImageFile(file);
+    const imageFiles = clipboardImageFiles(clipboard);
     if (imageFiles.length === 0) return;
 
     const pastedText = clipboard.getData('text/plain');
@@ -2970,6 +3204,17 @@ function ChatPage(props: {
       });
     }
     void addMultimediaAttachments(imageFiles);
+  }
+
+  function handleChatPagePaste(event: ReactClipboardEvent<HTMLElement>): void {
+    if (liveModeActive ? !liveInputReady : runBusy || !connected) return;
+    const target = event.target;
+    if (target instanceof HTMLTextAreaElement || target instanceof HTMLInputElement || (target instanceof HTMLElement && target.isContentEditable)) return;
+    const imageFiles = clipboardImageFiles(event.clipboardData);
+    if (imageFiles.length === 0) return;
+    event.preventDefault();
+    void addMultimediaAttachments(imageFiles);
+    requestAnimationFrame(() => chatTextareaRef.current?.focus());
   }
 
   function removeMultimediaAttachment(id: string | undefined): void {
@@ -3063,12 +3308,17 @@ function ChatPage(props: {
     setLiveRealtimeMessage('');
   }
 
-  function showArtifactPreview(preview: ArtifactPreviewResult): void {
+  const showArtifactPreview = useCallback((preview: ArtifactPreviewResult): void => {
     setArtifactPreview(preview);
     setArtifactTextSelection(null);
     setToolPanelCollapsed(false);
     setToolPanelTab('artifacts');
-  }
+  }, []);
+
+  const closeArtifactPreview = useCallback((): void => {
+    setArtifactPreview(null);
+    setArtifactTextSelection(null);
+  }, []);
 
   function appendArtifactSelectionToComposer(value: string): void {
     const insert = value.trim();
@@ -3125,7 +3375,7 @@ function ChatPage(props: {
   }
 
   return (
-    <section className="page chat-page">
+    <section className="page chat-page" onPaste={handleChatPagePaste}>
       <div className="chat-header">
         <div className="chat-session-title">{props.tr('Assistant Chat', '助手对话')}</div>
         <div className="chat-actions">
@@ -3327,11 +3577,20 @@ function ChatPage(props: {
                       <p>{artifactPreview.artifact.kind} | {formatBytes(artifactPreview.artifact.sizeBytes)}</p>
                     </div>
                     <div className="artifact-side-preview-actions">
-                      <button className="mini-button" onClick={() => void window.tasiHarness.app.openArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
+                      <button type="button" className="artifact-side-preview-action-button" onClick={() => void window.tasiHarness.app.openArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
                         {props.tr('Open', '打开')}
                       </button>
-                      <button className="mini-button" onClick={() => void window.tasiHarness.app.revealArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
+                      <button type="button" className="artifact-side-preview-action-button" onClick={() => void window.tasiHarness.app.revealArtifact({ path: artifactPreview.artifact.path, absPath: artifactPreview.artifact.absPath })}>
                         {props.tr('Folder', '目录')}
+                      </button>
+                      <button
+                        type="button"
+                        className="artifact-side-preview-action-button"
+                        onClick={closeArtifactPreview}
+                        title={props.tr('Close file preview', '关闭文件预览')}
+                        aria-label={props.tr('Close file preview', '关闭文件预览')}
+                      >
+                        {props.tr('Close', '关闭')}
                       </button>
                     </div>
                   </div>
@@ -3497,12 +3756,18 @@ function ChatPage(props: {
             )}
           </div>
           {(multimediaAttachments.length > 0 || visibleWechatSessionAttachments.length > 0) && (
-            <div className="chat-media-row">
+          <div className="chat-media-row">
               {multimediaAttachments.map((attachment) => (
                 <span key={attachment.id} className={`chat-media-chip ${attachment.kind}`} title={attachment.filename}>
-                  <span className="chat-media-kind">{attachment.kind}</span>
-                  <span className="chat-media-name">{attachment.filename}</span>
-                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  {attachment.kind === 'image' && attachment.contentBase64 ? (
+                    <img className="chat-media-thumb" src={attachmentDataUrl(attachment)} alt={attachment.filename} />
+                  ) : (
+                    <span className="chat-media-kind">{attachment.kind}</span>
+                  )}
+                  <span className="chat-media-info">
+                    <span className="chat-media-name">{attachment.filename}</span>
+                    <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  </span>
                   <button
                     className="chat-session-doc-remove"
                     onClick={() => removeMultimediaAttachment(attachment.id)}
@@ -3520,9 +3785,15 @@ function ChatPage(props: {
                   className={`chat-media-chip ${attachment.kind} readonly`}
                   title={attachment.filename}
                 >
-                  <span className="chat-media-kind">{attachment.kind}</span>
-                  <span className="chat-media-name">{attachment.filename}</span>
-                  <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  {attachment.kind === 'image' && attachment.contentBase64 ? (
+                    <img className="chat-media-thumb" src={attachmentDataUrl(attachment)} alt={attachment.filename} />
+                  ) : (
+                    <span className="chat-media-kind">{attachment.kind}</span>
+                  )}
+                  <span className="chat-media-info">
+                    <span className="chat-media-name">{attachment.filename}</span>
+                    <span className="chat-media-size">{formatBytes(attachment.sizeBytes)}</span>
+                  </span>
                   <span className="chat-media-source">{props.tr('WeChat', '微信')}</span>
                 </span>
               ))}
@@ -3653,6 +3924,16 @@ function ChatPage(props: {
                   <circle cx="8.5" cy="8.5" r="1" fill="currentColor" />
                 </svg>
               </button>
+              <button
+                type="button"
+                className="chat-attach-button chat-plugin-mention-button"
+                onMouseDown={(event) => openPluginMentionPicker(event)}
+                disabled={liveModeActive ? !liveInputReady : runBusy || !connected}
+                title={props.tr('Mention plugin', '引用插件')}
+                aria-label={props.tr('Mention plugin', '引用插件')}
+              >
+                @
+              </button>
             </div>
             <button
               className={`send-btn${runBusy ? ' stop' : ''}`}
@@ -3753,6 +4034,39 @@ function isWorkspaceArtifactPath(value: string): boolean {
   return ARTIFACT_EXTENSIONS.has(artifactPathExtension(candidate));
 }
 
+function localFileUrl(value: string | undefined): string {
+  const clean = value?.trim();
+  if (!clean) return '';
+  if (/^file:\/\//i.test(clean)) return clean;
+  if (/^https?:\/\//i.test(clean)) return '';
+  const normalized = clean.replace(/\\/g, '/');
+  const path = normalized.startsWith('/') ? normalized : `/${normalized}`;
+  const encoded = path
+    .split('/')
+    .map((segment, index) => {
+      if (index === 0) return '';
+      return encodeURIComponent(segment).replace(/%3A/gi, ':');
+    })
+    .join('/');
+  return `file://${encoded}`;
+}
+
+function localFileDirectoryUrl(value: string | undefined): string {
+  const fileUrl = localFileUrl(value);
+  if (!fileUrl) return '';
+  const end = fileUrl.lastIndexOf('/');
+  return end >= 0 ? `${fileUrl.slice(0, end + 1)}` : '';
+}
+
+function htmlContentWithBaseHref(content: string, baseHref: string): string {
+  if (!baseHref) return content;
+  const base = `<base href="${baseHref.replace(/"/g, '&quot;')}">`;
+  if (/<base\b/i.test(content)) return content;
+  if (/<head[^>]*>/i.test(content)) return content.replace(/<head([^>]*)>/i, `<head$1>${base}`);
+  if (/<html[^>]*>/i.test(content)) return content.replace(/<html([^>]*)>/i, `<html$1><head>${base}</head>`);
+  return `${base}${content}`;
+}
+
 function isClickableArtifactReference(value: string, artifacts?: AgentArtifactRef[]): boolean {
   return Boolean(findClickedArtifact(value, artifacts)) || isFullArtifactPath(value) || isWorkspaceArtifactPath(value);
 }
@@ -3851,7 +4165,31 @@ function toolEventOneLine(text: string, maxChars = 180): string {
   return `${clean.slice(0, maxChars).trimEnd()}...`;
 }
 
-function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; sessionId?: string; tr: TranslateFn }): ReactElement {
+function toolEventArgObject(args: unknown): Record<string, unknown> {
+  return args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+}
+
+function toolEventCommandText(toolName: string, argsValue: unknown): string {
+  const args = toolEventArgObject(argsValue);
+  const preferred = ['command', 'path', 'url', 'query', 'selector', 'text'];
+  for (const key of preferred) {
+    const value = args[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return toolName;
+}
+
+function toolEventActionLabel(event: ToolEvent, running: boolean, tr: TranslateFn): string {
+  if (event.status === 'running' || (running && !event.status && !event.content.trim())) return tr('Running command', '正在运行命令');
+  if (event.status === 'cancelled') return tr('Command cancelled', '命令已取消');
+  if (!event.ok) return tr('Command failed', '命令运行失败');
+  if (event.status === 'completed') return tr('Command completed', '运行完成');
+  if (event.toolName === 'file_read') return tr('Read file', '已读取文件');
+  if (event.toolName.startsWith('browser_')) return tr('Ran browser command', '运行了浏览器命令');
+  return tr('Ran command', '运行了命令');
+}
+
+function ToolEventCardComponent({ event, sessionId, tr, running = false }: { event: ToolEvent; sessionId?: string; tr: TranslateFn; running?: boolean }): ReactElement {
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullArgs, setFullArgs] = useState<unknown | null>(null);
   const [loading, setLoading] = useState(false);
@@ -3859,6 +4197,9 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
   const content = fullContent ?? event.content;
   const args = fullArgs ?? event.args;
   const argsPreview = useMemo(() => stringifyToolValue(args), [args]);
+  const commandFullText = useMemo(() => toolEventCommandText(event.toolName, args), [args, event.toolName]);
+  const commandText = useMemo(() => toolEventOneLine(commandFullText, 120), [commandFullText]);
+  const actionLabel = toolEventActionLabel(event, running, tr);
   const summaryPreview = useMemo(() => {
     const argsLine = argsPreview && argsPreview !== '{}' ? argsPreview : '';
     const contentLine = content.trim();
@@ -3884,16 +4225,26 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
   return (
     <details className={`tool-event-card ${event.ok ? 'ok' : 'fail'}`} open={!event.ok}>
       <summary className="tool-event-summary">
-        <span className="tool-event-status">{event.ok ? 'OK' : 'ERR'}</span>
-        <strong className="tool-event-name">{event.toolName}</strong>
-        <span className="tool-event-preview">{summaryPreview || tr('No output', '无输出')}</span>
-        <span className="tool-event-time">{prettyDate(event.createdAt)}</span>
+        <span className="tool-event-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="m8 9 3 3-3 3" />
+            <path d="M13 15h3" />
+            <rect x="3" y="4" width="18" height="16" rx="3" />
+          </svg>
+        </span>
+        <span className="tool-event-status">{actionLabel}</span>
+        <span className="tool-event-name">{commandText}</span>
+        <span className="tool-event-chevron" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="m9 6 6 6-6 6" /></svg>
+        </span>
       </summary>
       <div className="tool-event-detail">
+        <div className="tool-event-section-label">{tr('Command', '命令')}</div>
+        <pre className="code-block small">{commandFullText}</pre>
         <div className="tool-event-section-label">{tr('Arguments', '参数')}</div>
         <pre className="code-block small">{argsPreview || '{}'}</pre>
         <div className="tool-event-section-label">{tr('Result', '结果')}</div>
-        <pre className="code-block small">{content}</pre>
+        <pre className="code-block small">{content || summaryPreview || (event.status === 'running' ? tr('Waiting for tool result...', '等待工具返回结果...') : tr('No output', '无输出'))}</pre>
       </div>
       {canLoadFull && (
         <button className="mini-button" disabled={loading} onClick={() => void loadFull()}>
@@ -3907,18 +4258,13 @@ function ToolEventCardComponent({ event, sessionId, tr }: { event: ToolEvent; se
 
 const ToolEventCard = memo(ToolEventCardComponent);
 
-function MessageToolTraceComponent({ events, sessionId, tr }: { events: ToolEvent[]; sessionId?: string; tr: TranslateFn }): ReactElement | null {
+function MessageToolTraceComponent({ events, sessionId, tr, running = false }: { events: ToolEvent[]; sessionId?: string; tr: TranslateFn; running?: boolean }): ReactElement | null {
   if (events.length === 0) return null;
-  const failedCount = events.filter((event) => !event.ok).length;
   return (
     <div className="msg-tool-trace">
-      <div className="msg-tool-trace-head">
-        <span>{tr(`Tool trace (${events.length})`, `工具轨迹（${events.length}）`)}</span>
-        {failedCount > 0 && <strong>{tr(`${failedCount} failed`, `${failedCount} 个失败`)}</strong>}
-      </div>
       <div className="msg-tool-trace-list">
         {events.map((event) => (
-          <ToolEventCard key={event.id} event={event} sessionId={sessionId} tr={tr} />
+          <ToolEventCard key={event.id} event={event} sessionId={sessionId} tr={tr} running={running} />
         ))}
       </div>
     </div>
@@ -3934,9 +4280,8 @@ function InlineToolActivityBubble({ events, sessionId, tr }: { events: ToolEvent
       <div className="msg-avatar">AI</div>
       <div className="msg-bubble-wrap">
         <div className="msg-bubble">
-          <MessageToolTrace events={events} sessionId={sessionId} tr={tr} />
+          <MessageToolTrace events={events} sessionId={sessionId} tr={tr} running />
         </div>
-        <div className="msg-time">{tr('Working', '执行中')}</div>
       </div>
     </div>
   );
@@ -3952,8 +4297,8 @@ function ReasoningListComponent({ content, parts, livePreview, tr }: { content: 
   }, [view.text, livePreview]);
   if (!view.text) return null;
   return (
-    <div className="msg-reasoning">
-      <div className="msg-reasoning-title">{tr('Reasoning', '推理过程')}</div>
+    <div className={`msg-reasoning ${livePreview ? 'live' : 'final'}`}>
+      <div className="msg-reasoning-title">{livePreview ? tr('Thinking', '正在思考') : tr('Thinking content', '思考内容')}</div>
       <div className="msg-reasoning-list" ref={panelRef}>
         {livePreview && view.clippedText && (
           <div className="msg-reasoning-live-note">
@@ -4054,7 +4399,6 @@ function MessageContentListComponent({
   items: explicitItems,
   livePreview,
   tr,
-  title,
   artifacts,
   sessionId,
   onPreviewArtifact
@@ -4063,11 +4407,11 @@ function MessageContentListComponent({
   items?: string[];
   livePreview: boolean;
   tr: TranslateFn;
-  title?: string;
   artifacts?: AgentArtifactRef[];
   sessionId?: string;
   onPreviewArtifact?: (preview: ArtifactPreviewResult) => void;
 }): ReactElement | null {
+  const livePanelRef = useRef<HTMLDivElement | null>(null);
   const liveView = useMemo(
     () => livePreview ? assistantLiveContentPreviewText(content, explicitItems) : undefined,
     [content, explicitItems, livePreview]
@@ -4076,14 +4420,16 @@ function MessageContentListComponent({
     () => livePreview ? undefined : (explicitItems ? assistantContentPartsView(explicitItems) : assistantContentListView(content)),
     [content, explicitItems, livePreview]
   );
+  useEffect(() => {
+    if (!livePreview) return;
+    const panel = livePanelRef.current;
+    if (!panel) return;
+    panel.scrollTo({ top: panel.scrollHeight, behavior: 'auto' });
+  }, [livePreview, liveView?.text]);
   if (livePreview) {
     if (!liveView?.text) return null;
     return (
-      <div className="msg-content-panel live">
-        <div className="msg-content-title">
-          <span>{title ?? tr('Assistant content', '回复内容')}</span>
-          <span>1</span>
-        </div>
+      <div className="msg-content-panel live" ref={livePanelRef}>
         <div className="msg-content-list">
           {liveView.clipped && (
             <div className="msg-content-live-note">
@@ -4101,10 +4447,6 @@ function MessageContentListComponent({
   if (items.length === 0) return null;
   return (
     <div className="msg-content-panel final">
-      <div className="msg-content-title">
-        <span>{title ?? tr('Assistant content', '回复内容')}</span>
-        <span>{items.length}</span>
-      </div>
       <div className="msg-content-list">
         {items.map((item, index) => (
           <div className="msg-content-item" key={`${index}-${item.length}`}>
@@ -4154,32 +4496,21 @@ function assistantExportTitle(content: string): string {
   return firstText.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1').slice(0, 80);
 }
 
-function LegacyMessageBubble({ message }: { message: AgentMessage }): ReactElement {
-  const role = message.role === 'assistant' ? 'ai' : message.role;
-  const content = message.role === 'user' ? decodeLikelyPercentEncodedChineseText(message.content) : message.content;
-  const externalDisplay = message.role === 'user' ? externalMessageDisplay(message.external) : null;
-  const avatar = message.role === 'assistant' ? 'AI' : (externalDisplay?.avatarLabel || 'You');
-  return (
-    <div className={`msg-row ${role}`}>
-      <div className="msg-avatar">{avatar}</div>
-      <div className="msg-bubble-wrap">
-        {externalDisplay && <div className="msg-sender">{externalDisplay.senderLabel}</div>}
-        <div className="msg-bubble">{renderMarkdownContent(content, `msg-${message.id ?? 'x'}`)}</div>
-        <div className="msg-time">{prettyDate(message.createdAt)}</div>
-      </div>
-    </div>
-  );
-}
-
 function MessageAttachmentsComponent({ attachments }: { attachments?: AgentMessageAttachment[] }): ReactElement | null {
   if (!attachments || attachments.length === 0) return null;
   return (
     <div className="msg-attachment-list">
       {attachments.map((attachment, index) => (
         <div key={attachment.id ?? `${attachment.filename}-${index}`} className={`msg-attachment ${attachment.kind}`}>
-          <span className="msg-attachment-kind">{attachment.kind}</span>
-          <span className="msg-attachment-name">{attachment.filename}</span>
-          <span className="msg-attachment-size">{formatBytes(attachment.sizeBytes)}</span>
+          {attachment.kind === 'image' && attachment.contentBase64 ? (
+            <img className="msg-attachment-thumb" src={attachmentDataUrl(attachment)} alt={attachment.filename} />
+          ) : (
+            <span className="msg-attachment-kind">{attachment.kind}</span>
+          )}
+          <span className="msg-attachment-info">
+            <span className="msg-attachment-name">{attachment.filename}</span>
+            <span className="msg-attachment-size">{formatBytes(attachment.sizeBytes)}</span>
+          </span>
         </div>
       ))}
     </div>
@@ -4316,37 +4647,32 @@ function HtmlArtifactPreview(props: {
   content: string;
   onTextSelection?: (selection: ArtifactTextSelection | null) => void;
 }): ReactElement {
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const [loadTick, setLoadTick] = useState(0);
+  const webviewRef = useRef<PreviewWebviewElement | null>(null);
+  const [previewUrl, setPreviewUrl] = useState('');
 
   useEffect(() => {
-    const iframe = iframeRef.current;
-    const doc = iframe?.contentDocument;
-    const win = iframe?.contentWindow;
-    if (!iframe || !doc || !win) return;
-    const capture = () => {
-      window.setTimeout(() => {
-        reportArtifactSelection(props.artifact, win.getSelection(), props.onTextSelection, undefined, iframe.getBoundingClientRect());
-      }, 0);
-    };
-    doc.addEventListener('mouseup', capture);
-    doc.addEventListener('keyup', capture);
-    doc.addEventListener('selectionchange', capture);
+    const fileUrl = localFileUrl(props.artifact.absPath || props.artifact.path);
+    if (fileUrl) {
+      setPreviewUrl(fileUrl);
+      return;
+    }
+    const baseHref = localFileDirectoryUrl(props.artifact.absPath || props.artifact.path);
+    const html = htmlContentWithBaseHref(props.content, baseHref);
+    const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    setPreviewUrl(url);
     return () => {
-      doc.removeEventListener('mouseup', capture);
-      doc.removeEventListener('keyup', capture);
-      doc.removeEventListener('selectionchange', capture);
+      URL.revokeObjectURL(url);
     };
-  }, [loadTick, props.artifact, props.onTextSelection]);
+  }, [props.artifact.absPath, props.artifact.path, props.content]);
 
   return (
-    <iframe
-      ref={iframeRef}
+    <webview
+      ref={webviewRef}
       className="artifact-html-preview"
-      srcDoc={props.content}
-      title={props.artifact.name}
-      sandbox="allow-same-origin allow-scripts"
-      onLoad={() => setLoadTick((value) => value + 1)}
+      src={previewUrl || 'about:blank'}
+      partition={EMBEDDED_BROWSER_PARTITION}
+      webpreferences="zoomFactor=1"
     />
   );
 }
@@ -4692,11 +5018,25 @@ function PdfPreviewContent({ dataBase64, name }: { dataBase64: string; name: str
   return (
     <div className="artifact-pdf-native" aria-label={name}>
       <div className="artifact-office-toolbar">
-        <button className="mini-button" disabled={loading || currentPage <= 1} onClick={() => goToPage(currentPage - 1)}>{'<'}</button>
-        <span>{loading ? 'Loading...' : `${currentPage} / ${pageCount}`}</span>
-        <button className="mini-button" disabled={loading || currentPage >= pageCount} onClick={() => goToPage(currentPage + 1)}>{'>'}</button>
-        <button className="mini-button" disabled={scale <= 0.3} onClick={() => zoomBy(-0.15)}>-</button>
-        <button className="mini-button" disabled={scale >= 2.6} onClick={() => zoomBy(0.15)}>+</button>
+        <button type="button" className="mini-button" disabled={loading || currentPage <= 1} onClick={() => goToPage(currentPage - 1)}>{'‹'}</button>
+        <input
+          className="artifact-office-page-input"
+          type="number"
+          min={1}
+          max={Math.max(1, pageCount)}
+          value={loading ? 1 : currentPage}
+          disabled={loading || pageCount <= 0}
+          aria-label="Page"
+          onChange={(event) => {
+            const nextPage = Number(event.target.value);
+            if (Number.isFinite(nextPage)) goToPage(nextPage);
+          }}
+        />
+        <span className="artifact-office-page-total">/ {loading ? '-' : pageCount}</span>
+        <button type="button" className="mini-button" disabled={loading || currentPage >= pageCount} onClick={() => goToPage(currentPage + 1)}>{'›'}</button>
+        <button type="button" className="mini-button" disabled={scale <= 0.3} onClick={() => zoomBy(-0.15)}>-</button>
+        <span className="artifact-office-zoom-label">{Math.round(scale * 100)}%</span>
+        <button type="button" className="mini-button" disabled={scale >= 2.6} onClick={() => zoomBy(0.15)}>+</button>
       </div>
       {error && <div className="tool-empty">{error}</div>}
       <div className="artifact-pdf-body">
@@ -5275,18 +5615,17 @@ function MessageArtifactsComponent({ artifacts, sessionId, tr, onPreviewArtifact
     <>
       <div className="artifact-list">
         {artifacts.map((artifact) => (
-            <div className="artifact-card" key={artifact.id}>
-              <div className="artifact-main">
+          <div className="artifact-card" key={artifact.id}>
+            <div className="artifact-main">
               <button
                 className="artifact-name-button"
                 disabled={busyId === `preview:${artifact.id}` || busyId === `open:${artifact.id}`}
                 onClick={() => void previewArtifact(artifact)}
-                title={tr('Preview file', '预览文件')}
+                title={artifact.name}
               >
                 {artifact.name}
               </button>
               <span>{artifact.kind} | {formatBytes(artifact.sizeBytes)}</span>
-              <code>{artifact.path}</code>
             </div>
             <div className="artifact-actions">
               {canPreviewArtifact(artifact) && (
@@ -5336,7 +5675,7 @@ function MessageBubbleComponent({
 }): ReactElement {
   const role = message.role === 'assistant' ? 'ai' : message.role;
   const isWechatPending = message.role === 'assistant' && message.content === WECHAT_PENDING_MARKER;
-  const externalDisplay = message.role === 'user' ? externalMessageDisplay(message.external) : null;
+  const externalDisplay = message.role === 'user' && message.external ? externalMessageDisplay(message.external) : null;
   const avatar = message.role === 'assistant' ? 'AI' : (externalDisplay?.avatarLabel || 'You');
   const [fullContent, setFullContent] = useState<string | null>(null);
   const [fullReasoning, setFullReasoning] = useState<string | undefined>();
@@ -5352,14 +5691,14 @@ function MessageBubbleComponent({
     () => message.role === 'assistant' ? contentParts.filter((item) => item.trim()) : EMPTY_STRING_ARRAY,
     [message.role, contentParts]
   );
-  const completedAssistantContent = useMemo(
-    () => message.role === 'assistant' ? completedAssistantItems.join('\n\n') : '',
-    [message.role, completedAssistantItems]
-  );
   const currentLiveAssistantContent = message.role === 'assistant' && shouldUseLiveContentPreview ? content : '';
   const finalAssistantContent = message.role === 'assistant' && !shouldUseLiveContentPreview ? content : '';
   const actionContent = content;
   const isLivePreviewing = shouldUseLiveContentPreview || liveReasoningPreview;
+  const shouldShowReasoning = message.role === 'assistant'
+    && liveReasoningPreview
+    && Boolean(reasoningContent?.trim());
+  const markdownContent = message.role === 'assistant' ? finalAssistantContent : content;
   const citations = useMemo(
     () => {
       if (message.role !== 'assistant' || isLivePreviewing) return [];
@@ -5370,18 +5709,137 @@ function MessageBubbleComponent({
   );
   const renderedMarkdown = useMemo(
     () => {
-      const markdownContent = message.role === 'assistant' ? finalAssistantContent : content;
       return markdownContent.trim() ? renderMarkdownContent(markdownContent, `msg-${message.id ?? 'x'}`, {
         artifacts: message.artifacts,
         sessionId,
         onPreviewArtifact
       }) : null;
     },
-    [content, finalAssistantContent, message.artifacts, message.id, message.role, onPreviewArtifact]
+    [markdownContent, message.artifacts, message.id, onPreviewArtifact, sessionId]
   );
   const [copied, setCopied] = useState(false);
   const [exportBusy, setExportBusy] = useState<'pdf' | 'docx' | null>(null);
-  const canLoadFull = Boolean(sessionId && message.id && !isLivePreviewing && (message.contentOmitted || message.reasoningOmitted) && fullContent === null);
+  const canLoadFull = Boolean(sessionId && message.id && !isLivePreviewing && message.contentOmitted && fullContent === null);
+  const reasoningNode = shouldShowReasoning
+    ? <ReasoningList content={reasoningContent ?? ''} parts={message.reasoning_parts} livePreview={liveReasoningPreview} tr={tr} />
+    : null;
+  const currentContentNode = currentLiveAssistantContent.trim()
+    ? <MessageContentList content={currentLiveAssistantContent} livePreview={true} tr={tr} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
+    : renderedMarkdown;
+  const assistantTimelineNodes = useMemo(() => {
+    if (message.role !== 'assistant') return null;
+    const nodes: ReactElement[] = [];
+    const renderedContentIndexes = new Set<number>();
+    const renderedToolIds = new Set<string>();
+    const toolEventsById = new Map(toolEvents.map((event) => [event.id, event]));
+    let contentCursor = 0;
+    let renderedWholeReasoning = false;
+    const reasoningTimelinePositions = (message.displayTimeline ?? [])
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => item.type === 'reasoning_content');
+    const fallbackReasoningTimelineIndex = reasoningTimelinePositions.at(-1)?.index;
+
+    const renderContentIndex = (index: number, key: string): void => {
+      if (renderedContentIndexes.has(index)) return;
+      if (index < completedAssistantItems.length) {
+        nodes.push(
+          <MessageContentList
+            key={key}
+            content=""
+            items={[completedAssistantItems[index]]}
+            livePreview={false}
+            tr={tr}
+            artifacts={message.artifacts}
+            sessionId={sessionId}
+            onPreviewArtifact={onPreviewArtifact}
+          />
+        );
+        renderedContentIndexes.add(index);
+        return;
+      }
+      if (index === completedAssistantItems.length && currentContentNode) {
+        nodes.push(<div key={key}>{currentContentNode}</div>);
+        renderedContentIndexes.add(index);
+      }
+    };
+
+    const renderToolEvent = (event: ToolEvent | undefined, key: string): void => {
+      if (!event || renderedToolIds.has(event.id)) return;
+      nodes.push(
+        <MessageToolTrace
+          key={key}
+          events={[event]}
+          sessionId={sessionId}
+          tr={tr}
+          running={liveContentPreview || liveReasoningPreview}
+        />
+      );
+      renderedToolIds.add(event.id);
+    };
+
+    const renderReasoning = (timelineIndex: number | undefined, key: string): void => {
+      if (!reasoningNode) return;
+      if (renderedWholeReasoning) return;
+      if (typeof timelineIndex === 'number' && timelineIndex !== fallbackReasoningTimelineIndex) return;
+      nodes.push(<div key={key}>{reasoningNode}</div>);
+      renderedWholeReasoning = true;
+    };
+
+    const timeline = message.displayTimeline ?? [];
+    for (let index = 0; index < timeline.length; index += 1) {
+      const item = timeline[index];
+      if (item.type === 'content') {
+        const contentIndex = typeof item.index === 'number' ? item.index : contentCursor;
+        renderContentIndex(contentIndex, `content-${index}-${contentIndex}`);
+        contentCursor = Math.max(contentCursor, contentIndex + 1);
+      } else if (item.type === 'tool') {
+        const byId = item.toolEventId ? toolEventsById.get(item.toolEventId) : undefined;
+        const nextUnrendered = byId ?? toolEvents.find((event) => !renderedToolIds.has(event.id));
+        renderToolEvent(nextUnrendered, `tool-${index}-${item.toolEventId ?? nextUnrendered?.id ?? 'unknown'}`);
+      } else {
+        renderReasoning(index, `reasoning-${index}-${item.index ?? 'all'}`);
+      }
+    }
+
+    if (timeline.length === 0 && completedAssistantItems.length > 0 && toolEvents.length > 0) {
+      const toolsPerContent = Math.max(1, Math.ceil(toolEvents.length / completedAssistantItems.length));
+      for (let index = 0; index < completedAssistantItems.length; index += 1) {
+        renderContentIndex(index, `fallback-content-${index}`);
+        for (const event of toolEvents.slice(index * toolsPerContent, (index + 1) * toolsPerContent)) {
+          renderToolEvent(event, `fallback-tool-${event.id}`);
+        }
+      }
+    }
+
+    for (let index = 0; index < completedAssistantItems.length; index += 1) {
+      renderContentIndex(index, `remaining-content-${index}`);
+    }
+    for (const event of toolEvents) {
+      renderToolEvent(event, `remaining-tool-${event.id}`);
+    }
+
+    const currentContentIndex = completedAssistantItems.length;
+    const contentFirst = displaySectionBefore(message.displaySectionOrder, 'content', 'reasoning_content', true);
+    if (contentFirst) renderContentIndex(currentContentIndex, 'current-content');
+    renderReasoning(undefined, 'remaining-reasoning');
+    if (!contentFirst) renderContentIndex(currentContentIndex, 'current-content');
+
+    return nodes;
+  }, [
+    completedAssistantItems,
+    currentContentNode,
+    liveContentPreview,
+    liveReasoningPreview,
+    message.artifacts,
+    message.displaySectionOrder,
+    message.displayTimeline,
+    message.role,
+    onPreviewArtifact,
+    reasoningNode,
+    sessionId,
+    toolEvents,
+    tr
+  ]);
 
   useEffect(() => {
     if (!copied) return;
@@ -5458,17 +5916,13 @@ function MessageBubbleComponent({
               <CitationLinkStrip citations={citations} />
               <MessageAttachments attachments={message.attachments} />
               <MessageArtifacts artifacts={message.artifacts} sessionId={sessionId} tr={tr} onPreviewArtifact={onPreviewArtifact} />
-              {message.role === 'assistant' && <MessageToolTrace events={toolEvents} sessionId={sessionId} tr={tr} />}
-              {completedAssistantContent.trim()
-                ? <MessageContentList content={completedAssistantContent} items={completedAssistantItems} livePreview={false} tr={tr} title={tr('Assistant content', '回复内容')} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
-                : null}
-              {message.role === 'assistant' && reasoningContent?.trim()
-                ? <ReasoningList content={reasoningContent} parts={message.reasoning_parts} livePreview={liveReasoningPreview} tr={tr} />
-                : null}
-              {currentLiveAssistantContent.trim()
-                ? <MessageContentList content={currentLiveAssistantContent} livePreview={true} tr={tr} title={tr('Current reply', '当前回复')} artifacts={message.artifacts} sessionId={sessionId} onPreviewArtifact={onPreviewArtifact} />
-                : null}
-              {renderedMarkdown}
+              {message.role === 'assistant' ? (
+                <div className="msg-assistant-stack">
+                  {assistantTimelineNodes}
+                </div>
+              ) : (
+                renderedMarkdown
+              )}
               {canLoadFull && (
                 <button className="mini-button" disabled={loadingFull} onClick={() => void loadFullContent()}>
                   {loadingFull ? '...' : tr('Load full message', '加载完整消息')}

@@ -67,12 +67,12 @@ export class DshSidecarRuntimeBridge {
         const tool = this.createProxyTool(definition);
         this.disposers.set(definition.function.name, this.toolRegistry.register(tool));
       }
-      this.syncEnabledToolNames(previousNames, tools.map((tool) => tool.function.name));
+      this.pruneEnabledRuntimeToolNames(previousNames, tools.map((tool) => tool.function.name));
       this.lastError = '';
       return { toolNames: tools.map((tool) => tool.function.name) };
     } catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
-      this.syncEnabledToolNames(previousNames, []);
+      this.pruneEnabledRuntimeToolNames(previousNames, []);
       this.skillManager?.setRuntimeSkills([]);
       return { toolNames: [], error: this.lastError };
     }
@@ -103,16 +103,13 @@ export class DshSidecarRuntimeBridge {
     };
   }
 
-  private syncEnabledToolNames(previousNames: Set<string>, nextNames: string[]): void {
-    const nextNameSet = new Set(nextNames);
+  private pruneEnabledRuntimeToolNames(previousNames: Set<string>, nextNames: string[]): void {
+    const runtimeNames = new Set([...previousNames, ...nextNames]);
+    if (runtimeNames.size === 0) return;
     const current = this.configStore.get().enabledToolNames;
-    const retained = current.filter((name) => !previousNames.has(name) || nextNameSet.has(name));
-    const merged = [...retained];
-    for (const name of nextNames) {
-      if (!merged.includes(name)) merged.push(name);
-    }
-    if (merged.length !== current.length || merged.some((name, index) => current[index] !== name)) {
-      this.configStore.update({ enabledToolNames: merged });
+    const retained = current.filter((name) => !runtimeNames.has(name));
+    if (retained.length !== current.length) {
+      this.configStore.update({ enabledToolNames: retained });
     }
   }
 }

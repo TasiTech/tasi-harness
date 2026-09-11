@@ -1,4 +1,4 @@
-import type { AgentArtifactRef, AgentMessage, AgentMessageDeltaStream, AgentRunOptions, AgentRunResult, AppConfig, DshSidecarRuntimePlugin, DshSidecarRuntimeStatus, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolEvent } from '../../shared/types.js';
+import type { AgentArtifactRef, AgentMessage, AgentMessageDeltaStream, AgentMessageDisplayItem, AgentRunOptions, AgentRunResult, AppConfig, DshSidecarRuntimePlugin, DshSidecarRuntimeStatus, LlmCompletion, LlmRequestMetadata, SessionRecord, ToolApprovalRequester, ToolCall, ToolEvent } from '../../shared/types.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import JSZip from 'jszip';
@@ -60,6 +60,11 @@ const STREAM_SNAPSHOT_PERSIST_MS = 2000;
 const STREAM_SNAPSHOT_PERSIST_CHARS = 4096;
 const RECOVERABLE_LLM_INTERRUPTION_PATTERN = /Invalid LLM (?:JSON )?stream event|LLM stream response did not include a readable body|fetch failed|terminated|socket hang up|ECONNRESET|EPIPE|UND_ERR|network/i;
 const ITERATION_LIMIT_MESSAGE_PATTERN = /^\u672c\u8f6e\u5df2\u8fbe\u5230\u6700\u5927(?:\u6a21\u578b\u8fed\u4ee3\u8f6e\u6b21|\u6267\u884c\u6b65\u6570)\uff08\d+\uff09\uff0c\u6211\u5148\u505c\u5728\u8fd9\u91cc\uff0c\u907f\u514d\u7ee7\u7eed\u6d88\u8017\u65e0\u6548(?:\u8bf7\u6c42|\u6b65\u9aa4)\u3002/;
+const TEXTUAL_TOOL_CALL_MARKERS = [
+  'Assistant requested tool calls:',
+  'Historical assistant tool-use record (not a current tool-call request):'
+] as const;
+const TEXTUAL_TOOL_CALL_REPAIR_LIMIT = 2;
 
 interface SkillDeliveryValidation {
   ok: boolean;
@@ -88,6 +93,129 @@ function parseToolArgs(raw: string): unknown {
   } catch {
     return { raw };
   }
+}
+
+function repairJsonStringMarkdownEscapes(raw: string): string {
+  const jsonEscapes = new Set(['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u']);
+  const markdownEscapes = new Set(['_', '*', '`', '[', ']', '(', ')', '#', '+', '-', '.', '!', '{', '}']);
+  let output = '';
+  let inString = false;
+  for (let index = 0; index < raw.length;) {
+    const char = raw[index];
+    if (char === '"') {
+      output += char;
+      inString = !inString;
+      index += 1;
+      continue;
+    }
+    if (!inString || char !== '\\') {
+      output += char;
+      index += 1;
+      continue;
+    }
+
+    let end = index;
+    while (raw[end] === '\\') end += 1;
+    const count = end - index;
+    const next = raw[end];
+    if (!next) {
+      output += '\\'.repeat(count);
+      index = end;
+      continue;
+    }
+    if (jsonEscapes.has(next)) {
+      output += '\\'.repeat(count);
+      if (next === '"' && count % 2 === 0) {
+        index = end;
+      } else {
+        output += next;
+        index = end + 1;
+      }
+      continue;
+    }
+
+    const literalBackslashes = markdownEscapes.has(next)
+      ? Math.floor(count / 2)
+      : Math.max(1, Math.floor(count / 2));
+    output += '\\\\'.repeat(literalBackslashes);
+    output += next;
+    index = end + 1;
+  }
+  return output;
+}
+
+function parseToolCallArgsObject(raw: string): Record<string, unknown> | null {
+  const candidates = [
+    raw.trim(),
+    raw.trim().replace(/\\"/g, '"'),
+    repairJsonStringMarkdownEscapes(raw.trim()),
+    repairJsonStringMarkdownEscapes(raw.trim().replace(/\\"/g, '"'))
+  ];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as Record<string, unknown>;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return null;
+}
+
+function findTextualToolCallMarker(content: string): { index: number; marker: string } | null {
+  let best: { index: number; marker: string } | null = null;
+  for (const marker of TEXTUAL_TOOL_CALL_MARKERS) {
+    const index = content.indexOf(marker);
+    if (index < 0) continue;
+    if (!best || index < best.index) best = { index, marker };
+  }
+  return best;
+}
+
+function parseTextualToolCallRequest(
+  content: string,
+  availableToolNames: Set<string>
+): { content: string; toolCalls: ToolCall[] } | null {
+  const marker = findTextualToolCallMarker(content);
+  if (!marker) return null;
+  const before = content.slice(0, marker.index).trimEnd();
+  const after = content.slice(marker.index + marker.marker.length);
+  const lines = after.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const toolCalls: ToolCall[] = [];
+
+  for (const line of lines) {
+    const match = /^[-*]\s*([A-Za-z0-9_.\\-]+)\s*:\s*(\{.*\})\s*$/.exec(line);
+    if (!match) return null;
+    const name = (match[1] ?? '').replace(/\\_/g, '_');
+    if (!availableToolNames.has(name)) return null;
+    const args = parseToolCallArgsObject(match[2] ?? '');
+    if (!args) return null;
+    toolCalls.push({
+      id: createId('toolcall'),
+      type: 'function',
+      function: {
+        name,
+        arguments: stableStringify(args)
+      }
+    });
+  }
+
+  return toolCalls.length > 0 ? { content: before, toolCalls } : null;
+}
+
+function contentBeforeTextualToolCallMarker(content: string): string {
+  const marker = findTextualToolCallMarker(content);
+  return marker ? content.slice(0, marker.index).trimEnd() : content;
+}
+
+function textualToolCallRepairPrompt(content: string): string {
+  return [
+    'Your previous response contained a literal text block that looked like tool calls, but it could not be executed as tool calls.',
+    'Retry this step now using actual structured tool_calls from the available tools. Do not write the tool-call list as visible text.',
+    '',
+    'Previous malformed tool-call block:',
+    compactBlock(content, 4000)
+  ].join('\n');
 }
 
 function stableStringify(value: unknown): string {
@@ -153,6 +281,16 @@ function toolArgsRecord(args: unknown): Record<string, unknown> {
 function stringArgValue(args: Record<string, unknown>, name: string): string {
   const value = args[name];
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function applyLlmOverride(config: AppConfig, override: AgentRunOptions['llm']): AppConfig {
+  if (!override) return config;
+  return {
+    ...config,
+    provider: override.provider ?? config.provider,
+    model: override.model?.trim() || config.model,
+    reasoningEffort: override.reasoningEffort ?? config.reasoningEffort
+  };
 }
 
 function isDocumentArtifactPath(path: string, documentIntent: boolean): boolean {
@@ -707,16 +845,27 @@ function repeatedReasoningDiagnostic(detection: ReasoningLoopDetection): string 
   ].join('\n');
 }
 
-function reasoningOverrunDiagnostic(reasoning: string, reason: 'without-content' | 'total-limit'): string {
+function reasoningOverrunDiagnostic(reasoning: string, reason: 'without-content' | 'total-limit', toolEvents: ToolEvent[] = []): string {
   const lineCount = normalizeReasoningLines(reasoning).length;
   const lead = reason === 'without-content'
     ? 'Stopped because the model produced a long reasoning stream without any visible answer or tool call.'
     : 'Stopped because the model reasoning exceeded the safety limit for one run.';
-  return [
+  const lines = [
     lead,
     `Reasoning length: ${reasoning.length} chars, ${lineCount} non-empty lines.`,
     'This usually means the model is stuck planning instead of making progress. Try continuing with a narrower next step, or use a tool/file-backed workflow for the blocking operation.'
-  ].join('\n');
+  ];
+  const recentEvents = toolEvents.slice(-5);
+  if (recentEvents.length > 0) {
+    lines.push('', 'Recent completed tool context:');
+    for (const event of recentEvents) {
+      const status = event.ok ? 'ok' : 'failed';
+      const detail = compactToolText(event.content, 220);
+      lines.push(`- ${event.toolName}: ${status}${detail ? `: ${detail}` : ''}`);
+    }
+    lines.push('', 'Suggested next step: continue from the last completed tool result and perform one concrete tool-backed action, such as writing or running a focused script, instead of re-planning the whole task.');
+  }
+  return lines.join('\n');
 }
 
 function reasoningOverrunReason(reasoning: string, visibleContent: string): 'without-content' | 'total-limit' | null {
@@ -817,11 +966,33 @@ function splitReasoningParts(content: string): string[] {
   return sentenceItems.length > 0 ? sentenceItems : [normalized];
 }
 
+function displayTimelineItemKey(item: AgentMessageDisplayItem): string {
+  if (item.type === 'tool') return `tool:${item.toolEventId ?? ''}`;
+  return `${item.type}:${item.index ?? ''}`;
+}
+
+function mergeDisplayTimeline(
+  current: AgentMessageDisplayItem[] | undefined,
+  incoming: AgentMessageDisplayItem[] | undefined
+): AgentMessageDisplayItem[] | undefined {
+  if (!current || current.length === 0) return incoming;
+  if (!incoming || incoming.length === 0) return current;
+  const seen = new Set(current.map(displayTimelineItemKey));
+  const next = [...current];
+  for (const item of incoming) {
+    const key = displayTimelineItemKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    next.push(item);
+  }
+  return next;
+}
+
 export class AgentLoop {
   constructor(
     private readonly deps: {
       getConfig: () => AppConfig;
-      createClient: () => LlmClient;
+      createClient: (config: AppConfig) => LlmClient;
       toolRegistry: ToolRegistry;
       sessions: SessionStore;
       promptBuilder: PromptBuilder;
@@ -836,7 +1007,7 @@ export class AgentLoop {
 
   async run(options: AgentLoopRuntimeOptions): Promise<AgentRunResult> {
     throwIfAborted(options.signal);
-    const cfg = this.deps.getConfig();
+    const cfg = applyLlmOverride(this.deps.getConfig(), options.llm);
     const memoryEnabled = options.useMemory !== false;
     const skillsEnabled = options.useSkills !== false;
     const requestId = createId('run');
@@ -880,7 +1051,7 @@ export class AgentLoop {
       const requestMetadata: LlmRequestMetadata = { session: session.id };
       if (options.turnType !== undefined) requestMetadata.turn_type = options.turnType;
       if (options.sessionDone !== undefined) requestMetadata.session_done = options.sessionDone;
-      const client = this.deps.createClient();
+      const client = this.deps.createClient(cfg);
       const configuredToolNames = options.enabledToolNames ?? cfg.enabledToolNames;
       const enabledToolNames = [...new Set([...configuredToolNames, ...pluginMentions.enabledToolNames])].filter((name) => {
         if (!memoryEnabled && name === 'memory') return false;
@@ -907,7 +1078,9 @@ export class AgentLoop {
       let latestIterationReasoning = '';
       let latestIterationReasoningParts: string[] = [];
       const visibleContentParts: string[] = [];
+      const visibleDisplayTimeline: AgentMessageDisplayItem[] = [];
       let reasoningOnlyContinuationCount = 0;
+      let textualToolCallRepairCount = 0;
       let lastStreamPersistedAt = 0;
       let lastStreamPersistedLength = 0;
       let lastToolResultSignature = '';
@@ -918,6 +1091,15 @@ export class AgentLoop {
 
       const joinReasoning = (parts: string[]): string => parts.map((part) => part.trim()).filter(Boolean).join('\n');
       const joinReasoningParts = (parts: string[]): string[] => parts.map((part) => part.trim()).filter(Boolean);
+      const appendDisplayTimelineItem = (item: AgentMessageDisplayItem): void => {
+        const exists = visibleDisplayTimeline.some((existing) => {
+          if (existing.type !== item.type) return false;
+          if (item.type === 'tool') return existing.type === 'tool' && existing.toolEventId === item.toolEventId;
+          if (item.type === 'content') return existing.type === 'content' && existing.index === item.index;
+          return existing.type === 'reasoning_content' && existing.index === item.index;
+        });
+        if (!exists) visibleDisplayTimeline.push(item);
+      };
       const persistMessages = (messagesToPersist: AgentMessage[], events: ToolEvent[] = []): SessionRecord => {
         updatedSession = this.deps.sessions.upsertMessages(session.id, messagesToPersist, events, execution);
         options.onSessionUpdated?.(updatedSession);
@@ -936,6 +1118,7 @@ export class AgentLoop {
           content,
           reasoning_content: persistedReasoning,
           content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
+          displayTimeline: visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined,
           createdAt
         }]);
       };
@@ -952,6 +1135,7 @@ export class AgentLoop {
             reasoning_content: reasoning,
             reasoning_parts: reasoningParts,
             content_parts: contentParts.length > 0 ? [...contentParts] : undefined,
+            displayTimeline: visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined,
             createdAt: visibleAssistantCreatedAt
           })
         });
@@ -989,6 +1173,7 @@ export class AgentLoop {
           reasoning_content: incoming.reasoning_content !== undefined ? incoming.reasoning_content : current.reasoning_content,
           reasoning_parts: incoming.reasoning_parts !== undefined ? incoming.reasoning_parts : current.reasoning_parts,
           content_parts: incoming.content_parts !== undefined ? incoming.content_parts : current.content_parts,
+          displayTimeline: mergeDisplayTimeline(current.displayTimeline, incoming.displayTimeline),
           createdAt: current.createdAt ?? incoming.createdAt
         };
       };
@@ -1064,6 +1249,8 @@ export class AgentLoop {
         throwIfAborted(options.signal);
         const streamPersistId = createId('msg');
         const streamPersistCreatedAt = nowIso();
+        let currentContentTimelineIndex: number | undefined;
+        let currentReasoningTimelineIndex: number | undefined;
         lastStreamPersistedAt = 0;
         lastStreamPersistedLength = 0;
         let streamedContent = '';
@@ -1081,6 +1268,7 @@ export class AgentLoop {
             reasoning_content: '',
             reasoning_parts: [],
             content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            displayTimeline: visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined,
             createdAt: visibleAssistantCreatedAt
           }, true);
         }
@@ -1093,11 +1281,15 @@ export class AgentLoop {
           completion = canStream
             ? await streamComplete!({ messages, tools, temperature: cfg.temperature, metadata: iterationRequestMetadata, signal: options.signal }, (delta) => {
               if (delta.reasoning_content) {
+                if (currentReasoningTimelineIndex === undefined) {
+                  currentReasoningTimelineIndex = accumulatedReasoningParts.length;
+                  appendDisplayTimelineItem({ type: 'reasoning_content', index: currentReasoningTimelineIndex });
+                }
                 streamedReasoning += delta.reasoning_content;
                 const reasoningLoop = detectRepeatedReasoningLoop([accumulatedReasoning, streamedReasoning].filter(Boolean).join('\n'));
                 if (reasoningLoop) throw new ReasoningLoopAbort(repeatedReasoningDiagnostic(reasoningLoop));
                 const overrunReason = reasoningOverrunReason(streamedReasoning, streamedContent);
-                if (overrunReason) throw new ReasoningLoopAbort(reasoningOverrunDiagnostic(streamedReasoning, overrunReason));
+                if (overrunReason) throw new ReasoningLoopAbort(reasoningOverrunDiagnostic(streamedReasoning, overrunReason, toolEvents));
                 emitMessageDelta({
                   sessionId: session.id,
                   messageId: visibleAssistantId,
@@ -1108,11 +1300,16 @@ export class AgentLoop {
                   reasoningLength: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS ? streamedReasoning.length : undefined,
                   contentOmitted: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS,
                   contentLength: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS ? streamedContent.length : undefined,
+                  displayTimeline: [...visibleDisplayTimeline],
                   createdAt: visibleAssistantCreatedAt
                 });
                 persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, streamedReasoning || undefined, false, visibleContentParts);
               }
               if (delta.content) {
+                if (currentContentTimelineIndex === undefined) {
+                  currentContentTimelineIndex = visibleContentParts.length;
+                  appendDisplayTimelineItem({ type: 'content', index: currentContentTimelineIndex });
+                }
                 streamedContent += delta.content;
                 emitMessageDelta({
                   sessionId: session.id,
@@ -1124,6 +1321,7 @@ export class AgentLoop {
                   contentLength: streamedContent.length > CONTENT_STREAM_PREVIEW_CHARS ? streamedContent.length : undefined,
                   reasoningOmitted: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS,
                   reasoningLength: streamedReasoning.length > REASONING_STREAM_PREVIEW_CHARS ? streamedReasoning.length : undefined,
+                  displayTimeline: [...visibleDisplayTimeline],
                   createdAt: visibleAssistantCreatedAt
                 });
                 persistStreamSnapshot(streamPersistId, streamPersistCreatedAt, streamedContent, streamedReasoning || undefined, false, visibleContentParts);
@@ -1170,6 +1368,7 @@ export class AgentLoop {
             reasoning_content: '',
             reasoning_parts: [],
             content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            displayTimeline: visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined,
             createdAt: visibleAssistantCreatedAt
           }, true);
           completion = await client.complete({
@@ -1182,9 +1381,51 @@ export class AgentLoop {
             signal: options.signal
           });
         }
-        const toolCalls = completion.message.tool_calls ?? [];
+        const structuredToolCalls = completion.message.tool_calls ?? [];
+        const availableToolNames = new Set(tools.map((tool) => tool.function.name));
+        const textualToolRequest = structuredToolCalls.length === 0
+          ? parseTextualToolCallRequest(completion.message.content ?? '', availableToolNames)
+          : null;
+        const malformedTextualToolRequest = structuredToolCalls.length === 0
+          && textualToolRequest === null
+          && findTextualToolCallMarker(completion.message.content ?? '') !== null;
+        if (malformedTextualToolRequest && textualToolCallRepairCount < TEXTUAL_TOOL_CALL_REPAIR_LIMIT) {
+          textualToolCallRepairCount += 1;
+          const visiblePrefix = contentBeforeTextualToolCallMarker(completion.message.content ?? '');
+          if (visiblePrefix.trim()) {
+            currentContentTimelineIndex = visibleContentParts.length;
+            appendDisplayTimelineItem({ type: 'content', index: currentContentTimelineIndex });
+            visibleContentParts.push(visiblePrefix.trim());
+          }
+          const hiddenAssistant: AgentMessage = {
+            ...completion.message,
+            id: streamPersistId,
+            role: 'assistant',
+            hidden: true,
+            content: visiblePrefix,
+            content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+            displayTimeline: visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined,
+            createdAt: streamPersistCreatedAt
+          };
+          const repairMessage: AgentMessage = {
+            id: createId('msg'),
+            role: 'user',
+            hidden: true,
+            content: textualToolCallRepairPrompt(completion.message.content ?? ''),
+            createdAt: nowIso()
+          };
+          messages.push(hiddenAssistant, repairMessage);
+          persistMessages([hiddenAssistant, repairMessage]);
+          finalResponse = '';
+          stopReason = undefined;
+          continue;
+        }
+        const completionMessage = textualToolRequest
+          ? { ...completion.message, content: textualToolRequest.content, tool_calls: textualToolRequest.toolCalls }
+          : completion.message;
+        const toolCalls = completionMessage.tool_calls ?? [];
         const assistant = {
-          ...completion.message,
+          ...completionMessage,
           id: streamPersistId,
           createdAt: streamPersistCreatedAt
         };
@@ -1193,7 +1434,7 @@ export class AgentLoop {
         if (reasoningOverrun) {
           usage = completion.usage ?? usage;
           log_probs = completion.log_probs ?? log_probs;
-          finalResponse = reasoningOverrunDiagnostic(currentReasoning, reasoningOverrun);
+          finalResponse = reasoningOverrunDiagnostic(currentReasoning, reasoningOverrun, toolEvents);
           stopReason = 'reasoning-loop';
           const diagnosticMessage: AgentMessage = {
             id: streamPersistId,
@@ -1229,6 +1470,14 @@ export class AgentLoop {
           if (canStream) emitDoneDelta(finalResponse, visibleReasoning.text, visibleReasoning.parts, visibleContentParts);
           break;
         }
+        if (currentReasoning.trim() && currentReasoningTimelineIndex === undefined) {
+          currentReasoningTimelineIndex = accumulatedReasoningParts.length;
+          appendDisplayTimelineItem({ type: 'reasoning_content', index: currentReasoningTimelineIndex });
+        }
+        if ((assistant.content ?? '').trim() && currentContentTimelineIndex === undefined) {
+          currentContentTimelineIndex = visibleContentParts.length;
+          appendDisplayTimelineItem({ type: 'content', index: currentContentTimelineIndex });
+        }
         if (currentReasoning.trim()) {
           const currentParts = splitReasoningParts(currentReasoning);
           latestIterationReasoningParts = currentParts;
@@ -1243,6 +1492,7 @@ export class AgentLoop {
           delete assistant.reasoning_content;
           delete assistant.reasoning_parts;
         }
+        assistant.displayTimeline = visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined;
         usage = completion.usage ?? usage;
         log_probs = completion.log_probs ?? log_probs;
         messages.push(assistant);
@@ -1268,6 +1518,11 @@ export class AgentLoop {
           if (stopReason === 'empty') {
             finalResponse = emptyAssistantResponse();
             assistant.content = finalResponse;
+            if (currentContentTimelineIndex === undefined) {
+              currentContentTimelineIndex = visibleContentParts.length;
+              appendDisplayTimelineItem({ type: 'content', index: currentContentTimelineIndex });
+              assistant.displayTimeline = [...visibleDisplayTimeline];
+            }
           }
           assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
           if (assistant.hidden !== true) {
@@ -1311,11 +1566,38 @@ export class AgentLoop {
           visibleContentParts.push(assistant.content.trim());
         }
         assistant.content_parts = visibleContentParts.length > 0 ? [...visibleContentParts] : undefined;
+        assistant.displayTimeline = visibleDisplayTimeline.length > 0 ? [...visibleDisplayTimeline] : undefined;
         persistMessages([sessionVisibleAssistantMessage(assistant, toolCalls.length)]);
 
         for (const call of toolCalls) {
           throwIfAborted(options.signal);
           const args = parseToolArgs(call.function.arguments);
+          const eventId = createId('toolevent');
+          const startedAt = nowIso();
+          const runningEvent: ToolEvent = {
+            id: eventId,
+            toolName: call.function.name,
+            args,
+            status: 'running',
+            ok: true,
+            content: '',
+            createdAt: startedAt
+          };
+          appendDisplayTimelineItem({ type: 'tool', toolEventId: eventId });
+          if (canStream) {
+            emitMessageDelta({
+              sessionId: session.id,
+              messageId: visibleAssistantId,
+              role: 'assistant',
+              type: 'content',
+              delta: '',
+              content: '',
+              content_parts: visibleContentParts.length > 0 ? [...visibleContentParts] : undefined,
+              displayTimeline: [...visibleDisplayTimeline],
+              createdAt: visibleAssistantCreatedAt
+            }, true);
+          }
+          options.onToolEvent?.(session.id, runningEvent);
           const result = await this.deps.toolRegistry.execute(call.function.name, args, {
             sessionId: session.id,
             workspaceDir: execution.workspaceDir,
@@ -1323,18 +1605,21 @@ export class AgentLoop {
             safetyApproval: this.deps.getConfig().safetyApproval,
             requestToolApproval: options.requestToolApproval
           });
-          throwIfAborted(options.signal);
+          const abortedAfterExecution = options.signal?.aborted === true;
           const event: ToolEvent = {
-            id: createId('toolevent'),
+            id: eventId,
             toolName: call.function.name,
             args,
-            ok: result.ok,
+            status: abortedAfterExecution ? 'cancelled' : result.ok ? 'completed' : 'failed',
+            ok: abortedAfterExecution ? false : result.ok,
             content: result.content,
             approval: result.approval,
-            createdAt: nowIso()
+            createdAt: startedAt,
+            completedAt: nowIso()
           };
           toolEvents.push(event);
           options.onToolEvent?.(session.id, event);
+          throwIfAborted(options.signal);
           const toolMessage: AgentMessage = {
             id: createId('msg'),
             role: 'tool',

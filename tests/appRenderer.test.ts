@@ -274,6 +274,58 @@ describe('externalMessageDisplay', () => {
 });
 
 describe('mergeMessageDelta', () => {
+  it('preserves streamed assistant display section order', () => {
+    const withContentFirst = mergeMessageDelta([], {
+      sessionId: 'session_test',
+      messageId: 'msg_streamed',
+      role: 'assistant',
+      type: 'content',
+      delta: 'Answer first.',
+      displaySectionOrder: ['content'],
+      createdAt: '2026-09-02T09:17:55.000Z'
+    });
+    const withReasoningNext = mergeMessageDelta(withContentFirst, {
+      sessionId: 'session_test',
+      messageId: 'msg_streamed',
+      role: 'assistant',
+      type: 'reasoning_content',
+      delta: 'Then thinking.',
+      displaySectionOrder: ['content', 'reasoning_content'],
+      createdAt: '2026-09-02T09:17:55.000Z'
+    });
+
+    expect(withReasoningNext[0]?.displaySectionOrder).toEqual(['content', 'reasoning_content']);
+  });
+
+  it('merges streamed assistant timeline entries instead of replacing earlier entries', () => {
+    const withContentFirst = mergeMessageDelta([], {
+      sessionId: 'session_test',
+      messageId: 'msg_streamed',
+      role: 'assistant',
+      type: 'content',
+      delta: 'Visible update.',
+      displaySectionOrder: ['content'],
+      displayTimeline: [{ type: 'content', index: 0 }],
+      createdAt: '2026-09-02T09:17:55.000Z'
+    });
+    const withReasoningNext = mergeMessageDelta(withContentFirst, {
+      sessionId: 'session_test',
+      messageId: 'msg_streamed',
+      role: 'assistant',
+      type: 'reasoning_content',
+      delta: 'Later reasoning.',
+      displaySectionOrder: ['reasoning_content'],
+      displayTimeline: [{ type: 'reasoning_content', index: 0 }],
+      createdAt: '2026-09-02T09:17:55.000Z'
+    });
+
+    expect(withReasoningNext[0]?.displaySectionOrder).toEqual(['content', 'reasoning_content']);
+    expect(withReasoningNext[0]?.displayTimeline).toEqual([
+      { type: 'content', index: 0 },
+      { type: 'reasoning_content', index: 0 }
+    ]);
+  });
+
   it('coalesces a late done delta with the final persisted assistant message', () => {
     const messages = mergeMessageDelta([
       {
