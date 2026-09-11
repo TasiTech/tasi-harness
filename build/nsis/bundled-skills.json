@@ -1,6 +1,11 @@
 {
-  "generatedAt": "2026-08-04T06:47:07.068Z",
+  "generatedAt": "2026-09-11T06:18:34.085Z",
   "skills": [
+    {
+      "name": "article-writer",
+      "folder": "article-writer",
+      "category": "document-processing"
+    },
     {
       "name": "chart-generator",
       "folder": "chart-generator",
@@ -20,11 +25,6 @@
       "name": "diagram-generator-1.1.1",
       "folder": "diagram-generator-1.1.1",
       "category": "local"
-    },
-    {
-      "name": "document",
-      "folder": "document",
-      "category": "work"
     },
     {
       "name": "docx",
@@ -47,14 +47,54 @@
       "category": "productivity"
     },
     {
+      "name": "ponytail",
+      "folder": "ponytail",
+      "category": "developer"
+    },
+    {
+      "name": "ponytail-audit",
+      "folder": "ponytail-audit",
+      "category": "developer"
+    },
+    {
+      "name": "ponytail-debt",
+      "folder": "ponytail-debt",
+      "category": "developer"
+    },
+    {
+      "name": "ponytail-gain",
+      "folder": "ponytail-gain",
+      "category": "developer"
+    },
+    {
+      "name": "ponytail-help",
+      "folder": "ponytail-help",
+      "category": "developer"
+    },
+    {
+      "name": "ponytail-review",
+      "folder": "ponytail-review",
+      "category": "developer"
+    },
+    {
       "name": "pptx",
       "folder": "pptx",
       "category": "work"
     },
     {
+      "name": "review-agent",
+      "folder": "review-agent",
+      "category": "developer"
+    },
+    {
       "name": "skill-creator",
       "folder": "skill-creator-0.1.0",
       "category": "skill"
+    },
+    {
+      "name": "solution-writer",
+      "folder": "solution-writer",
+      "category": "work"
     },
     {
       "name": "tasi-browser-automation",

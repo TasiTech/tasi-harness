@@ -120,7 +120,7 @@ function usesOpenAIRealtimeProtocol(config: AppConfig): boolean {
 function liveToolSchema(): Record<string, unknown> {
   return {
     name: 'create_live_task',
-    description: 'Create a background AgentLoop task for complex, slow, tool-using, file/code/browser/research, or explicitly delegated work. Do not use this for greetings, casual chat, or simple questions.',
+    description: 'Create a background AgentLoop task for lookup/query/search/weather/current-info requests, complex or slow work, tool-using work, file/code/browser/research work, or explicitly delegated work. Do not use this for greetings, casual chat, or simple non-lookup questions.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -168,14 +168,16 @@ function buildSessionUpdate(config: AppConfig, req: LiveRealtimeStartRequest): L
     'You are the realtime voice front end for Tasi Harness live_agent mode.',
     'You handle full duplex voice conversation: listen to user speech, answer with short spoken responses, and keep the conversation moving naturally.',
     'Use create_live_task to hand difficult work to the background Harness AgentLoop task queue.',
-    'After creating a background task, briefly tell the user it has been queued and continue the conversation.',
+    'After creating a background task, do not produce a separate queued/submitted acknowledgement. The app shows task status; wait for the task-completion event before summarizing results.',
     [
       '## Live Task Queue Policy',
       '- The user system prompt / agent instruction is authoritative for deciding whether a request should become a background task.',
       '- Call create_live_task when the system prompt says this class of request should be queued or delegated.',
+      '- Call create_live_task for query-style requests, including "look up", "search", "check", "find", weather, prices, schedules, current information, web facts, data lookup, and their Chinese equivalents such as 查一下、查询、搜索、找一下、天气、价格、实时信息.',
       '- Also call create_live_task when the request is clearly complex, slow, multi-step, requires tools/files/code/browser actions/research, or can run independently in the background.',
-      '- If the current request is simple enough for realtime chat, answer directly in the live conversation.',
-      '- Do not create background tasks for greetings, casual conversation, or simple questions unless the system prompt explicitly requires it.'
+      '- When a create_live_task function result says the task is queued, stay silent instead of saying that the task was submitted.',
+      '- If the current request is simple enough for realtime chat and is not a query/lookup/search/current-info request, answer directly in the live conversation.',
+      '- Do not create background tasks for greetings, casual conversation, or simple non-lookup questions unless the system prompt explicitly requires it.'
     ].join('\n')
   ].filter(Boolean).join('\n\n');
 

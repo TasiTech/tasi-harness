@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
@@ -402,9 +402,24 @@ trap cleanup EXIT
 PAYLOAD_START=$((PAYLOAD_LINE + 1))
 tail -n +"$PAYLOAD_START" "$0" | tar -xzf - -C "$WORK_DIR"
 
-APP_SOURCE="$WORK_DIR/linux-unpacked"
+find_payload_app_source() {
+  local matches=()
+  if [[ -d "$WORK_DIR/linux-unpacked" ]]; then
+    printf '%s\n' "$WORK_DIR/linux-unpacked"
+    return 0
+  fi
+  shopt -s nullglob
+  matches=("$WORK_DIR"/linux-*-unpacked)
+  shopt -u nullglob
+  if [[ "\${#matches[@]}" -eq 1 && -d "\${matches[0]}" ]]; then
+    printf '%s\n' "\${matches[0]}"
+  fi
+  return 0
+}
+
+APP_SOURCE="$(find_payload_app_source)"
 if [[ ! -d "$APP_SOURCE" ]]; then
-  echo "Installer payload is missing linux-unpacked." >&2
+  echo "Installer payload is missing a linux unpacked app directory." >&2
   exit 1
 fi
 
@@ -439,11 +454,28 @@ function artifactSafeName(value) {
   return String(value).trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'app';
 }
 
+function findLinuxUnpackedPath() {
+  if (existsSync(linuxUnpackedPath)) return linuxUnpackedPath;
+  if (!existsSync(releaseDir)) {
+    throw new Error(`Expected Linux unpacked app was not produced. Release directory does not exist: ${releaseDir}`);
+  }
+  const candidates = readdirSync(releaseDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^linux(?:-[a-z0-9]+)?-unpacked$/i.test(entry.name))
+    .map((entry) => join(releaseDir, entry.name))
+    .sort();
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length > 1) {
+    const currentArchPath = join(releaseDir, `linux-${archLabel()}-unpacked`);
+    if (candidates.includes(currentArchPath)) return currentArchPath;
+    throw new Error(`Expected one Linux unpacked app directory, found: ${candidates.join(', ')}`);
+  }
+  throw new Error(`Expected Linux unpacked app was not produced. Looked for ${linuxUnpackedPath} or linux-*-unpacked in ${releaseDir}`);
+}
+
 function createLinuxBinInstaller(targets) {
   if (!targets.ubuntuBin) return;
-  if (!existsSync(linuxUnpackedPath)) {
-    throw new Error(`Expected Linux unpacked app was not produced: ${linuxUnpackedPath}`);
-  }
+  const linuxUnpackedSourcePath = findLinuxUnpackedPath();
+  const linuxUnpackedSourceName = basename(linuxUnpackedSourcePath);
 
   const productName = String(packageMetadata.build?.productName ?? packageMetadata.productName ?? packageMetadata.name ?? 'Tasi Harness');
   const appId = 'tasi-harness';
@@ -451,7 +483,7 @@ function createLinuxBinInstaller(targets) {
   const artifactName = `${artifactSafeName(productName)}-${version}-${archLabel()}.bin`;
   const installerPath = join(releaseDir, artifactName);
   const payloadPath = join(releaseDir, '.tasi-harness-linux-bin-payload.tar.gz');
-  ensureSuccess(run('tar', ['-czf', payloadPath, '-C', releaseDir, 'linux-unpacked'], 'Creating Ubuntu/Linux .bin payload'), 'Creating Ubuntu/Linux .bin payload');
+  ensureSuccess(run('tar', ['-czf', payloadPath, '-C', releaseDir, linuxUnpackedSourceName], 'Creating Ubuntu/Linux .bin payload'), 'Creating Ubuntu/Linux .bin payload');
 
   const stub = createLinuxBinInstallerStub({ productName, appId, version });
   const payloadLine = (stub.match(/\n/g) ?? []).length;

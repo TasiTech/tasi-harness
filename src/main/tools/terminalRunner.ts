@@ -54,6 +54,12 @@ export interface TerminalRunOptions {
   allowShellTools: boolean;
 }
 
+export function isUnsafeWindowsMultilinePythonCommand(command: string, platform = process.platform): boolean {
+  if (platform !== 'win32') return false;
+  if (!/\r?\n/.test(command)) return false;
+  return /^\s*(?:py(?:\.exe)?(?:\s+-\d+(?:\.\d+)?)?|python(?:\d+(?:\.\d+)?)?(?:\.exe)?)\s+-c\s*["']/i.test(command.trim());
+}
+
 export async function runTerminalCommand(options: TerminalRunOptions): Promise<ToolExecutionResult> {
   const command = options.command.trim();
   if (!command) return { ok: false, content: 'Command cannot be empty.' };
@@ -65,6 +71,16 @@ export async function runTerminalCommand(options: TerminalRunOptions): Promise<T
   }
   if (classifyTerminalCommandSafety(command).blocked) {
     return { ok: false, content: 'Blocked dangerous command pattern.' };
+  }
+  if (isUnsafeWindowsMultilinePythonCommand(command)) {
+    return {
+      ok: false,
+      content: [
+        'Blocked multiline python -c on Windows.',
+        'Windows shell parsing can treat literal newlines in an inline Python command as command boundaries, which may run an empty script and report only exit=0.',
+        'Write the Python code to a .py file and run it, or make the python -c script a single line.'
+      ].join('\n')
+    };
   }
 
   return new Promise((resolve) => {

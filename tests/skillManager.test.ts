@@ -50,8 +50,11 @@ describe('SkillManager', () => {
     expect(doc.displayCategory).toBe('旅行');
     expect(doc.content).toContain('display_name: 携程旅行');
     expect(doc.content).toContain('display_category: 旅行');
-    expect(manager.renderPromptIndex()).toContain('携程旅行 (ctrip-travel)');
-    expect(manager.renderPromptIndex()).toContain('旅行 (travel)');
+    const promptIndex = manager.renderPromptIndex();
+    expect(promptIndex).toContain('携程旅行 (ctrip-travel)');
+    expect(promptIndex).toContain('旅行 (travel)');
+    expect(promptIndex).not.toContain('skill_file=');
+    expect(promptIndex).not.toContain('skill_dir=');
   });
 
   it('lists and reads saved browser coach recordings', () => {

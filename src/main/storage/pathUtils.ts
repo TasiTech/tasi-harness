@@ -27,6 +27,7 @@ export function defaultConfig(): AppConfig {
     omniBaseUrl: omniProviderDefaultBaseUrl('openai'),
     omniApiKey: '',
     omniModel: omniProviderDefaultModel('openai'),
+    reasoningEffort: 'auto',
     temperature: 0.3,
     maxIterations: 200,
     sessionDocumentMaxDocs: 10,
@@ -47,6 +48,7 @@ export function defaultConfig(): AppConfig {
     browserExecutionLoggingEnabled: false,
     theme: 'dark',
     textBrightness: 100,
+    textColor: '',
     customThemes: [],
     systemPersona:
       'You are Tasi Harness, a desktop AI agent. Be practical, tool-aware, careful with local files, and ask for clarification only when necessary.',

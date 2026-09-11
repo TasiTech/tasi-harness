@@ -14,6 +14,68 @@ afterEach(() => {
 });
 
 describe('MarketplaceManager', () => {
+  it('loads SkillHub skills from the current JSON API instead of the retired builders browse page', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+
+    const resourcesRoot = join(env.home, 'resources');
+    mkdirSync(join(resourcesRoot, 'markets'), { recursive: true });
+    writeFileSync(join(resourcesRoot, 'markets', 'skillhub.json'), JSON.stringify({ market: { id: 'skillhub' }, skills: [] }), 'utf8');
+
+    const skillManager = new SkillManager(env.home);
+    const sources: SkillMarketplaceSource[] = [{
+      id: 'skillhub',
+      name: 'SkillHub',
+      description: 'SkillHub source',
+      catalogUrl: 'https://skillhub.builders/browse',
+      enabled: true
+    }];
+    const manager = new MarketplaceManager(resourcesRoot, skillManager, () => sources);
+
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const urlText = String(url);
+      if (urlText.startsWith('https://api.skillhub.cn/api/skills?')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: {
+            skills: [{
+              category: 'data-analysis',
+              description: 'Generate charts from data.',
+              description_zh: 'Generate charts from data.',
+              downloads: 237210,
+              installs: 8,
+              name: 'smart-charts',
+              namespace: {
+                handle: 'user_5b28ea14',
+                publicSlug: 'smart-charts'
+              },
+              slug: 'smart-charts',
+              stars: 61,
+              subCategories: [{ key: 'data-visualization', name: 'data visualization' }],
+              version: '8.1.0'
+            }],
+            total: 1
+          },
+          message: 'success'
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response('', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+    const result = await manager.browse('charts');
+
+    expect(result.skills[0]).toMatchObject({
+      id: 'user_5b28ea14/smart-charts',
+      sourceId: 'skillhub',
+      name: 'smart-charts',
+      category: 'data-analysis',
+      version: '8.1.0',
+      homepage: 'https://skillhub.cn/user_5b28ea14/smart-charts',
+      installCommand: 'npx skillhub-install install user_5b28ea14/smart-charts'
+    });
+    expect(fetchMock.mock.calls.some((call) => String(call[0]).includes('skillhub.builders'))).toBe(false);
+  });
   it('expands Chinese aliases so 小红书 can find xiaohongshu skills', async () => {
     const env = tempHome();
     cleanup = env.cleanup;

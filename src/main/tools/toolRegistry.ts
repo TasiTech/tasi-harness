@@ -113,10 +113,17 @@ function approvalFromTerminal(args: unknown): ApprovalCandidate | null {
 export class ToolRegistry {
   private readonly tools = new Map<string, RegisteredTool>();
 
-  register(tool: RegisteredTool): void {
+  register(tool: RegisteredTool): () => void {
     const name = tool.definition.function.name;
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(name)) throw new Error(`Invalid tool name: ${name}`);
     this.tools.set(name, tool);
+    return () => {
+      if (this.tools.get(name) === tool) this.tools.delete(name);
+    };
+  }
+
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
   }
 
   definitions(enabledNames?: string[]): ToolDefinition[] {

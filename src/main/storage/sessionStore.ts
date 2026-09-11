@@ -1,11 +1,15 @@
-import { existsSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   AgentExecutionDetails,
   AgentMessage,
+  AgentMessageDisplayItem,
   LlmUsage,
   MemoryDomain,
   SearchResult,
+  SessionHistoryCategory,
+  SessionListPageRequest,
+  SessionListPageResult,
   SessionOptimizationContextRequest,
   SessionOptimizationContextResult,
   SessionRecord,
@@ -26,19 +30,39 @@ const DISPLAY_TOOL_CONTENT_CHARS = 6000;
 const DISPLAY_REASONING_CHARS = 4000;
 const DISPLAY_ATTACHMENT_BASE64_CHARS = 0;
 const DISPLAY_ARGS_CHARS = 2000;
+const CONTENT_PARTS_CACHE_LIMIT = 200;
+const SESSION_HISTORY_PAGE_SIZE = 24;
+const SESSION_HISTORY_MAX_PAGE_SIZE = 100;
 const FAILURE_SIGNAL_PATTERN = /\b(error|failed?|failure|exception|timeout|timed out|denied|refused|exceeded|too large|not found)\b|失败|错误|异常|超时|超过|拒绝|找不到/i;
 const IMPORTANT_TOOL_PATTERN = /^(browser_|skill_|file_|terminal$|session_search$)/;
 
+interface SessionSummaryIndexEntry extends SessionSummary {
+  fileMtimeMs: number;
+  fileSize: number;
+}
+
+interface SessionSummaryIndex {
+  version: 1;
+  sessions: Record<string, SessionSummaryIndexEntry>;
+}
+
 export class SessionStore {
   private readonly dir: string;
+  private readonly indexFile: string;
   private readonly maxSystemPromptHistory = 1;
+  private readonly contentPartsCache = new Map<string, {
+    signature: string;
+    partsByMessageId: Map<string, string[]>;
+    timelineByMessageId: Map<string, AgentMessageDisplayItem[]>;
+  }>();
 
   constructor(harnessHome: string) {
     this.dir = join(harnessHome, 'sessions');
+    this.indexFile = join(harnessHome, 'sessions-index.json');
     ensureDir(this.dir);
   }
 
-  create(title = 'New session', id?: string): SessionRecord {
+  create(title = 'New session', id?: string, metadata?: Pick<SessionRecord, 'origin' | 'external'>): SessionRecord {
     const ts = nowIso();
     const record: SessionRecord = {
       id: id !== undefined ? this.ensureValidProvidedId(id) : createId('session'),
@@ -47,6 +71,8 @@ export class SessionStore {
       updatedAt: ts,
       messageCount: 0,
       domain: 'other',
+      origin: metadata?.origin ?? 'desktop',
+      external: metadata?.external,
       systemPromptHistory: [],
       messages: [],
       toolEvents: [],
@@ -73,12 +99,14 @@ export class SessionStore {
     record.lastExecution = record.lastExecution ?? { mode: 'workspace', workspaceDir: '' };
     record.lastUsage = record.lastUsage ?? undefined;
     record.totalUsage = record.totalUsage ?? undefined;
+    record.origin = record.origin ?? (record.id.startsWith('im_') || record.id.startsWith('dsh-im-') ? 'external-im' : 'desktop');
     return record;
   }
 
   readForDisplay(id: string): SessionRecord | null {
     const record = this.read(id);
     if (!record) return null;
+    const contentDisplay = this.contentDisplayForRecord(record);
     return {
       ...record,
       systemPrompt: record.systemPrompt ? this.clipText(record.systemPrompt, DISPLAY_MESSAGE_CHARS) : undefined,
@@ -86,18 +114,26 @@ export class SessionStore {
         ...item,
         prompt: this.clipText(item.prompt, DISPLAY_MESSAGE_CHARS)
       })),
-      messages: record.messages.map((message) => this.compactMessageForDisplay(message)),
+      messages: record.messages
+        .filter((message) => message.hidden !== true)
+        .map((message) => this.compactMessageForDisplay(
+          message,
+          contentDisplay.partsByMessageId.get(message.id ?? ''),
+          contentDisplay.timelineByMessageId.get(message.id ?? '')
+        )),
       toolEvents: record.toolEvents.map((event) => this.compactToolEventForDisplay(event))
     };
   }
 
-  readMessageContent(sessionId: string, messageId: string): { content: string; reasoning_content?: string; attachments?: AgentMessage['attachments'] } | null {
+  readMessageContent(sessionId: string, messageId: string): { content: string; reasoning_content?: string; content_parts?: string[]; attachments?: AgentMessage['attachments'] } | null {
     const record = this.read(sessionId);
     const message = record?.messages.find((item) => item.id === messageId);
     if (!message) return null;
+    const contentParts = record ? this.contentDisplayForRecord(record).partsByMessageId.get(messageId) : undefined;
     return {
       content: message.content,
       reasoning_content: message.reasoning_content,
+      content_parts: contentParts ?? message.content_parts,
       attachments: message.attachments
     };
   }
@@ -112,14 +148,36 @@ export class SessionStore {
     };
   }
 
+  toolEventForDisplay(event: ToolEvent): ToolEvent {
+    return this.compactToolEventForDisplay(event);
+  }
+
   list(): SessionSummary[] {
-    return readdirSync(this.dir)
-      .filter((name) => name.endsWith('.json'))
-      .map((name) => this.read(name.slice(0, -5)))
-      .filter((record): record is SessionRecord => Boolean(record))
-      .filter((record) => !this.isHiddenSession(record.id))
-      .map((record) => this.summary(record))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return this.indexedSummaries();
+  }
+
+  listPage(req: SessionListPageRequest = {}): SessionListPageResult {
+    const pageSize = this.clampInt(req.pageSize, SESSION_HISTORY_PAGE_SIZE, 1, SESSION_HISTORY_MAX_PAGE_SIZE);
+    const requestedPage = this.clampInt(req.page, 1, 1, Number.MAX_SAFE_INTEGER);
+    const query = req.query?.trim().toLowerCase() ?? '';
+    const category = req.category ?? 'all';
+    const summaries = this.indexedSummaries();
+    const categoryCounts = this.sessionCategoryCounts(summaries, req.wechatSessionId);
+    const filtered = summaries.filter((summary) => (
+      this.sessionMatchesCategory(summary, category, req.wechatSessionId)
+      && (!query || summary.title.toLowerCase().includes(query))
+    ));
+    const total = filtered.length;
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(requestedPage, totalPages);
+    return {
+      sessions: filtered.slice((page - 1) * pageSize, page * pageSize),
+      page,
+      pageSize,
+      total,
+      totalPages,
+      categoryCounts
+    };
   }
 
   appendMessages(id: string, messages: AgentMessage[], toolEvents: ToolEvent[] = [], execution?: AgentExecutionDetails): SessionRecord {
@@ -201,6 +259,7 @@ export class SessionStore {
     const file = this.fileFor(id);
     if (!existsSync(file)) return false;
     unlinkSync(file);
+    this.removeIndexSummary(id);
     return true;
   }
 
@@ -211,10 +270,11 @@ export class SessionStore {
     for (const summary of this.list()) {
       const record = this.read(summary.id);
       if (!record) continue;
-      const corpus = `${record.title}\n${record.messages.map((m) => m.content).join('\n')}`.toLowerCase();
+      const searchableMessages = record.messages.filter((message) => message.role !== 'assistant' || message.hidden !== true);
+      const corpus = `${record.title}\n${searchableMessages.map((m) => m.content).join('\n')}`.toLowerCase();
       const score = terms.reduce((sum, term) => sum + (corpus.includes(term) ? 1 : 0), 0);
       if (score > 0) {
-        const highlights = record.messages
+        const highlights = searchableMessages
           .map((m) => m.content)
           .filter((text) => terms.some((term) => text.toLowerCase().includes(term)))
           .slice(0, 3)
@@ -286,6 +346,7 @@ export class SessionStore {
     delete persisted.messageCount;
     delete persisted.toolEvents;
     writeFileSync(this.fileFor(record.id), `${JSON.stringify(persisted, null, 2)}\n`, 'utf8');
+    this.upsertIndexSummary(redactedRecord);
   }
 
   private writeMessages(
@@ -315,7 +376,7 @@ export class SessionStore {
     return messages.map((message) => ({ ...message, createdAt: message.createdAt ?? nowIso() }));
   }
 
-  private compactMessageForDisplay(message: AgentMessage): AgentMessage {
+  private compactMessageForDisplay(message: AgentMessage, derivedContentParts?: string[], derivedTimeline?: AgentMessageDisplayItem[]): AgentMessage {
     const content = this.compactTextForDisplay(message.content, DISPLAY_MESSAGE_CHARS);
     const reasoning = message.reasoning_content ? this.compactTextForDisplay(message.reasoning_content, DISPLAY_REASONING_CHARS) : undefined;
     return {
@@ -327,6 +388,8 @@ export class SessionStore {
       reasoningOmitted: reasoning?.omitted || undefined,
       reasoningLength: reasoning?.omitted ? reasoning.length : undefined,
       reasoning_parts: message.reasoning_parts?.map((part) => this.clipText(part, 1000)),
+      content_parts: derivedContentParts?.map((part) => this.clipText(part, 2000)) ?? message.content_parts?.map((part) => this.clipText(part, 2000)),
+      displayTimeline: derivedTimeline ?? message.displayTimeline,
       attachments: message.attachments?.map((attachment) => ({
         ...attachment,
         contentBase64: DISPLAY_ATTACHMENT_BASE64_CHARS > 0
@@ -378,7 +441,7 @@ export class SessionStore {
       .slice(-3)
       .map((message, index) => `User ${index + 1}: ${this.clipText(message.content, 1000)}`);
     const assistantMessages = record.messages
-      .filter((message) => message.role === 'assistant' && message.content.trim())
+      .filter((message) => message.role === 'assistant' && message.hidden !== true && message.content.trim())
       .slice(-2)
       .map((message, index) => `Assistant ${index + 1}: ${this.clipText(message.content, 1000)}`);
     const failureEvents = record.toolEvents
@@ -446,7 +509,95 @@ export class SessionStore {
   private persistableMessage(message: AgentMessage): AgentMessage {
     const next = { ...message };
     delete next.reasoning_parts;
+    delete next.content_parts;
+    delete next.displayTimeline;
     return next;
+  }
+
+  private contentDisplayForRecord(record: SessionRecord): {
+    partsByMessageId: Map<string, string[]>;
+    timelineByMessageId: Map<string, AgentMessageDisplayItem[]>;
+  } {
+    const signature = this.contentPartsSignature(record);
+    const cached = this.contentPartsCache.get(record.id);
+    if (cached?.signature === signature) {
+      return {
+        partsByMessageId: cached.partsByMessageId,
+        timelineByMessageId: cached.timelineByMessageId
+      };
+    }
+
+    const partsByMessageId = new Map<string, string[]>();
+    const timelineByMessageId = new Map<string, AgentMessageDisplayItem[]>();
+    let pendingParts: string[] = [];
+    let pendingTimeline: AgentMessageDisplayItem[] = [];
+    let toolEventCursor = 0;
+    for (const message of record.messages ?? []) {
+      if (message.role === 'user') {
+        pendingParts = [];
+        pendingTimeline = [];
+        continue;
+      }
+      if (message.role === 'tool') {
+        const event = record.toolEvents?.[toolEventCursor];
+        toolEventCursor += 1;
+        if (event) pendingTimeline.push({ type: 'tool', toolEventId: event.id });
+        continue;
+      }
+      if (message.role !== 'assistant') continue;
+
+      const content = message.content.trim();
+      if (message.hidden === true) {
+        if (content) {
+          const contentIndex = pendingParts.length;
+          pendingParts.push(content);
+          const timeline = message.displayTimeline ?? [];
+          const hasTimelineContent = timeline.some((item) => item.type === 'content');
+          if (timeline.length > 0) {
+            for (const item of timeline) {
+              if (item.type === 'content') pendingTimeline.push({ type: 'content', index: contentIndex });
+              if (item.type === 'tool') pendingTimeline.push(item);
+            }
+          }
+          if (!hasTimelineContent) pendingTimeline.push({ type: 'content', index: contentIndex });
+        }
+        continue;
+      }
+      if (content && pendingParts.length > 0 && message.id) {
+        partsByMessageId.set(message.id, [...pendingParts]);
+        const ownTimeline = message.displayTimeline ?? [];
+        const timeline = ownTimeline.length > 0
+          ? ownTimeline
+          : [
+              ...pendingTimeline,
+              ...(content ? [{ type: 'content', index: pendingParts.length } satisfies AgentMessageDisplayItem] : [])
+            ];
+        if (timeline.length > 0) timelineByMessageId.set(message.id, timeline);
+      }
+      if (content) pendingParts = [];
+      if (content) pendingTimeline = [];
+    }
+
+    this.contentPartsCache.set(record.id, { signature, partsByMessageId, timelineByMessageId });
+    if (this.contentPartsCache.size > CONTENT_PARTS_CACHE_LIMIT) {
+      const oldestKey = this.contentPartsCache.keys().next().value;
+      if (oldestKey) this.contentPartsCache.delete(oldestKey);
+    }
+    return { partsByMessageId, timelineByMessageId };
+  }
+
+  private contentPartsSignature(record: SessionRecord): string {
+    return (record.messages ?? [])
+      .map((message) => [
+        message.id ?? '',
+        message.role,
+        message.hidden === true ? '1' : '0',
+        message.createdAt ?? '',
+        message.content.length,
+        message.hidden === true ? message.content : ''
+      ].join(':'))
+      .join('|')
+      + `::tools:${(record.toolEvents ?? []).map((event) => `${event.id}:${event.createdAt}`).join('|')}`;
   }
 
   private ensureValidProvidedId(id: string): string {
@@ -473,6 +624,178 @@ export class SessionStore {
     return id.startsWith('backend_session_');
   }
 
+  private indexedSummaries(): SessionSummary[] {
+    const index = this.readSummaryIndex();
+    const nextEntries: Record<string, SessionSummaryIndexEntry> = {};
+    let changed = false;
+    for (const filename of readdirSync(this.dir).filter((name) => name.endsWith('.json'))) {
+      const id = filename.slice(0, -5);
+      if (this.isHiddenSession(id)) continue;
+      let stat;
+      try {
+        stat = statSync(this.fileFor(id));
+      } catch {
+        changed = true;
+        continue;
+      }
+      const current = index.sessions[id];
+      if (current && current.fileMtimeMs === stat.mtimeMs && current.fileSize === stat.size) {
+        nextEntries[id] = current;
+        continue;
+      }
+      const summary = this.summaryFromFile(filename);
+      if (!summary) {
+        changed = true;
+        continue;
+      }
+      nextEntries[id] = { ...summary, fileMtimeMs: stat.mtimeMs, fileSize: stat.size };
+      changed = true;
+    }
+    if (Object.keys(index.sessions).length !== Object.keys(nextEntries).length) changed = true;
+    if (changed) this.writeSummaryIndex({ version: 1, sessions: nextEntries });
+    return Object.values(nextEntries)
+      .map(({ fileMtimeMs: _fileMtimeMs, fileSize: _fileSize, ...summary }) => summary)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  private readSummaryIndex(): SessionSummaryIndex {
+    if (!existsSync(this.indexFile)) return { version: 1, sessions: {} };
+    try {
+      const parsed = JSON.parse(readFileSync(this.indexFile, 'utf8')) as Partial<SessionSummaryIndex>;
+      if (parsed.version !== 1 || !parsed.sessions || typeof parsed.sessions !== 'object') {
+        return { version: 1, sessions: {} };
+      }
+      return {
+        version: 1,
+        sessions: Object.fromEntries(
+          Object.entries(parsed.sessions).filter((entry): entry is [string, SessionSummaryIndexEntry] => {
+            const item = entry[1];
+            return Boolean(item?.id && item.title && item.createdAt && item.updatedAt);
+          })
+        )
+      };
+    } catch {
+      return { version: 1, sessions: {} };
+    }
+  }
+
+  private writeSummaryIndex(index: SessionSummaryIndex): void {
+    writeFileSync(this.indexFile, `${JSON.stringify(index, null, 2)}\n`, 'utf8');
+  }
+
+  private upsertIndexSummary(record: SessionRecord): void {
+    if (this.isHiddenSession(record.id)) return;
+    try {
+      const stat = statSync(this.fileFor(record.id));
+      const index = this.readSummaryIndex();
+      index.sessions[record.id] = {
+        ...this.summary(record),
+        fileMtimeMs: stat.mtimeMs,
+        fileSize: stat.size
+      };
+      this.writeSummaryIndex(index);
+    } catch {
+      // Indexes are an optimization; session JSON remains the source of truth.
+    }
+  }
+
+  private removeIndexSummary(id: string): void {
+    const index = this.readSummaryIndex();
+    if (!index.sessions[id]) return;
+    delete index.sessions[id];
+    this.writeSummaryIndex(index);
+  }
+
+  private summaryFromFile(filename: string): SessionSummary | null {
+    const id = filename.slice(0, -5);
+    if (this.isHiddenSession(id)) return null;
+    try {
+      const raw = readFileSync(this.fileFor(id), 'utf8');
+      const title = this.readJsonString(raw, 'title') || 'New session';
+      const createdAt = this.readJsonString(raw, 'createdAt') || nowIso();
+      const updatedAt = this.readJsonString(raw, 'updatedAt') || createdAt;
+      const messageCount = this.readJsonNumber(raw, 'messageCount') ?? this.estimateMessageCount(raw);
+      const rawDomain = this.readJsonString(raw, 'domain');
+      const domain = normalizeMemoryDomain(rawDomain || inferMemoryDomains(title)[0] || 'other');
+      const origin = this.readJsonString(raw, 'origin') === 'external-im' ? 'external-im' : undefined;
+      return { id, title, createdAt, updatedAt, messageCount, domain, origin };
+    } catch {
+      try {
+        const record = this.read(id);
+        return record ? this.summary(record) : null;
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  private readJsonString(raw: string, key: string): string | undefined {
+    const match = raw.match(new RegExp(`"${key}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`));
+    if (!match) return undefined;
+    try {
+      return JSON.parse(`"${match[1]}"`) as string;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private readJsonNumber(raw: string, key: string): number | undefined {
+    const match = raw.match(new RegExp(`"${key}"\\s*:\\s*(\\d+)`));
+    if (!match) return undefined;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : undefined;
+  }
+
+  private estimateMessageCount(raw: string): number {
+    return raw.match(/"role"\s*:\s*"(?:system|user|assistant|tool)"/g)?.length ?? 0;
+  }
+
+  private sessionCategoryCounts(sessions: SessionSummary[], wechatSessionId?: string): Partial<Record<SessionHistoryCategory, number>> {
+    const counts: Partial<Record<SessionHistoryCategory, number>> = {
+      all: sessions.length,
+      'wechat-clawbot': 0,
+      'external-im': 0
+    };
+    for (const session of sessions) {
+      if (this.isExternalImSessionSummary(session)) {
+        counts['external-im'] = (counts['external-im'] ?? 0) + 1;
+        continue;
+      }
+      if (this.isWechatSessionSummary(session, wechatSessionId)) {
+        counts['wechat-clawbot'] = (counts['wechat-clawbot'] ?? 0) + 1;
+        continue;
+      }
+      const domain = normalizeMemoryDomain(session.domain);
+      counts[domain] = (counts[domain] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  private sessionMatchesCategory(session: SessionSummary, category: SessionHistoryCategory, wechatSessionId?: string): boolean {
+    if (category === 'all') return true;
+    const isWechat = this.isWechatSessionSummary(session, wechatSessionId);
+    if (category === 'external-im') return this.isExternalImSessionSummary(session);
+    if (category === 'wechat-clawbot') return isWechat;
+    return !isWechat && !this.isExternalImSessionSummary(session) && normalizeMemoryDomain(session.domain) === category;
+  }
+
+  private isExternalImSessionSummary(session: SessionSummary): boolean {
+    return session.origin === 'external-im' || session.id.startsWith('im_') || session.id.startsWith('dsh-im-');
+  }
+
+  private isWechatSessionSummary(session: SessionSummary, wechatSessionId?: string): boolean {
+    const configuredId = wechatSessionId?.trim();
+    if (configuredId && session.id === configuredId) return true;
+    const title = session.title.trim().toLowerCase();
+    return title === 'wechat session' || title.startsWith('wechat clawbot') || title.startsWith('[wechat:');
+  }
+
+  private clampInt(value: unknown, fallback: number, min: number, max: number): number {
+    const parsed = Math.floor(Number(value));
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.min(max, Math.max(min, parsed));
+  }
+
   private summary(record: SessionRecord): SessionSummary {
     return {
       id: record.id,
@@ -480,7 +803,9 @@ export class SessionStore {
       createdAt: record.createdAt,
       updatedAt: record.updatedAt,
       messageCount: record.messages.length,
-      domain: normalizeMemoryDomain(record.domain || this.inferRecordDomain(record))
+      domain: normalizeMemoryDomain(record.domain || this.inferRecordDomain(record)),
+      origin: record.origin,
+      external: record.external
     };
   }
 
@@ -488,7 +813,7 @@ export class SessionStore {
     const seed = [
       record.title,
       ...record.messages
-        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .filter((message) => message.role === 'user' || (message.role === 'assistant' && message.hidden !== true))
         .slice(0, 8)
         .map((message) => message.content)
     ]
@@ -527,13 +852,17 @@ export class SessionStore {
     for (const message of messages) {
       if (message.role !== 'tool') continue;
       const content = message.content ?? '';
+      const ok = !/\b(error|failed?|exception)\b/i.test(content);
+      const createdAt = message.createdAt ?? nowIso();
       events.push({
         id: message.id || createId('toolevent'),
         toolName: message.name || 'tool',
         args: {},
-        ok: !/\b(error|failed?|exception)\b/i.test(content),
+        status: ok ? 'completed' : 'failed',
+        ok,
         content,
-        createdAt: message.createdAt ?? nowIso()
+        createdAt,
+        completedAt: createdAt
       });
     }
     return events;

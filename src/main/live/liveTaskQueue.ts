@@ -173,8 +173,8 @@ export class LiveTaskQueue {
         finishedAt: nowIso()
       }, {
         title: 'AgentLoop',
-        label: 'Status',
-        content: 'Completed.'
+        label: 'Result',
+        content: result.finalResponse || '(no result content)'
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

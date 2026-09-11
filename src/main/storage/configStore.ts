@@ -5,6 +5,7 @@ import { isOmniProviderKind, normalizeProviderKind, omniProviderDefaultBaseUrl, 
 import { defaultConfig, ensureDir } from './pathUtils.js';
 import { JsonFileStore } from './jsonFileStore.js';
 
+const REASONING_EFFORTS = new Set(['auto', 'none', 'low', 'medium', 'xhigh']);
 const IMAGE_MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -45,6 +46,19 @@ function cleanOptionalText(value: unknown, maxLength: number): string | undefine
   if (typeof value !== 'string') return undefined;
   const clean = value.trim().slice(0, maxLength);
   return clean || undefined;
+}
+
+function cleanOptionalColor(value: unknown): string {
+  const clean = cleanOptionalText(value, 80);
+  if (!clean) return '';
+  if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(clean)) return clean;
+  if (/^rgba?\(\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(clean)) return clean;
+  return '';
+}
+
+function sanitizeReasoningEffort(value: unknown, fallback: AppConfig['reasoningEffort']): AppConfig['reasoningEffort'] {
+  if (value === 'high') return 'xhigh';
+  return REASONING_EFFORTS.has(value as string) ? value as AppConfig['reasoningEffort'] : fallback;
 }
 
 function sanitizeCustomThemeTokens(input: unknown): CustomThemeTokens {
@@ -142,6 +156,7 @@ export class ConfigStore {
     merged.omniModel = cleanText(merged.omniModel, omniProviderDefaultModel(merged.omniProvider), 200);
     if (!merged.omniBaseUrl) merged.omniBaseUrl = omniProviderDefaultBaseUrl(merged.omniProvider);
     merged.omniApiKey = typeof merged.omniApiKey === 'string' ? merged.omniApiKey : defaults.omniApiKey;
+    merged.reasoningEffort = sanitizeReasoningEffort(merged.reasoningEffort, defaults.reasoningEffort);
     merged.temperature = Number.isFinite(merged.temperature) ? merged.temperature : defaults.temperature;
     merged.maxIterations = Math.max(1, Math.min(200, Number(merged.maxIterations) || defaults.maxIterations));
     merged.sessionDocumentMaxDocs = Math.max(1, Math.min(100, Number(merged.sessionDocumentMaxDocs) || defaults.sessionDocumentMaxDocs));
@@ -168,6 +183,7 @@ export class ConfigStore {
     merged.browserExecutionLoggingEnabled = merged.browserExecutionLoggingEnabled === true;
     merged.theme = sanitizeTheme(merged.theme, defaults.theme, merged.customThemes);
     merged.textBrightness = Math.max(70, Math.min(150, Number(merged.textBrightness) || defaults.textBrightness));
+    merged.textColor = cleanOptionalColor(merged.textColor);
     merged.omniSystemPrompt = cleanText(merged.omniSystemPrompt, defaults.omniSystemPrompt, 12000);
     merged.skillMarketSources = Array.isArray(merged.skillMarketSources) && merged.skillMarketSources.length > 0 ? merged.skillMarketSources : defaults.skillMarketSources;
     const configuredTools = Array.isArray(merged.enabledToolNames) ? merged.enabledToolNames.filter((name): name is string => typeof name === 'string' && name.trim().length > 0) : [];
@@ -242,6 +258,7 @@ export class ConfigStore {
       },
       branding: sanitizeBranding(partial.branding ?? current.branding, current.branding)
     };
+    next.reasoningEffort = sanitizeReasoningEffort(next.reasoningEffort, current.reasoningEffort);
     ensureDir(next.workspaceDir);
     this.store.write(next);
     return next;

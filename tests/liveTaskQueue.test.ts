@@ -57,6 +57,7 @@ describe('LiveTaskQueue', () => {
     expect(completed?.result).toBe('finished');
     expect(completed?.trace.some((entry) => entry.label === 'Reasoning' && entry.content === 'thinking')).toBe(true);
     expect(completed?.trace.some((entry) => entry.label === 'Tool Result' && entry.content === 'done')).toBe(true);
+    expect(completed?.trace.some((entry) => entry.label === 'Result' && entry.content === 'finished')).toBe(true);
   });
 
   it('reuses a recent identical task in the same live session', async () => {

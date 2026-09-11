@@ -1,9 +1,10 @@
-import type { BrowserWindow as ElectronBrowserWindow, Rectangle, WebContents } from 'electron';
+﻿import type { BrowserWindow as ElectronBrowserWindow, ContextMenuParams, MenuItemConstructorOptions, Rectangle, WebContents } from 'electron';
+import { execFile } from 'node:child_process';
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request as httpsRequest } from 'node:https';
 import { createRequire } from 'node:module';
-import { basename, dirname, extname, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import JSZip from 'jszip';
 import { AppContext } from './appContext.js';
@@ -11,9 +12,16 @@ import { generateFollowUpQuestions } from './agent/followUpQuestions.js';
 import { createLlmClient, testLlmConnection } from './agent/llmClient.js';
 import type {
   AgentToolEventStream,
+  AgentArtifactRef,
+  AgentMessage,
   AgentMessageAttachment,
+  AgentRunOptions,
+  AgentRunResult,
   AssistantMessageExportRequest,
   AppConfig,
+  ArtifactPathRequest,
+  ArtifactPreviewRequest,
+  ArtifactPreviewResult,
   BrowserCoachGenerateSkillRequest,
   BrowserCoachRecording,
   BrowserCoachStartRequest,
@@ -32,26 +40,46 @@ import type {
   LiveRealtimeEvent,
   LiveRealtimeStartRequest,
   PersonalKnowledgeUploadRequest,
+  ProviderKind,
   RegisteredTool,
+  ReasoningEffort,
   SessionDocumentUploadRequest,
+  SessionListPageRequest,
   ScheduledTaskCreateRequest,
   ScheduledTaskPatchRequest,
+  SessionRecord,
   SessionUpdateEvent,
   SkillArchiveUploadRequest,
+  MarketplaceBrowseRequest,
   SkillInstallRequest,
   SkillOptimizationRunRequest,
   SkillPatchRequest,
   SkillWriteRequest,
+  CustomThemeTokens,
   DreamSkinGalleryQuery,
   DreamSkinThemeInstallRequest,
+  DshMarketplaceBrowseRequest,
+  DshMarketplacePluginInstallRequest,
+  DshSidecarClientMount,
+  DshSidecarClientMountOpenRequest,
+  DshSidecarChatRunRequest,
+  DshSidecarChatRunResult,
+  DshSidecarInputPart,
+  DshSidecarPluginActionRequest,
+  DshSidecarPluginInstallRequest,
+  DshSidecarPluginUploadRequest,
+  DshSidecarRuntimePlugin,
+  ExternalConversationMetadata,
   ThemeImportRequest,
   ToolRunRequest,
   WechatChannelLoginStatusPayload,
   WechatChannelQrCodePayload
 } from '../shared/types.js';
 import { createId, nowIso } from '../shared/types.js';
-import { EMBEDDED_BROWSER_PARTITION } from '../shared/browserConstants.js';
+import { EMBEDDED_BROWSER_PARTITION, EMBEDDED_BROWSER_PREVIEW_PARTITION } from '../shared/browserConstants.js';
+import { classifyArtifactKind, isArtifactExtension, mimeTypeForArtifact, previewModeForArtifact } from '../shared/artifacts.js';
 import { applyBrandDockIcon, applyPlatformAppIdentity, resolveBrandWindowIconPath } from './appIcon.js';
+import { normalizeArtifactRequestPath, resolveArtifactRequestPath as resolveArtifactRequestPathWithContext, type ArtifactResolutionSession } from './artifactRequests.js';
 import { buildAssistantMessageDocx, buildAssistantMessageExportHtml, safeExportBasename } from './export/messageExport.js';
 import { BrowserCoachRecorder } from './browser/browserCoachRecorder.js';
 import { buildBrowserCoachSkillContentWithModel } from './browser/browserCoachSkill.js';
@@ -65,10 +93,12 @@ import { installDreamSkinTheme, listDreamSkinGallery } from './storage/dreamSkin
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const electronRequire = createRequire(import.meta.url);
 const { app, BrowserWindow, Menu, dialog, ipcMain, screen, webContents } = electronRequire('electron/main') as typeof import('electron/main');
-const { shell } = electronRequire('electron/common') as typeof import('electron/common');
+const { shell, clipboard } = electronRequire('electron/common') as typeof import('electron/common');
 let mainWindow: ElectronBrowserWindow | null = null;
 let devToolsWindow: ElectronBrowserWindow | null = null;
+const pluginClientWindows = new Map<string, ElectronBrowserWindow>();
 const context = new AppContext();
+context.dshSidecarManager.setMainRequestHandler(handleDshSidecarMainRequest);
 const browserCoachRecorder = new BrowserCoachRecorder(
   join(__dirname, '..', 'preload', 'browserCoachPreload.js'),
   (recording) => {
@@ -83,14 +113,36 @@ const activeChatControllers = new Map<number, AbortController>();
 const activeWechatRuns = new Map<string, AbortController>();
 let wechatPollerAbortController: AbortController | null = null;
 let wechatPollerFingerprint = '';
+let embeddedPreviewResetCleanup: (() => void) | null = null;
 const seenWechatMessageIds: string[] = [];
 const seenWechatMessageIdSet = new Set<string>();
 const WECHAT_PENDING_MARKER = '__TASI_WECHAT_PENDING__';
+const EXTERNAL_IM_MAX_CONCURRENT_RUNS = 1;
+let activeExternalImRuns = 0;
+const externalImSlotWaiters: Array<() => void> = [];
+const externalImSessionQueues = new Map<string, Promise<unknown>>();
 const KNOWLEDGE_IMPORT_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.text', '.log', '.json', '.csv', '.docx', '.xlsx', '.pptx', '.pdf', '.ofd']);
 const WECHAT_DOCUMENT_EXTENSIONS = new Set(['.docx', '.pptx', '.xlsx', '.pdf', '.ofd', '.xml', '.txt', '.md', '.markdown', '.json', '.csv', '.log', '.text']);
 const MAX_WECHAT_MULTIMEDIA_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 const MAX_WECHAT_DOCUMENT_BYTES = 32 * 1024 * 1024;
 const WECHAT_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
+const BUILTIN_TITLE_BAR_THEME_TOKENS: Record<'dark' | 'light' | 'tech', Pick<CustomThemeTokens, 'bgPrimary' | 'textPrimary'>> = {
+  dark: {
+    bgPrimary: '#0a0a0f',
+    textPrimary: '#f0f0f5'
+  },
+  light: {
+    bgPrimary: '#f5f6fb',
+    textPrimary: '#1a1a2e'
+  },
+  tech: {
+    bgPrimary: '#081f3a',
+    textPrimary: '#eef9ff'
+  }
+};
+const TITLE_BAR_TRANSPARENT_COLOR = 'rgba(0, 0, 0, 0)';
+type TitleBarThemeConfig = Pick<AppConfig, 'theme' | 'customThemes' | 'textColor'>;
+type TitleBarThemeTokens = Pick<CustomThemeTokens, 'bgPrimary' | 'textPrimary'>;
 const pendingToolApprovals = new Map<string, {
   senderId: number;
   request: ToolApprovalRequest;
@@ -134,6 +186,855 @@ function logAgentChatError(details: {
   }
 }
 
+function firstDshPluginMention(input: string): string | undefined {
+  const match = input.match(/(^|[\s,;.!?\u3001\u3002\uff0c\uff1b\uff01\uff1f])@([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)/);
+  return match?.[2]?.trim().replace(/^@/, '');
+}
+
+function dshRuntimePluginAliases(plugin: DshSidecarRuntimePlugin): string[] {
+  const aliases = new Set<string>();
+  const add = (value?: string) => {
+    const clean = value?.trim().replace(/^@/, '').replace(/^\//, '').toLowerCase();
+    if (clean) aliases.add(clean);
+  };
+  add(plugin.id);
+  add(plugin.packageName);
+  const packageParts = plugin.packageName.replace(/^@/, '').split('/');
+  if (packageParts.length > 1) {
+    add(packageParts.join('/'));
+    add(packageParts.at(-1));
+  }
+  for (const command of plugin.commands ?? []) add(command);
+  return [...aliases];
+}
+
+function resolveDshRuntimePluginMention(ref: string, plugins: DshSidecarRuntimePlugin[]): DshSidecarRuntimePlugin | undefined {
+  const clean = ref.trim().replace(/^@/, '').toLowerCase();
+  return plugins.find((plugin) => dshRuntimePluginAliases(plugin).includes(clean));
+}
+
+function canHandleDirectDshSidecarChat(plugin: DshSidecarRuntimePlugin): boolean {
+  if (!plugin.enabled || (plugin.status !== 'loaded' && plugin.status !== 'partial')) return false;
+  return (plugin.commands ?? []).length > 0;
+}
+
+function normalizeAttachmentBase64Payload(value: string): string {
+  const clean = value.trim();
+  const dataUrl = clean.match(/^data:[^;,]+;base64,(.+)$/i);
+  return (dataUrl?.[1] ?? clean).replace(/\s+/g, '');
+}
+
+function dshInputParts(input: string, attachments?: AgentMessageAttachment[]): DshSidecarInputPart[] {
+  const parts: DshSidecarInputPart[] = [];
+  if (input.trim()) parts.push({ type: 'text', text: input });
+  for (const attachment of attachments ?? []) {
+    const base = {
+      name: attachment.filename,
+      mime: attachment.mimeType,
+      data: normalizeAttachmentBase64Payload(attachment.contentBase64)
+    };
+    if (attachment.kind === 'image') parts.push({ type: 'image', ...base });
+    else if (attachment.kind === 'audio') parts.push({ type: 'audio', ...base });
+    else if (attachment.kind === 'video') parts.push({ type: 'video', ...base });
+  }
+  return parts;
+}
+
+function recentSidecarMessages(sessionId?: string): NonNullable<DshSidecarChatRunRequest['context']>['recentMessages'] {
+  if (!sessionId) return [];
+  const record = context.sessionStore.read(sessionId);
+  if (!record) return [];
+  return record.messages
+    .filter((message) => message.hidden !== true && message.content.trim())
+    .slice(-16)
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+      name: message.name
+    }));
+}
+
+function sidecarResultContent(result: DshSidecarChatRunResult): string {
+  const textParts = (result.parts ?? [])
+    .filter((part): part is Extract<NonNullable<DshSidecarChatRunResult['parts']>[number], { type: 'text' }> => part.type === 'text')
+    .map((part) => part.text.trim())
+    .filter(Boolean);
+  const artifactLines = (result.artifacts ?? [])
+    .map((artifact) => `Artifact: ${artifact.name} (${artifact.path})`);
+  const seen = new Set<string>();
+  const chunks = [
+    result.content?.trim(),
+    ...textParts,
+    ...artifactLines
+  ].filter((chunk): chunk is string => Boolean(chunk));
+  const body = chunks.filter((chunk) => {
+    if (seen.has(chunk)) return false;
+    seen.add(chunk);
+    return true;
+  }).join('\n\n').trim();
+  if (body) return body;
+  if (result.error) return result.error;
+  return result.ok ? 'DSH sidecar completed without textual output.' : 'DSH sidecar failed without an error message.';
+}
+
+function dshSidecarToolMessage(event: ToolEvent): AgentMessage {
+  return {
+    id: event.id,
+    role: 'tool',
+    name: event.toolName,
+    hidden: true,
+    content: event.content,
+    createdAt: event.createdAt
+  };
+}
+
+function artifactResolutionSession(record: SessionRecord): ArtifactResolutionSession {
+  return {
+    id: record.id,
+    updatedAt: record.updatedAt,
+    workspaceDir: record.lastExecution?.workspaceDir,
+    artifacts: record.messages.flatMap((message) => message.artifacts ?? [])
+  };
+}
+
+function artifactResolutionSessions(preferredSessionId?: string): ArtifactResolutionSession[] {
+  const sessions: ArtifactResolutionSession[] = [];
+  const seen = new Set<string>();
+  const addRecord = (record: SessionRecord | null) => {
+    if (!record || seen.has(record.id)) return;
+    seen.add(record.id);
+    sessions.push(artifactResolutionSession(record));
+  };
+  const preferred = preferredSessionId?.trim();
+  if (preferred) addRecord(context.sessionStore.read(preferred));
+  for (const summary of context.sessionStore.list().slice(0, 48)) addRecord(context.sessionStore.read(summary.id));
+  return sessions;
+}
+
+function resolveArtifactRequestPath(req: ArtifactPathRequest): string {
+  return resolveArtifactRequestPathWithContext(req, {
+    workspaceDir: context.getConfig().workspaceDir,
+    harnessHome: context.harnessHome,
+    sessions: artifactResolutionSessions(req.sessionId)
+  });
+}
+
+function artifactRefFromPath(path: string, source: AgentArtifactRef['source'] = 'assistant-link'): AgentArtifactRef {
+  const stat = statSync(path);
+  const ext = extname(path).toLowerCase();
+  return {
+    id: createId('artifact'),
+    name: basename(path),
+    path: isPathInside(context.getConfig().workspaceDir, path) ? relative(context.getConfig().workspaceDir, path) : path,
+    absPath: path,
+    ext,
+    kind: classifyArtifactKind(ext),
+    previewMode: previewModeForArtifact(ext),
+    mimeType: mimeTypeForArtifact(ext),
+    sizeBytes: stat.size,
+    source,
+    createdAt: nowIso()
+  };
+}
+
+function dshSidecarArtifacts(result: DshSidecarChatRunResult, workspaceDir: string): AgentArtifactRef[] {
+  const out: AgentArtifactRef[] = [];
+  const seen = new Set<string>();
+  for (const artifact of result.artifacts ?? []) {
+    const raw = artifact.path?.trim();
+    if (!raw) continue;
+    const normalizedRaw = normalizeArtifactRequestPath(raw);
+    const target = isAbsolute(normalizedRaw) ? resolve(normalizedRaw) : resolve(workspaceDir, normalizedRaw);
+    if (seen.has(target) || !existsSync(target)) continue;
+    const stat = statSync(target);
+    if (!stat.isFile()) continue;
+    const ext = extname(target).toLowerCase();
+    if (!isArtifactExtension(ext)) continue;
+    seen.add(target);
+    out.push({
+      id: createId('artifact'),
+      name: artifact.name?.trim() || basename(target),
+      path: isPathInside(workspaceDir, target) ? relative(workspaceDir, target) : target,
+      absPath: target,
+      ext,
+      kind: classifyArtifactKind(ext),
+      previewMode: previewModeForArtifact(ext),
+      mimeType: artifact.mime || mimeTypeForArtifact(ext),
+      sizeBytes: stat.size,
+      source: 'dsh-sidecar',
+      createdAt: nowIso()
+    });
+  }
+  return out;
+}
+
+function execFileText(command: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolvePromise, reject) => {
+    execFile(command, args, { windowsHide: true, timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error([error.message, stderr].filter(Boolean).join('\n')));
+        return;
+      }
+      resolvePromise({ stdout, stderr });
+    });
+  });
+}
+
+async function exportOfficeArtifactToPdf(target: string, artifact: AgentArtifactRef): Promise<Buffer | null> {
+  if (process.platform !== 'win32') return null;
+  if (!['.docx', '.pptx', '.xlsx'].includes(artifact.ext)) return null;
+  const sourceStat = statSync(target);
+  const cacheKey = createHash('sha256')
+    .update(`${target}\n${sourceStat.size}\n${sourceStat.mtimeMs}`)
+    .digest('hex');
+  const safeName = basename(target).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
+  const previewDir = join(context.harnessHome, 'artifact-previews', 'office-pdf');
+  mkdirSync(previewDir, { recursive: true });
+  const pdfPath = join(previewDir, `${cacheKey}-${safeName}.pdf`);
+  if (existsSync(pdfPath) && statSync(pdfPath).isFile() && statSync(pdfPath).size > 0) {
+    return readFileSync(pdfPath);
+  }
+
+  const scriptPath = join(previewDir, 'export-office-preview.ps1');
+  const script = `
+param(
+  [Parameter(Mandatory = $true)][string]$inputPath,
+  [Parameter(Mandatory = $true)][string]$outputPath
+)
+$ErrorActionPreference = 'Stop'
+$ext = [System.IO.Path]::GetExtension($inputPath).ToLowerInvariant()
+$outDir = Split-Path -Parent $outputPath
+New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+if (Test-Path -LiteralPath $outputPath) { Remove-Item -LiteralPath $outputPath -Force }
+function Release-Com($value) {
+  if ($null -ne $value) {
+    [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($value)
+  }
+}
+switch ($ext) {
+  '.docx' {
+    $app = $null
+    $doc = $null
+    try {
+      $app = New-Object -ComObject Word.Application
+      $app.Visible = $false
+      $doc = $app.Documents.Open($inputPath, $false, $true, $false)
+      $doc.ExportAsFixedFormat($outputPath, 17)
+    } finally {
+      if ($null -ne $doc) { $doc.Close($false); Release-Com $doc }
+      if ($null -ne $app) { $app.Quit(); Release-Com $app }
+    }
+  }
+  '.pptx' {
+    $app = $null
+    $presentation = $null
+    try {
+      $app = New-Object -ComObject PowerPoint.Application
+      $presentation = $app.Presentations.Open($inputPath, $true, $true, $false)
+      $presentation.SaveAs($outputPath, 32)
+    } finally {
+      if ($null -ne $presentation) { $presentation.Close(); Release-Com $presentation }
+      if ($null -ne $app) { $app.Quit(); Release-Com $app }
+    }
+  }
+  '.xlsx' {
+    $app = $null
+    $workbook = $null
+    try {
+      $app = New-Object -ComObject Excel.Application
+      $app.Visible = $false
+      $app.DisplayAlerts = $false
+      $workbook = $app.Workbooks.Open($inputPath, 3, $true)
+      $workbook.ExportAsFixedFormat(0, $outputPath)
+    } finally {
+      if ($null -ne $workbook) { $workbook.Close($false); Release-Com $workbook }
+      if ($null -ne $app) { $app.Quit(); Release-Com $app }
+    }
+  }
+  default { throw "Unsupported Office preview extension: $ext" }
+}
+if (!(Test-Path -LiteralPath $outputPath)) { throw "Office did not create a PDF preview." }
+`;
+  writeFileSync(scriptPath, script, 'utf8');
+
+  try {
+    await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptPath, target, pdfPath], 180_000);
+    if (!existsSync(pdfPath) || statSync(pdfPath).size === 0) return null;
+    return readFileSync(pdfPath);
+  } catch (cause) {
+    try {
+      if (existsSync(pdfPath)) rmSync(pdfPath, { force: true });
+    } catch {
+      // Ignore cleanup failures for preview cache files.
+    }
+    console.warn('[artifactPreview] Office PDF export failed, using browser preview fallback:', cause);
+    return null;
+  }
+}
+
+async function artifactPreview(req: ArtifactPreviewRequest): Promise<ArtifactPreviewResult> {
+  const target = resolveArtifactRequestPath(req);
+  const artifact = artifactRefFromPath(target);
+  const defaultMaxBytes = ['pdf', 'model3d', 'office'].includes(artifact.previewMode) ? 256 * 1024 * 1024 : 8 * 1024 * 1024;
+  const maxBytes = Math.max(1, Math.min(256 * 1024 * 1024, Math.floor(Number(req.maxBytes) || defaultMaxBytes)));
+  const size = artifact.sizeBytes ?? 0;
+  if (size > maxBytes && artifact.previewMode !== 'external') {
+    throw new Error(`Artifact is too large to preview (${size} bytes). Use Open instead.`);
+  }
+  if (artifact.previewMode === 'text' || artifact.previewMode === 'code' || artifact.previewMode === 'markdown') {
+    return { artifact, content: readFileSync(target, 'utf8') };
+  }
+  if (artifact.previewMode === 'office') {
+    const exportedPdf = await exportOfficeArtifactToPdf(target, artifact);
+    if (exportedPdf) {
+      return {
+        artifact: { ...artifact, mimeType: 'application/pdf' },
+        dataBase64: exportedPdf.toString('base64'),
+        content: 'office-pdf-preview'
+      };
+    }
+    return { artifact, dataBase64: readFileSync(target).toString('base64') };
+  }
+  if (artifact.previewMode === 'image' || artifact.previewMode === 'pdf' || artifact.previewMode === 'model3d' || artifact.previewMode === 'media') {
+    return { artifact, dataBase64: readFileSync(target).toString('base64') };
+  }
+  return { artifact };
+}
+
+async function maybeRunDshSidecarChatTurn(params: {
+  sender: WebContents;
+  input: string;
+  sessionId?: string;
+  executionMode?: 'workspace' | 'sandbox';
+  attachments?: AgentMessageAttachment[];
+  controller: AbortController;
+}): Promise<AgentRunResult | null> {
+  const pluginRef = firstDshPluginMention(params.input);
+  if (!pluginRef) return null;
+  let runtimePlugin: DshSidecarRuntimePlugin | undefined;
+  try {
+    const runtimeStatus = await context.dshSidecarManager.runtimeStatus();
+    runtimePlugin = resolveDshRuntimePluginMention(pluginRef, runtimeStatus.plugins);
+  } catch {
+    runtimePlugin = undefined;
+  }
+  if (!runtimePlugin || !canHandleDirectDshSidecarChat(runtimePlugin)) return null;
+  const cfg = context.getConfig();
+  const requestId = createId('run');
+  const execution = context.sandboxManager.prepare(params.executionMode ?? cfg.defaultExecutionMode, cfg.workspaceDir, requestId);
+  const session = params.sessionId
+    ? context.sessionStore.read(params.sessionId) ?? context.sessionStore.create('New session', params.sessionId)
+    : context.sessionStore.create();
+  const attachments = Array.isArray(params.attachments) ? params.attachments : undefined;
+  const userMessage: AgentMessage = {
+    id: createId('msg'),
+    role: 'user',
+    content: params.input,
+    attachments: attachments?.length ? attachments : undefined,
+    createdAt: nowIso()
+  };
+  const userUpdated = context.sessionStore.appendMessages(session.id, [userMessage], [], execution);
+  broadcastSessionUpdated({ sessionId: userUpdated.id, source: 'chat', updatedAt: userUpdated.updatedAt });
+  if (params.controller.signal.aborted) throw chatAbortError(params.controller);
+  const sidecarResult = await context.dshSidecarManager.chatRun({
+    pluginRef,
+    sessionId: session.id,
+    workspaceDir: execution.workspaceDir,
+    input: {
+      parts: dshInputParts(params.input, attachments)
+    },
+    context: {
+      recentMessages: recentSidecarMessages(params.sessionId),
+      allowedRoots: [execution.workspaceDir],
+      locale: app.getLocale(),
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      llm: {
+        provider: cfg.provider,
+        model: cfg.model,
+        reasoningEffort: cfg.reasoningEffort
+      }
+    },
+    options: {
+      stream: false,
+      timeoutMs: 10 * 60_000
+    }
+  });
+  if (params.controller.signal.aborted) throw chatAbortError(params.controller);
+  const queuedFollowups = (sidecarResult.messages ?? [])
+    .map((message) => message.content.trim())
+    .filter(Boolean);
+  if (queuedFollowups.length > 0) {
+    const sync = await context.dshSidecarRuntimeBridge.sync();
+    const followupInput = queuedFollowups.join('\n\n');
+    const event: ToolEvent = {
+      id: createId('toolevent'),
+      toolName: 'dsh_sidecar_chat',
+      args: {
+        pluginRef,
+        queuedFollowups: queuedFollowups.length,
+        partTypes: dshInputParts(params.input, attachments).map((part) => part.type)
+      },
+      ok: sidecarResult.ok,
+      content: JSON.stringify({
+        ...(sidecarResult.diagnostics ?? { plugin: pluginRef }),
+        runtimeTools: sync.toolNames,
+        syncError: sync.error
+      }, null, 2),
+      createdAt: nowIso()
+    };
+    const eventUpdated = context.sessionStore.appendMessages(session.id, [dshSidecarToolMessage(event)], [event], execution);
+    broadcastSessionUpdated({ sessionId: eventUpdated.id, source: 'chat', updatedAt: eventUpdated.updatedAt });
+    safeSend(params.sender, 'agent:tool-event', { sessionId: session.id, event: context.sessionStore.toolEventForDisplay(event) } satisfies AgentToolEventStream);
+    const result = await context.agentLoop.run({
+      userInput: followupInput,
+      sessionId: session.id,
+      executionMode: params.executionMode,
+      origin: 'chat',
+      signal: params.controller.signal,
+      persistUserMessage: false,
+      omitHistoryMessageIds: userMessage.id ? [userMessage.id] : undefined,
+      enabledToolNames: [...new Set([...context.getConfig().enabledToolNames, ...sync.toolNames])],
+      requestToolApproval: (request) => requestInteractiveToolApproval(params.sender, request),
+      onToolEvent: (eventSessionId, toolEvent) => {
+        const payload: AgentToolEventStream = { sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) };
+        safeSend(params.sender, 'agent:tool-event', payload);
+      },
+      onMessageDelta: (_eventSessionId, messageDelta) => {
+        safeSend(params.sender, 'agent:message-delta', messageDelta);
+      },
+      onSessionUpdated: (record) => {
+        broadcastSessionUpdated({
+          sessionId: record.id,
+          source: 'chat',
+          updatedAt: record.updatedAt
+        });
+      }
+    });
+    const displayRecord = context.sessionStore.readForDisplay(session.id);
+    return {
+      ...result,
+      messages: displayRecord?.messages ?? result.messages.filter((message) => message.hidden !== true),
+      toolEvents: displayRecord?.toolEvents ?? result.toolEvents
+    };
+  }
+  const finalResponse = sidecarResultContent(sidecarResult);
+  const artifacts = dshSidecarArtifacts(sidecarResult, execution.workspaceDir);
+  const assistantMessage: AgentMessage = {
+    id: createId('msg'),
+    role: 'assistant',
+    content: finalResponse,
+    artifacts: artifacts.length > 0 ? artifacts : undefined,
+    createdAt: nowIso()
+  };
+  const event: ToolEvent = {
+    id: createId('toolevent'),
+    toolName: 'dsh_sidecar_chat',
+    args: {
+      pluginRef,
+      partTypes: dshInputParts(params.input, attachments).map((part) => part.type)
+    },
+    ok: sidecarResult.ok,
+    content: JSON.stringify(sidecarResult.diagnostics ?? { plugin: pluginRef }, null, 2),
+    createdAt: nowIso()
+  };
+  const updated = context.sessionStore.appendMessages(session.id, [dshSidecarToolMessage(event), assistantMessage], [event], execution);
+  safeSend(params.sender, 'agent:tool-event', { sessionId: session.id, event: context.sessionStore.toolEventForDisplay(event) } satisfies AgentToolEventStream);
+  safeSend(params.sender, 'agent:message-delta', {
+    sessionId: session.id,
+    messageId: assistantMessage.id!,
+    role: 'assistant',
+    type: 'done',
+    content: finalResponse,
+    createdAt: assistantMessage.createdAt
+  });
+  broadcastSessionUpdated({ sessionId: updated.id, source: 'chat', updatedAt: updated.updatedAt });
+  return {
+    sessionId: session.id,
+    finalResponse,
+    messages: context.sessionStore.readForDisplay(session.id)?.messages ?? updated.messages,
+    toolEvents: context.sessionStore.readForDisplay(session.id)?.toolEvents ?? updated.toolEvents,
+    iterations: 1,
+    execution
+  };
+}
+
+async function handleDshSidecarMainRequest(method: string, params: unknown): Promise<unknown> {
+  if (method === 'main.chat.run') return await runDshSidecarMainChat(params);
+  throw new Error(`Unknown Tasi main request from DSH sidecar: ${method}`);
+}
+
+async function runDshSidecarMainChat(params: unknown): Promise<AgentRunResult & { ok: true; content: string }> {
+  const request = normalizeDshMainChatRequest(params);
+  return await enqueueExternalImRun(request.sessionId, () => executeDshSidecarMainChat(request));
+}
+
+async function executeDshSidecarMainChat(request: DshMainChatRequest): Promise<AgentRunResult & { ok: true; content: string }> {
+  const cfg = context.getConfig();
+  const requestId = createId('run');
+  const executionMode = cfg.defaultExecutionMode;
+  const workspaceDir = request.workspaceDir ?? externalImWorkspaceDir(request.sessionId);
+  const execution = context.sandboxManager.prepare(executionMode, workspaceDir, requestId);
+  const session = context.sessionStore.read(request.sessionId) ?? context.sessionStore.create(
+    externalImSessionTitle(request.external, request.input),
+    request.sessionId,
+    { origin: 'external-im', external: request.external }
+  );
+  const userMessage: AgentMessage = {
+    id: createId('msg'),
+    role: 'user',
+    content: request.input,
+    external: request.external,
+    attachments: request.attachments.length > 0 ? request.attachments : undefined,
+    createdAt: nowIso()
+  };
+  const updated = context.sessionStore.appendMessages(session.id, [userMessage], [], execution);
+  broadcastSessionUpdated({ sessionId: updated.id, source: 'external', updatedAt: updated.updatedAt });
+  const sync = await context.dshSidecarRuntimeBridge.sync().catch((error) => ({
+    toolNames: [] as string[],
+    error: error instanceof Error ? error.message : String(error)
+  }));
+  const result = await context.agentLoop.run({
+    userInput: request.input,
+    attachments: request.attachments.length > 0 ? request.attachments : undefined,
+    sessionId: session.id,
+    executionMode,
+    workspaceDir,
+    llm: request.llm,
+    origin: 'scheduled',
+    persistUserMessage: false,
+    omitHistoryMessageIds: userMessage.id ? [userMessage.id] : undefined,
+    enabledToolNames: [...new Set([...cfg.enabledToolNames, ...sync.toolNames])],
+    signal: request.controller.signal,
+    onToolEvent: (eventSessionId, toolEvent) => {
+      broadcastAgentToolEvent({ sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) });
+    },
+    onMessageDelta: (_eventSessionId, messageDelta) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        safeSend(win.webContents, 'agent:message-delta', messageDelta);
+      }
+    },
+    onSessionUpdated: (record) => {
+      broadcastSessionUpdated({
+        sessionId: record.id,
+        source: 'external',
+        updatedAt: record.updatedAt
+      });
+    }
+  });
+  const displayRecord = context.sessionStore.readForDisplay(result.sessionId);
+  return {
+    ...result,
+    ok: true,
+    content: result.finalResponse,
+    messages: displayRecord?.messages ?? result.messages,
+    toolEvents: displayRecord?.toolEvents ?? result.toolEvents
+  };
+}
+
+interface DshMainChatRequest {
+  input: string;
+  sessionId: string;
+  workspaceDir?: string;
+  llm?: AgentRunOptions['llm'];
+  attachments: AgentMessageAttachment[];
+  controller: AbortController;
+  external: ExternalConversationMetadata;
+}
+
+function normalizeDshMainChatRequest(params: unknown): DshMainChatRequest {
+  const record = params && typeof params === 'object' && !Array.isArray(params) ? params as Record<string, unknown> : {};
+  const parts = Array.isArray(record.parts) ? normalizeDshMainInputParts(record.parts) : [];
+  const directInput = typeof record.input === 'string' ? record.input.trim() : '';
+  const input = directInput || dshMainInputText(parts) || 'Message from DSH plugin';
+  const external = dshMainExternalMetadata(record);
+  const explicitSessionId = dshMainExplicitSessionId(record, external);
+  return {
+    input,
+    sessionId: explicitSessionId ?? dshMainSessionId(external),
+    workspaceDir: dshMainWorkspaceDir(typeof record.workspaceDir === 'string' ? record.workspaceDir : undefined),
+    llm: dshMainLlmOverride(record),
+    attachments: dshMainAttachments(parts),
+    controller: new AbortController(),
+    external
+  };
+}
+
+function normalizeDshMainInputParts(values: unknown[]): DshSidecarInputPart[] {
+  const parts: DshSidecarInputPart[] = [];
+  for (const value of values) {
+    if (typeof value === 'string') {
+      if (value.trim()) parts.push({ type: 'text', text: value });
+      continue;
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const item = value as Record<string, unknown>;
+    const type = typeof item.type === 'string' ? item.type : 'text';
+    if (type === 'text' || type === 'selection') {
+      const text = typeof item.text === 'string' ? item.text : (typeof item.content === 'string' ? item.content : '');
+      if (!text.trim()) continue;
+      parts.push(type === 'selection' ? { type: 'selection', source: 'chat', text } : { type: 'text', text });
+      continue;
+    }
+    if (type === 'image' || type === 'audio' || type === 'video') {
+      parts.push({
+        type,
+        name: typeof item.name === 'string' ? item.name : undefined,
+        mime: typeof item.mime === 'string' ? item.mime : (typeof item.mimeType === 'string' ? item.mimeType : 'application/octet-stream'),
+        data: typeof item.data === 'string' ? item.data : (typeof item.contentBase64 === 'string' ? item.contentBase64 : undefined),
+        path: typeof item.path === 'string' ? item.path : undefined
+      });
+      continue;
+    }
+    if (type === 'file') {
+      const name = typeof item.name === 'string' ? item.name : (typeof item.path === 'string' ? basename(item.path) : 'file');
+      parts.push({
+        type: 'file',
+        name,
+        mime: typeof item.mime === 'string' ? item.mime : (typeof item.mimeType === 'string' ? item.mimeType : undefined),
+        data: typeof item.data === 'string' ? item.data : (typeof item.contentBase64 === 'string' ? item.contentBase64 : undefined),
+        path: typeof item.path === 'string' ? item.path : undefined
+      });
+      continue;
+    }
+    if (type === 'url' && typeof item.url === 'string') parts.push({ type: 'url', url: item.url, title: typeof item.title === 'string' ? item.title : undefined });
+    else if (type === 'json') parts.push({ type: 'json', name: typeof item.name === 'string' ? item.name : undefined, value: item.value ?? item });
+  }
+  return parts;
+}
+
+function dshMainInputText(parts: DshSidecarInputPart[]): string {
+  return parts.map((part) => {
+    if (part.type === 'text') return part.text;
+    if (part.type === 'selection') return part.text;
+    if (part.type === 'url') return part.url;
+    if (part.type === 'json') return JSON.stringify(part.value);
+    if ('path' in part && part.path) return `[${part.type}: ${part.path}]`;
+    if ('name' in part && part.name) return `[${part.type}: ${part.name}]`;
+    return `[${part.type}]`;
+  }).filter(Boolean).join('\n\n').trim();
+}
+
+function dshMainAttachments(parts: DshSidecarInputPart[]): AgentMessageAttachment[] {
+  return parts.flatMap((part) => {
+    if (part.type !== 'image' && part.type !== 'audio' && part.type !== 'video') return [];
+    if (!part.data) return [];
+    return [{
+      id: createId('att'),
+      kind: part.type,
+      filename: part.name || `${part.type}.${part.mime.split('/').pop() || 'bin'}`,
+      mimeType: part.mime,
+      contentBase64: normalizeAttachmentBase64Payload(part.data)
+    }];
+  });
+}
+
+function dshMainSessionId(external: ExternalConversationMetadata): string {
+  const provider = safeExternalSegment(external.provider || 'im');
+  const key = [
+    external.pluginId,
+    external.provider,
+    external.botId,
+    external.scope,
+    external.externalConversationId
+  ].filter(Boolean).join('\0') || `${provider}:${new Date().toISOString().slice(0, 10)}`;
+  const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
+  return `im_${provider}_${hash}`;
+}
+
+function dshMainExplicitSessionId(record: Record<string, unknown>, external: ExternalConversationMetadata): string | undefined {
+  const source = typeof record.source === 'string' ? record.source.trim().toLowerCase() : '';
+  const provider = external.provider.trim().toLowerCase();
+  if (source !== 'dsh-subagent' && provider !== 'subagent') return undefined;
+  const candidates = dshMainObjectCandidates(record);
+  const sessionId = firstDshString(candidates, ['sessionId', 'session_id', 'childSessionId', 'child_session_id']);
+  if (!sessionId || /[^a-zA-Z0-9_.-]/.test(sessionId)) return undefined;
+  return sessionId;
+}
+
+function dshMainLlmOverride(record: Record<string, unknown>): AgentRunOptions['llm'] | undefined {
+  const candidates = dshMainObjectCandidates(record);
+  const llmCandidates = [dshMainRecordValue(record.llm), ...candidates];
+  const provider = dshMainProviderKind(firstDshString(llmCandidates, ['provider']));
+  const model = firstDshString(llmCandidates, ['model']);
+  const reasoningEffort = dshMainReasoningEffort(firstDshString(llmCandidates, ['reasoningEffort', 'reasoning_effort']));
+  if (!provider && !model && !reasoningEffort) return undefined;
+  return { provider, model, reasoningEffort };
+}
+
+function dshMainProviderKind(value?: string): ProviderKind | undefined {
+  if (!value) return undefined;
+  const clean = value.trim();
+  const allowed: ProviderKind[] = ['openai', 'openai-compatible', 'vllm', 'deepseek', 'qwen-bailian', 'soildapi', 'minimax', 'kimi', 'anthropic', 'anthropic-compatible', 'ollama', 'mock'];
+  return allowed.includes(clean as ProviderKind) ? clean as ProviderKind : undefined;
+}
+
+function dshMainReasoningEffort(value?: string): ReasoningEffort | undefined {
+  if (!value) return undefined;
+  const clean = value.trim();
+  const allowed: ReasoningEffort[] = ['auto', 'none', 'low', 'medium', 'xhigh'];
+  return allowed.includes(clean as ReasoningEffort) ? clean as ReasoningEffort : undefined;
+}
+
+function dshMainRecordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function dshMainExternalMetadata(record: Record<string, unknown>): ExternalConversationMetadata {
+  const candidates = dshMainObjectCandidates(record);
+  if (typeof record.source === 'string' && record.source.trim().toLowerCase() === 'dsh-subagent') {
+    const sessionId = firstDshString(candidates, ['sessionId', 'session_id', 'childSessionId', 'child_session_id']);
+    const name = firstDshString(candidates, ['senderName', 'sender_name', 'name', 'agentName', 'agent_name', 'member']) || 'subagent';
+    return {
+      provider: 'subagent',
+      pluginId: firstDshString(candidates, ['pluginId', 'plugin_id']) || 'dsh-agent-teams',
+      scope: 'private',
+      externalConversationId: sessionId || firstDshString(candidates, ['parentSession', 'parentSessionId']) || 'default',
+      senderId: firstDshString(candidates, ['senderId', 'sender_id']) || name,
+      senderName: name,
+      displayName: firstDshString(candidates, ['displayName', 'display_name']) || name
+    };
+  }
+  const provider = firstDshString(candidates, ['provider', 'channel', 'channelId', 'platform', 'platformId']) || 'dsh-im';
+  const botId = firstDshString(candidates, ['botId', 'bot_id', 'agentId', 'agent_id', 'robotId', 'robot_id']);
+  const conversationId = firstDshString(candidates, [
+    'externalConversationId',
+    'conversationId',
+    'conversation_id',
+    'threadId',
+    'thread_id',
+    'chatId',
+    'chat_id',
+    'groupId',
+    'group_id',
+    'sessionId',
+    'session_id',
+    'agentId',
+    'agent_id'
+  ]);
+  const senderId = firstDshString(candidates, ['senderId', 'sender_id', 'userId', 'user_id', 'fromUserId', 'from_user_id', 'openid', 'openId']);
+  const senderName = firstDshString(candidates, ['senderName', 'sender_name', 'userName', 'user_name', 'nickname', 'name']);
+  const displayName = firstDshString(candidates, ['displayName', 'display_name', 'title', 'conversationName', 'groupName']) || senderName;
+  return {
+    provider,
+    pluginId: firstDshString(candidates, ['pluginId', 'plugin_id']) || '@xmanrui/dsh-im',
+    botId,
+    scope: dshMainScope(candidates),
+    externalConversationId: conversationId || senderId || botId || 'default',
+    senderId,
+    senderName,
+    displayName
+  };
+}
+
+function dshMainObjectCandidates(value: unknown): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<unknown>();
+  const visit = (item: unknown, depth: number) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item) || seen.has(item) || depth > 4) return;
+    seen.add(item);
+    const record = item as Record<string, unknown>;
+    out.push(record);
+    for (const key of ['raw', 'payload', 'request', 'args', 'message', 'data', 'body', 'event', 'sender', 'conversation', 'external', 'context', 'llm']) {
+      visit(record[key], depth + 1);
+    }
+  };
+  visit(value, 0);
+  return out;
+}
+
+function firstDshString(candidates: Array<Record<string, unknown>>, keys: string[]): string | undefined {
+  for (const candidate of candidates) {
+    for (const key of keys) {
+      const value = candidate[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+  }
+  return undefined;
+}
+
+function dshMainScope(candidates: Array<Record<string, unknown>>): ExternalConversationMetadata['scope'] {
+  const explicit = firstDshString(candidates, ['scope', 'chatType', 'conversationType', 'type'])?.toLowerCase();
+  if (explicit === 'private' || explicit === 'group' || explicit === 'channel') return explicit;
+  if (firstDshString(candidates, ['groupId', 'group_id', 'guildId', 'guild_id', 'channelId', 'channel_id'])) return 'group';
+  return 'unknown';
+}
+
+function safeExternalSegment(value: string): string {
+  return value.trim().toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'im';
+}
+
+function externalProviderTitle(provider: string): string {
+  const clean = provider.trim();
+  const lower = clean.toLowerCase().replace(/^@/, '');
+  if (!lower || lower === 'dsh-im' || lower === 'xmanrui/dsh-im' || lower === 'xmanrui-dsh-im') return 'IM';
+  if (lower === 'wechat' || lower === 'weixin' || lower === 'wx') return 'WeChat';
+  if (lower === 'lark' || lower === 'feishu') return 'Feishu';
+  if (lower === 'dingding' || lower === 'dingtalk') return 'DingTalk';
+  if (lower === 'qq') return 'QQ';
+  return clean
+    .split(/[-_\s/]+/g)
+    .filter(Boolean)
+    .map((part) => /^[a-z0-9]+$/i.test(part) ? `${part.slice(0, 1).toUpperCase()}${part.slice(1)}` : part)
+    .join(' ') || 'IM';
+}
+
+function externalImSessionTitle(external: ExternalConversationMetadata, input: string): string {
+  const provider = externalProviderTitle(external.provider);
+  const scope = external.scope && external.scope !== 'unknown' ? ` ${external.scope}` : '';
+  const name = external.displayName || external.senderName || external.externalConversationId || 'conversation';
+  const preview = input.trim().slice(0, 36);
+  return `${provider}${scope} / ${name}${preview ? ` - ${preview}` : ''}`.slice(0, 96);
+}
+
+function externalImWorkspaceDir(sessionId: string): string {
+  const dir = join(context.harnessHome, 'im-artifacts', safeExternalSegment(sessionId));
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function enqueueExternalImRun<T>(sessionId: string, task: () => Promise<T>): Promise<T> {
+  const previous = externalImSessionQueues.get(sessionId) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(async () => {
+    await acquireExternalImSlot();
+    try {
+      return await task();
+    } finally {
+      releaseExternalImSlot();
+    }
+  });
+  const stored = run.catch(() => undefined);
+  externalImSessionQueues.set(sessionId, stored);
+  stored.finally(() => {
+    if (externalImSessionQueues.get(sessionId) === stored) externalImSessionQueues.delete(sessionId);
+  });
+  return await run;
+}
+
+async function acquireExternalImSlot(): Promise<void> {
+  while (activeExternalImRuns >= EXTERNAL_IM_MAX_CONCURRENT_RUNS) {
+    await new Promise<void>((resolveWaiter) => {
+      externalImSlotWaiters.push(resolveWaiter);
+    });
+  }
+  activeExternalImRuns += 1;
+}
+
+function releaseExternalImSlot(): void {
+  activeExternalImRuns = Math.max(0, activeExternalImRuns - 1);
+  externalImSlotWaiters.shift()?.();
+}
+
+function dshMainWorkspaceDir(source?: string): string | undefined {
+  const clean = source?.trim();
+  if (!clean || !isAbsolute(clean)) return undefined;
+  try {
+    const target = resolve(clean);
+    return existsSync(target) && statSync(target).isDirectory() ? target : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function logRealtimeEvent(event: string, details?: Record<string, unknown>): void {
   const file = join(context.harnessHome, 'logs', 'realtime.log');
   const record = {
@@ -154,17 +1055,34 @@ function logRealtimeEvent(event: string, details?: Record<string, unknown>): voi
   else console.info(line);
 }
 
+function isDisposedWebContentsSendError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Render frame was disposed|WebContents was destroyed|Object has been destroyed/i.test(message);
+}
+
+function safeSend(contents: WebContents | undefined | null, channel: string, payload: unknown): boolean {
+  if (!contents || contents.isDestroyed()) return false;
+  try {
+    contents.send(channel, payload);
+    return true;
+  } catch (error) {
+    if (isDisposedWebContentsSendError(error)) return false;
+    console.warn(`[ipc] failed to send ${channel}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 function broadcastSessionUpdated(event: SessionUpdateEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('sessions:updated', event);
+    safeSend(win.webContents, 'sessions:updated', event);
   }
 }
 
 function broadcastAgentToolEvent(payload: AgentToolEventStream): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('agent:tool-event', payload);
+    safeSend(win.webContents, 'agent:tool-event', payload);
   }
 }
 
@@ -172,14 +1090,14 @@ function broadcastLiveTaskUpdate(task: LiveAgentTaskUpdateEvent['task']): void {
   const payload: LiveAgentTaskUpdateEvent = { task };
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('live-tasks:updated', payload);
+    safeSend(win.webContents, 'live-tasks:updated', payload);
   }
 }
 
 function broadcastLiveRealtimeEvent(payload: LiveRealtimeEvent): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (win.isDestroyed()) continue;
-    win.webContents.send('live-realtime:event', payload);
+    safeSend(win.webContents, 'live-realtime:event', payload);
   }
 }
 
@@ -217,7 +1135,11 @@ function requestInteractiveToolApproval(sender: WebContents, request: ToolApprov
       resolve({ id: request.id, approved: false });
     }, request.timeoutMs);
     pendingToolApprovals.set(request.id, { senderId: sender.id, request, resolve, timeout });
-    sender.send('tool-approval:request', request);
+    if (!safeSend(sender, 'tool-approval:request', request)) {
+      clearTimeout(timeout);
+      pendingToolApprovals.delete(request.id);
+      resolve({ id: request.id, approved: false });
+    }
   });
 }
 
@@ -252,18 +1174,126 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
+function titleBarCssColor(value: string | undefined): string | undefined {
+  const text = value?.trim();
+  if (!text) return undefined;
+  if (/^#(?:[0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(text)) return text;
+  if (/^rgba?\(\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(text)) return text;
+  if (/^hsla?\(\s*\d+(?:\.\d+)?(?:deg)?\s*,\s*\d+(?:\.\d+)?%\s*,\s*\d+(?:\.\d+)?%(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(text)) return text;
+  return undefined;
+}
+
+function resolveTitleBarThemeTokens(config: TitleBarThemeConfig): TitleBarThemeTokens {
+  const textColor = titleBarCssColor(config.textColor);
+  if (config.theme === 'light' || config.theme === 'tech') {
+    return {
+      ...BUILTIN_TITLE_BAR_THEME_TOKENS[config.theme],
+      textPrimary: textColor || BUILTIN_TITLE_BAR_THEME_TOKENS[config.theme].textPrimary
+    };
+  }
+  if (config.theme.startsWith('custom:')) {
+    const themeId = config.theme.slice('custom:'.length);
+    const theme = config.customThemes.find((item) => item.id === themeId);
+    return {
+      bgPrimary: titleBarCssColor(theme?.tokens.bgPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.bgPrimary,
+      textPrimary: textColor || titleBarCssColor(theme?.tokens.textPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary
+    };
+  }
+  return {
+    ...BUILTIN_TITLE_BAR_THEME_TOKENS.dark,
+    textPrimary: textColor || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary
+  };
+}
+
+function mainWindowTitleBarOverlay(config: TitleBarThemeConfig): Electron.TitleBarOverlayOptions {
+  const tokens = resolveTitleBarThemeTokens(config);
+  return {
+    color: TITLE_BAR_TRANSPARENT_COLOR,
+    symbolColor: titleBarCssColor(tokens.textPrimary) || BUILTIN_TITLE_BAR_THEME_TOKENS.dark.textPrimary,
+    height: 48
+  };
+}
+
+function titleBarThemeConfigFromPayload(payload: unknown): TitleBarThemeConfig {
+  const current = context.getConfig();
+  const raw = payload && typeof payload === 'object' ? payload as Partial<TitleBarThemeConfig> : {};
+  const theme = raw.theme === 'dark' || raw.theme === 'light' || raw.theme === 'tech' || (typeof raw.theme === 'string' && raw.theme.startsWith('custom:'))
+    ? raw.theme
+    : current.theme;
+  return {
+    theme,
+    textColor: titleBarCssColor(raw.textColor) || current.textColor,
+    customThemes: Array.isArray(raw.customThemes) ? raw.customThemes : current.customThemes
+  };
+}
+
 function isAbortLikeError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.name === 'AbortError') return true;
   return /operation was aborted|session stopped by user|aborted/i.test(error.message);
 }
 
+function abortReasonText(controller: AbortController): string {
+  const reason = controller.signal.reason;
+  if (typeof reason === 'string' && reason.trim()) return reason.trim();
+  if (reason instanceof Error && reason.message.trim()) return reason.message.trim();
+  return 'unknown';
+}
+
+function abortChatController(controller: AbortController, reason: string): void {
+  try {
+    controller.abort(reason);
+  } catch {
+    controller.abort();
+  }
+}
+
+function chatAbortError(controller: AbortController): Error {
+  const reason = abortReasonText(controller);
+  if (reason === 'agent:stop') return new Error('Session stopped by user.');
+  if (reason === 'app:before-quit') return new Error('Session stopped because the app is quitting.');
+  if (reason === 'web-contents-destroyed') return new Error('Session stopped because the chat window was closed or reloaded.');
+  return new Error(`Session stopped by harness abort signal (${reason}).`);
+}
+
+const LIVE_TASK_INTERIM_PATTERNS = [
+  /\b(background\s+task|task)\b.{0,40}\b(queued|submitted|created|started|running)\b/i,
+  /\b(queued|submitted|created|started)\b.{0,40}\b(background\s+task|task)\b/i,
+  /[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf).{0,16}(\u63d0\u4ea4|\u521b\u5efa|\u52a0\u5165|\u6392\u961f|\u5f00\u59cb)/,
+  /(\u67e5\u8be2|\u8bf7\u6c42).{0,8}[\u4efb\u52a1].{0,16}(\u5df2|\u5df2\u7ecf)/,
+  /(\u8bf7\u7a0d\u7b49|\u7a0d\u7b49|\u7b49\u4e00\u4e0b)/,
+  /\u5e2e\u4f60.{0,12}(\u67e5|\u770b|\u5904\u7406|\u641c)/,
+  /\b(please wait|one moment|hold on|let me check|i'?ll check|i will check)\b/i
+];
+
+function textValue(value: unknown): string {
+  return typeof value === 'string' ? value : (value == null ? '' : String(value));
+}
+
+function isLiveTaskInterimAssistantContent(content: unknown): boolean {
+  const text = textValue(content).replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 220) return false;
+  return LIVE_TASK_INTERIM_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+function hasRecentLiveTaskForSession(sessionId: string): boolean {
+  const now = Date.now();
+  const tasks = liveSessionStore.read(sessionId)?.tasks ?? [];
+  return tasks.some((task) => {
+    if (task.status === 'queued' || task.status === 'running') return true;
+    const createdMs = Date.parse(task.createdAt);
+    const updatedMs = Date.parse(task.updatedAt);
+    return (Number.isFinite(createdMs) && now - createdMs < 20000)
+      || (Number.isFinite(updatedMs) && now - updatedMs < 20000);
+  });
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null;
 }
 
-function escapeHtmlText(input: string): string {
-  return input
+function escapeHtmlText(input: unknown): string {
+  return textValue(input)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
@@ -636,14 +1666,14 @@ function buildBuiltinSkillCreatorGuide(): string {
   ].join('\n\n');
 }
 
-function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content: string; createdAt?: string }> }): string {
+function buildTaskTrace(result: { iterations: number; execution: { mode: 'workspace' | 'sandbox' }; toolEvents: Array<{ toolName: string; ok: boolean; content?: string; createdAt?: string }> }): string {
   const lines = [
     `Iterations: ${result.iterations}`,
     `Execution mode: ${result.execution.mode}`,
     `Tool events: ${result.toolEvents.length}`
   ];
   for (const event of result.toolEvents) {
-    const preview = event.content.replace(/\s+/g, ' ').slice(0, 140);
+    const preview = textValue(event.content).replace(/\s+/g, ' ').slice(0, 140);
     lines.push(`- [${event.ok ? 'ok' : 'fail'}] ${event.toolName}${event.createdAt ? ` @ ${event.createdAt}` : ''} :: ${preview}`);
   }
   return lines.join('\n');
@@ -1527,6 +2557,125 @@ function openMainWindowDevTools(win: ElectronBrowserWindow): void {
   win.webContents.openDevTools({ mode: 'detach', title: `${context.getConfig().branding.productName} DevTools` });
 }
 
+function isExternalUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function copyTextToSystemClipboard(text: string): void {
+  if (!text) return;
+  clipboard.writeText(text);
+}
+
+function appendContextSeparator(template: MenuItemConstructorOptions[]): void {
+  const last = template[template.length - 1];
+  if (!last || last.type === 'separator') return;
+  template.push({ type: 'separator' });
+}
+
+function trimContextSeparators(template: MenuItemConstructorOptions[]): MenuItemConstructorOptions[] {
+  while (template[0]?.type === 'separator') template.shift();
+  while (template[template.length - 1]?.type === 'separator') template.pop();
+  return template;
+}
+
+function buildNativeContextMenuTemplate(contents: WebContents, params: ContextMenuParams): MenuItemConstructorOptions[] {
+  const template: MenuItemConstructorOptions[] = [];
+  const flags = params.editFlags;
+  const selectionText = params.selectionText?.trim() ?? '';
+  const linkUrl = params.linkURL?.trim() ?? '';
+  const srcUrl = params.srcURL?.trim() ?? '';
+  const selectedUrl = selectionText ? findFirstHttpUrl(selectionText) ?? '' : '';
+
+  if (linkUrl) {
+    if (isExternalUrl(linkUrl)) {
+      template.push({
+        label: '打开链接',
+        click: () => void shell.openExternal(linkUrl)
+      });
+    }
+    template.push({
+      label: '复制链接地址',
+      click: () => copyTextToSystemClipboard(linkUrl)
+    });
+    appendContextSeparator(template);
+  } else if (selectedUrl && isExternalUrl(selectedUrl)) {
+    template.push({
+      label: '打开选中链接',
+      click: () => void shell.openExternal(selectedUrl)
+    });
+    template.push({
+      label: '复制选中链接',
+      click: () => copyTextToSystemClipboard(selectedUrl)
+    });
+    appendContextSeparator(template);
+  }
+
+  if (srcUrl && (params.mediaType === 'image' || params.mediaType === 'video' || params.mediaType === 'audio')) {
+    if (params.mediaType === 'image') {
+      template.push({
+        label: '复制图片',
+        click: () => contents.copyImageAt(params.x, params.y)
+      });
+    }
+    template.push({
+      label: params.mediaType === 'image' ? '复制图片地址' : '复制媒体地址',
+      click: () => copyTextToSystemClipboard(srcUrl)
+    });
+    if (isExternalUrl(srcUrl) || srcUrl.startsWith('data:')) {
+      template.push({
+        label: params.mediaType === 'image' ? '图片另存为...' : '媒体另存为...',
+        click: () => contents.downloadURL(srcUrl)
+      });
+    }
+    appendContextSeparator(template);
+  }
+
+  if (params.isEditable) {
+    template.push(
+      { label: '撤销', role: 'undo', enabled: flags.canUndo },
+      { label: '重做', role: 'redo', enabled: flags.canRedo },
+      { type: 'separator' },
+      { label: '剪切', role: 'cut', enabled: flags.canCut },
+      { label: '复制', role: 'copy', enabled: flags.canCopy },
+      { label: '粘贴', role: 'paste', enabled: flags.canPaste },
+      { label: '删除', role: 'delete', enabled: flags.canDelete },
+      { type: 'separator' },
+      { label: '全选', role: 'selectAll', enabled: flags.canSelectAll }
+    );
+  } else {
+    if (selectionText) {
+      template.push({
+        label: '复制',
+        role: 'copy',
+        enabled: flags.canCopy
+      });
+      appendContextSeparator(template);
+    }
+    template.push({
+      label: '全选',
+      role: 'selectAll',
+      enabled: flags.canSelectAll
+    });
+  }
+
+  return trimContextSeparators(template).filter((item, index, list) => !(item.type === 'separator' && list[index - 1]?.type === 'separator'));
+}
+
+function registerNativeContextMenu(contents: WebContents): void {
+  contents.on('context-menu', (_event, params) => {
+    if (contents.isDestroyed()) return;
+    const template = buildNativeContextMenuTemplate(contents, params);
+    if (template.length === 0) return;
+    const win = BrowserWindow.fromWebContents(contents) ?? mainWindow ?? undefined;
+    Menu.buildFromTemplate(template).popup(win ? { window: win } : undefined);
+  });
+}
+
 function resetEmbeddedPreviewWebContentsState(target: WebContents): void {
   try {
     target.setZoomFactor(1);
@@ -1543,12 +2692,41 @@ function resetEmbeddedPreviewWebContentsState(target: WebContents): void {
   });
 }
 
+function clearEmbeddedPreviewWebContentsBinding(): void {
+  embeddedPreviewWebContentsId = null;
+  embeddedPreviewResetCleanup?.();
+  embeddedPreviewResetCleanup = null;
+}
+
+function bindEmbeddedPreviewWebContents(target: WebContents): void {
+  clearEmbeddedPreviewWebContentsBinding();
+  embeddedPreviewWebContentsId = target.id;
+  const reset = () => resetEmbeddedPreviewWebContentsState(target);
+  reset();
+  target.on('dom-ready', reset);
+  target.on('did-navigate', reset);
+  target.on('did-navigate-in-page', reset);
+  target.on('did-stop-loading', reset);
+  target.once('destroyed', clearEmbeddedPreviewWebContentsBinding);
+  embeddedPreviewResetCleanup = () => {
+    target.off('dom-ready', reset);
+    target.off('did-navigate', reset);
+    target.off('did-navigate-in-page', reset);
+    target.off('did-stop-loading', reset);
+    target.off('destroyed', clearEmbeddedPreviewWebContentsBinding);
+  };
+}
+
 function resolveEmbeddedPreviewWebContents(): WebContents | null {
   if (!embeddedPreviewWebContentsId) return null;
   const target = webContents.fromId(embeddedPreviewWebContentsId);
   if (!target || target.isDestroyed()) return null;
-  if (sessionPartition(target) !== EMBEDDED_BROWSER_PARTITION) return null;
+  if (!isAllowedEmbeddedPreviewPartition(sessionPartition(target))) return null;
   return target;
+}
+
+function isAllowedEmbeddedPreviewPartition(partition: string): boolean {
+  return partition === EMBEDDED_BROWSER_PARTITION || partition === EMBEDDED_BROWSER_PREVIEW_PARTITION;
 }
 
 context.embeddedBrowserAutomation.setSharedWebContentsResolver(() => resolveEmbeddedPreviewWebContents());
@@ -1670,7 +2848,7 @@ function isBrowserFormMutationEvent(event: ToolEvent): boolean {
   }
   if (event.toolName === 'browser_click' || event.toolName === 'browser_find') {
     const combined = previewSourceText(event.toolName, event.args, event.content);
-    return /\b(submit|sign in|login|log in|confirm|continue|authorize|approve|save|apply|send|next)\b|提交|登录|确认|继续|授权|保存|申请|发送|下一步/.test(combined);
+    return /\b(submit|sign in|login|log in|confirm|continue|authorize|approve|save|apply|send|next)\b/i.test(combined);
   }
   return false;
 }
@@ -1872,6 +3050,7 @@ async function exportAssistantMessage(req: AssistantMessageExportRequest): Promi
 async function createWindow(): Promise<void> {
   const cfg = context.getConfig();
   const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
+  const titleBarOverlay = mainWindowTitleBarOverlay(cfg);
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -1881,11 +3060,7 @@ async function createWindow(): Promise<void> {
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     ...(process.platform === 'win32'
       ? {
-          titleBarOverlay: {
-            color: '#0c0b18',
-            symbolColor: '#eee7ff',
-            height: 48
-          }
+          titleBarOverlay
         }
       : {}),
     autoHideMenuBar: true,
@@ -1913,12 +3088,83 @@ async function createWindow(): Promise<void> {
   }
 }
 
+function pluginClientWindowKey(mount: DshSidecarClientMount): string {
+  return `${mount.pluginId}:${mount.id}:${mount.mountPoint}`;
+}
+
+function shouldOpenPluginClientWindow(req: DshSidecarClientMountOpenRequest, mount: DshSidecarClientMount): boolean {
+  return req.mode === 'window'
+    || req.mode === 'desktop-companion'
+    || mount.mountPoint === 'desktop-companion'
+    || mount.mountPoint === 'floating';
+}
+
+function openPluginClientWindow(mount: DshSidecarClientMount): void {
+  const key = pluginClientWindowKey(mount);
+  const existing = pluginClientWindows.get(key);
+  if (existing && !existing.isDestroyed()) {
+    existing.focus();
+    return;
+  }
+  const display = screen.getPrimaryDisplay().workArea;
+  const isCompanion = mount.mountPoint === 'desktop-companion' || mount.mountPoint === 'floating';
+  const isSettings = mount.mountPoint === 'settings';
+  const width = isCompanion ? 360 : isSettings ? 1120 : 960;
+  const height = isCompanion ? 460 : isSettings ? 760 : 720;
+  const appIconPath = resolveBrandWindowIconPath(context.getConfig().branding.logoPath);
+  const win = new BrowserWindow({
+    width,
+    height,
+    minWidth: isCompanion ? 220 : isSettings ? 900 : 520,
+    minHeight: isCompanion ? 220 : isSettings ? 620 : 360,
+    x: isCompanion ? Math.max(display.x, display.x + display.width - width - 32) : undefined,
+    y: isCompanion ? Math.max(display.y, display.y + display.height - height - 48) : undefined,
+    title: mount.title,
+    ...(appIconPath ? { icon: appIconPath } : {}),
+    frame: !isCompanion,
+    transparent: isCompanion,
+    alwaysOnTop: isCompanion,
+    skipTaskbar: isCompanion,
+    resizable: true,
+    backgroundColor: isCompanion ? TITLE_BAR_TRANSPARENT_COLOR : '#111418',
+    webPreferences: {
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webviewTag: false
+    }
+  });
+  pluginClientWindows.set(key, win);
+  if (isCompanion) {
+    win.webContents.on('before-input-event', (_event, input) => {
+      if (input.type === 'keyDown' && input.key === 'Escape') {
+        win.close();
+      }
+    });
+  }
+  win.on('closed', () => {
+    if (pluginClientWindows.get(key) === win) pluginClientWindows.delete(key);
+  });
+  void win.loadURL(mount.url);
+}
+
+async function openDshClientMount(req: DshSidecarClientMountOpenRequest): Promise<DshSidecarClientMount> {
+  const mounts = await context.dshSidecarManager.listClientMounts();
+  const cleanId = req.id.trim();
+  const mount = mounts.find((item) => item.id === cleanId && (!req.pluginId || item.pluginId === req.pluginId))
+    ?? mounts.find((item) => item.id === cleanId || item.pluginId === req.pluginId);
+  if (!mount) throw new Error(`Unknown DSH client mount: ${req.pluginId ? `${req.pluginId}/` : ''}${req.id}`);
+  if (shouldOpenPluginClientWindow(req, mount)) openPluginClientWindow(mount);
+  return mount;
+}
+
 function applyMainWindowBranding(): void {
   const cfg = context.getConfig();
   app.setName(cfg.branding.productName);
   applyBrandDockIcon(cfg.branding.logoPath);
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.setTitle(cfg.branding.productName);
+  applyMainWindowTitleBarOverlay(cfg);
   const appIconPath = resolveBrandWindowIconPath(cfg.branding.logoPath);
   if (!appIconPath) return;
   try {
@@ -1926,6 +3172,11 @@ function applyMainWindowBranding(): void {
   } catch {
     // Some platforms ignore runtime icon updates.
   }
+}
+
+function applyMainWindowTitleBarOverlay(config: TitleBarThemeConfig = context.getConfig()): void {
+  if (process.platform !== 'win32' || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setTitleBarOverlay(mainWindowTitleBarOverlay(config));
 }
 
 function registerWechatTools(): void {
@@ -2107,10 +3358,15 @@ function registerIpc(): void {
       ],
       theme: `custom:${theme.id}`
     });
+    applyMainWindowTitleBarOverlay(next);
     return { ...context.configStore.publicConfig(false), apiKeyConfigured: Boolean(next.apiKey) };
   });
   ipcMain.handle('themes:dreamskin:list', async (_event, req?: DreamSkinGalleryQuery) => listDreamSkinGallery(req ?? {}));
-  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => installDreamSkinTheme(context.harnessHome, context.configStore, req));
+  ipcMain.handle('themes:dreamskin:install', async (_event, req: DreamSkinThemeInstallRequest) => {
+    const next = await installDreamSkinTheme(context.harnessHome, context.configStore, req);
+    applyMainWindowTitleBarOverlay();
+    return next;
+  });
   ipcMain.handle('liveRealtime:start', async (_event, req?: LiveRealtimeStartRequest) => liveRealtimeManager.start(req ?? {}));
   ipcMain.handle('liveRealtime:send', async (_event, event: LiveRealtimeClientEvent) => {
     liveRealtimeManager.send(event);
@@ -2143,12 +3399,22 @@ function registerIpc(): void {
       context.sessionStore.create('New session', sessionId);
     }
     liveSessionStore.create(sessionId);
-    const updated = context.sessionStore.appendMessages(sessionId, [{
+    const message: AgentMessage = {
       role: req.role === 'assistant' ? 'assistant' : 'user',
       content,
       attachments: Array.isArray(req.attachments) && req.attachments.length > 0 ? req.attachments : undefined,
       createdAt: req.createdAt
-    }], []);
+    };
+    const current = context.sessionStore.read(sessionId);
+    const existingMessages = current?.messages ?? [];
+    const lastMessage = existingMessages.at(-1);
+    const incomingInterim = message.role === 'assistant' && isLiveTaskInterimAssistantContent(message.content);
+    const lastInterim = lastMessage?.role === 'assistant' && isLiveTaskInterimAssistantContent(lastMessage.content);
+    const updated = incomingInterim && hasRecentLiveTaskForSession(sessionId)
+      ? (current ?? context.sessionStore.read(sessionId) ?? context.sessionStore.create('New session', sessionId))
+      : lastInterim && message.role === 'assistant' && !incomingInterim
+        ? context.sessionStore.replaceMessages(sessionId, [...existingMessages.slice(0, -1), message])
+        : context.sessionStore.appendMessages(sessionId, [message], []);
     broadcastSessionUpdated({
       sessionId: updated.id,
       source: 'external',
@@ -2229,21 +3495,39 @@ function registerIpc(): void {
     let completedSessionId: string | undefined;
     let completedToolEvents: ToolEvent[] = [];
     try {
+      const sidecarResult = await maybeRunDshSidecarChatTurn({
+        sender: _event.sender,
+        input,
+        sessionId,
+        executionMode,
+        attachments: Array.isArray(attachments) ? attachments : undefined,
+        controller
+      });
+      if (sidecarResult) {
+        completedSessionId = sidecarResult.sessionId;
+        completedToolEvents = sidecarResult.toolEvents;
+        return sidecarResult;
+      }
+      await context.dshSidecarRuntimeBridge.sync().catch((error) => ({
+        toolNames: [] as string[],
+        error: error instanceof Error ? error.message : String(error)
+      }));
       const result = await context.agentLoop.run({
         userInput: input,
         attachments: Array.isArray(attachments) ? attachments : undefined,
         sessionId,
         executionMode,
         usePersonalKnowledgeBase: usePersonalKnowledgeBase === true,
+        enabledToolNames: context.getConfig().enabledToolNames,
         origin: 'chat',
         signal: controller.signal,
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
-          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-          _event.sender.send('agent:tool-event', payload);
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) };
+          safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
-          _event.sender.send('agent:message-delta', messageDelta);
+          safeSend(_event.sender, 'agent:message-delta', messageDelta);
         },
         onSessionUpdated: (record) => {
           broadcastSessionUpdated({
@@ -2266,9 +3550,16 @@ function registerIpc(): void {
         source: 'chat',
         updatedAt: new Date().toISOString()
       });
-      return { ...result, followUpQuestions, totalUsage: usageRecord.totalUsage };
+      const displayRecord = context.sessionStore.readForDisplay(result.sessionId);
+      return {
+        ...result,
+        messages: displayRecord?.messages ?? result.messages,
+        toolEvents: displayRecord?.toolEvents ?? result.toolEvents,
+        followUpQuestions,
+        totalUsage: usageRecord.totalUsage
+      };
     } catch (error) {
-      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      if (controller.signal.aborted) throw chatAbortError(controller);
       logAgentChatError({
         error,
         input,
@@ -2320,11 +3611,11 @@ function registerIpc(): void {
         enabledToolNames,
         requestToolApproval: (request) => requestInteractiveToolApproval(_event.sender, request),
         onToolEvent: (eventSessionId, toolEvent) => {
-          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: toolEvent };
-          _event.sender.send('agent:tool-event', payload);
+          const payload: AgentToolEventStream = { sessionId: eventSessionId, event: context.sessionStore.toolEventForDisplay(toolEvent) };
+          safeSend(_event.sender, 'agent:tool-event', payload);
         },
         onMessageDelta: (_eventSessionId, messageDelta) => {
-          _event.sender.send('agent:message-delta', messageDelta);
+          safeSend(_event.sender, 'agent:message-delta', messageDelta);
         },
         onSessionUpdated: (record) => {
           broadcastSessionUpdated({
@@ -2342,9 +3633,15 @@ function registerIpc(): void {
         source: 'chat',
         updatedAt: new Date().toISOString()
       });
-      return { ...result, totalUsage: usageRecord.totalUsage };
+      const displayRecord = context.sessionStore.readForDisplay(result.sessionId);
+      return {
+        ...result,
+        messages: displayRecord?.messages ?? result.messages,
+        toolEvents: displayRecord?.toolEvents ?? result.toolEvents,
+        totalUsage: usageRecord.totalUsage
+      };
     } catch (error) {
-      if (controller.signal.aborted || isAbortLikeError(error)) throw new Error('Session stopped by user.');
+      if (controller.signal.aborted) throw chatAbortError(controller);
       logAgentChatError({
         error,
         input,
@@ -2364,7 +3661,7 @@ function registerIpc(): void {
     const controller = activeChatControllers.get(senderId);
     let stoppedChat = 0;
     if (controller) {
-      controller.abort();
+      abortChatController(controller, 'agent:stop');
       stoppedChat = 1;
     }
     const wechatControllers = [...activeWechatRuns.values()];
@@ -2393,7 +3690,9 @@ function registerIpc(): void {
       }
     }
     if (context.getConfig().browserMode === 'external') {
-      await closeExternalBrowserPreview();
+      void closeExternalBrowserPreview().catch((error) => {
+        console.warn(`[browser] Failed to close external preview after stop: ${error instanceof Error ? error.message : String(error)}`);
+      });
     }
     if (stoppedChat === 0 && stoppedWechat === 0) {
       return { ok: true, content: 'No active session to stop.' };
@@ -2402,6 +3701,7 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('sessions:list', () => context.sessionStore.list());
+  ipcMain.handle('sessions:listPage', (_event, req: SessionListPageRequest) => context.sessionStore.listPage(req));
   ipcMain.handle('sessions:read', (_event, id: string) => context.sessionStore.read(id));
   ipcMain.handle('sessions:readForDisplay', (_event, id: string) => context.sessionStore.readForDisplay(id));
   ipcMain.handle('sessions:readMessageContent', (_event, req: { sessionId: string; messageId: string }) => {
@@ -2503,9 +3803,40 @@ function registerIpc(): void {
   ipcMain.handle('skills:delete', (_event, name: string) => context.skillManager.delete(name));
   ipcMain.handle('skills:installBundled', (_event, name: string, overwrite?: boolean) => context.skillManager.installBundled(name, Boolean(overwrite)));
   ipcMain.handle('skills:uploadArchive', (_event, req: SkillArchiveUploadRequest) => context.skillManager.uploadArchive(req));
-  ipcMain.handle('skills:market:browse', (_event, query?: string) => context.marketplaceManager.browse(query));
+  ipcMain.handle('skills:market:browse', (_event, req?: string | MarketplaceBrowseRequest) => context.marketplaceManager.browse(req));
   ipcMain.handle('skills:market:install', (_event, req: SkillInstallRequest) => context.marketplaceManager.install(req));
   ipcMain.handle('skills:market:uninstall', (_event, name: string) => context.marketplaceManager.uninstall(name));
+  ipcMain.handle('dsh-sidecar:status', () => context.dshSidecarManager.status());
+  ipcMain.handle('dsh-sidecar:start', () => context.dshSidecarManager.start());
+  ipcMain.handle('dsh-sidecar:stop', () => context.dshSidecarManager.stop());
+  ipcMain.handle('dsh-sidecar:plugins:list', () => context.dshSidecarManager.list());
+  ipcMain.handle('dsh-sidecar:runtime:status', () => context.dshSidecarManager.runtimeStatus());
+  ipcMain.handle('dsh-sidecar:runtime:sync', () => context.dshSidecarRuntimeBridge.sync());
+  ipcMain.handle('dsh-sidecar:client-mounts:list', () => context.dshSidecarManager.listClientMounts());
+  ipcMain.handle('dsh-sidecar:client-mounts:open', async (_event, req: DshSidecarClientMountOpenRequest) => {
+    return await openDshClientMount(req);
+  });
+  ipcMain.handle('dsh-sidecar:chat:run', (_event, req: DshSidecarChatRunRequest) => context.dshSidecarManager.chatRun(req));
+  ipcMain.handle('dsh-sidecar:plugins:install', async (_event, req: DshSidecarPluginInstallRequest) => {
+    return await context.dshSidecarManager.install(req);
+  });
+  ipcMain.handle('dsh-sidecar:plugins:upload', async (_event, req: DshSidecarPluginUploadRequest) => {
+    return await context.dshSidecarManager.upload(req);
+  });
+  ipcMain.handle('dsh-sidecar:plugins:enable', async (_event, req: DshSidecarPluginActionRequest) => {
+    return await context.dshSidecarManager.enable(req);
+  });
+  ipcMain.handle('dsh-sidecar:plugins:disable', async (_event, req: DshSidecarPluginActionRequest) => {
+    return await context.dshSidecarManager.disable(req);
+  });
+  ipcMain.handle('dsh-sidecar:plugins:uninstall', async (_event, req: DshSidecarPluginActionRequest) => {
+    return await context.dshSidecarManager.uninstall(req);
+  });
+  ipcMain.handle('plugins:market:browse', (_event, req?: string | DshMarketplaceBrowseRequest) => context.dshPluginMarketplaceManager.browse(req));
+  ipcMain.handle('plugins:market:detail', (_event, id: string) => context.dshPluginMarketplaceManager.detail(id));
+  ipcMain.handle('plugins:market:install', async (_event, req: DshMarketplacePluginInstallRequest) => {
+    return await context.dshPluginMarketplaceManager.install(req);
+  });
   ipcMain.handle('browser-coach:start', async (_event, req?: BrowserCoachStartRequest) => {
     const config = context.getConfig();
     if (config.browserMode === 'external') {
@@ -2651,6 +3982,17 @@ function registerIpc(): void {
     return picked.canceled || picked.filePaths.length === 0 ? '' : picked.filePaths[0];
   });
   ipcMain.handle('app:exportAssistantMessage', async (_event, req: AssistantMessageExportRequest) => exportAssistantMessage(req));
+  ipcMain.handle('app:artifactPreview', async (_event, req: ArtifactPreviewRequest) => artifactPreview(req));
+  ipcMain.handle('app:openArtifact', async (_event, req: ArtifactPathRequest) => {
+    const target = resolveArtifactRequestPath(req);
+    const err = await shell.openPath(target);
+    return { ok: !err, content: err || 'Opened.' };
+  });
+  ipcMain.handle('app:revealArtifact', async (_event, req: ArtifactPathRequest) => {
+    const target = resolveArtifactRequestPath(req);
+    shell.showItemInFolder(target);
+    return { ok: true, content: 'Revealed.' };
+  });
   ipcMain.handle('app:openPath', async (_event, path: string) => {
     const err = await shell.openPath(path);
     return { ok: !err, content: err || 'Opened.' };
@@ -2670,7 +4012,7 @@ function registerIpc(): void {
   ipcMain.handle('app:closeExternalPreview', async () => closeExternalBrowserPreview());
   ipcMain.handle('app:setEmbeddedPreviewWebContentsId', (_event, id: number | null) => {
     if (id == null) {
-      embeddedPreviewWebContentsId = null;
+      clearEmbeddedPreviewWebContentsBinding();
       return { ok: true, content: 'Cleared embedded preview webContents binding.' };
     }
     const numeric = Number(id);
@@ -2681,13 +4023,15 @@ function registerIpc(): void {
     if (!target || target.isDestroyed()) {
       return { ok: false, content: `webContents not found: ${id}` };
     }
-    if (sessionPartition(target) !== EMBEDDED_BROWSER_PARTITION) {
-      return { ok: false, content: `webContents ${id} is not in embedded browser partition ${EMBEDDED_BROWSER_PARTITION}.` };
+    if (!isAllowedEmbeddedPreviewPartition(sessionPartition(target))) {
+      return { ok: false, content: `webContents ${id} is not in an allowed embedded browser partition.` };
     }
-    embeddedPreviewWebContentsId = target.id;
-    resetEmbeddedPreviewWebContentsState(target);
-    target.once('did-stop-loading', () => resetEmbeddedPreviewWebContentsState(target));
+    bindEmbeddedPreviewWebContents(target);
     return { ok: true, content: `Bound embedded preview webContents id=${target.id}.` };
+  });
+  ipcMain.handle('app:setWindowTitleBarTheme', (_event, preview?: unknown) => {
+    applyMainWindowTitleBarOverlay(preview ? titleBarThemeConfigFromPayload(preview) : context.getConfig());
+    return true;
   });
   ipcMain.handle('app:windowMinimize', (event) => {
     const win = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
@@ -2713,9 +4057,10 @@ app.on('before-quit', () => {
   liveRealtimeManager.stop();
   denyPendingToolApprovals();
   browserCoachRecorder.close();
-  for (const controller of activeChatControllers.values()) controller.abort();
+  for (const controller of activeChatControllers.values()) abortChatController(controller, 'app:before-quit');
   activeChatControllers.clear();
   stopWechatPoller();
+  void context.dshSidecarManager.stop();
   void closeExternalBrowserPreview();
 });
 
@@ -2726,11 +4071,12 @@ app.whenReady().then(() => {
   applyBrandDockIcon(context.getConfig().branding.logoPath);
   registerWechatTools();
   app.on('web-contents-created', (_event, contents) => {
+    registerNativeContextMenu(contents);
     contents.once('destroyed', () => {
       if (contents.id === embeddedPreviewWebContentsId) embeddedPreviewWebContentsId = null;
       const controller = activeChatControllers.get(contents.id);
       if (controller) {
-        controller.abort();
+        abortChatController(controller, 'web-contents-destroyed');
         activeChatControllers.delete(contents.id);
       }
     });

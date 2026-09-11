@@ -2,11 +2,13 @@
 
 [English](ARCHITECTURE.en.md) | [简体中文](ARCHITECTURE.zh-CN.md)
 
-本文档对应 Tasi Harness v1.4.0 附近的当前代码实现。
+本文档对应 Tasi Harness v1.7.0 附近的当前代码实现。
 
 ## 代码架构图
 
 ![Tasi Harness architecture](architechcture.png)
+
+Draw.io 源文件：[architechcture.drawio](architechcture.drawio)。
 
 图片文件名继续使用历史上的 `architechcture.png`，以兼容已有文档链接。
 

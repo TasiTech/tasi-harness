@@ -1,0 +1,163 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+import type { DshSidecarRuntimeSkill, DshSidecarToolCallRequest, ToolDefinition, ToolExecutionResult } from '../src/shared/types.js';
+import { ConfigStore } from '../src/main/storage/configStore.js';
+import { SkillManager } from '../src/main/skills/skillManager.js';
+import { ToolRegistry } from '../src/main/tools/toolRegistry.js';
+import type { DshSidecarManager } from '../src/main/plugins/dshSidecarManager.js';
+import { DshSidecarRuntimeBridge } from '../src/main/plugins/dshSidecarRuntimeBridge.js';
+import { tempHome } from './helpers.js';
+
+let cleanup = () => {};
+afterEach(() => cleanup());
+
+describe('DshSidecarRuntimeBridge', () => {
+  it('registers sidecar runtime tools without enabling them globally', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    configStore.update({
+      enabledToolNames: [...configStore.get().enabledToolNames, 'agent_teams_view']
+    });
+    const registry = new ToolRegistry();
+    const calls: DshSidecarToolCallRequest[] = [];
+    const tool: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'agent_teams_view',
+        description: 'View a compatibility team.',
+        parameters: { type: 'object', properties: {} }
+      }
+    };
+    const sidecar = {
+      runtimeTools: async () => [tool],
+      callRuntimeTool: async (req: DshSidecarToolCallRequest): Promise<ToolExecutionResult> => {
+        calls.push(req);
+        return { ok: true, content: 'team view' };
+      }
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore);
+    const result = await bridge.sync();
+
+    expect(result.toolNames).toEqual(['agent_teams_view']);
+    expect(registry.names()).toContain('agent_teams_view');
+    expect(configStore.get().enabledToolNames).not.toContain('agent_teams_view');
+    const executed = await registry.execute('agent_teams_view', { team_id: 'demo' }, {
+      sessionId: 'session-1',
+      workspaceDir: env.home,
+      requestId: 'call-1'
+    });
+    expect(executed.content).toBe('team view');
+    expect(calls[0]).toMatchObject({
+      name: 'agent_teams_view',
+      args: { team_id: 'demo' },
+      context: {
+        sessionId: 'session-1',
+        workspaceDir: env.home,
+        requestId: 'call-1'
+      }
+    });
+  });
+
+  it('syncs sidecar runtime skills into the installed skill index', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    const registry = new ToolRegistry();
+    const skillManager = new SkillManager(env.home);
+    const runtimeSkill: DshSidecarRuntimeSkill = {
+      name: 'superdesign',
+      description: 'Design frontend UI on the Superdesign canvas.',
+      pluginId: 'superdesign-dsh',
+      packageName: 'superdesign-dsh',
+      path: 'C:\\plugin\\skills\\superdesign\\SKILL.md',
+      content: '---\nname: superdesign\ndescription: Design frontend UI on the Superdesign canvas.\n---\n\nUse Superdesign for UI work.'
+    };
+    const sidecar = {
+      runtimeTools: async () => [],
+      runtimeSkills: async () => [runtimeSkill]
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore, skillManager);
+    await bridge.sync();
+
+    expect(skillManager.list().find((skill) => skill.name === 'superdesign')).toMatchObject({
+      source: 'dsh',
+      readonly: true,
+      category: 'dsh',
+      displayCategory: 'DSH (superdesign-dsh)'
+    });
+    expect(skillManager.renderPromptIndex()).toContain('superdesign [DSH (superdesign-dsh) (dsh)]');
+    expect(skillManager.read('superdesign')?.content).toContain('Use Superdesign for UI work.');
+  });
+
+  it('resolves path-like runtime tool args against the workspace', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    const registry = new ToolRegistry();
+    const calls: DshSidecarToolCallRequest[] = [];
+    const tool: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'modlens_read_image',
+        description: 'Read an image.',
+        parameters: { type: 'object', properties: {} }
+      }
+    };
+    const sidecar = {
+      runtimeTools: async () => [tool],
+      runtimeSkills: async () => [],
+      callRuntimeTool: async (req: DshSidecarToolCallRequest): Promise<ToolExecutionResult> => {
+        calls.push(req);
+        return { ok: true, content: 'read' };
+      }
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore);
+    await bridge.sync();
+    await registry.execute('modlens_read_image', {
+      path: 'screenshots/01-chat.png',
+      source_url: 'https://example.com/image.png'
+    }, {
+      sessionId: 'session-1',
+      workspaceDir: env.home,
+      requestId: 'call-1'
+    });
+
+    expect(calls[0]?.args).toMatchObject({
+      path: join(env.home, 'screenshots/01-chat.png'),
+      source_url: 'https://example.com/image.png'
+    });
+  });
+
+  it('prunes stale DSH IM runtime tools from global enabled tools on sync', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const configStore = new ConfigStore(env.home);
+    configStore.update({
+      enabledToolNames: [...configStore.get().enabledToolNames, 'dsh_im_return_file']
+    });
+    const registry = new ToolRegistry();
+    const tool: ToolDefinition = {
+      type: 'function',
+      function: {
+        name: 'dsh_im_return_file',
+        description: 'Return a file to the IM conversation.',
+        parameters: { type: 'object', properties: {} }
+      }
+    };
+    const sidecar = {
+      runtimeTools: async () => [tool],
+      runtimeSkills: async () => []
+    } as unknown as DshSidecarManager;
+
+    const bridge = new DshSidecarRuntimeBridge(sidecar, registry, configStore);
+    const result = await bridge.sync();
+
+    expect(result.toolNames).toEqual(['dsh_im_return_file']);
+    expect(registry.names()).toContain('dsh_im_return_file');
+    expect(configStore.get().enabledToolNames).not.toContain('dsh_im_return_file');
+  });
+});

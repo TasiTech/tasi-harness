@@ -26,13 +26,36 @@ describe('PromptBuilder', () => {
 
     expect(prompt).toContain('Browser mode is external.');
     expect(prompt).toContain('In external browser mode, use browser_* tools as the default workflow');
-    expect(prompt).toContain('browser_close_policy');
-    expect(prompt).toContain('keep_open');
+    expect(prompt).toContain('Browser close policy');
     expect(prompt).toContain('engine=auto');
     expect(prompt).toContain('shell.openExternal fallback');
   });
 
-  it('tells the agent to follow relevant skill workflows instead of skipping to a self-generated answer', async () => {
+  it('separates stable system instructions from volatile runtime context', async () => {
+    const env = tempHome();
+    cleanup = env.cleanup;
+    const builder = new PromptBuilder(
+      new MemoryStore(env.home),
+      new SkillManager(env.home),
+      new PersonalKnowledgeBase(env.home)
+    );
+
+    const prompt = await builder.buildForMessages(defaultConfig(), { sessionId: 'session_cache', userInput: 'remember this' });
+
+    expect(prompt.systemPrompt).toContain('## Operating model');
+    expect(prompt.systemPrompt).toContain('## Installed skills index');
+    expect(prompt.systemPrompt).toContain('Current session id: session_cache');
+    expect(prompt.systemPrompt).not.toContain('Current timestamp:');
+    expect(prompt.systemPrompt).not.toContain('## Persistent memory snapshot');
+    expect(prompt.systemPrompt).not.toContain('## Session document XML snapshot');
+    expect(prompt.runtimeContext).toContain('Current timestamp:');
+    expect(prompt.runtimeContext).toContain('## Persistent memory snapshot');
+    expect(prompt.runtimeContext).toContain('## Session document XML snapshot');
+    expect(prompt.displayPrompt).toContain(prompt.systemPrompt);
+    expect(prompt.displayPrompt).toContain(prompt.runtimeContext);
+  });
+
+  it('keeps skill, browser, and citation rules compact but enforceable', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const builder = new PromptBuilder(
@@ -43,38 +66,15 @@ describe('PromptBuilder', () => {
 
     const prompt = await builder.build(defaultConfig(), { userInput: 'plan a trip itinerary' });
 
-    expect(prompt).toContain('treat that skill as an execution workflow, not optional background reading');
-    expect(prompt).toContain('enter skill execution mode and stay in that mode');
-    expect(prompt).toContain('your first substantive step should be to call skill_view for that skill');
-    expect(prompt).toContain('follow its instructions, routing rules, and completion criteria');
-    expect(prompt).toContain('Reading skill_view only loads instructions; it does not count as completing the skill');
-    expect(prompt).toContain('The content returned by skill_view is workflow guidance, not evidence');
-    expect(prompt).toContain('do not skip straight to a general-knowledge answer');
-    expect(prompt).toContain('If SKILL.md lists references/*.md files, load the references relevant to the planned provider/tool path');
-    expect(prompt).toContain('Prioritize reading the most relevant provider reference first');
-    expect(prompt).toContain('If the only tool you have called for a skill-driven request is skill_view');
-    expect(prompt).toContain('prefer an assistant turn with tool calls immediately after reading the skill');
-    expect(prompt).toContain('the next substantive action must be one of');
-    expect(prompt).toContain('A final answer that skips required skill steps is incorrect');
-    expect(prompt).toContain('Before producing a final answer for a skill-driven request');
-    expect(prompt).toContain('return a degraded answer rather than presenting an unverified answer as complete');
-    expect(prompt).toContain('2025 年春节假期接待 16.8 万人次[1](https://example.com/news)。');
-    expect(prompt).toContain('inline citations near claims are required for web-backed answers');
-    expect(prompt).toContain('Do not use named Markdown links such as `[Source Title](https://example.com)` as evidence citations');
-    expect(prompt).toContain('Convert every evidence URL to a numbered citation like `[1](https://example.com)`');
-    expect(prompt).toContain('Do not output source-only named links without numeric labels');
-    expect(prompt).toContain('Preserve source traceability from tool use to final answer');
-    expect(prompt).toContain('Important data and important viewpoints taken from retrieved/opened content must include numbered citation links');
-    expect(prompt).toContain('study conclusions, policy positions, quoted or paraphrased expert views');
-    expect(prompt).toContain('For data-heavy answers, cite every important number or live-data item near the value');
-    expect(prompt).toContain('In tables, put the citation in the same row or source column');
-    expect(prompt).toContain('cite article-level or official-page URLs for timelines, quotes, official responses');
-    expect(prompt).toContain('Do not replace opened article/source URLs with a generic search page');
-    expect(prompt).toContain('add a compact Sources/来源 section');
-    expect(prompt).toContain('Do not write plain `[1] Source title`');
-    expect(prompt).toContain('Keep evidence links separate from action links');
-    expect(prompt).toContain('label it as [estimated], [inferred], or [unverified]');
-    expect(prompt).toContain('URL-encode spaces and unsafe characters');
+    expect(prompt).toContain('mandatory execution workflow');
+    expect(prompt).toContain('your first substantive step should be to call skill_view');
+    expect(prompt).toContain('routing rules, references, tool requirements, and completion criteria');
+    expect(prompt).toContain('skill_view loads workflow guidance only');
+    expect(prompt).toContain('clearly return a blocked/degraded answer');
+    expect(prompt).toContain('Keep internal reasoning compact and non-repetitive');
+    expect(prompt).toContain('Progress rule');
+    expect(prompt).toContain('numbered inline Markdown links like [1](https://example.com)');
+    expect(prompt).toContain('Important live or retrieved facts need citations near the value');
   });
 
   it('can disable memory and skills for a single run', async () => {
@@ -111,7 +111,7 @@ describe('PromptBuilder', () => {
     expect(prompt).toContain('context: domain=travel');
   });
 
-  it('injects uploaded session document XML into the system prompt', async () => {
+  it('injects uploaded session document XML into runtime context', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const sessionDocs = new SessionDocumentContextStore(env.home);
@@ -128,14 +128,15 @@ describe('PromptBuilder', () => {
       sessionDocs
     );
 
-    const prompt = await builder.build(defaultConfig(), { sessionId: 'session_xml', userInput: 'summarize this document' });
+    const prompt = await builder.buildForMessages(defaultConfig(), { sessionId: 'session_xml', userInput: 'summarize this document' });
 
-    expect(prompt).toContain('Session document XML snapshot');
-    expect(prompt).toContain('source.xml');
-    expect(prompt).toContain('<session_document');
+    expect(prompt.systemPrompt).not.toContain('<session_document');
+    expect(prompt.runtimeContext).toContain('Session document XML snapshot');
+    expect(prompt.runtimeContext).toContain('source.xml');
+    expect(prompt.runtimeContext).toContain('<session_document');
   });
 
-  it('includes up to ten uploaded session documents in the system prompt', async () => {
+  it('includes up to ten uploaded session documents in runtime context', async () => {
     const env = tempHome();
     cleanup = env.cleanup;
     const sessionDocs = new SessionDocumentContextStore(env.home);
@@ -155,18 +156,11 @@ describe('PromptBuilder', () => {
       sessionDocs
     );
 
-    const prompt = await builder.build(defaultConfig(), { sessionId, userInput: 'summarize uploaded files' });
+    const prompt = await builder.buildForMessages(defaultConfig(), { sessionId, userInput: 'summarize uploaded files' });
 
-    expect(prompt).toContain('a.xml');
-    expect(prompt).toContain('b.xml');
-    expect(prompt).toContain('c.xml');
-    expect(prompt).toContain('d.xml');
-    expect(prompt).toContain('e.xml');
-    expect(prompt).toContain('f.xml');
-    expect(prompt).toContain('g.xml');
-    expect(prompt).toContain('h.xml');
-    expect(prompt).toContain('i.xml');
-    expect(prompt).toContain('j.xml');
+    for (const name of ['a.xml', 'b.xml', 'c.xml', 'd.xml', 'e.xml', 'f.xml', 'g.xml', 'h.xml', 'i.xml', 'j.xml']) {
+      expect(prompt.runtimeContext).toContain(name);
+    }
   });
 
   it('respects configured session docs max from execution settings', async () => {
@@ -189,11 +183,11 @@ describe('PromptBuilder', () => {
       sessionDocs
     );
 
-    const prompt = await builder.build({ ...defaultConfig(), sessionDocumentMaxDocs: 2 }, { sessionId, userInput: 'summarize uploaded files' });
+    const prompt = await builder.buildForMessages({ ...defaultConfig(), sessionDocumentMaxDocs: 2 }, { sessionId, userInput: 'summarize uploaded files' });
 
-    expect(prompt).toContain('c.xml');
-    expect(prompt).toContain('b.xml');
-    expect(prompt).not.toContain('a.xml');
-    expect(prompt).toContain('Settings > Execution > Session docs max');
+    expect(prompt.runtimeContext).toContain('c.xml');
+    expect(prompt.runtimeContext).toContain('b.xml');
+    expect(prompt.runtimeContext).not.toContain('a.xml');
+    expect(prompt.runtimeContext).toContain('Settings > Execution > Session docs max');
   });
 });

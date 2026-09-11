@@ -7,6 +7,7 @@ declare module 'react' {
         src?: string;
         partition?: string;
         allowpopups?: string;
+        webpreferences?: string;
       };
     }
   }

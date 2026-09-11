@@ -1,14 +1,18 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { MarketplaceBrowseResult, MarketplaceSkill, MarketplaceSkillSnapshot, SkillInstallRequest, SkillMarketplaceSource, SkillSupportingFile } from '../../shared/types.js';
+import type { MarketplaceBrowseRequest, MarketplaceBrowseResult, MarketplaceSkill, MarketplaceSkillSnapshot, SkillInstallRequest, SkillMarketplaceSource, SkillSupportingFile } from '../../shared/types.js';
 import { parseSkillMarkdown, SkillManager } from './skillManager.js';
 
 const CLAWHUB_BASE_URL = 'https://clawhub.ai';
 const CLAWHUB_FALLBACK_CONVEX_URL = 'https://wry-manatee-359.convex.cloud';
 const CLAWHUB_FALLBACK_CONVEX_SITE_URL = 'https://wry-manatee-359.convex.site';
-const SKILLHUB_BASE_URL = 'https://skillhub.builders';
+const SKILLHUB_BASE_URL = 'https://skillhub.cn';
+const SKILLHUB_API_BASE_URL = 'https://api.skillhub.cn';
 const REMOTE_TIMEOUT_MS = 12_000;
 const MAX_CLAWHUB_SKILLS = 80;
+const MAX_SKILLHUB_SKILLS = 1000;
+const DEFAULT_MARKET_PAGE_SIZE = 24;
+const MAX_MARKET_PAGE_SIZE = 100;
 const SEARCH_SYNONYM_GROUPS = [
   ['\u5c0f\u7ea2\u4e66', 'xiaohongshu', 'rednote']
 ];
@@ -98,6 +102,60 @@ interface SkillHubDetailResult {
   installCommand?: string;
 }
 
+interface SkillHubBrowseResponse {
+  code?: number;
+  data?: {
+    skills?: unknown[];
+    total?: number;
+  };
+  message?: string;
+}
+
+interface SkillHubDetailResponse {
+  contentZhAvailable?: boolean;
+  latestVersion?: {
+    changelog?: string;
+    version?: string;
+  };
+  namespace?: {
+    canonicalName?: string;
+    displayName?: string;
+    handle?: string;
+    publicSlug?: string;
+  };
+  owner?: {
+    displayName?: string;
+    handle?: string;
+  };
+  skill?: {
+    category?: string;
+    displayName?: string;
+    labels?: Record<string, string>;
+    slug?: string;
+    source?: string;
+    sourceUrl?: string | null;
+    stats?: {
+      downloads?: number;
+      installs?: number;
+      stars?: number;
+      versions?: number;
+    };
+    subCategories?: Array<{ key?: string; name?: string }>;
+    summary?: string;
+    summary_zh?: string;
+    tags?: Record<string, string>;
+    upstream_url?: string | null;
+    verified?: boolean;
+  };
+  slug?: string;
+}
+
+interface NormalizedMarketplaceBrowseRequest {
+  query: string;
+  page: number;
+  pageSize: number;
+}
+
 export class MarketplaceManager {
   private clawHubConvexUrl: string | undefined;
 
@@ -107,22 +165,25 @@ export class MarketplaceManager {
     private readonly getSources: () => SkillMarketplaceSource[]
   ) {}
 
-  async browse(query = ''): Promise<MarketplaceBrowseResult> {
+  async browse(input: string | MarketplaceBrowseRequest = ''): Promise<MarketplaceBrowseResult> {
+    const req = this.normalizeBrowseRequest(input);
     const installed = this.skillManager.list();
-    const searchTerms = this.expandSearchTerms(query);
+    const searchTerms = this.expandSearchTerms(req.query);
+    const end = req.page * req.pageSize;
+    const loadLimit = end + 1;
     const loadedSkills = await Promise.all(
       this.getSources()
         .filter((source) => source.enabled)
         .map(async (source) => {
           try {
-            return await this.loadSource(source, searchTerms);
+            return await this.loadSource(source, searchTerms, loadLimit);
           } catch (error) {
             console.warn(`[marketplace] failed to load source ${source.id}:`, error);
             return [];
           }
         })
     );
-    const skills = loadedSkills
+    const allSkills = loadedSkills
       .flat()
       .filter((skill) => {
         if (searchTerms.length === 0) return true;
@@ -137,9 +198,16 @@ export class MarketplaceManager {
           installedSkillName: installedSkill?.name
         };
       });
+    const start = (req.page - 1) * req.pageSize;
+    const skills = allSkills.slice(start, end);
     return {
       sources: this.getSources(),
-      skills
+      skills,
+      page: req.page,
+      pageSize: req.pageSize,
+      total: allSkills.length,
+      loaded: skills.length,
+      hasMore: allSkills.length > end
     };
   }
 
@@ -223,12 +291,12 @@ export class MarketplaceManager {
     return null;
   }
 
-  private async loadSource(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
+  private async loadSource(source: SkillMarketplaceSource, searchTerms: string[], limit: number): Promise<MarketplaceSkill[]> {
     if (source.id.toLowerCase() === 'clawhub') {
-      return this.loadClawHubSource(source, searchTerms);
+      return this.loadClawHubSource(source, searchTerms, limit);
     }
     if (source.id.toLowerCase() === 'skillhub') {
-      return this.loadSkillHubSource(source);
+      return this.loadSkillHubSource(source, searchTerms, limit);
     }
     return this.loadCatalogSource(source);
   }
@@ -262,13 +330,13 @@ export class MarketplaceManager {
     }));
   }
 
-  private async loadClawHubSource(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
+  private async loadClawHubSource(source: SkillMarketplaceSource, searchTerms: string[], limit: number): Promise<MarketplaceSkill[]> {
     try {
       if (searchTerms.length > 0) {
-        const searched = await this.loadClawHubSearchRemote(source, searchTerms);
+        const searched = await this.loadClawHubSearchRemote(source, searchTerms, limit);
         if (searched.length > 0) return searched;
       }
-      const remote = await this.loadClawHubRemote(source);
+      const remote = await this.loadClawHubRemote(source, limit);
       if (remote.length > 0) return remote;
     } catch (error) {
       console.warn('[marketplace] ClawHub remote fetch failed, fallback to local catalog:', error);
@@ -276,7 +344,7 @@ export class MarketplaceManager {
     return this.loadCatalogSource(source);
   }
 
-  private async loadClawHubSearchRemote(source: SkillMarketplaceSource, searchTerms: string[]): Promise<MarketplaceSkill[]> {
+  private async loadClawHubSearchRemote(source: SkillMarketplaceSource, searchTerms: string[], limit: number): Promise<MarketplaceSkill[]> {
     const convexUrl = await this.resolveClawHubConvexUrl(source);
     const skills: MarketplaceSkill[] = [];
     const settled = await Promise.allSettled(
@@ -284,7 +352,7 @@ export class MarketplaceManager {
         path: 'search:searchSkills',
         args: {
           query,
-          limit: MAX_CLAWHUB_SKILLS,
+          limit: Math.min(Math.max(limit, DEFAULT_MARKET_PAGE_SIZE), MAX_CLAWHUB_SKILLS),
           highlightedOnly: false,
           nonSuspiciousOnly: false
         }
@@ -332,12 +400,13 @@ export class MarketplaceManager {
     return this.dedupeBySourceSkillId(skills);
   }
 
-  private async loadClawHubRemote(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
+  private async loadClawHubRemote(source: SkillMarketplaceSource, limit: number): Promise<MarketplaceSkill[]> {
     const convexUrl = await this.resolveClawHubConvexUrl(source);
     const skills: MarketplaceSkill[] = [];
     let cursor: string | undefined;
     let pageCount = 0;
-    while (skills.length < MAX_CLAWHUB_SKILLS && pageCount < 4) {
+    const target = Math.min(Math.max(limit, DEFAULT_MARKET_PAGE_SIZE), MAX_CLAWHUB_SKILLS);
+    while (skills.length < target && pageCount < Math.ceil(target / 30) + 1) {
       const args: Record<string, unknown> = {
         numItems: 30,
         sort: 'downloads',
@@ -385,7 +454,7 @@ export class MarketplaceManager {
           installCommand: owner ? `clawhub install ${owner}/${slug}` : undefined,
           installed: false
         });
-        if (skills.length >= MAX_CLAWHUB_SKILLS) break;
+        if (skills.length >= target) break;
       }
       pageCount += 1;
       const hasMore = Boolean(response.value?.hasMore);
@@ -545,9 +614,9 @@ export class MarketplaceManager {
     }
   }
 
-  private async loadSkillHubSource(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
+  private async loadSkillHubSource(source: SkillMarketplaceSource, searchTerms: string[], limit: number): Promise<MarketplaceSkill[]> {
     try {
-      const remote = await this.loadSkillHubRemote(source);
+      const remote = await this.loadSkillHubRemote(source, searchTerms, limit);
       if (remote.length > 0) return remote;
     } catch (error) {
       console.warn('[marketplace] SkillHub remote fetch failed, fallback to local catalog:', error);
@@ -555,83 +624,152 @@ export class MarketplaceManager {
     return this.loadCatalogSource(source);
   }
 
-  private async loadSkillHubRemote(source: SkillMarketplaceSource): Promise<MarketplaceSkill[]> {
-    const browseUrl = source.catalogUrl?.trim() || `${SKILLHUB_BASE_URL}/browse`;
-    const html = await this.fetchText(browseUrl);
-    const cardRegex = /<a[^>]*href="\/skills\/([^"?#]+)"[^>]*>([\s\S]*?)<\/a>/g;
-    const skills: MarketplaceSkill[] = [];
-    for (const match of html.matchAll(cardRegex)) {
-      const slugRaw = this.cleanText(match[1] ?? '');
-      const block = match[2] ?? '';
-      if (!slugRaw || !/<h3/i.test(block) || !/installs/i.test(block)) continue;
-      const slug = this.decodeHtml(slugRaw);
-      const name = this.stripHtml(this.extractFirst(block, /<h3[^>]*>([\s\S]*?)<\/h3>/i) ?? slug);
-      const description = this.stripHtml(this.extractFirst(block, /<p[^>]*>([\s\S]*?)<\/p>/i) ?? `Skill from ${source.name}`);
-      const category = this.stripHtml(this.extractFirst(block, /<span[^>]*rounded-full[^>]*border-primary\/30[^>]*>([\s\S]*?)<\/span>/i) ?? 'general');
-      const installs = this.cleanText(this.extractFirst(block, /([\d,]+)(?:<!-- -->)?\s*installs/i) ?? '');
-      const homepage = `${SKILLHUB_BASE_URL}/skills/${encodeURIComponent(slug)}`;
-      const installCommand = `npx skillhub-install install ${slug}`;
-      const readme = [description, installs ? `Installs: ${installs}` : '', `Source: ${homepage}`].filter(Boolean).join('\n\n');
-      skills.push({
-        id: slug,
-        sourceId: source.id,
-        sourceName: source.name,
-        name,
-        description,
-        category,
-        version: 'latest',
-        readme,
-        skillContent: this.buildGeneratedSkillContent({
-          name: slug,
-          title: name,
-          description,
-          category,
-          sourceName: source.name,
-          homepage,
-          installCommand
-        }),
-        homepage,
-        installCommand,
-        installed: false
-      });
-    }
-    return this.dedupeBySourceSkillId(skills);
+  private async loadSkillHubRemote(source: SkillMarketplaceSource, searchTerms: string[], limit: number): Promise<MarketplaceSkill[]> {
+    const url = new URL('/api/skills', this.skillHubApiBaseUrl(source));
+    url.searchParams.set('page', '1');
+    url.searchParams.set('page_size', String(Math.min(Math.max(limit, DEFAULT_MARKET_PAGE_SIZE), MAX_SKILLHUB_SKILLS)));
+    const query = searchTerms[0];
+    if (query) url.searchParams.set('q', query);
+    const response = await this.fetchJson<SkillHubBrowseResponse>(url.toString());
+    const items = Array.isArray(response.data?.skills) ? response.data.skills : [];
+    const skills = items.map((item) => this.skillHubListItemToSkill(source, item)).filter((skill): skill is MarketplaceSkill => Boolean(skill));
+    if (skills.length > 0 || !query) return this.dedupeBySourceSkillId(skills);
+    const fallbackUrl = new URL('/api/skills', this.skillHubApiBaseUrl(source));
+    fallbackUrl.searchParams.set('page', '1');
+    fallbackUrl.searchParams.set('page_size', String(Math.min(Math.max(limit, DEFAULT_MARKET_PAGE_SIZE), MAX_SKILLHUB_SKILLS)));
+    const fallback = await this.fetchJson<SkillHubBrowseResponse>(fallbackUrl.toString());
+    const fallbackItems = Array.isArray(fallback.data?.skills) ? fallback.data.skills : [];
+    return this.dedupeBySourceSkillId(
+      fallbackItems
+        .map((item) => this.skillHubListItemToSkill(source, item))
+        .filter((skill): skill is MarketplaceSkill => Boolean(skill))
+    );
   }
 
-  private async fetchSkillHubDetail(homepage: string, fallback: MarketplaceSkill): Promise<SkillHubDetailResult | null> {
+  private skillHubListItemToSkill(source: SkillMarketplaceSource, item: unknown): MarketplaceSkill | null {
+    const obj = item && typeof item === 'object' ? item as Record<string, unknown> : {};
+    const namespace = obj.namespace && typeof obj.namespace === 'object' ? obj.namespace as Record<string, unknown> : {};
+    const slug = this.cleanText(String(obj.slug ?? namespace.publicSlug ?? ''));
+    if (!slug) return null;
+    const owner = this.cleanText(String(namespace.handle ?? obj.ownerName ?? ''));
+    const id = owner ? `${owner}/${slug}` : slug;
+    const name = this.cleanText(String(obj.name ?? slug));
+    const description = this.cleanText(String(obj.description_zh ?? obj.description ?? `Skill from ${source.name}`));
+    const category = this.cleanText(String(obj.category ?? 'general'));
+    const version = this.cleanText(String(obj.version ?? 'latest'));
+    const homepage = this.skillHubHomepage(owner, slug);
+    const installCommand = `npx skillhub-install install ${owner ? `${owner}/` : ''}${slug}`;
+    const metrics = [
+      typeof obj.downloads === 'number' ? `Downloads: ${obj.downloads}` : '',
+      typeof obj.installs === 'number' ? `Installs: ${obj.installs}` : '',
+      typeof obj.stars === 'number' ? `Stars: ${obj.stars}` : ''
+    ].filter(Boolean).join(' | ');
+    const subCategories = Array.isArray(obj.subCategories)
+      ? obj.subCategories
+        .map((entry) => entry && typeof entry === 'object' ? this.cleanText(String((entry as Record<string, unknown>).name ?? '')) : '')
+        .filter(Boolean)
+      : [];
+    const readme = [description, subCategories.length > 0 ? `Subcategories: ${subCategories.join(', ')}` : '', metrics, `Source: ${homepage}`].filter(Boolean).join('\n\n');
+    return {
+      id,
+      sourceId: source.id,
+      sourceName: source.name,
+      name,
+      description,
+      category,
+      version,
+      readme,
+      skillContent: this.buildGeneratedSkillContent({
+        name: slug,
+        title: name,
+        description,
+        category,
+        sourceName: source.name,
+        homepage,
+        about: readme,
+        installCommand
+      }),
+      homepage,
+      installCommand,
+      installed: false
+    };
+  }
+
+  private skillHubApiBaseUrl(source: SkillMarketplaceSource): string {
+    const catalogUrl = source.catalogUrl?.trim();
+    if (!catalogUrl) return SKILLHUB_API_BASE_URL;
     try {
-      const html = await this.fetchText(homepage);
-      const title = this.stripHtml(this.extractFirst(html, /<h1[^>]*>([\s\S]*?)<\/h1>/i) ?? fallback.name);
-      const metaDescription = this.decodeHtml(this.extractFirst(html, /<meta\s+name="description"\s+content="([^"]*)"/i) ?? fallback.description);
-      const category = this.stripHtml(this.extractFirst(html, /<span class="rounded-full bg-secondary[^"]*"[^>]*>([^<]+)<\/span>/i) ?? fallback.category);
-      const version = this.cleanText(
-        this.extractFirst(html, /"softwareVersion":"([^"]+)"/i)
-          ?? this.extractFirst(html, />v(?:<!-- -->)?\s*([^<]+)</i)
-          ?? fallback.version
-      );
-      const installCommand = this.decodeHtml(this.extractFirst(html, /<code[^>]*>([^<]*skillhub-install[^<]*)<\/code>/i) ?? '');
-      const aboutHtml = this.extractFirst(html, /<h2[^>]*>\s*About\s*<\/h2>\s*<div[^>]*>([\s\S]*?)<\/div>\s*<\/section>/i);
-      const about = aboutHtml ? this.stripHtml(aboutHtml) : '';
-      const readme = [metaDescription, about, installCommand ? `Install: ${installCommand}` : ''].filter(Boolean).join('\n\n');
+      const parsed = new URL(catalogUrl);
+      if (parsed.hostname === 'api.skillhub.cn') return `${parsed.protocol}//${parsed.host}`;
+      if (parsed.hostname === 'skillhub.cn' || parsed.hostname === 'www.skillhub.cn' || parsed.hostname === 'skillhub.builders') {
+        return SKILLHUB_API_BASE_URL;
+      }
+      return `${parsed.protocol}//${parsed.host}`;
+    } catch {
+      return SKILLHUB_API_BASE_URL;
+    }
+  }
+
+  private async fetchSkillHubDetail(sourceHomepage: string, fallback: MarketplaceSkill): Promise<SkillHubDetailResult | null> {
+    try {
+      const identity = this.parseSkillHubIdentity(sourceHomepage, fallback.id);
+      const detail = await this.fetchJson<SkillHubDetailResponse>(`${SKILLHUB_API_BASE_URL}/api/v1/skills/${encodeURIComponent(identity.slug)}`);
+      const skill = detail.skill ?? {};
+      const namespace = detail.namespace ?? {};
+      const title = this.cleanText(skill.displayName ?? fallback.name);
+      const description = this.cleanText(skill.summary_zh ?? skill.summary ?? fallback.description);
+      const category = this.cleanText(skill.category ?? fallback.category);
+      const version = this.cleanText(detail.latestVersion?.version ?? skill.tags?.latest ?? fallback.version);
+      const owner = this.cleanText(namespace.handle ?? detail.owner?.handle ?? identity.owner ?? '');
+      const homepage = this.skillHubHomepage(owner, identity.slug);
+      const installCommand = `npx skillhub-install install ${owner ? `${owner}/` : ''}${identity.slug}`;
+      const stats = [
+        typeof skill.stats?.downloads === 'number' ? `Downloads: ${skill.stats.downloads}` : '',
+        typeof skill.stats?.installs === 'number' ? `Installs: ${skill.stats.installs}` : '',
+        typeof skill.stats?.stars === 'number' ? `Stars: ${skill.stats.stars}` : '',
+        detail.latestVersion?.changelog ? `Changelog: ${detail.latestVersion.changelog}` : ''
+      ].filter(Boolean).join('\n');
+      const about = [description, stats].filter(Boolean).join('\n\n');
+      const readme = [description, stats, `Install: ${installCommand}`].filter(Boolean).join('\n\n');
       const skillContent = this.buildGeneratedSkillContent({
-        name: fallback.id,
+        name: identity.slug,
         title,
-        description: metaDescription,
+        description,
         category,
         sourceName: fallback.sourceName,
         homepage,
         about,
-        installCommand: installCommand || undefined
+        installCommand
       });
       return {
         skillContent,
         readme,
         version,
-        installCommand: installCommand || undefined
+        installCommand
       };
     } catch {
       return null;
     }
+  }
+
+  private parseSkillHubIdentity(homepage: string, fallbackId: string): { owner?: string; slug: string } {
+    const value = homepage || fallbackId;
+    try {
+      const url = new URL(value);
+      const parts = url.pathname.split('/').filter(Boolean);
+      const slug = parts.at(-1) || fallbackId.split('/').filter(Boolean).at(-1) || fallbackId;
+      const owner = parts.length > 1 ? parts.at(-2) : fallbackId.split('/').filter(Boolean).at(-2);
+      return { owner, slug };
+    } catch {
+      const parts = fallbackId.split('/').filter(Boolean);
+      return parts.length > 1 ? { owner: parts[0], slug: parts[1] } : { slug: fallbackId };
+    }
+  }
+
+  private skillHubHomepage(owner: string | undefined, slug: string): string {
+    return owner
+      ? `${SKILLHUB_BASE_URL}/${encodeURIComponent(owner)}/${encodeURIComponent(slug)}`
+      : `${SKILLHUB_BASE_URL}/${encodeURIComponent(slug)}`;
   }
 
   private extractConvexUrlFromSource(catalogUrl?: string): string | null {
@@ -653,6 +791,16 @@ export class MarketplaceManager {
     });
     if (!response.ok) throw new Error(`Request failed: ${url} -> ${response.status}`);
     return response.text();
+  }
+
+  private async fetchJson<T>(url: string): Promise<T> {
+    const response = await this.fetchWithTimeout(url, {
+      headers: {
+        Accept: 'application/json,text/plain;q=0.5,*/*;q=0.2'
+      }
+    });
+    if (!response.ok) throw new Error(`Request failed: ${url} -> ${response.status}`);
+    return response.json() as Promise<T>;
   }
 
   private async postJson<T>(url: string, payload: unknown): Promise<T> {
@@ -748,6 +896,15 @@ export class MarketplaceManager {
       byKey.set(`${skill.sourceId}::${skill.id}`, skill);
     }
     return [...byKey.values()];
+  }
+
+  private normalizeBrowseRequest(input: string | MarketplaceBrowseRequest): NormalizedMarketplaceBrowseRequest {
+    const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : { query: typeof input === 'string' ? input : '' };
+    return {
+      query: typeof raw.query === 'string' ? raw.query.trim() : '',
+      page: Math.max(1, Math.floor(Number(raw.page) || 1)),
+      pageSize: Math.max(1, Math.min(MAX_MARKET_PAGE_SIZE, Math.floor(Number(raw.pageSize) || DEFAULT_MARKET_PAGE_SIZE)))
+    };
   }
 
   private expandSearchTerms(query: string): string[] {

@@ -4,14 +4,18 @@ import type { LlmClient } from './llmClient.js';
 
 const FOLLOW_UP_TIMEOUT_MS = 8000;
 
-function stripCodeFences(input: string): string {
-  const trimmed = input.trim();
+function textValue(value: unknown): string {
+  return typeof value === 'string' ? value : (value == null ? '' : String(value));
+}
+
+function stripCodeFences(input: unknown): string {
+  const trimmed = textValue(input).trim();
   if (!trimmed.startsWith('```')) return trimmed;
   return trimmed.replace(/^```[\w-]*\s*|\s*```$/g, '').trim();
 }
 
-function normalizeQuestion(input: string): string {
-  return input
+function normalizeQuestion(input: unknown): string {
+  return textValue(input)
     .trim()
     .replace(/^[-*\d.()\s]+/, '')
     .replace(
@@ -41,7 +45,7 @@ function dedupeQuestions(input: string[], limit = 4): string[] {
   return result;
 }
 
-function parseFollowUpQuestions(content: string): string[] {
+function parseFollowUpQuestions(content: unknown): string[] {
   const cleaned = stripCodeFences(content);
   if (!cleaned) return [];
 
@@ -112,8 +116,8 @@ function finalizeQuestions(primary: string[], fallback: string[], limit: number)
   return dedupeQuestions([...preferred, ...fallback], limit);
 }
 
-function truncateQuestionTopic(input: string, maxChars: number): string {
-  const singleLine = input
+function truncateQuestionTopic(input: unknown, maxChars: number): string {
+  const singleLine = textValue(input)
     .replace(/[\r\n]+/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/[“”"'`]/g, '')
@@ -123,8 +127,8 @@ function truncateQuestionTopic(input: string, maxChars: number): string {
   return `${singleLine.slice(0, maxChars).trim()}...`;
 }
 
-function topicFromContext(userInput: string, finalResponse: string): string {
-  const candidates = [userInput, finalResponse]
+function topicFromContext(userInput: unknown, finalResponse: unknown): string {
+  const candidates = [textValue(userInput), textValue(finalResponse)]
     .map((item) => item.trim())
     .filter((item) => item.length >= 4)
     .map((item) => item.split(/[。！？!?;；\n]/)[0]?.trim() ?? '')
@@ -134,9 +138,9 @@ function topicFromContext(userInput: string, finalResponse: string): string {
   return truncateQuestionTopic(candidates[0], maxChars);
 }
 
-function fallbackQuestions(userInput: string, finalResponse: string): string[] {
+function fallbackQuestions(userInput: unknown, finalResponse: unknown): string[] {
   const topic = topicFromContext(userInput, finalResponse);
-  if (looksChinese(userInput)) {
+  if (looksChinese(textValue(userInput))) {
     if (topic) {
       return [
         `围绕“${topic}”，我下一步先做什么最合适？`,
@@ -170,8 +174,10 @@ export async function generateFollowUpQuestions(
   context: { userInput: string; finalResponse: string },
   limit = 3
 ): Promise<string[]> {
-  const baseFallback = fallbackQuestions(context.userInput, context.finalResponse).slice(0, limit);
-  if (!context.finalResponse.trim()) return baseFallback;
+  const userInput = textValue(context.userInput);
+  const finalResponse = textValue(context.finalResponse);
+  const baseFallback = fallbackQuestions(userInput, finalResponse).slice(0, limit);
+  if (!finalResponse.trim()) return baseFallback;
   if (!config.baseUrl?.trim() || !config.model?.trim()) return baseFallback;
   if (providerRequiresApiKey(config.provider) && !config.apiKey?.trim()) return baseFallback;
 
@@ -200,8 +206,8 @@ export async function generateFollowUpQuestions(
           {
             role: 'user',
             content: [
-              `User question:\n${context.userInput}`,
-              `Assistant answer:\n${context.finalResponse}`,
+              `User question:\n${userInput}`,
+              `Assistant answer:\n${finalResponse}`,
               'Return 3 follow-up questions written exactly as the user would send them in chat.'
             ].join('\n\n')
           }

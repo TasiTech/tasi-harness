@@ -22,6 +22,7 @@ const electronRequire = createRequire(import.meta.url);
 const { app, BrowserWindow } = electronRequire('electron/main') as typeof import('electron/main');
 
 const DEFAULT_TIMEOUT_MS = 60000;
+const DEFAULT_SCRIPT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 300000;
 const DEFAULT_EXTRACT_MAX_CHARS = 8000;
 const DEFAULT_SNAPSHOT_MAX_ELEMENTS = 0;
@@ -78,6 +79,17 @@ interface ClickDispatchResult {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms.`)), timeoutMs);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function normalizeUrl(input: string): string {
@@ -1135,7 +1147,13 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     const width = clampInt(Number(options.width), 1280, 320, 3840);
     const height = clampInt(Number(options.height), 900, 240, 2400);
     const scale = Number.isFinite(Number(options.scale)) ? Math.max(0.25, Math.min(4, Number(options.scale))) : 1;
-    const wc = this.getTargetWebContents();
+    const shared = this.resolveSharedWebContents();
+    const wc = shared ?? this.ensureWindow().webContents;
+    this.trackWebContents(wc);
+    if (shared) {
+      wc.setZoomFactor(1);
+      return this.stateFrom(wc);
+    }
     const win = BrowserWindow.fromWebContents(wc) ?? this.window;
     if (win && !win.isDestroyed()) win.setContentSize(width, height);
     wc.setZoomFactor(scale);
@@ -1301,12 +1319,13 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
     };
   }
 
-  private async evalInPage<T>(script: string): Promise<T> {
+  private async evalInPage<T>(script: string, options?: { timeoutMs?: number }): Promise<T> {
+    const timeoutMs = clampInt(Number(options?.timeoutMs), DEFAULT_SCRIPT_TIMEOUT_MS, 1000, MAX_TIMEOUT_MS);
     const wc = this.getTargetWebContents();
     if (wc.isLoadingMainFrame()) {
-      await this.waitForIdle(DEFAULT_TIMEOUT_MS, wc).catch(() => {});
+      await this.waitForIdle(timeoutMs, wc).catch(() => {});
     }
-    return wc.executeJavaScript(script, true) as Promise<T>;
+    return await withTimeout(wc.executeJavaScript(script, true) as Promise<T>, timeoutMs, 'Browser JavaScript execution');
   }
 
   private async resolveElementObjectId(wc: WebContents, selector: string, index: number): Promise<string> {
@@ -1332,10 +1351,11 @@ export class EmbeddedBrowserAutomation implements BrowserAutomation {
   }
 
   private async sendDebuggerCommand(wc: WebContents, method: string, params: Record<string, unknown>): Promise<unknown> {
+    const timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS;
     const wasAttached = wc.debugger.isAttached();
     if (!wasAttached) wc.debugger.attach('1.3');
     try {
-      return await wc.debugger.sendCommand(method, params);
+      return await withTimeout(wc.debugger.sendCommand(method, params), timeoutMs, `Browser debugger command ${method}`);
     } finally {
       if (!wasAttached && wc.debugger.isAttached()) {
         try {

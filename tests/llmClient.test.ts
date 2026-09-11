@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createLlmClient } from '../src/main/agent/llmClient.js';
+import { clearModelContextWindowCacheForTests, createLlmClient } from '../src/main/agent/llmClient.js';
 import type { ToolDefinition } from '../src/shared/types.js';
 import { defaultConfig } from '../src/main/storage/pathUtils.js';
 
@@ -19,7 +19,9 @@ const browserOpenTool: ToolDefinition = {
 };
 
 afterEach(() => {
+  clearModelContextWindowCacheForTests();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('llmClient', () => {
@@ -159,7 +161,822 @@ describe('llmClient', () => {
     const body = JSON.parse(String(init.body));
     expect(body.model).toBe('served-model');
     expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.include_reasoning).toBe(true);
     expect(result.message.content).toBe('vLLM response.');
+  });
+
+  it('flattens historical tool traces for vLLM requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'continued' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    await client.complete({
+      messages: [
+        {
+          role: 'user',
+          content: 'look at this image',
+          attachments: [
+            {
+              kind: 'image',
+              filename: 'image.png',
+              mimeType: 'image/png',
+              sizeBytes: 2485,
+              contentBase64: 'iVBORw0KGgoAAAANSUhEUgAA'
+            }
+          ]
+        },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            {
+              id: 'chatcmpl-tool-abc123',
+              type: 'function',
+              function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+            }
+          ]
+        },
+        {
+          role: 'tool',
+          name: 'browser_open',
+          tool_call_id: 'chatcmpl-tool-abc123',
+          content: `{"ok":true,"contentBase64":"${'A'.repeat(240)}"}`
+        },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(typeof body.messages[0].content).toBe('string');
+    expect(body.messages[0].content).toContain('Historical attachments omitted');
+    expect(body.messages[0].content).toContain('image.png');
+    expect(body.messages[1].tool_calls).toBeUndefined();
+    expect(body.messages[1].content).toContain('Historical assistant tool-use record');
+    expect(body.messages[1].content).not.toContain('Assistant requested tool calls');
+    expect(body.messages[2].content).toContain('Tool result from browser_open');
+    expect(body.messages[2].content).toContain('[base64 omitted from history]');
+    expect(body.messages[2].content).not.toContain('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+    expect(body.tools).toEqual([browserOpenTool]);
+  });
+
+  it('uses a chat completions probe to compress oversized OpenAI-compatible prompts', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'compressed ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const oldText = Array.from({ length: 1200 }, (_, index) => `old decision line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'What should we do next?' }
+      ]
+    });
+
+    expect(result.message.content).toBe('compressed ok');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [probeEndpoint, probeInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    const probeBody = JSON.parse(String(probeInit.body));
+    expect(probeBody).toMatchObject({
+      model: 'served-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 99999999,
+      stream: false
+    });
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user']);
+    expect(body.messages[0].content).toContain('Earlier conversation history was compressed');
+    expect(body.messages[0].content).toContain('Critical Context Capsule');
+    expect(body.messages[0].content).toContain('Active task: What should we do next?');
+    expect(JSON.stringify(body).length).toBeLessThan(oldText.length);
+    expect(infoSpy).toHaveBeenCalledTimes(1);
+    const logLine = String(infoSpy.mock.calls[0]?.[0] ?? '');
+    expect(logLine).toContain('[llm][context-compression]');
+    expect(logLine).toContain('"before_tokens"');
+    expect(logLine).toContain('"after_tokens"');
+    expect(logLine).toContain('"trigger_condition"');
+  });
+
+  it('keeps context compression stable when tool-call arguments omit optional fields', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'compressed without crashing' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const oldText = Array.from({ length: 1100 }, (_, index) => `old tool context line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [{
+            id: 'call_1',
+            type: 'function',
+            function: { name: 'skill_view', arguments: JSON.stringify({ name: 'demo-skill' }) }
+          }]
+        },
+        { role: 'tool', name: 'skill_view', tool_call_id: 'call_1', content: '# Skill: demo-skill\nMust validate.' },
+        {
+          role: 'assistant',
+          content: oldText,
+          tool_calls: [{
+            id: 'call_2',
+            type: 'function',
+            function: { name: 'file_read', arguments: '{}' }
+          }]
+        },
+        { role: 'tool', name: 'file_read', tool_call_id: 'call_2', content: 'File not found.' },
+        { role: 'user', content: 'Continue.' }
+      ]
+    });
+
+    expect(result.message.content).toBe('compressed without crashing');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages[0].content).toContain('Critical Context Capsule');
+    expect(body.messages[0].content).toContain('demo-skill');
+  });
+
+  it('does not call the models endpoint when the context probe is not parseable', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message: 'max_tokens is too large'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'local hint ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const oldText = Array.from({ length: 1200 }, (_, index) => `old decision line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'What should we do next?' }
+      ]
+    });
+
+    expect(result.message.content).toBe('local hint ok');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [chatEndpoint, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect(chatEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).not.toContain('http://127.0.0.1:8000/v1/models/served-model');
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+  });
+
+  it('does not probe known-context models for prompts below the interactive soft budget', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'modest prompt ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = Array.from({ length: 1200 }, (_, index) => `old decision line ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'What should we do next?' }
+      ]
+    });
+
+    expect(result.message.content).toBe('modest prompt ok');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(body.max_tokens).not.toBe(99999999);
+  });
+
+  it('uses the probed context-window budget when the model context is very large', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens. (parameter=max_tokens, value=99999999)'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'large-context prompt ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = 'x'.repeat(290_000);
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'Continue from the important decisions.' }
+      ]
+    });
+
+    expect(result.message.content).toBe('large-context prompt ok');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(infoSpy).not.toHaveBeenCalled();
+  });
+
+  it('uses the context-window budget for intra-turn iteration requests', async () => {
+    const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens.'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'iteration prompt ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const oldText = 'x'.repeat(330_000);
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'Continue from the important decisions.' }
+      ],
+      metadata: { context_compression: 'iteration' }
+    });
+
+    expect(result.message.content).toBe('iteration prompt ok');
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'assistant', 'user']);
+    expect(body.messages[0].content).not.toContain('Earlier conversation history was compressed');
+    expect(infoSpy).not.toHaveBeenCalled();
+  });
+
+  it('reuses probed context length across client instances for the same endpoint and model', async () => {
+    vi.spyOn(console, 'info').mockImplementation(() => {});
+    let probeCalls = 0;
+    const fetchMock = vi.fn(async (_endpoint: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      if (body.max_tokens === 99999999) {
+        probeCalls += 1;
+        return new Response(
+          JSON.stringify({
+            error: {
+              message:
+                'max_tokens=99999999 cannot be greater than max_model_len=max_total_tokens=1010000. Please request fewer output tokens.'
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: `ok ${probeCalls}` }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const config = {
+      ...defaultConfig(),
+      provider: 'vllm' as const,
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    };
+    const prompt = 'x'.repeat(330_000);
+
+    await createLlmClient(config).complete({ messages: [{ role: 'user', content: prompt }] });
+    await createLlmClient(config).complete({ messages: [{ role: 'user', content: prompt }] });
+
+    expect(probeCalls).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries once with compressed context when the provider reports the real context limit', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'probe ignored' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, your prompt contains at least 1001 input tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'retry ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'tiny-context-model'
+    });
+
+    const oldText = Array.from({ length: 170 }, (_, index) => `historical observation ${index}`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: oldText },
+        { role: 'assistant', content: 'Old answer.' },
+        { role: 'user', content: 'Continue.' }
+      ]
+    });
+
+    expect(result.message.content).toBe('retry ok');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [probeEndpoint] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(probeEndpoint).toBe('http://127.0.0.1:8000/v1/chat/completions');
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).not.toContain('http://127.0.0.1:8000/v1/models/tiny-context-model');
+    const [, firstInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const [, secondInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const firstBody = JSON.parse(String(firstInit.body));
+    const secondBody = JSON.parse(String(secondInit.body));
+    expect(JSON.stringify(firstBody).length).toBeGreaterThan(JSON.stringify(secondBody).length);
+    expect(secondBody.messages[0].content).toContain('Earlier conversation history was compressed');
+  });
+
+  it('recompresses more aggressively when a pre-compressed prompt still exceeds the provider limit', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 99999999 output tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              message:
+                "This model's maximum context length is 1000 tokens. However, you requested 0 output tokens and your prompt contains at least 1001 input tokens."
+            }
+          }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: 'assistant', content: 'second compression ok' }
+              }
+            ]
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    const longCurrentRequest = Array.from({ length: 1200 }, (_, index) => `current requirement line ${index} with detailed context`).join('\n');
+    const result = await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: longCurrentRequest }
+      ]
+    });
+
+    expect(result.message.content).toBe('second compression ok');
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const [, firstPostInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    const [, secondPostInit] = fetchMock.mock.calls[2] as [string, RequestInit];
+    const firstPostBody = JSON.parse(String(firstPostInit.body));
+    const secondPostBody = JSON.parse(String(secondPostInit.body));
+    expect(JSON.stringify(secondPostBody).length).toBeLessThan(JSON.stringify(firstPostBody).length);
+    expect(secondPostBody.messages[1].content).toContain('[compressed from');
+  });
+
+  it('sends vLLM reasoning effort and parses the current reasoning field', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', reasoning: 'vLLM thought', content: 'vLLM answer.' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-reasoning-model',
+      reasoningEffort: 'xhigh'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'think' }]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.reasoning_effort).toBe('xhigh');
+    expect(body.include_reasoning).toBe(true);
+    expect(result.message.reasoning_content).toBe('vLLM thought');
+    expect(result.message.content).toBe('vLLM answer.');
+  });
+
+  it('extracts inline think blocks into reasoning content for vLLM-compatible responses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: '<think>hidden thought</think>\nVisible answer.' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-reasoning-model',
+      reasoningEffort: 'xhigh'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'think' }]
+    });
+
+    expect(result.message.reasoning_content).toBe('hidden thought');
+    expect(result.message.content).toBe('Visible answer.');
+  });
+
+  it('parses vLLM reasoning_details arrays when present', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: 'assistant',
+                reasoning_details: [{ text: 'detail one' }, { content: 'detail two' }],
+                content: 'Visible answer.'
+              }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-reasoning-model',
+      reasoningEffort: 'xhigh'
+    });
+
+    const result = await client.complete({
+      messages: [{ role: 'user', content: 'think' }]
+    });
+
+    expect(result.message.reasoning_content).toBe('detail one\ndetail two');
+    expect(result.message.content).toBe('Visible answer.');
+  });
+
+  it('sends vLLM reasoning effort and parses streamed reasoning deltas', async () => {
+    const events = [
+      {
+        id: 'chatcmpl_vllm_stream',
+        choices: [
+          {
+            delta: {
+              reasoning: 'think ',
+              content: 'Hello '
+            }
+          }
+        ]
+      },
+      {
+        choices: [
+          {
+            delta: {
+              reasoning: 'now',
+              content: 'world'
+            }
+          }
+        ]
+      }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [...events.map((event) => `data: ${JSON.stringify(event)}`), 'data: [DONE]'].join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-reasoning-model',
+      reasoningEffort: 'medium'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.(
+      {
+        messages: [{ role: 'user', content: 'hello' }]
+      },
+      (delta) => {
+        if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+        if (delta.content) deltas.push(`c:${delta.content}`);
+      }
+    );
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.reasoning_effort).toBe('medium');
+    expect(body.include_reasoning).toBe(true);
+    expect(result?.message.reasoning_content).toBe('think now');
+    expect(result?.message.content).toBe('Hello world');
+    expect(deltas).toEqual(['r:think ', 'c:Hello ', 'r:now', 'c:world']);
+  });
+
+  it('extracts streamed inline think blocks into final reasoning content', async () => {
+    const events = [
+      {
+        id: 'chatcmpl_vllm_stream',
+        choices: [{ delta: { content: '<think>hidden ' } }]
+      },
+      {
+        choices: [{ delta: { content: 'thought</think>\nVisible answer.' } }]
+      }
+    ];
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [...events.map((event) => `data: ${JSON.stringify(event)}`), 'data: [DONE]'].join('\n\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'vllm',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: '',
+      model: 'served-reasoning-model',
+      reasoningEffort: 'medium'
+    });
+
+    const result = await client.streamComplete?.(
+      {
+        messages: [{ role: 'user', content: 'hello' }]
+      },
+      () => {}
+    );
+
+    expect(result?.message.reasoning_content).toBe('hidden thought');
+    expect(result?.message.content).toBe('Visible answer.');
   });
 
   it('requests and returns OpenAI-compatible log probabilities', async () => {
@@ -355,9 +1172,9 @@ describe('llmClient', () => {
           role: 'user',
           content: 'Describe these files.',
           attachments: [
-            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'aW1hZ2U=' },
+            { kind: 'image', filename: 'cat.png', mimeType: 'image/png', contentBase64: 'data:image/png;base64,aW1hZ2U=' },
             { kind: 'video', filename: 'clip.mp4', mimeType: 'video/mp4', contentBase64: 'dmlkZW8=' },
-            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'YXVkaW8=' }
+            { kind: 'audio', filename: 'voice.mp3', mimeType: 'audio/mpeg', contentBase64: 'data:audio/mpeg;base64,YXVkaW8=' }
           ]
         }
       ]
@@ -370,7 +1187,7 @@ describe('llmClient', () => {
       { type: 'text', text: 'Describe these files.' },
       { type: 'image_url', image_url: { url: 'data:image/png;base64,aW1hZ2U=' } },
       { type: 'video_url', video_url: { url: 'data:video/mp4;base64,dmlkZW8=' } },
-      { type: 'input_audio', input_audio: { data: 'data:audio/mpeg;base64,YXVkaW8=', format: 'mp3' } }
+      { type: 'input_audio', input_audio: { data: 'YXVkaW8=', format: 'mp3' } }
     ]);
   });
 
@@ -421,6 +1238,104 @@ describe('llmClient', () => {
     const body = JSON.parse(String(init.body));
     expect(body.messages[1].tool_calls[0].function.arguments).toBe('{"raw":"url=https://example.com"}');
     expect(() => JSON.parse(body.messages[1].tool_calls[0].function.arguments)).not.toThrow();
+  });
+
+  it('converts orphan historical tool messages before sending OpenAI-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'soildapi',
+      baseUrl: 'https://api.soildapi.test/v1',
+      apiKey: 'test-key',
+      model: 'deepseek-v4-flash-0731'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: 'question 1' },
+        { role: 'tool', name: 'terminal', tool_call_id: 'call_hidden', content: 'ran npm test' },
+        { role: 'assistant', content: 'old final answer' },
+        { role: 'user', content: 'question 2' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['system', 'user', 'user', 'assistant', 'user']);
+    expect(body.messages.some((message: any) => message.role === 'tool')).toBe(false);
+    expect(body.messages[2].content).toContain('Tool result from terminal (call_hidden)');
+  });
+
+  it('textifies incomplete tool-call blocks before sending OpenAI-compatible requests', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: { role: 'assistant', content: 'ok' }
+            }
+          ]
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'openai-compatible',
+      baseUrl: 'http://127.0.0.1:8000/v1',
+      apiKey: 'test-key',
+      model: 'served-model'
+    });
+
+    await client.complete({
+      messages: [
+        { role: 'user', content: 'run tools' },
+        {
+          role: 'assistant',
+          content: 'I will run both.',
+          tool_calls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'browser_open', arguments: '{"url":"https://example.com"}' }
+            },
+            {
+              id: 'call_2',
+              type: 'function',
+              function: { name: 'missing_tool', arguments: '{}' }
+            }
+          ]
+        },
+        { role: 'tool', name: 'browser_open', tool_call_id: 'call_1', content: 'opened' },
+        { role: 'user', content: 'continue' }
+      ],
+      tools: [browserOpenTool]
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body));
+    expect(body.messages.map((message: any) => message.role)).toEqual(['user', 'assistant', 'user', 'user']);
+    expect(body.messages[1].tool_calls).toBeUndefined();
+    expect(body.messages[1].content).toContain('Historical assistant tool-use record');
+    expect(body.messages[1].content).not.toContain('Assistant requested tool calls');
+    expect(body.messages[2].content).toContain('Tool result from browser_open (call_1)');
   });
 
   it('streams openai-compatible content, reasoning_content, and tool call arguments', async () => {
@@ -496,6 +1411,159 @@ describe('llmClient', () => {
     expect(deltas).toEqual(['r:think ', 'c:Hello ', 'r:now', 'c:world']);
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(String(init.body)).stream).toBe(true);
+  });
+
+  it('parses openai-compatible SSE events split across multiple data lines', async () => {
+    const event = {
+      id: 'chatcmpl_split',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning: 'do that.\n\n',
+            content: 'OK'
+          },
+          logprobs: null,
+          finish_reason: null
+        }
+      ]
+    };
+    const json = JSON.stringify(event);
+    const splitAt = json.indexOf('finish_reason') + 'finish'.length;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          `data: ${json.slice(0, splitAt)}`,
+          `data: ${json.slice(splitAt)}`,
+          '',
+          'data: [DONE]',
+          ''
+        ].join('\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+      if (delta.content) deltas.push(`c:${delta.content}`);
+    });
+
+    expect(result?.message.content).toBe('OK');
+    expect(result?.message.reasoning_content).toBe('do that.');
+    expect(deltas).toEqual(['r:do that.\n\n', 'c:OK']);
+  });
+
+  it('waits for OpenAI-compatible SSE JSON continued after an early event boundary', async () => {
+    const event = {
+      id: 'chatcmpl_boundary_split',
+      choices: [
+        {
+          index: 0,
+          delta: {
+            reasoning: 'PDF path.\n\n',
+            content: 'Done'
+          },
+          logprobs: null,
+          finish_reason: null
+        }
+      ]
+    };
+    const json = JSON.stringify(event);
+    const splitAt = json.indexOf('finish_reason') + 'finish'.length;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        [
+          `data: ${json.slice(0, splitAt)}`,
+          '',
+          json.slice(splitAt),
+          '',
+          'data: [DONE]',
+          ''
+        ].join('\n'),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+      )
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+      if (delta.content) deltas.push(`c:${delta.content}`);
+    });
+
+    expect(result?.message.content).toBe('Done');
+    expect(result?.message.reasoning_content).toBe('PDF path.');
+    expect(deltas).toEqual(['r:PDF path.\n\n', 'c:Done']);
+  });
+
+  it('repairs a final OpenAI-compatible SSE event truncated after finish_reason null', async () => {
+    const truncated = '{"id":"chatcmpl-adcda007e01b901d","object":"chat.completion.chunk","created":1787794299,"model":"qwen3.8-27b-nvfp4","choices":[{"index":0,"delta":{"reasoning":"."},"logprobs":null,"finish_reason":null';
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(`data: ${truncated}`, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    const deltas: string[] = [];
+    const result = await client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, (delta) => {
+      if (delta.reasoning_content) deltas.push(`r:${delta.reasoning_content}`);
+      if (delta.content) deltas.push(`c:${delta.content}`);
+    });
+
+    expect(result?.message.reasoning_content).toBe('.');
+    expect(deltas).toEqual(['r:.']);
+  });
+
+  it('cancels an OpenAI-compatible stream when SSE parsing fails', async () => {
+    const cancelSpy = vi.fn();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {not json}\n\n'));
+      },
+      cancel: cancelSpy
+    });
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = createLlmClient({
+      ...defaultConfig(),
+      provider: 'qwen-bailian',
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      apiKey: 'test-key',
+      model: 'qwen3.8-27b-nvfp4'
+    });
+
+    await expect(client.streamComplete?.({ messages: [{ role: 'user', content: 'hello' }] }, () => {}))
+      .rejects
+      .toThrow('Invalid LLM stream event');
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
   });
 
   it('streams anthropic content deltas', async () => {

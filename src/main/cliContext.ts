@@ -165,11 +165,11 @@ export class CliContext {
     );
     this.agentLoop = new AgentLoop({
       getConfig: () => this.getConfig(),
-      createClient: () => createLlmClient(this.getConfig()),
+      createClient: (config) => createLlmClient(config),
       toolRegistry: this.toolRegistry,
       sessions: this.sessionStore,
       promptBuilder: this.promptBuilder,
-      prepareExecution: (mode, runId) => this.sandboxManager.prepare(mode ?? this.getConfig().defaultExecutionMode, this.getConfig().workspaceDir, runId),
+      prepareExecution: (mode, runId, workspaceDir) => this.sandboxManager.prepare(mode ?? this.getConfig().defaultExecutionMode, workspaceDir ?? this.getConfig().workspaceDir, runId),
       beginDeferredMemory: (sessionId) => this.memoryStore.beginDeferredSession(sessionId),
       commitDeferredMemory: (sessionId) => {
         const result = this.memoryStore.commitDeferredSession(sessionId);

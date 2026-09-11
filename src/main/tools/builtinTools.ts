@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, join, relative, resolve } from 'node:path';
+import { TextDecoder } from 'node:util';
 import type { AppConfig, MemoryMutationOptions, RegisteredTool, ToolExecutionContext, ToolExecutionResult } from '../../shared/types.js';
 import { createId } from '../../shared/types.js';
 import type { MemoryStore } from '../storage/memoryStore.js';
@@ -13,6 +14,32 @@ import { runTerminalCommand } from './terminalRunner.js';
 
 const BROWSER_DEFAULT_TIMEOUT_MS = 60000;
 const BROWSER_MANUAL_LOGIN_TIMEOUT_MS = 300000;
+const DOCUMENT_FILE_EXTENSIONS = new Set(['.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pdf', '.ofd']);
+const BINARY_FILE_EXTENSIONS = new Set([
+  '.7z',
+  '.avi',
+  '.bin',
+  '.bmp',
+  '.db',
+  '.dll',
+  '.dmg',
+  '.exe',
+  '.gif',
+  '.gz',
+  '.ico',
+  '.jpeg',
+  '.jpg',
+  '.mov',
+  '.mp3',
+  '.mp4',
+  '.png',
+  '.rar',
+  '.sqlite',
+  '.tar',
+  '.webp',
+  '.zip'
+]);
+const UTF8_TEXT_DECODER = new TextDecoder('utf-8', { fatal: true });
 
 export interface BuiltinToolDeps {
   getConfig: () => AppConfig;
@@ -31,6 +58,31 @@ function numberArg(args: Record<string, unknown>, name: string, fallback: number
 
 function normalizePathSlashes(input: string): string {
   return input.replace(/\\/g, '/');
+}
+
+function isProbablyUtf8Text(buffer: Buffer): boolean {
+  if (buffer.length === 0) return true;
+  if (buffer.includes(0)) return false;
+  try {
+    UTF8_TEXT_DECODER.decode(buffer);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function renderNonTextFileReadMessage(target: string, ext: string): string {
+  const filename = basename(target);
+  if (DOCUMENT_FILE_EXTENSIONS.has(ext)) {
+    return [
+      `file_read only reads UTF-8 text-like files, but ${filename} is a document file (${ext}).`,
+      'Use the document upload/session document context or Personal Knowledge Base flow so the dedicated document converter handles it.'
+    ].join('\n');
+  }
+  return [
+    `file_read only reads UTF-8 text-like files, but ${filename} appears to be binary or non-text content.`,
+    'Use a format-specific tool or convert it to text before reading.'
+  ].join('\n');
 }
 
 function extractReferencedMarkdownPaths(markdown: string): string[] {
@@ -500,7 +552,7 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       type: 'function',
       function: {
         name: 'file_read',
-        description: 'Read a UTF-8 text file. Relative paths resolve inside the workspace; outside-workspace paths require approval.',
+        description: 'Read a UTF-8 text-like file. Use document upload/session document context or Personal Knowledge Base for PDF, Office, OFD, and other non-text formats. Relative paths resolve inside the workspace; outside-workspace paths require approval.',
         parameters: {
           type: 'object',
           properties: { path: { type: 'string', description: 'Workspace-relative or absolute file path.' } },
@@ -513,7 +565,15 @@ export function createBuiltinTools(deps: BuiltinToolDeps): RegisteredTool[] {
       const target = resolveToolPath(cfg.workspaceDir, stringArg(objectArgs(args), 'path'));
       if (!existsSync(target)) return { ok: false, content: 'File not found.' };
       if (statSync(target).isDirectory()) return { ok: false, content: 'Path is a directory.' };
-      return { ok: true, content: readFileSync(target, 'utf8') };
+      const ext = extname(target).toLowerCase();
+      if (DOCUMENT_FILE_EXTENSIONS.has(ext) || BINARY_FILE_EXTENSIONS.has(ext)) {
+        return { ok: false, content: renderNonTextFileReadMessage(target, ext || '(no extension)') };
+      }
+      const buffer = readFileSync(target);
+      if (!isProbablyUtf8Text(buffer)) {
+        return { ok: false, content: renderNonTextFileReadMessage(target, ext || '(no extension)') };
+      }
+      return { ok: true, content: buffer.toString('utf8') };
     }
   };
 
